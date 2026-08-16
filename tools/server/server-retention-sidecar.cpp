@@ -9,6 +9,10 @@
 namespace {
 constexpr size_t MAX_CATALOG_ARTIFACTS = SERVER_RETENTION_MAX_CANDIDATES;
 constexpr uint64_t MAX_TURN_TABLE_BYTES = 16ull*1024*1024;
+constexpr uint64_t MAX_PREFIX_INDEX_TOKEN_BYTES = 16ull*1024*1024;
+constexpr uint64_t MAX_PREFIX_INDEX_EDGE_BYTES = 16ull*1024*1024;
+constexpr size_t MAX_PREFIX_INDEX_NODES = 2*SERVER_RETENTION_MAX_CANDIDATES + 1;
+constexpr size_t MAX_PREFIX_INDEX_LINEAGE_REFS = 65536;
 constexpr uint64_t TURN_BOUNDARY_BYTES =
     sizeof(common_retention_turn_boundary);
 
@@ -19,6 +23,438 @@ bool checked_add(uint64_t & dst, uint64_t value) {
     dst += value;
     return true;
 }
+}
+
+struct server_retention_prefix_index::impl {
+    struct node;
+
+    struct edge {
+        std::vector<llama_token> label;
+        std::unique_ptr<node> child;
+    };
+
+    struct node {
+        uint32_t total_refs = 0;
+        uint32_t terminal_refs = 0;
+        std::unordered_map<uint64_t, uint32_t> lineage_refs;
+        std::unordered_map<llama_token, edge> edges;
+    };
+
+    struct artifact_record {
+        uint64_t lineage_id = 0;
+        std::vector<llama_token> tokens;
+    };
+
+    node root;
+    std::unordered_map<uint64_t, artifact_record> artifacts;
+    uint64_t artifact_token_bytes = 0;
+    uint64_t edge_token_bytes = 0;
+    size_t nodes = 1;
+    size_t lineage_ref_entries = 0;
+    bool healthy = true;
+
+    void poison() noexcept {
+        healthy = false;
+        artifacts.clear();
+        root = {};
+        artifact_token_bytes = 0;
+        edge_token_bytes = 0;
+        nodes = 1;
+        lineage_ref_entries = 0;
+    }
+
+    bool add_ref(node & cur, uint64_t lineage_id) {
+        if (cur.total_refs == UINT32_MAX) {
+            return false;
+        }
+        auto found = cur.lineage_refs.find(lineage_id);
+        if (found == cur.lineage_refs.end()) {
+            if (lineage_ref_entries == MAX_PREFIX_INDEX_LINEAGE_REFS) {
+                return false;
+            }
+            found = cur.lineage_refs.emplace(lineage_id, 0).first;
+            lineage_ref_entries++;
+        }
+        if (found->second == UINT32_MAX) {
+            return false;
+        }
+        cur.total_refs++;
+        found->second++;
+        return true;
+    }
+
+    bool insert(uint64_t lineage_id, const std::vector<llama_token> & tokens) {
+        node * cur = &root;
+        size_t pos = 0;
+        if (!add_ref(*cur, lineage_id)) {
+            return false;
+        }
+
+        while (pos < tokens.size()) {
+            auto found = cur->edges.find(tokens[pos]);
+            if (found == cur->edges.end()) {
+                if (nodes == MAX_PREFIX_INDEX_NODES) {
+                    return false;
+                }
+                edge added;
+                added.label.assign(tokens.begin() + pos, tokens.end());
+                added.child = std::make_unique<node>();
+                if (!add_ref(*added.child, lineage_id)) {
+                    return false;
+                }
+                added.child->terminal_refs = 1;
+                const uint64_t added_bytes =
+                    uint64_t(added.label.capacity())*sizeof(llama_token);
+                if (added_bytes > MAX_PREFIX_INDEX_EDGE_BYTES - edge_token_bytes) {
+                    return false;
+                }
+                cur->edges.emplace(tokens[pos], std::move(added));
+                edge_token_bytes += added_bytes;
+                nodes++;
+                return true;
+            }
+
+            edge & current = found->second;
+            size_t shared = 0;
+            while (shared < current.label.size() &&
+                   pos + shared < tokens.size() &&
+                   current.label[shared] == tokens[pos + shared]) {
+                shared++;
+            }
+            if (shared == current.label.size()) {
+                pos += shared;
+                cur = current.child.get();
+                if (!cur || !add_ref(*cur, lineage_id)) {
+                    return false;
+                }
+                continue;
+            }
+            if (shared == 0 || nodes + 1 > MAX_PREFIX_INDEX_NODES) {
+                return false;
+            }
+
+            auto middle = std::make_unique<node>();
+            middle->total_refs = current.child->total_refs;
+            middle->lineage_refs = current.child->lineage_refs;
+            if (lineage_ref_entries >
+                MAX_PREFIX_INDEX_LINEAGE_REFS - middle->lineage_refs.size()) {
+                return false;
+            }
+            lineage_ref_entries += middle->lineage_refs.size();
+            if (!add_ref(*middle, lineage_id)) {
+                return false;
+            }
+
+            edge old_suffix;
+            old_suffix.label.assign(
+                current.label.begin() + shared, current.label.end());
+            std::vector<llama_token> prefix(
+                current.label.begin(), current.label.begin() + shared);
+
+            const bool ends_at_split = pos + shared == tokens.size();
+            edge new_suffix;
+            if (!ends_at_split) {
+                if (nodes + 2 > MAX_PREFIX_INDEX_NODES) {
+                    return false;
+                }
+                new_suffix.label.assign(
+                    tokens.begin() + pos + shared, tokens.end());
+                new_suffix.child = std::make_unique<node>();
+                if (!add_ref(*new_suffix.child, lineage_id)) {
+                    return false;
+                }
+                new_suffix.child->terminal_refs = 1;
+            } else {
+                middle->terminal_refs = 1;
+            }
+
+            middle->edges.reserve(ends_at_split ? 1 : 2);
+            const llama_token old_first = old_suffix.label.front();
+            middle->edges.emplace(old_first, std::move(old_suffix));
+            if (!ends_at_split) {
+                const llama_token new_first = new_suffix.label.front();
+                middle->edges.emplace(new_first, std::move(new_suffix));
+            }
+
+            uint64_t replacement_bytes =
+                uint64_t(prefix.capacity())*sizeof(llama_token);
+            for (const auto & item : middle->edges) {
+                const uint64_t bytes =
+                    uint64_t(item.second.label.capacity())*sizeof(llama_token);
+                if (bytes > UINT64_MAX - replacement_bytes) {
+                    return false;
+                }
+                replacement_bytes += bytes;
+            }
+            const uint64_t old_bytes =
+                uint64_t(current.label.capacity())*sizeof(llama_token);
+            if (replacement_bytes < old_bytes ||
+                replacement_bytes - old_bytes >
+                    MAX_PREFIX_INDEX_EDGE_BYTES - edge_token_bytes) {
+                return false;
+            }
+
+            edge_token_bytes += replacement_bytes - old_bytes;
+            old_suffix = {};
+            auto old_child = std::move(current.child);
+            auto old_edge = middle->edges.find(old_first);
+            old_edge->second.child = std::move(old_child);
+            current.label = std::move(prefix);
+            current.child = std::move(middle);
+            nodes += ends_at_split ? 1 : 2;
+            return true;
+        }
+
+        if (cur->terminal_refs == UINT32_MAX) {
+            return false;
+        }
+        cur->terminal_refs++;
+        return true;
+    }
+
+    static uint32_t lineage_refs_at(const node & cur, uint64_t lineage_id) {
+        const auto found = cur.lineage_refs.find(lineage_id);
+        return found == cur.lineage_refs.end() ? 0 : found->second;
+    }
+
+    bool remove_ref(node & cur, uint64_t lineage_id) noexcept {
+        const auto found = cur.lineage_refs.find(lineage_id);
+        if (cur.total_refs == 0 || found == cur.lineage_refs.end() ||
+            found->second == 0) {
+            return false;
+        }
+        cur.total_refs--;
+        found->second--;
+        if (found->second == 0) {
+            cur.lineage_refs.erase(found);
+            lineage_ref_entries--;
+        }
+        return true;
+    }
+
+    bool retire_artifact(const artifact_record & record) noexcept {
+        struct path_entry {
+            node * parent;
+            llama_token edge_key;
+            node * child;
+        };
+        std::vector<path_entry> path;
+        try {
+            path.reserve(std::min(record.tokens.size(), nodes));
+        } catch (...) {
+            return false;
+        }
+        node * cur = &root;
+        size_t pos = 0;
+        if (!remove_ref(*cur, record.lineage_id)) {
+            return false;
+        }
+        while (pos < record.tokens.size()) {
+            auto found = cur->edges.find(record.tokens[pos]);
+            if (found == cur->edges.end() || !found->second.child ||
+                found->second.label.size() > record.tokens.size() - pos ||
+                !std::equal(
+                    found->second.label.begin(), found->second.label.end(),
+                    record.tokens.begin() + pos)) {
+                return false;
+            }
+            node * child = found->second.child.get();
+            path.push_back({ cur, found->first, child });
+            if (!remove_ref(*child, record.lineage_id)) {
+                return false;
+            }
+            pos += found->second.label.size();
+            cur = child;
+        }
+        if (cur->terminal_refs == 0) {
+            return false;
+        }
+        cur->terminal_refs--;
+
+        for (auto it = path.rbegin(); it != path.rend(); ++it) {
+            auto edge_it = it->parent->edges.find(it->edge_key);
+            if (edge_it == it->parent->edges.end() ||
+                edge_it->second.child.get() != it->child) {
+                return false;
+            }
+            if (it->child->total_refs == 0) {
+                if (!it->child->edges.empty() || !it->child->lineage_refs.empty() ||
+                    it->child->terminal_refs != 0) {
+                    return false;
+                }
+                edge_token_bytes -=
+                    uint64_t(edge_it->second.label.capacity())*sizeof(llama_token);
+                it->parent->edges.erase(edge_it);
+                nodes--;
+                continue;
+            }
+
+            // A retired one-shot branch can leave its split point as a
+            // nonterminal unary node. Recompress it immediately so historical
+            // branch churn cannot consume the live-cardinality node bound.
+            while (edge_it->second.child &&
+                   edge_it->second.child->terminal_refs == 0 &&
+                   edge_it->second.child->edges.size() == 1) {
+                auto * unary = edge_it->second.child.get();
+                auto only = unary->edges.begin();
+                if (!only->second.child ||
+                    lineage_ref_entries < unary->lineage_refs.size()) {
+                    return false;
+                }
+                std::vector<llama_token> merged;
+                try {
+                    if (only->second.label.size() >
+                        std::numeric_limits<size_t>::max() -
+                            edge_it->second.label.size()) {
+                        return false;
+                    }
+                    merged.reserve(
+                        edge_it->second.label.size() + only->second.label.size());
+                    merged.insert(
+                        merged.end(), edge_it->second.label.begin(),
+                        edge_it->second.label.end());
+                    merged.insert(
+                        merged.end(), only->second.label.begin(),
+                        only->second.label.end());
+                } catch (...) {
+                    return false;
+                }
+                const uint64_t old_bytes =
+                    (uint64_t(edge_it->second.label.capacity()) +
+                     uint64_t(only->second.label.capacity()))*sizeof(llama_token);
+                const uint64_t new_bytes =
+                    uint64_t(merged.capacity())*sizeof(llama_token);
+                if (old_bytes > edge_token_bytes ||
+                    new_bytes >
+                        MAX_PREFIX_INDEX_EDGE_BYTES - (edge_token_bytes - old_bytes)) {
+                    return false;
+                }
+                auto grandchild = std::move(only->second.child);
+                lineage_ref_entries -= unary->lineage_refs.size();
+                edge_token_bytes = edge_token_bytes - old_bytes + new_bytes;
+                edge_it->second.label = std::move(merged);
+                edge_it->second.child = std::move(grandchild);
+                nodes--;
+            }
+        }
+        return true;
+    }
+};
+
+server_retention_prefix_index::server_retention_prefix_index() noexcept {
+    try {
+        pimpl = std::make_unique<impl>();
+    } catch (...) {
+    }
+}
+
+server_retention_prefix_index::~server_retention_prefix_index() = default;
+
+bool server_retention_prefix_index::publish(
+        llama_cache_acct_artifact_id artifact,
+        uint64_t lineage_id,
+        const std::vector<llama_token> & tokens) noexcept {
+    if (!pimpl || !pimpl->healthy) {
+        return false;
+    }
+    if (artifact.v == 0 || lineage_id == 0 || tokens.empty() ||
+        pimpl->artifacts.count(artifact.v) != 0) {
+        return false;
+    }
+    if (pimpl->artifacts.size() == SERVER_RETENTION_MAX_CANDIDATES) {
+        pimpl->poison();
+        return false;
+    }
+    if (tokens.size() > MAX_PREFIX_INDEX_TOKEN_BYTES/sizeof(llama_token) ||
+        uint64_t(tokens.size())*sizeof(llama_token) >
+            MAX_PREFIX_INDEX_TOKEN_BYTES - pimpl->artifact_token_bytes) {
+        pimpl->poison();
+        return false;
+    }
+    try {
+        impl::artifact_record record;
+        record.lineage_id = lineage_id;
+        record.tokens = tokens;
+        const uint64_t bytes =
+            uint64_t(record.tokens.capacity())*sizeof(llama_token);
+        if (bytes > MAX_PREFIX_INDEX_TOKEN_BYTES - pimpl->artifact_token_bytes ||
+            !pimpl->insert(lineage_id, record.tokens)) {
+            pimpl->poison();
+            return false;
+        }
+        pimpl->artifact_token_bytes += bytes;
+        pimpl->artifacts.emplace(artifact.v, std::move(record));
+        return true;
+    } catch (...) {
+        pimpl->poison();
+        return false;
+    }
+}
+
+void server_retention_prefix_index::retire(
+        llama_cache_acct_artifact_id artifact) noexcept {
+    if (!pimpl || !pimpl->healthy || artifact.v == 0) {
+        return;
+    }
+    const auto found = pimpl->artifacts.find(artifact.v);
+    if (found == pimpl->artifacts.end()) {
+        return;
+    }
+    const uint64_t bytes =
+        uint64_t(found->second.tokens.capacity())*sizeof(llama_token);
+    if (!pimpl->retire_artifact(found->second) ||
+        bytes > pimpl->artifact_token_bytes) {
+        pimpl->poison();
+        return;
+    }
+    pimpl->artifact_token_bytes -= bytes;
+    pimpl->artifacts.erase(found);
+}
+
+bool server_retention_prefix_index::external_shared_coverage(
+        llama_cache_acct_artifact_id artifact,
+        uint64_t & coverage_tokens) const noexcept {
+    coverage_tokens = 0;
+    if (!pimpl || !pimpl->healthy || artifact.v == 0) {
+        return false;
+    }
+    const auto found = pimpl->artifacts.find(artifact.v);
+    if (found == pimpl->artifacts.end()) {
+        return false;
+    }
+    const auto & record = found->second;
+    const impl::node * cur = &pimpl->root;
+    size_t pos = 0;
+    while (pos < record.tokens.size()) {
+        const auto edge = cur->edges.find(record.tokens[pos]);
+        if (edge == cur->edges.end() || !edge->second.child ||
+            edge->second.label.size() > record.tokens.size() - pos ||
+            !std::equal(
+                edge->second.label.begin(), edge->second.label.end(),
+                record.tokens.begin() + pos)) {
+            return false;
+        }
+        pos += edge->second.label.size();
+        cur = edge->second.child.get();
+        if (cur->total_refs > impl::lineage_refs_at(*cur, record.lineage_id)) {
+            coverage_tokens = pos;
+        } else {
+            break;
+        }
+    }
+    return true;
+}
+
+bool server_retention_prefix_index::available() const noexcept {
+    return pimpl && pimpl->healthy;
+}
+
+size_t server_retention_prefix_index::size() const noexcept {
+    return available() ? pimpl->artifacts.size() : 0;
+}
+
+uint64_t server_retention_prefix_index::token_bytes() const noexcept {
+    return available() ? pimpl->artifact_token_bytes + pimpl->edge_token_bytes : 0;
 }
 
 void server_cache_acct_mark_shadow_unavailable(

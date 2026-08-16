@@ -4,7 +4,9 @@
 #include "server-cache-lease.h"
 #include "../../src/llama-cache-accounting.h"
 
+#include <memory>
 #include <unordered_map>
+#include <vector>
 
 constexpr size_t SERVER_RETENTION_MAX_CANDIDATES = 8192;
 
@@ -105,6 +107,36 @@ struct server_retention_value_snapshot_result {
 
 using server_retention_value_snapshot_visitor = bool (*)(
     void *, const server_retention_value_snapshot &) noexcept;
+
+// Bounded exact-token radix index used to lower cross-lineage shared-prefix
+// coverage into the pure DF1 projector. Same-lineage aliases never count as
+// external coverage. Any allocation, arithmetic, or cardinality failure
+// poisons the index so callers cannot consume a partially indexed view.
+class server_retention_prefix_index {
+public:
+    server_retention_prefix_index() noexcept;
+    ~server_retention_prefix_index();
+
+    server_retention_prefix_index(const server_retention_prefix_index &) = delete;
+    server_retention_prefix_index & operator=(const server_retention_prefix_index &) = delete;
+
+    bool publish(
+        llama_cache_acct_artifact_id artifact,
+        uint64_t lineage_id,
+        const std::vector<llama_token> & tokens) noexcept;
+    void retire(llama_cache_acct_artifact_id artifact) noexcept;
+    bool external_shared_coverage(
+        llama_cache_acct_artifact_id artifact,
+        uint64_t & coverage_tokens) const noexcept;
+
+    bool available() const noexcept;
+    size_t size() const noexcept;
+    uint64_t token_bytes() const noexcept;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
 
 struct server_retention_lineage_ticket {
     common_retention_pool pool = common_retention_pool::attention;

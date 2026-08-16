@@ -55,6 +55,232 @@ static common_chat_msg_spans make_spans() {
     return spans;
 }
 
+static llama_tokens prefix_tokens(
+        llama_token stem_base,
+        size_t stem_size,
+        llama_token tail_base,
+        size_t tail_size) {
+    llama_tokens out;
+    out.reserve(stem_size + tail_size);
+    for (size_t i = 0; i < stem_size; ++i) {
+        out.push_back(stem_base + llama_token(i));
+    }
+    for (size_t i = 0; i < tail_size; ++i) {
+        out.push_back(tail_base + llama_token(i));
+    }
+    return out;
+}
+
+static void test_exact_prefix_index() {
+    server_retention_prefix_index index;
+    CHECK(index.available());
+
+    const llama_cache_acct_artifact_id main_id { 1 };
+    const llama_cache_acct_artifact_id child_a_id { 2 };
+    const llama_cache_acct_artifact_id child_b_id { 3 };
+    const llama_cache_acct_artifact_id alias_id { 4 };
+    const auto main = prefix_tokens(1000, 80, 2000, 40);
+    const auto child_a = prefix_tokens(1000, 80, 3000, 2);
+    const auto child_b = prefix_tokens(1000, 60, 4000, 3);
+
+    CHECK(index.publish(main_id, 10, main));
+    uint64_t coverage = UINT64_MAX;
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == 0);
+
+    // Same-lineage aliases never manufacture retained-prefix value.
+    CHECK(index.publish(alias_id, 10, child_a));
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == 0);
+
+    // The split occurs inside the original compressed edge. Both directions
+    // must observe the exact 80-token cross-lineage prefix.
+    CHECK(index.publish(child_a_id, 20, child_a));
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == 80);
+    CHECK(index.external_shared_coverage(child_a_id, coverage));
+    CHECK(coverage == child_a.size());
+
+    CHECK(index.publish(child_b_id, 30, child_b));
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == 80);
+    index.retire(child_a_id);
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == 60);
+    index.retire(child_b_id);
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == 0);
+
+    // Exact identical prompts in distinct lineages share the whole frontier.
+    const llama_cache_acct_artifact_id exact_id { 5 };
+    CHECK(index.publish(exact_id, 40, main));
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == main.size());
+    index.retire(exact_id);
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == 0);
+
+    CHECK(index.size() == 2);
+    CHECK(index.token_bytes() != 0);
+    index.retire(alias_id);
+    index.retire(main_id);
+    CHECK(index.size() == 0);
+    CHECK(index.token_bytes() == 0);
+
+    // Duplicate identities are refused without damaging a complete index.
+    CHECK(index.publish(main_id, 10, main));
+    CHECK(index.available());
+    CHECK(!index.publish(main_id, 10, main));
+    CHECK(index.available());
+    CHECK(index.external_shared_coverage(main_id, coverage));
+    CHECK(coverage == 0);
+}
+
+static void test_prefix_index_cap_fail_closed() {
+    server_retention_prefix_index index;
+    for (size_t i = 0; i < SERVER_RETENTION_MAX_CANDIDATES; ++i) {
+        const llama_tokens tokens { llama_token(i) };
+        CHECK(index.publish(
+            llama_cache_acct_artifact_id { i + 1 }, i + 1, tokens));
+    }
+    CHECK(index.size() == SERVER_RETENTION_MAX_CANDIDATES);
+    CHECK(!index.publish(
+        llama_cache_acct_artifact_id { 1 }, 1, llama_tokens { 123456 }));
+    CHECK(index.available());
+    CHECK(!index.publish(
+        llama_cache_acct_artifact_id {}, 1, llama_tokens { 123456 }));
+    CHECK(index.available());
+    CHECK(!index.publish(
+        llama_cache_acct_artifact_id { SERVER_RETENTION_MAX_CANDIDATES + 1 },
+        SERVER_RETENTION_MAX_CANDIDATES + 1, {}));
+    CHECK(index.available());
+    CHECK(!index.publish(
+        llama_cache_acct_artifact_id { SERVER_RETENTION_MAX_CANDIDATES + 1 },
+        SERVER_RETENTION_MAX_CANDIDATES + 1,
+        llama_tokens { 999999 }));
+    CHECK(!index.available());
+    uint64_t coverage = UINT64_MAX;
+    CHECK(!index.external_shared_coverage(
+        llama_cache_acct_artifact_id { 1 }, coverage));
+    CHECK(coverage == 0);
+}
+
+static void test_prefix_index_oversized_input_fail_closed() {
+    server_retention_prefix_index index;
+    llama_tokens oversized(
+        (16ull*1024*1024)/sizeof(llama_token) + 1, llama_token(1));
+    CHECK(!index.publish(
+        llama_cache_acct_artifact_id { 1 }, 1, oversized));
+    CHECK(!index.available());
+    CHECK(index.size() == 0);
+    CHECK(index.token_bytes() == 0);
+}
+
+static void test_prefix_index_matches_exhaustive_oracle() {
+    struct fixture_record {
+        llama_tokens tokens;
+        uint64_t lineage_id = 0;
+        bool active = false;
+    };
+    std::vector<fixture_record> records(64);
+    server_retention_prefix_index index;
+    uint64_t rng = 0x9e3779b97f4a7c15ULL;
+    auto next = [&]() {
+        rng = rng*6364136223846793005ULL + 1442695040888963407ULL;
+        return rng;
+    };
+
+    for (size_t step = 0; step < 1000; ++step) {
+        const size_t slot = next()%records.size();
+        auto & record = records[slot];
+        const llama_cache_acct_artifact_id artifact { slot + 1 };
+        if (record.active) {
+            index.retire(artifact);
+            record = {};
+        } else {
+            record.lineage_id = 1 + next()%8;
+            const size_t stem = 1 + next()%24;
+            const size_t tail = next()%12;
+            record.tokens.reserve(stem + tail);
+            for (size_t i = 0; i < stem; ++i) {
+                record.tokens.push_back(100 + llama_token(i));
+            }
+            const llama_token salt = llama_token(next()%16)*1000;
+            for (size_t i = 0; i < tail; ++i) {
+                record.tokens.push_back(10000 + salt + llama_token(i));
+            }
+            CHECK(index.publish(artifact, record.lineage_id, record.tokens));
+            record.active = true;
+        }
+
+        CHECK(index.available());
+        for (size_t i = 0; i < records.size(); ++i) {
+            if (!records[i].active) {
+                continue;
+            }
+            uint64_t expected = 0;
+            for (size_t j = 0; j < records.size(); ++j) {
+                if (!records[j].active ||
+                    records[j].lineage_id == records[i].lineage_id) {
+                    continue;
+                }
+                size_t shared = 0;
+                while (shared < records[i].tokens.size() &&
+                       shared < records[j].tokens.size() &&
+                       records[i].tokens[shared] == records[j].tokens[shared]) {
+                    shared++;
+                }
+                expected = std::max(expected, uint64_t(shared));
+            }
+            uint64_t actual = UINT64_MAX;
+            CHECK(index.external_shared_coverage(
+                llama_cache_acct_artifact_id { i + 1 }, actual));
+            CHECK(actual == expected);
+        }
+    }
+
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (records[i].active) {
+            index.retire(llama_cache_acct_artifact_id { i + 1 });
+        }
+    }
+    CHECK(index.available());
+    CHECK(index.size() == 0);
+    CHECK(index.token_bytes() == 0);
+}
+
+static void test_prefix_index_branch_churn_recompresses() {
+    server_retention_prefix_index index;
+    constexpr size_t main_size = 16400;
+    llama_tokens main;
+    main.reserve(main_size);
+    for (size_t i = 0; i < main_size; ++i) {
+        main.push_back(100 + llama_token(i));
+    }
+    const llama_cache_acct_artifact_id main_id { 1 };
+    const llama_cache_acct_artifact_id branch_id { 2 };
+    CHECK(index.publish(main_id, 1, main));
+
+    for (size_t divergence = 1; divergence < main_size; ++divergence) {
+        llama_tokens branch(main.begin(), main.begin() + divergence + 1);
+        branch.back() = -llama_token(divergence);
+        CHECK(index.publish(branch_id, 2, branch));
+        uint64_t coverage = UINT64_MAX;
+        CHECK(index.external_shared_coverage(main_id, coverage));
+        CHECK(coverage == divergence);
+        index.retire(branch_id);
+        CHECK(index.available());
+        CHECK(index.size() == 1);
+        CHECK(index.external_shared_coverage(main_id, coverage));
+        CHECK(coverage == 0);
+    }
+
+    index.retire(main_id);
+    CHECK(index.available());
+    CHECK(index.size() == 0);
+    CHECK(index.token_bytes() == 0);
+}
+
 static void test_turn_table_and_geometry() {
     common_retention_turn_table turns;
     CHECK(common_retention_build_turn_table(make_spans(), true, 44, turns));
@@ -883,6 +1109,11 @@ static void test_observer_store_accounting() {
 }
 
 int main() {
+    test_exact_prefix_index();
+    test_prefix_index_cap_fail_closed();
+    test_prefix_index_oversized_input_fail_closed();
+    test_prefix_index_matches_exhaustive_oracle();
+    test_prefix_index_branch_churn_recompresses();
     test_turn_table_and_geometry();
     test_codec();
     test_store_and_allocator_import();
