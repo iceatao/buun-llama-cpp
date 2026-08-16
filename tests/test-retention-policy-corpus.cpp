@@ -548,6 +548,7 @@ struct contention_request {
 struct contention_entry {
     std::string key;
     server_retention_instance_key instance;
+    llama_tokens tokens;
     uint64_t prompt_tokens = 0;
     uint64_t recency = 0;
 };
@@ -564,6 +565,8 @@ struct contention_result {
     uint64_t tool_evictions = 0;
     uint64_t main_return_reused_tokens = 0;
     uint64_t tool_return_reused_tokens = 0;
+    uint64_t evicted_lost_work_tokens = 0;
+    uint64_t projected_lost_work_tokens = 0;
     uint64_t final_competition_epoch = 0;
     bool complete = true;
 };
@@ -572,6 +575,44 @@ common_chat_msg_spans contention_spans(uint64_t prompt_tokens) {
     common_chat_msg_spans out;
     out.add(COMMON_CHAT_ROLE_USER, 0, prompt_tokens);
     return out;
+}
+
+llama_tokens contention_tokens(const contention_request & request) {
+    llama_tokens out;
+    out.reserve(request.prompt_tokens);
+    const std::string key = request.key;
+    if (key == "main" || key.rfind("agent-", 0) == 0) {
+        constexpr uint64_t shared_stem = 80000;
+        for (uint64_t i = 0; i < shared_stem; ++i) {
+            out.push_back(llama_token(1000 + i));
+        }
+        uint64_t tail_base = key == "main" ? 200000 : 400000;
+        for (const unsigned char ch : key) {
+            tail_base = tail_base*33 + ch;
+        }
+        tail_base %= 100000000;
+        for (uint64_t i = shared_stem; i < request.prompt_tokens; ++i) {
+            out.push_back(llama_token(tail_base + i - shared_stem));
+        }
+        return out;
+    }
+
+    uint64_t base = 100000000;
+    for (const unsigned char ch : key) {
+        base = base*33 + ch;
+    }
+    base %= 1000000000;
+    for (uint64_t i = 0; i < request.prompt_tokens; ++i) {
+        out.push_back(llama_token(base + i));
+    }
+    return out;
+}
+
+uint64_t contention_lcp(
+        const llama_tokens & a,
+        const llama_tokens & b) {
+    return uint64_t(std::mismatch(
+        a.begin(), a.end(), b.begin(), b.end()).first - a.begin());
 }
 
 contention_result run_contention_workload(contention_policy policy) {
@@ -600,12 +641,16 @@ contention_result run_contention_workload(contention_policy policy) {
     constexpr uint64_t resident_bytes = 100;
     server_retention_sidecar_store store;
     store.configure(nullptr, {}, nullptr);
-    std::vector<contention_entry> cache;
-    int32_t next_slot = 10000;
-    uint64_t next_recency = 1;
     contention_result result;
     result.policy = policy == contention_policy::retained_fifo
         ? "retained_fifo" : "decayed_frequency";
+    if (!store.enable_prefix_tracking()) {
+        result.complete = false;
+        return result;
+    }
+    std::vector<contention_entry> cache;
+    int32_t next_slot = 10000;
+    uint64_t next_recency = 1;
 
     const auto find = [&](const char * key) {
         return std::find_if(cache.begin(), cache.end(),
@@ -618,6 +663,7 @@ contention_result run_contention_workload(contention_policy policy) {
         }
         result.pressure_waves++;
         auto victim = cache.end();
+        uint64_t projected_lost_work = 0;
         if (policy == contention_policy::retained_fifo) {
             victim = std::min_element(cache.begin(), cache.end(),
                 [&](const auto & a, const auto & b) {
@@ -631,6 +677,29 @@ contention_result run_contention_workload(contention_policy policy) {
                 });
         } else {
             const auto catalog = store.candidate_snapshot();
+            std::unordered_map<uint64_t, uint64_t> external_coverage;
+            external_coverage.reserve(catalog.size());
+            const auto inventory = store.value_snapshots(
+                &external_coverage,
+                [](void * context,
+                   const server_retention_value_snapshot & value) noexcept {
+                    auto & coverage = *static_cast<
+                        std::unordered_map<uint64_t, uint64_t> *>(context);
+                    try {
+                        return coverage.emplace(
+                            value.artifact_id.v,
+                            value.external_shared_coverage_tokens).second;
+                    } catch (...) {
+                        return false;
+                    }
+                });
+            if (inventory.status !=
+                    server_retention_value_snapshot_status::complete ||
+                inventory.size != catalog.size() ||
+                external_coverage.size() != catalog.size()) {
+                result.complete = false;
+                return;
+            }
             std::vector<server_cache_yield_candidate> candidates;
             std::unordered_map<uint64_t, uint64_t> bytes;
             candidates.reserve(catalog.size());
@@ -654,6 +723,14 @@ contention_result run_contention_workload(contention_policy policy) {
                 candidate.release_ops = {
                     llama_cache_acct_op_id { source.artifact_id.v },
                 };
+                const auto coverage = external_coverage.find(
+                    source.artifact_id.v);
+                if (coverage == external_coverage.end()) {
+                    result.complete = false;
+                    return;
+                }
+                candidate.external_shared_coverage_tokens =
+                    coverage->second;
                 candidates.push_back(std::move(candidate));
                 bytes.emplace(source.artifact_id.v, resident_bytes);
             }
@@ -668,11 +745,34 @@ contention_result run_contention_workload(contention_policy policy) {
                     return store.artifact_id(entry.instance).v ==
                            projected.victim_artifact;
                 });
+            if (victim != cache.end()) {
+                projected_lost_work = projected.lost_work;
+            }
         }
         if (victim == cache.end() || victim->instance == incoming) {
             result.complete = false;
             return;
         }
+        uint64_t retained_prefix = 0;
+        for (auto candidate = cache.begin(); candidate != cache.end();
+             ++candidate) {
+            if (candidate == victim) {
+                continue;
+            }
+            retained_prefix = std::max(
+                retained_prefix,
+                contention_lcp(victim->tokens, candidate->tokens));
+        }
+        const uint64_t actual_lost_work =
+            victim->prompt_tokens - retained_prefix;
+        if (policy == contention_policy::decayed_frequency) {
+            if (projected_lost_work != actual_lost_work) {
+                result.complete = false;
+                return;
+            }
+            result.projected_lost_work_tokens += projected_lost_work;
+        }
+        result.evicted_lost_work_tokens += actual_lost_work;
         result.main_evictions += victim->key == "main";
         result.tool_evictions += victim->key == "agent-1";
         result.evictions++;
@@ -683,13 +783,23 @@ contention_result run_contention_workload(contention_policy policy) {
     for (size_t request_index = 0;
          request_index < requests.size(); ++request_index) {
         const auto & request = requests[request_index];
+        auto request_tokens = contention_tokens(request);
         result.requests++;
         result.prompt_tokens += request.prompt_tokens;
         auto exact = find(request.key);
-        const uint64_t hit_tokens = exact == cache.end()
-            ? 0 : request.prompt_tokens;
-        if (exact != cache.end() &&
-            store.credit_reuse(exact->instance) ==
+        auto source = cache.end();
+        uint64_t hit_tokens = 0;
+        for (auto candidate = cache.begin(); candidate != cache.end();
+             ++candidate) {
+            const uint64_t lcp = contention_lcp(
+                request_tokens, candidate->tokens);
+            if (lcp > hit_tokens) {
+                source = candidate;
+                hit_tokens = lcp;
+            }
+        }
+        if (source != cache.end() &&
+            store.credit_reuse(source->instance) ==
                 common_retention_credit_result::unavailable) {
             result.complete = false;
             break;
@@ -706,16 +816,23 @@ contention_result run_contention_workload(contention_policy policy) {
         if (exact == cache.end()) {
             const auto destination =
                 server_retention_instance_key::for_slot(next_slot++);
-            const bool admitted = store.publish(destination,
+            bool admitted = true;
+            if (source != cache.end() && hit_tokens != 0) {
+                admitted = store.branch(source->instance, destination);
+            }
+            admitted = admitted && store.publish(destination,
                 common_retention_pool::attention,
                 contention_spans(request.prompt_tokens), true,
                 request.prompt_tokens, request.prompt_tokens, true);
+            admitted = admitted && store.publish_prefix(
+                destination, "contention-shared-stem-v1", request_tokens);
             if (!admitted) {
                 result.complete = false;
                 break;
             }
             cache.push_back({ request.key, destination,
-                request.prompt_tokens, next_recency++ });
+                std::move(request_tokens), request.prompt_tokens,
+                next_recency++ });
             if (cache.size() > capacity_entries) {
                 evict(destination);
             }
@@ -734,38 +851,50 @@ void test_stateful_contention_workload(
     fifo = run_contention_workload(contention_policy::retained_fifo);
     decayed = run_contention_workload(
         contention_policy::decayed_frequency);
+    const auto main_tokens = contention_tokens({ "main", 120000 });
+    const auto agent_1_tokens = contention_tokens({ "agent-1", 82000 });
+    const auto agent_2_tokens = contention_tokens({ "agent-2", 82000 });
+    const auto seed_tokens = contention_tokens({ "seed-a", 80000 });
+    CHECK(contention_lcp(main_tokens, agent_1_tokens) == 80000);
+    CHECK(contention_lcp(agent_1_tokens, agent_2_tokens) == 80000);
+    CHECK(contention_lcp(main_tokens, seed_tokens) == 0);
     CHECK(fifo.complete);
     CHECK(decayed.complete);
     CHECK(fifo.requests == 18);
     CHECK(fifo.prompt_tokens == 1622000);
-    CHECK(fifo.avoided_prefill_tokens == 404000);
-    CHECK(fifo.fresh_prefill_tokens == 1218000);
+    CHECK(fifo.avoided_prefill_tokens == 1204000);
+    CHECK(fifo.fresh_prefill_tokens == 418000);
     CHECK(fifo.pressure_waves == 10);
     CHECK(fifo.evictions == 10);
     CHECK(fifo.main_evictions == 1);
     CHECK(fifo.tool_evictions == 1);
-    CHECK(fifo.main_return_reused_tokens == 0);
-    CHECK(fifo.tool_return_reused_tokens == 0);
+    CHECK(fifo.main_return_reused_tokens == 80000);
+    CHECK(fifo.tool_return_reused_tokens == 80000);
+    CHECK(fifo.evicted_lost_work_tokens == 292000);
+    CHECK(fifo.projected_lost_work_tokens == 0);
     CHECK(fifo.final_competition_epoch == 25);
 
     CHECK(decayed.requests == 18);
     CHECK(decayed.prompt_tokens == 1622000);
-    CHECK(decayed.avoided_prefill_tokens == 606000);
-    CHECK(decayed.fresh_prefill_tokens == 1016000);
-    CHECK(decayed.pressure_waves == 8);
-    CHECK(decayed.evictions == 8);
+    CHECK(decayed.avoided_prefill_tokens == 1242000);
+    CHECK(decayed.fresh_prefill_tokens == 380000);
+    CHECK(decayed.pressure_waves == 10);
+    CHECK(decayed.evictions == 10);
     CHECK(decayed.main_evictions == 0);
-    CHECK(decayed.tool_evictions == 0);
+    CHECK(decayed.tool_evictions == 2);
     CHECK(decayed.main_return_reused_tokens == 120000);
-    CHECK(decayed.tool_return_reused_tokens == 82000);
-    CHECK(decayed.final_competition_epoch == 21);
+    CHECK(decayed.tool_return_reused_tokens == 80000);
+    CHECK(decayed.evicted_lost_work_tokens == 98000);
+    CHECK(decayed.projected_lost_work_tokens == 98000);
+    CHECK(decayed.final_competition_epoch == 25);
 
     // This is a retained-source counterfactual for the planned
     // non-consuming policy, not an efficacy replay of today's consuming
     // fixed-host default. Both arms run identical production-owned
-    // admission, reuse-credit, pressure-wave, and retirement transitions;
-    // only the pressure victim comparator differs. The separate branch-flood
-    // corpus above owns branch/source-credit isolation.
+    // admission, divergent branch, reuse-credit, pressure-wave, prefix-index,
+    // and retirement transitions; only the pressure victim comparator
+    // differs. Both arms account the best retained 80K shared stem, so an
+    // evicted main/tool return is a partial hit rather than a false cold miss.
     CHECK(fifo.avoided_prefill_tokens + fifo.fresh_prefill_tokens ==
           fifo.prompt_tokens);
     CHECK(decayed.avoided_prefill_tokens +
@@ -776,7 +905,7 @@ void emit_json(
         const std::vector<corpus_result> & report,
         const contention_result & fifo,
         const contention_result & decayed) {
-    std::printf("{\"version\":1,\"scenarios\":[");
+    std::printf("{\"version\":2,\"scenarios\":[");
     for (size_t i = 0; i < report.size(); ++i) {
         const auto & value = report[i];
         std::printf(
@@ -802,6 +931,8 @@ void emit_json(
             "\"main_evictions\":%llu,\"tool_evictions\":%llu,"
             "\"main_return_reused_tokens\":%llu,"
             "\"tool_return_reused_tokens\":%llu,"
+            "\"evicted_lost_work_tokens\":%llu,"
+            "\"projected_lost_work_tokens\":%llu,"
             "\"final_competition_epoch\":%llu}",
             value.policy, value.complete ? "true" : "false",
             (unsigned long long) value.requests,
@@ -814,6 +945,8 @@ void emit_json(
             (unsigned long long) value.tool_evictions,
             (unsigned long long) value.main_return_reused_tokens,
             (unsigned long long) value.tool_return_reused_tokens,
+            (unsigned long long) value.evicted_lost_work_tokens,
+            (unsigned long long) value.projected_lost_work_tokens,
             (unsigned long long) value.final_competition_epoch);
     };
     std::printf("],\"contention_workload\":{");
@@ -845,7 +978,7 @@ int main(int argc, char ** argv) {
     } else {
         std::printf(
             "retention policy corpus: PASS (%zu scenarios, "
-            "synthetic retained-source delta %llu modeled "
+            "shared-stem retained-source delta %llu modeled "
             "fresh-prefill tokens)\n",
             report.size(),
             (unsigned long long) (fifo.fresh_prefill_tokens -
