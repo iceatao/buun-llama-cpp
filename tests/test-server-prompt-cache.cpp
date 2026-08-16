@@ -1359,6 +1359,111 @@ void test_lifecycle_df2_reprojects_each_multi_victim_wave() {
     CHECK(authority.destruction.host_trade_df2_executed == 2);
 }
 
+void test_lifecycle_df2_phase_change_forgets_old_reuse() {
+    const auto run = [](bool age_old_credit) {
+        server_cache_authority authority;
+        const std::string execution = age_old_credit
+            ? "lifecycle-df2-phase-aged"
+            : "lifecycle-df2-phase-fresh";
+        server_prompt_cache cache(0, 0);
+        configure_host_trade(authority, cache, execution);
+        cache.retention_df2_capacity_authority = true;
+        CHECK(authority.retention.enable_prefix_tracking());
+        CHECK(cache.enable_retention_shadow());
+
+        const auto old_hot =
+            install_host_trade_entry(cache, authority, "phase-old", 100);
+        const auto old_key =
+            server_retention_instance_key::for_host_entry(&*old_hot);
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            authority.retention, old_key, old_hot->prompt,
+            old_hot->adapter_config_key, old_hot->prompt.n_tokens()));
+        for (int i = 0; i < 16; ++i) {
+            CHECK(authority.retention.begin_competition_wave());
+            CHECK(authority.retention.credit_reuse(old_key) ==
+                  common_retention_credit_result::credited);
+        }
+
+        const auto current_hot = install_host_trade_entry(
+            cache, authority, "phase-current", 100);
+        const auto current_key =
+            server_retention_instance_key::for_host_entry(&*current_hot);
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            authority.retention, current_key, current_hot->prompt,
+            current_hot->adapter_config_key, current_hot->prompt.n_tokens()));
+        if (age_old_credit) {
+            for (int i = 0; i < 16; ++i) {
+                CHECK(authority.retention.begin_competition_wave());
+            }
+        }
+        for (int i = 0; i < 3; ++i) {
+            CHECK(authority.retention.begin_competition_wave());
+            CHECK(authority.retention.credit_reuse(current_key) ==
+                  common_retention_credit_result::credited);
+        }
+
+        const auto old_artifact = authority.retention.artifact_id(old_key);
+        const auto current_artifact =
+            authority.retention.artifact_id(current_key);
+        cache.limit_size = 100;
+        cache.update();
+        CHECK(cache.states.size() == 1);
+        CHECK(authority.destruction.host_trade_df2_executed == 1);
+        CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+        const auto shadow = cache.retention_shadow_snapshot();
+        CHECK(shadow.complete == 1);
+        CHECK(shadow.last.proposed_artifact ==
+              (age_old_credit ? old_artifact : current_artifact));
+        return cache.states.front().adapter_config_key;
+    };
+
+    // Without an idle phase, sixteen old credits beat three new credits.
+    // After sixteen empty competition waves, the old value decays enough for
+    // the newly reused lineage to take over. The paired reversal prevents a
+    // frequency-blind FIFO implementation from satisfying the phase gate.
+    CHECK(run(false) == "phase-old");
+    CHECK(run(true) == "phase-current");
+}
+
+void test_lifecycle_df2_all_one_shot_converges_to_fifo() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-df2-all-one-shot";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    cache.retention_df2_capacity_authority = true;
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
+
+    const auto oldest =
+        install_host_trade_entry(cache, authority, "one-shot-a", 100);
+    const auto middle =
+        install_host_trade_entry(cache, authority, "one-shot-b", 100);
+    const auto newest =
+        install_host_trade_entry(cache, authority, "one-shot-c", 100);
+    for (const auto entry : { oldest, middle, newest }) {
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            authority.retention,
+            server_retention_instance_key::for_host_entry(&*entry),
+            entry->prompt, entry->adapter_config_key,
+            entry->prompt.n_tokens()));
+    }
+    const auto oldest_artifact = authority.retention.artifact_id(
+        server_retention_instance_key::for_host_entry(&*oldest));
+
+    cache.limit_size = 200;
+    cache.update();
+    CHECK(cache.states.size() == 2);
+    CHECK(cache.states.front().adapter_config_key == "one-shot-b");
+    CHECK(cache.states.back().adapter_config_key == "one-shot-c");
+    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.last.incumbent_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_artifact == oldest_artifact);
+    CHECK(shadow.last.agrees);
+}
+
 void make_host_trade_pair(
         server_prompt_cache::iterator victim,
         server_prompt_cache::iterator recovery,
@@ -3762,6 +3867,8 @@ int main(int argc, char ** argv) {
     test_lifecycle_df2_capacity_counts_recovery_pinned_coverage();
     test_lifecycle_df2_live_transition_matrix();
     test_lifecycle_df2_reprojects_each_multi_victim_wave();
+    test_lifecycle_df2_phase_change_forgets_old_reuse();
+    test_lifecycle_df2_all_one_shot_converges_to_fifo();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();
