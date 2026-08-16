@@ -40,13 +40,15 @@ static server_cache_destruction_artifact artifact(uint64_t id, uint64_t op) {
     out.candidate.artifact_id = { id };
     out.kind = common_retention_artifact_kind::live_slot;
     out.candidate.record.kind = out.kind;
-    out.candidate.record.turns.source =
-        common_retention_source_state::known;
-    out.candidate.record.turns.token_count = 1;
-    out.candidate.record.turns.boundaries = { { 0, 0, 1 } };
+    auto turns = std::make_shared<common_retention_turn_table>();
+    turns->source = common_retention_source_state::known;
+    turns->token_count = 1;
+    turns->boundaries = { { 0, 0, 1 } };
+    out.candidate.record.turns = std::move(turns);
     out.candidate.record.stamp.state =
         common_retention_score_state::known;
     out.candidate.record.stamp.stable_id = id;
+    out.candidate.record.stamp.lineage_id = id;
     out.candidate.record.stamp.recency_ordinal = id;
     out.candidate.record.stamp.coverage_tokens = 1;
     out.owner_slot = 0;

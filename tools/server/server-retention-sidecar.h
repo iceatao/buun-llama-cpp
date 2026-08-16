@@ -67,6 +67,7 @@ struct server_retention_candidate {
     llama_cache_acct_artifact_id artifact_id;
     server_retention_instance_key instance_key;
     common_retention_artifact_record record;
+    common_retention_lineage_record lineage;
     // D-S3's descriptor charge is provenance only. It is excluded from the D-S2
     // budget and must never be credited as eviction yield.
     llama_cache_acct_op_id provenance_op;
@@ -75,6 +76,14 @@ struct server_retention_candidate {
     std::vector<llama_cache_acct_op_id> release_ops;
     server_retention_candidate_availability avail =
         server_retention_candidate_availability::backing_missing_or_stale;
+};
+
+struct server_retention_lineage_ticket {
+    common_retention_pool pool = common_retention_pool::attention;
+    uint64_t lineage_id = 0;
+    std::shared_ptr<const common_retention_turn_table> turns;
+
+    bool valid() const noexcept { return lineage_id != 0 && bool(turns); }
 };
 
 // Allocation-free D-A4 creation-path view. The three comparison strings are
@@ -131,13 +140,55 @@ public:
         uint64_t coverage_tokens,
         bool coverage_valid,
         const server_cache_lease_identity * checkpoint_identity = nullptr,
-        const server_cache_lease_frontier * replacement_frontier = nullptr) noexcept;
+        const server_cache_lease_frontier * replacement_frontier = nullptr,
+        const server_retention_instance_key * lineage_source = nullptr,
+        const server_retention_lineage_ticket * lineage_ticket = nullptr,
+        bool defer_lineage_admission = false) noexcept;
     bool clone(
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept;
+    // Divergent reuse credits the immutable source separately, then admits
+    // the destination on probation without copied frequency or leases.
+    bool branch(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination,
+        const server_retention_instance_key * destination_lineage_source =
+            nullptr,
+        bool defer_lineage_admission = false) noexcept;
     bool rebind(
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept;
+    bool prepare_for_launch(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination) noexcept;
+    bool prepared_for_launch(
+        const server_retention_instance_key & destination) const noexcept;
+    bool consume_prepared_launch(
+        const server_retention_instance_key & destination,
+        server_retention_lineage_ticket & source) noexcept;
+    void abandon_prepared_launch(
+        const server_retention_instance_key & destination) noexcept;
+    common_retention_credit_result credit_reuse(
+        const server_retention_instance_key & source) noexcept;
+    bool acquire_lineage_ticket(
+        const server_retention_instance_key & source,
+        server_retention_lineage_ticket & out) noexcept;
+    void release_lineage_ticket(
+        server_retention_lineage_ticket & ticket) noexcept;
+    common_retention_credit_result credit_reuse(
+        const server_retention_lineage_ticket & source) noexcept;
+    bool activate_lineage_ticket(
+        const server_retention_lineage_ticket & ticket) noexcept;
+    bool set_lineage_prior(
+        const server_retention_instance_key & source,
+        uint32_t prior_milli) noexcept;
+    // One pressure/reclaim wave advances competition once, regardless of how
+    // many victims it later removes. DF1 exposes this only to tests/shadow
+    // observation; DF2 will own the authority call site.
+    bool begin_competition_wave() noexcept;
+    bool lineage_for_instance(
+        const server_retention_instance_key & key,
+        common_retention_lineage_record & out) const noexcept;
     // Interim D-S bridge: lifecycle choke points retire associations directly.
     // D-S5/D-S6 can consolidate this onto retire-by-artifact-id once D-S4 admission
     // owns the catalog mutation rather than merely carrying the strong id.
@@ -188,6 +239,9 @@ public:
     uint64_t live_bytes() const noexcept { return bytes_live; }
     uint64_t publish_ok() const noexcept { return n_publish_ok; }
     uint64_t unavailable() const noexcept { return n_unavailable; }
+    uint64_t competition_epoch_value() const noexcept {
+        return competition_epoch;
+    }
 
 private:
     struct catalog_entry {
@@ -201,8 +255,23 @@ private:
         llama_cache_acct_artifact_id artifact;
         bool checkpoint_identity_known = false;
         bool retire_pending = false;
+        server_retention_lineage_ticket prepared_source;
+    };
+    struct lineage_entry {
+        common_retention_lineage_record record;
+        uint32_t refs = 0;
+        bool admitted = false;
+    };
+    struct turn_table_entry {
+        std::shared_ptr<const common_retention_turn_table> table;
+        llama_cache_acct_op_id accounting_op;
+        uint64_t bytes = 0;
+        uint32_t refs = 0;
     };
     using catalog_map = std::unordered_map<uint64_t, catalog_entry>;
+    using lineage_map = std::unordered_map<uint64_t, lineage_entry>;
+    using turn_table_map = std::unordered_map<
+        const common_retention_turn_table *, turn_table_entry>;
     using association_map = std::unordered_map<
         server_retention_instance_key,
         llama_cache_acct_artifact_id,
@@ -214,11 +283,28 @@ private:
         const server_cache_lease_identity * checkpoint_identity,
         const server_cache_lease_frontier * replacement_frontier) noexcept;
     void retire_catalog_entry(catalog_map::iterator entry) noexcept;
+    bool retain_lineage(
+        common_retention_pool pool,
+        uint64_t lineage_id) noexcept;
+    void release_lineage(
+        common_retention_pool pool,
+        uint64_t lineage_id) noexcept;
+    bool retain_turn_table(
+        const std::shared_ptr<const common_retention_turn_table> & table,
+        llama_cache_acct_artifact_id attribution) noexcept;
+    void release_turn_table(
+        const std::shared_ptr<const common_retention_turn_table> & table) noexcept;
+    bool create_lineage(
+        common_retention_pool pool,
+        uint64_t & lineage_id) noexcept;
+    bool advance_competition_epoch() noexcept;
     void retire_association(association_map::iterator it) noexcept;
     static void release_recovery_pin(void * context) noexcept;
     void mark_unavailable() noexcept;
     static llama_cache_acct_artifact_id qualified_artifact_id(
         common_retention_pool pool, uint64_t stable_id) noexcept;
+    static uint64_t qualified_lineage_id(
+        common_retention_pool pool, uint64_t lineage_id) noexcept;
 
     llama_cache_acct_ledger * ledger = nullptr;
     server_cache_lease_table * leases = nullptr;
@@ -226,7 +312,12 @@ private:
     common_retention_allocator allocator;
     association_map associations;
     catalog_map catalog;
+    lineage_map lineages;
+    turn_table_map turn_tables;
+    common_retention_frequency_config frequency_config;
+    uint64_t competition_epoch = 1;
     uint64_t bytes_live = 0;
+    uint64_t turn_table_bytes_live = 0;
     uint64_t n_publish_ok = 0;
     uint64_t n_unavailable = 0;
 };

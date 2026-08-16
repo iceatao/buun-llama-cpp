@@ -3971,7 +3971,8 @@ static void server_prompt_cache_mirror_restore_retention(
         server_prompt_cache::iterator source,
         const server_prompt & destination,
         int32_t id_slot,
-        bool retained_source) {
+        bool retained_source,
+        bool continues_lineage) {
     if (!cache.retention_obs) {
         return;
     }
@@ -3979,12 +3980,22 @@ static void server_prompt_cache_mirror_restore_retention(
         server_retention_instance_key::for_host_entry(&*source);
     const auto live_key =
         server_retention_instance_key::for_slot(id_slot);
-    server_prompt_cache_mirror_artifact_clone(
-        cache,
-        host_key, common_retention_artifact_kind::host_entry, -1,
-        live_key, common_retention_artifact_kind::live_slot, id_slot,
-        destination, source->adapter_config_key,
-        destination.n_tokens());
+    if (continues_lineage) {
+        server_prompt_cache_mirror_artifact_clone(
+            cache,
+            host_key, common_retention_artifact_kind::host_entry, -1,
+            live_key, common_retention_artifact_kind::live_slot, id_slot,
+            destination, source->adapter_config_key,
+            destination.n_tokens());
+    } else {
+        (void) cache.retention_obs->branch(
+            host_key, live_key, nullptr, true);
+    }
+    // Selection does not count as reuse. Carry the immutable host source in a
+    // scheduler-consumed transition receipt so successful launch credits it
+    // once before admitting a divergent destination; every unlaunched path
+    // abandons the receipt and provisional branch.
+    (void) cache.retention_obs->prepare_for_launch(host_key, live_key);
 
     const auto admit_restored_checkpoints = [&]() {
         if (!cache.publish_authority || !cache.retention_obs) {
@@ -4048,10 +4059,13 @@ static void server_prompt_cache_mirror_restore_retention(
             const auto live_checkpoint =
                 server_retention_instance_key::for_checkpoint(
                     id_slot, &checkpoint);
+            const bool rebound = continues_lineage
+                ? cache.retention_obs->rebind(
+                    host_checkpoint, live_checkpoint)
+                : cache.retention_obs->branch(
+                    host_checkpoint, live_checkpoint, &live_key);
             const auto artifact =
-                cache.retention_obs->artifact_id(host_checkpoint);
-            const bool rebound = cache.retention_obs->rebind(
-                host_checkpoint, live_checkpoint);
+                cache.retention_obs->artifact_id(live_checkpoint);
             const server_cache_lease_subject checkpoint_destination {
                 artifact,
                 common_retention_artifact_kind::checkpoint,
@@ -4077,13 +4091,18 @@ static void server_prompt_cache_mirror_restore_retention(
         const auto destination_key =
             server_retention_instance_key::for_checkpoint(
                 id_slot, &*destination_checkpoint);
-        server_prompt_cache_mirror_artifact_clone(
-            cache,
-            source_key, common_retention_artifact_kind::checkpoint, -1,
-            destination_key, common_retention_artifact_kind::checkpoint,
-            id_slot,
-            destination, source->adapter_config_key,
-            destination_checkpoint->n_tokens);
+        if (continues_lineage) {
+            server_prompt_cache_mirror_artifact_clone(
+                cache,
+                source_key, common_retention_artifact_kind::checkpoint, -1,
+                destination_key, common_retention_artifact_kind::checkpoint,
+                id_slot,
+                destination, source->adapter_config_key,
+                destination_checkpoint->n_tokens);
+        } else {
+            (void) cache.retention_obs->branch(
+                source_key, destination_key, &live_key);
+        }
     }
     GGML_ASSERT(source_checkpoint == source->prompt.checkpoints.end());
     GGML_ASSERT(destination_checkpoint == destination.checkpoints.end());
@@ -4095,12 +4114,19 @@ void server_prompt_cache::commit_restore_delivery(
         server_prompt_cache_restore_delivery && delivery,
         server_prompt & destination,
         int32_t id_slot,
-        int32_t debug_source_id) {
+        int32_t debug_source_id,
+        uint64_t reused_prefix_tokens,
+        bool continues_lineage) {
     if (delivery.retains_source) {
         GGML_ASSERT(publish_authority != nullptr);
         destination = std::move(delivery.prompt);
         server_prompt_cache_mirror_restore_retention(
-            *this, source, destination, id_slot, true);
+            *this, source, destination, id_slot, true,
+            continues_lineage);
+        if (retention_obs && reused_prefix_tokens == 0) {
+            retention_obs->abandon_prepared_launch(
+                server_retention_instance_key::for_slot(id_slot));
+        }
         if (destruction_obs) {
             destruction_obs->note_host_restore(true);
         }
@@ -4121,7 +4147,12 @@ void server_prompt_cache::commit_restore_delivery(
     // Lifecycle-off is the historical move/rebind/erase terminal verbatim.
     destination = std::move(source->prompt);
     server_prompt_cache_mirror_restore_retention(
-        *this, source, destination, id_slot, false);
+        *this, source, destination, id_slot, false,
+        continues_lineage);
+    if (retention_obs && reused_prefix_tokens == 0) {
+        retention_obs->abandon_prepared_launch(
+            server_retention_instance_key::for_slot(id_slot));
+    }
     if (destruction_obs) {
         destruction_obs->note_host_restore(false);
     }
@@ -4151,6 +4182,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     // values this selection computes anyway
     [[maybe_unused]] int32_t obs_source_best = -1;
     [[maybe_unused]] int     obs_lcp_sel  = 0;
+    int reuse_lcp_best = 0;
 
     // find the most similar cached prompt, that would also preserve the most context.
     // Observer transport [A2, noexcept]: ONE row per visited entry, keyed by its
@@ -4236,6 +4268,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
                 f_sim_best = f_sim_cur;
                 obs_source_best = obs_source;
                 obs_lcp_sel = lcp_cur;
+                reuse_lcp_best = lcp_cur;
                 continue;
             }
         }
@@ -4245,6 +4278,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
             f_sim_best  = f_sim_cur;
 
             it_best = it;
+            reuse_lcp_best = lcp_cur;
             if constexpr (Observed) {
                 obs_source_best = obs_source;
                 obs_lcp_sel  = lcp_cur; // the winner's exact LCP, from the shipped computation
@@ -4338,7 +4372,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         *restored_family = delivery.cache_family;
     }
     commit_restore_delivery(
-        it_best, std::move(delivery), prompt, id_slot, obs_source_best);
+        it_best, std::move(delivery), prompt, id_slot, obs_source_best,
+        uint64_t(std::max(reuse_lcp_best, 0)),
+        reuse_lcp_best == int(it_best->prompt.tokens.size()));
 
     return true;
 }

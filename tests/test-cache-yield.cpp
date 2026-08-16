@@ -32,14 +32,21 @@ static server_cache_yield_candidate candidate(
     out.lease.cls = server_cache_lease_class::none;
     out.lease.eligibility = server_cache_lease_eligibility::eligible;
     out.record.kind = common_retention_artifact_kind::host_entry;
-    out.record.turns.source = common_retention_source_state::known;
-    out.record.turns.token_count = 10;
-    out.record.turns.boundaries.push_back({ 0, 0, 1 });
+    auto turns = std::make_shared<common_retention_turn_table>();
+    turns->source = common_retention_source_state::known;
+    turns->token_count = 10;
+    turns->boundaries.push_back({ 0, 0, 1 });
+    out.record.turns = std::move(turns);
     out.record.stamp.state = common_retention_score_state::known;
     out.record.stamp.pool = pool;
     out.record.stamp.stable_id = stable;
+    out.record.stamp.lineage_id = stable;
     out.record.stamp.recency_ordinal = recency;
     out.record.stamp.coverage_tokens = 10;
+    out.lineage.pool = pool;
+    out.lineage.lineage_id = stable;
+    out.lineage.admission_epoch = 1;
+    out.lineage.frequency_epoch = 1;
     out.release_ops = { llama_cache_acct_op_id{op} };
     return out;
 }
@@ -172,6 +179,210 @@ static void test_status_names() {
     CHECK(std::string(server_cache_yield_status_name(
               static_cast<server_cache_yield_status>(UINT8_MAX))) ==
           "invalid");
+}
+
+static void test_lineage_shadow_projection() {
+    fixture f;
+    f.bytes = { {1, 10}, {2, 20}, {3, 10} };
+    auto alias_a = candidate(
+        1, 1, common_retention_pool::attention, 1, 1);
+    auto alias_b = candidate(
+        2, 2, common_retention_pool::attention, 2, 2);
+    // Exact aliases share one lineage ledger. Releasing either loses no
+    // logical coverage; the projector emits one lineage candidate, not two
+    // copies of the same value, and breaks the equal-density tie by recency.
+    alias_b.record.stamp.lineage_id = 1;
+    alias_b.lineage = alias_a.lineage;
+
+    auto hot = candidate(
+        3, 3, common_retention_pool::attention, 3, 3);
+    hot.lineage.state = common_retention_frequency_state::promoted;
+    hot.lineage.reuse_hits = 2;
+    hot.lineage.frequency_q = 2*COMMON_RETENTION_FREQUENCY_ONE;
+    hot.lineage.last_credit_epoch = 1;
+
+    const auto projected = server_retention_shadow_project(
+        { hot, alias_a, alias_b }, 1, HOST, f.serial, f.preview());
+    CHECK(projected.complete);
+    CHECK(projected.alternatives.size() == 2);
+    CHECK(projected.alternatives[0].lineage_id == 1);
+    CHECK(projected.alternatives[0].artifact_ids.front().v == 1);
+    CHECK(projected.alternatives[0].lost_work_units == 0);
+    CHECK(projected.alternatives[1].lineage_id == 3);
+    CHECK(projected.alternatives[1].lost_work_units == 10);
+
+    // An ancestor alias can be discarded at zero logical loss while its
+    // longer descendant remains.
+    auto alias_b_turns =
+        std::make_shared<common_retention_turn_table>(*alias_b.record.turns);
+    alias_b_turns->token_count = 20;
+    alias_b.record.turns = std::move(alias_b_turns);
+    alias_b.record.stamp.coverage_tokens = 20;
+    const auto suffix = server_retention_shadow_project(
+        { alias_a, alias_b }, 1, HOST, f.serial, f.preview());
+    CHECK(suffix.complete && suffix.alternatives.size() == 1);
+    CHECK(suffix.alternatives[0].artifact_ids.front().v == 1);
+    CHECK(suffix.alternatives[0].lost_work_units == 0);
+
+    // If the ancestor is hard-protected it still contributes retained
+    // coverage, but is never proposed. Removing the descendant then loses
+    // only the unique suffix rather than charging the common stem twice.
+    alias_a.lease.cls = server_cache_lease_class::hard;
+    alias_a.lease.eligibility =
+        server_cache_lease_eligibility::hard_blocked;
+    const auto protected_ancestor = server_retention_shadow_project(
+        { alias_a, alias_b }, 1, HOST, f.serial, f.preview());
+    CHECK(protected_ancestor.complete &&
+          protected_ancestor.alternatives.size() == 1);
+    CHECK(protected_ancestor.alternatives[0].artifact_ids.front().v == 2);
+    CHECK(protected_ancestor.alternatives[0].lost_work_units == 10);
+
+    // Checkpoints are not prompt-payload substitutes or DF1 victims. A
+    // same-frontier checkpoint cannot turn the live/host lost work into zero.
+    auto checkpoint = alias_a;
+    checkpoint.artifact_id = { 50 };
+    checkpoint.record.kind = common_retention_artifact_kind::checkpoint;
+    checkpoint.release_ops = { llama_cache_acct_op_id{50} };
+    f.bytes.emplace(50, 1000);
+    const auto without_checkpoint = server_retention_shadow_project(
+        { alias_b, checkpoint }, 1, HOST, f.serial, f.preview());
+    CHECK(without_checkpoint.complete);
+    CHECK(without_checkpoint.alternatives.size() == 1);
+    CHECK(without_checkpoint.alternatives[0].artifact_ids.front().v == 2);
+    CHECK(without_checkpoint.alternatives[0].lost_work_units == 20);
+
+    // Ordinary full live/host frontiers remain policy candidates even if the
+    // legacy geometry scorer marked the frontier anchor. Mandatory status is
+    // artifact-typed and retained only for checkpoints.
+    auto full_host = candidate(
+        60, 60, common_retention_pool::attention, 60, 60);
+    full_host.record.stamp.mandatory_anchor = true;
+    f.bytes.emplace(60, 10);
+    const auto full_host_projection = server_retention_shadow_project(
+        { full_host }, 1, HOST, f.serial, f.preview());
+    CHECK(full_host_projection.complete);
+    CHECK(full_host_projection.alternatives.size() == 1);
+
+    // Two aliases may jointly release the last references to one allocation
+    // even though neither has positive marginal yield by itself.
+    auto shared_a = candidate(
+        70, 70, common_retention_pool::attention, 70, 70);
+    auto shared_b = candidate(
+        71, 71, common_retention_pool::attention, 71, 71);
+    shared_b.record.stamp.lineage_id = 70;
+    shared_b.lineage = shared_a.lineage;
+    const server_cache_yield_preview_callback shared_preview =
+        [](const auto & ops, uint64_t serial, auto & out) {
+            out = {};
+            out.accounting_serial = serial;
+            if (ops.size() == 2) {
+                out.rows.push_back({ HOST, 0, 64 });
+            }
+            return true;
+        };
+    const auto shared = server_retention_shadow_project(
+        { shared_a, shared_b }, 1, HOST, 91, shared_preview);
+    CHECK(shared.complete);
+    CHECK(shared.alternatives.size() == 1);
+    CHECK(shared.alternatives[0].artifact_ids.size() == 2);
+    CHECK(shared.alternatives[0].artifact_ids[0].v == 70);
+    CHECK(shared.alternatives[0].artifact_ids[1].v == 71);
+    CHECK(shared.alternatives[0].value.marginal_resource == 64);
+
+    // Shared allocations are not restricted to equal-frontier aliases. The
+    // exact compound {ancestor, descendant} must be discovered without also
+    // evicting an independent longest-prefix member of the same lineage.
+    auto shared_ancestor = candidate(
+        80, 80, common_retention_pool::attention, 80, 80);
+    auto shared_descendant = candidate(
+        81, 81, common_retention_pool::attention, 81, 81);
+    auto independent_tail = candidate(
+        82, 82, common_retention_pool::attention, 82, 82);
+    shared_ancestor.record.stamp.coverage_tokens = 10;
+    shared_descendant.record.stamp.coverage_tokens = 20;
+    independent_tail.record.stamp.coverage_tokens = 30;
+    for (auto * value : {
+            &shared_ancestor, &shared_descendant, &independent_tail }) {
+        auto turns = std::make_shared<common_retention_turn_table>(
+            *value->record.turns);
+        turns->token_count = 30;
+        value->record.turns = std::move(turns);
+    }
+    shared_descendant.record.stamp.lineage_id = 80;
+    independent_tail.record.stamp.lineage_id = 80;
+    shared_descendant.lineage = shared_ancestor.lineage;
+    independent_tail.lineage = shared_ancestor.lineage;
+    const server_cache_yield_preview_callback unequal_preview =
+        [](const auto & ops, uint64_t serial, auto & out) {
+            out = {};
+            out.accounting_serial = serial;
+            const auto has = [&](uint64_t id) {
+                return std::any_of(ops.begin(), ops.end(),
+                    [&](auto op) { return op.v == id; });
+            };
+            uint64_t bytes = has(82) ? 5 : 0;
+            if (has(80) && has(81)) {
+                bytes += 64;
+            }
+            if (bytes != 0) {
+                out.rows.push_back({ HOST, 0, bytes });
+            }
+            return true;
+        };
+    const auto unequal = server_retention_shadow_project(
+        { shared_ancestor, shared_descendant, independent_tail },
+        1, HOST, 92, unequal_preview);
+    CHECK(unequal.complete);
+    CHECK(unequal.alternatives.size() == 1);
+    CHECK(unequal.alternatives[0].artifact_ids.size() == 2);
+    CHECK(unequal.alternatives[0].artifact_ids[0].v == 80);
+    CHECK(unequal.alternatives[0].artifact_ids[1].v == 81);
+    CHECK(unequal.alternatives[0].lost_work_units == 0);
+    CHECK(unequal.alternatives[0].value.marginal_resource == 64);
+
+    const server_cache_yield_preview_callback removes_max_preview =
+        [](const auto & ops, uint64_t serial, auto & out) {
+            out = {};
+            out.accounting_serial = serial;
+            const auto has = [&](uint64_t id) {
+                return std::any_of(ops.begin(), ops.end(),
+                    [&](auto op) { return op.v == id; });
+            };
+            if (has(80) && has(82)) {
+                out.rows.push_back({ HOST, 0, 64 });
+            }
+            return true;
+        };
+    const auto removes_max = server_retention_shadow_project(
+        { shared_ancestor, shared_descendant, independent_tail },
+        1, HOST, 93, removes_max_preview);
+    CHECK(removes_max.complete);
+    CHECK(removes_max.alternatives.size() == 1);
+    CHECK(removes_max.alternatives[0].artifact_ids.size() == 2);
+    CHECK(removes_max.alternatives[0].artifact_ids[0].v == 80);
+    CHECK(removes_max.alternatives[0].artifact_ids[1].v == 82);
+    CHECK(removes_max.alternatives[0].lost_work_units == 10);
+
+    fixture flood_fixture;
+    std::vector<server_cache_yield_candidate> aliases;
+    aliases.reserve(100);
+    for (uint64_t i = 0; i < 100; ++i) {
+        const uint64_t id = 100 + i;
+        flood_fixture.bytes.emplace(id, 1);
+        auto value = candidate(
+            id, id, common_retention_pool::attention, id, id);
+        value.record.stamp.lineage_id = 77;
+        value.lineage = alias_a.lineage;
+        value.lineage.lineage_id = 77;
+        aliases.push_back(std::move(value));
+    }
+    const auto flood = server_retention_shadow_project(
+        aliases, 1, HOST, flood_fixture.serial,
+        flood_fixture.preview());
+    CHECK(flood.complete);
+    CHECK(flood.alternatives.size() == 1);
+    CHECK(flood.alternatives[0].lineage_id == 77);
+    CHECK(flood.alternatives[0].lost_work_units == 0);
 }
 
 static void test_planner_scan_preserves_valid_lease() {
@@ -359,6 +570,13 @@ static void test_value_record_order_reproduction() {
     common_retention_sidecar_snapshot snapshot;
     snapshot.recency_high_water[0] = 2;
     snapshot.stable_high_water[0] = 2;
+    snapshot.lineage_high_water[0] = 2;
+    snapshot.lineages = {
+        { common_retention_pool::attention,
+          common_retention_frequency_state::probation, 1, 0, 0, 1, 1, 0, 1000 },
+        { common_retention_pool::attention,
+          common_retention_frequency_state::probation, 2, 0, 0, 1, 1, 0, 1000 },
+    };
     snapshot.artifacts = { second.record, first.record };
     std::vector<uint8_t> bytes;
     CHECK(common_retention_sidecar_encode(snapshot, bytes));
@@ -490,6 +708,18 @@ static void test_resume_both_pools() {
     snapshot.recency_high_water[1] = 4;
     snapshot.stable_high_water[0] = 2;
     snapshot.stable_high_water[1] = 4;
+    snapshot.lineage_high_water[0] = 2;
+    snapshot.lineage_high_water[1] = 4;
+    snapshot.lineages = {
+        { common_retention_pool::attention,
+          common_retention_frequency_state::probation, 1, 0, 0, 1, 1, 0, 1000 },
+        { common_retention_pool::attention,
+          common_retention_frequency_state::probation, 2, 0, 0, 1, 1, 0, 1000 },
+        { common_retention_pool::recurrent,
+          common_retention_frequency_state::probation, 3, 0, 0, 1, 1, 0, 1000 },
+        { common_retention_pool::recurrent,
+          common_retention_frequency_state::probation, 4, 0, 0, 1, 1, 0, 1000 },
+    };
     snapshot.artifacts = { r4.record, a2.record, r3.record, a1.record };
     std::vector<uint8_t> bytes;
     CHECK(common_retention_sidecar_encode(snapshot, bytes));
@@ -655,6 +885,7 @@ static void test_exception_isolation() {
 int main() {
     test_atomic_assembler_contract();
     test_status_names();
+    test_lineage_shadow_projection();
     test_planner_scan_preserves_valid_lease();
     test_policy_v1_mixed_pools();
     test_planner_shared_union();

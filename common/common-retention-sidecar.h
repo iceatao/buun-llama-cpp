@@ -5,14 +5,18 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
-constexpr uint32_t COMMON_RETENTION_SIDECAR_VERSION = 1;
+constexpr uint32_t COMMON_RETENTION_SIDECAR_VERSION = 2;
 constexpr uint32_t COMMON_RETENTION_TURN_TABLE_VERSION = 1;
 // Stable ids are shifted left by one to form the pool-qualified durable key.
 // Keep the ceiling beside the codec/allocator contract so the server cannot drift.
 constexpr uint64_t COMMON_RETENTION_MAX_POOL_COUNTER =
     (UINT64_MAX >> 1) - 1;
+constexpr uint64_t COMMON_RETENTION_FREQUENCY_ONE = uint64_t(1) << 20;
+constexpr uint32_t COMMON_RETENTION_MAX_PRIOR_MILLI = 4000;
+constexpr size_t COMMON_RETENTION_MAX_TURN_BOUNDARIES = 8192;
 
 // Fidelity of the durable turn-table source.
 enum class common_retention_source_state : uint8_t {
@@ -42,6 +46,92 @@ enum class common_retention_score_state : uint8_t {
     _count,
 };
 
+enum class common_retention_frequency_state : uint8_t {
+    unavailable = 0,
+    probation,
+    promoted,
+    _count,
+};
+
+// Shadow-policy constants remain explicit inputs until DF1 trace selection
+// freezes them for DF2. Arithmetic is integer-only and saturating.
+struct common_retention_frequency_config {
+    uint64_t credit_q = COMMON_RETENTION_FREQUENCY_ONE;
+    uint64_t maximum_q = COMMON_RETENTION_FREQUENCY_ONE*16;
+    uint64_t decay_interval_epochs = 8;
+    uint32_t promotion_hits = 2;
+
+    bool valid() const noexcept;
+};
+
+// One record belongs to one logical lineage, never to one artifact/alias.
+// Artifact records carry lineage_id references; cloning cannot copy this
+// record or multiply its value.
+struct common_retention_lineage_record {
+    common_retention_pool pool = common_retention_pool::attention;
+    common_retention_frequency_state state =
+        common_retention_frequency_state::probation;
+    uint64_t lineage_id = 0;
+    uint64_t reuse_hits = 0;
+    uint64_t frequency_q = 0;
+    uint64_t admission_epoch = 0;
+    uint64_t frequency_epoch = 0;
+    uint64_t last_credit_epoch = 0;
+    uint32_t prior_milli = 1000;
+
+    bool valid(uint64_t competition_epoch) const noexcept;
+};
+
+enum class common_retention_credit_result : uint8_t {
+    credited = 0,
+    coalesced,
+    unavailable,
+    _count,
+};
+
+bool common_retention_frequency_normalize(
+        common_retention_lineage_record & lineage,
+        uint64_t competition_epoch,
+        const common_retention_frequency_config & config) noexcept;
+
+common_retention_credit_result common_retention_frequency_credit(
+        common_retention_lineage_record & lineage,
+        uint64_t competition_epoch,
+        const common_retention_frequency_config & config) noexcept;
+
+enum class common_retention_shadow_value_state : uint8_t {
+    known = 0,
+    unavailable,
+    _count,
+};
+
+struct common_retention_shadow_value {
+    common_retention_shadow_value_state state =
+        common_retention_shadow_value_state::unavailable;
+    common_retention_frequency_state frequency_state =
+        common_retention_frequency_state::unavailable;
+    uint64_t lineage_id = 0;
+    uint64_t normalized_frequency_q = 0;
+    uint64_t lost_value_q = 0;
+    uint64_t marginal_resource = 0;
+    uint64_t recency_ordinal = 0;
+};
+
+bool common_retention_shadow_quote(
+        common_retention_lineage_record lineage,
+        uint64_t competition_epoch,
+        uint64_t avoided_work_units,
+        uint64_t marginal_resource,
+        uint64_t recency_ordinal,
+        const common_retention_frequency_config & config,
+        common_retention_shadow_value & out) noexcept;
+
+// Negative means a is the preferred victim, positive means b, zero means the
+// quotes are identical. This is a shadow-only DF1 comparator.
+int common_retention_shadow_compare(
+        const common_retention_shadow_value & a,
+        const common_retention_shadow_value & b) noexcept;
+
 struct common_retention_turn_boundary {
     uint64_t ordinal  = 0;
     uint64_t token_pos = 0;
@@ -65,6 +155,7 @@ struct common_retention_stamp {
     // geometry policy to recover the non-evictable result.
     bool mandatory_anchor = false;
     uint64_t stable_id = 0;
+    uint64_t lineage_id = 0;
     uint64_t recency_ordinal = 0;
     uint64_t mapped_turn_ordinal = 0;
     uint64_t anchor_rank = 0;
@@ -75,7 +166,10 @@ struct common_retention_stamp {
 
 struct common_retention_artifact_record {
     common_retention_artifact_kind kind = common_retention_artifact_kind::live_slot;
-    common_retention_turn_table turns;
+    // Immutable prefix geometry is shared across physical aliases and
+    // checkpoints. A copied artifact record must not duplicate an 8K-entry
+    // boundary table.
+    std::shared_ptr<const common_retention_turn_table> turns;
     common_retention_stamp stamp;
 
     bool valid() const noexcept;
@@ -85,6 +179,9 @@ struct common_retention_sidecar_snapshot {
     uint32_t version = COMMON_RETENTION_SIDECAR_VERSION;
     std::array<uint64_t, size_t(common_retention_pool::_count)> recency_high_water = {};
     std::array<uint64_t, size_t(common_retention_pool::_count)> stable_high_water = {};
+    std::array<uint64_t, size_t(common_retention_pool::_count)> lineage_high_water = {};
+    uint64_t competition_epoch = 1;
+    std::vector<common_retention_lineage_record> lineages;
     std::vector<common_retention_artifact_record> artifacts;
 
     bool valid() const noexcept;
@@ -119,11 +216,17 @@ bool common_retention_sidecar_decode(
 class common_retention_allocator {
 public:
     bool issue(common_retention_pool pool, common_retention_stamp & stamp) noexcept;
+    bool issue_lineage(
+        common_retention_pool pool,
+        uint64_t competition_epoch,
+        common_retention_lineage_record & lineage) noexcept;
     bool import_snapshot(const common_retention_sidecar_snapshot & snapshot) noexcept;
     uint64_t recency_high_water(common_retention_pool pool) const noexcept;
     uint64_t stable_high_water(common_retention_pool pool) const noexcept;
+    uint64_t lineage_high_water(common_retention_pool pool) const noexcept;
 
 private:
     std::array<uint64_t, size_t(common_retention_pool::_count)> next_recency = { 1, 1 };
     std::array<uint64_t, size_t(common_retention_pool::_count)> next_stable = { 1, 1 };
+    std::array<uint64_t, size_t(common_retention_pool::_count)> next_lineage = { 1, 1 };
 };

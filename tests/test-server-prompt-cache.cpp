@@ -645,7 +645,24 @@ void test_lifecycle_restore_retains_immutable_source() {
 
     server_prompt live_first;
     cache.commit_restore_delivery(
-        cache.states.begin(), std::move(first), live_first, 4);
+        cache.states.begin(), std::move(first), live_first, 4, -1, 3);
+    const auto launch_prepared = [&](int32_t slot_id) {
+        const auto key = server_retention_instance_key::for_slot(slot_id);
+        CHECK(authority.retention.prepared_for_launch(key));
+        server_retention_lineage_ticket source_ticket;
+        CHECK(authority.retention.consume_prepared_launch(
+            key, source_ticket));
+        CHECK(authority.retention.credit_reuse(source_ticket) !=
+              common_retention_credit_result::unavailable);
+        authority.retention.release_lineage_ticket(source_ticket);
+        server_retention_lineage_ticket destination_ticket;
+        CHECK(authority.retention.acquire_lineage_ticket(
+            key, destination_ticket));
+        CHECK(authority.retention.activate_lineage_ticket(
+            destination_ticket));
+        authority.retention.release_lineage_ticket(destination_ticket);
+    };
+    launch_prepared(4);
     CHECK(cache.states.size() == 1);
     CHECK(cache.states.front().size() == host_size_before);
     CHECK(live_first.n_tokens() == 3);
@@ -689,6 +706,54 @@ void test_lifecycle_restore_retains_immutable_source() {
     CHECK(host_artifact.v != 0);
     CHECK(live_artifact.v != 0);
     CHECK(host_artifact != live_artifact);
+    common_retention_lineage_record host_lineage;
+    common_retention_lineage_record live_lineage;
+    CHECK(authority.retention.lineage_for_instance(
+        host_key, host_lineage));
+    CHECK(authority.retention.lineage_for_instance(
+        live_key, live_lineage));
+    CHECK(host_lineage.lineage_id == live_lineage.lineage_id);
+    CHECK(host_lineage.reuse_hits == 1);
+    CHECK(host_lineage.state ==
+          common_retention_frequency_state::probation);
+
+    // A divergent request still credits the immutable host source, but its
+    // live destination must start on probation rather than inheriting the
+    // source's accumulated value. The real load path selects this transition
+    // when LCP is shorter than the restored host frontier.
+    server_prompt_cache_restore_delivery divergent;
+    CHECK(cache.prepare_restore_delivery(cache.states.begin(), divergent));
+    server_prompt live_branch;
+    cache.commit_restore_delivery(
+        cache.states.begin(), std::move(divergent), live_branch,
+        5, -1, 2, false);
+    const auto divergent_checkpoint_key =
+        server_retention_instance_key::for_checkpoint(
+            5, &live_branch.checkpoints.front());
+    server_retention_checkpoint_inventory divergent_checkpoint;
+    CHECK(!authority.retention.checkpoint_inventory(
+        divergent_checkpoint_key, divergent_checkpoint));
+    common_retention_lineage_record branch_lineage;
+    CHECK(!authority.retention.lineage_for_instance(
+        server_retention_instance_key::for_slot(5), branch_lineage));
+    CHECK(authority.retention.lineage_for_instance(
+        host_key, host_lineage));
+    CHECK(host_lineage.reuse_hits == 1);
+    launch_prepared(5);
+    CHECK(authority.retention.lineage_for_instance(
+        server_retention_instance_key::for_slot(5), branch_lineage));
+    CHECK(authority.retention.checkpoint_inventory(
+        divergent_checkpoint_key, divergent_checkpoint));
+    CHECK(divergent_checkpoint.release_owned);
+    CHECK(branch_lineage.lineage_id != host_lineage.lineage_id);
+    CHECK(branch_lineage.reuse_hits == 0);
+    CHECK(branch_lineage.state ==
+          common_retention_frequency_state::probation);
+    CHECK(authority.retention.lineage_for_instance(
+        host_key, host_lineage));
+    CHECK(host_lineage.reuse_hits == 1);
+    CHECK(host_lineage.state ==
+          common_retention_frequency_state::probation);
 
     control_host_refresh_fixture refresh {
         &cache, &execution, &live_first, 4, "same",
@@ -792,9 +857,11 @@ void test_lifecycle_restore_retains_immutable_source() {
     server_prompt_cache_restore_delivery second;
     CHECK(cache.prepare_restore_delivery(cache.states.begin(), second));
     CHECK(second.cache_family == declared_branch);
+    CHECK(authority.retention.begin_competition_wave());
     server_prompt live_second;
     cache.commit_restore_delivery(
-        cache.states.begin(), std::move(second), live_second, 5);
+        cache.states.begin(), std::move(second), live_second, 5, -1, 3);
+    launch_prepared(5);
     CHECK(cache.states.size() == 1);
     CHECK(cache.states.front().size() == host_size_before);
     CHECK(live_second.n_tokens() == 3);
@@ -804,6 +871,11 @@ void test_lifecycle_restore_retains_immutable_source() {
         server_retention_instance_key::for_checkpoint(
             5, &live_second.checkpoints.front()), restored));
     CHECK(!restored.release_ops.empty());
+    CHECK(authority.retention.lineage_for_instance(
+        host_key, host_lineage));
+    CHECK(host_lineage.reuse_hits == 2);
+    CHECK(host_lineage.state ==
+          common_retention_frequency_state::promoted);
 
     // Restored members own independent operations and therefore participate
     // in the exact D-A4 release terminal instead of remaining permanently
@@ -828,7 +900,7 @@ void test_lifecycle_restore_retains_immutable_source() {
         server_retention_instance_key::for_checkpoint(
             5, &live_second.checkpoints.front()), restored));
     CHECK(!restored.release_ops.empty());
-    CHECK(authority.destruction.host_restores_retained == 2);
+    CHECK(authority.destruction.host_restores_retained == 3);
 
     cache.destroy_entry(
         cache.states.begin(), server_cache_destruction_reason::host_capacity);

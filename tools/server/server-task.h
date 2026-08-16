@@ -944,7 +944,9 @@ struct server_prompt_cache {
             server_prompt_cache_restore_delivery && delivery,
             server_prompt & destination,
             int32_t id_slot,
-            int32_t debug_source_id = -1);
+            int32_t debug_source_id = -1,
+            uint64_t reused_prefix_tokens = 0,
+            bool continues_lineage = true);
 
     void update();
 

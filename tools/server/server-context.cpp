@@ -645,6 +645,13 @@ struct server_slot {
     server_cache_authority * lifecycle_authority = nullptr;
     bool cache_debug_observability = false;
     common_retention_pool retention_pool = common_retention_pool::attention;
+    bool retention_reuse_pending = false;
+    uint64_t retention_reuse_tokens = 0;
+    server_retention_lineage_ticket retention_reuse_source;
+    server_retention_lineage_ticket retention_destination;
+    bool retention_branch_pending = false;
+    bool retention_request_succeeded = false;
+    bool retention_geometry_failed = false;
     server_cache_checkpoint_attempt_latch checkpoint_attempts;
     const common_prompt_checkpoint * checkpoint_seam_heuristic = nullptr;
     common_cache_plan_destruction_reason checkpoint_floor_refusal =
@@ -1376,6 +1383,18 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        if (retention_obs) {
+            retention_obs->release_lineage_ticket(retention_reuse_source);
+            retention_obs->release_lineage_ticket(retention_destination);
+        } else {
+            retention_reuse_source = {};
+            retention_destination = {};
+        }
+        retention_reuse_pending = false;
+        retention_reuse_tokens = 0;
+        retention_branch_pending = false;
+        retention_request_succeeded = false;
+        retention_geometry_failed = false;
         cache_plan_execution.clear();
         cache_plan_destruction_recovery_pin = {};
 
@@ -1417,6 +1436,30 @@ struct server_slot {
         // clear multimodal state
         mbatch.reset();
 
+    }
+
+    void commit_retention_reuse() noexcept {
+        if (!retention_reuse_pending) {
+            return;
+        }
+        retention_reuse_pending = false;
+        if (retention_obs && retention_reuse_tokens != 0 &&
+            retention_reuse_source.valid()) {
+            (void) retention_obs->credit_reuse(retention_reuse_source);
+            retention_obs->release_lineage_ticket(retention_reuse_source);
+        }
+        retention_request_succeeded = !retention_branch_pending ||
+            !retention_destination.valid() ||
+            (retention_obs && retention_obs->activate_lineage_ticket(
+                retention_destination));
+        retention_reuse_tokens = 0;
+    }
+
+    void abandon_retention_prepared_launch() noexcept {
+        if (retention_obs) {
+            retention_obs->abandon_prepared_launch(
+                server_retention_instance_key::for_slot(id));
+        }
     }
 
     void init_sampler() const {
@@ -1648,7 +1691,17 @@ struct server_slot {
             }
 
             if (retention_obs) {
-                if (!task->is_child() && prompt.n_tokens() > 0) {
+                if (retention_geometry_failed ||
+                    (retention_branch_pending &&
+                     !retention_request_succeeded)) {
+                    retention_obs->retire(
+                        server_retention_instance_key::for_slot(id));
+                    for (const auto & checkpoint : prompt.checkpoints) {
+                        retention_obs->retire(
+                            server_retention_instance_key::for_checkpoint(
+                                id, &checkpoint));
+                    }
+                } else if (!task->is_child() && prompt.n_tokens() > 0) {
                     const auto live_key =
                         server_retention_instance_key::for_slot(id);
                     const auto prior_artifact =
@@ -1682,7 +1735,19 @@ struct server_slot {
                             prompt.n_tokens() >= 0,
                             identity_known ? &identity : nullptr,
                             identity_known && prior_artifact.v != 0
-                                ? &frontier : nullptr);
+                                ? &frontier : nullptr,
+                            nullptr,
+                            retention_destination.valid()
+                                ? &retention_destination : nullptr);
+                    if (published) {
+                        // The historical automatic-main/family signal becomes
+                        // one bounded cold-start prior. It does not stack with
+                        // the implicit soft lease and decays with competition.
+                        (void) retention_obs->set_lineage_prior(
+                            live_key,
+                            common_cache_family_main_family(
+                                cache_family, true) ? 2000 : 1000);
+                    }
                     if (published && lease_obs) {
                         const auto artifact = retention_obs->artifact_id(
                             live_key);
@@ -2347,6 +2412,12 @@ private:
     // prompt_cache so it outlives both the observer that references it and the cache's
     // accounting-release destructor.
     std::unique_ptr<server_cache_authority> cache_authority;
+    // DF1 shadow owner for ordinary cache-enabled runs that do not enable the
+    // lifecycle/debug authority. It carries only bounded lineage/retention
+    // metadata: no ledger, lease table, observer serialization, or victim
+    // authority. Declared after cache_authority so it is destroyed first if a
+    // future migration temporarily references authority-owned state.
+    std::unique_ptr<server_retention_sidecar_store> cache_retention_shadow;
     // F3 artifact machinery is a lifecycle-authority sibling: it references
     // the frozen ledger but is destroyed before it. It exists only for an
     // armed dynamic-VBR memory after the one-shot manifest and ring admission.
@@ -3860,6 +3931,12 @@ private:
         // storage callback target is still alive.
         for (auto & slot : slots) {
             slot.cache_plan_destruction_recovery_pin = {};
+            if (slot.retention_obs) {
+                slot.retention_obs->release_lineage_ticket(
+                    slot.retention_reuse_source);
+                slot.retention_obs->release_lineage_ticket(
+                    slot.retention_destination);
+            }
         }
         if (cache_authority && !cache_authority->summary_emitted) {
             SRV_INF(
@@ -5628,6 +5705,9 @@ private:
         }
         if (params_base.cache_debug || params_base.cache_lifecycle) {
             cache_authority = std::make_unique<server_cache_authority>();
+        } else if (prompt_cache) {
+            cache_retention_shadow =
+                std::make_unique<server_retention_sidecar_store>();
         }
 
         // B0 shadow observer [P2]: constructed only under params_base.cache_debug — the observer
@@ -5697,6 +5777,20 @@ private:
                         },
                     });
             }
+        }
+        if (cache_retention_shadow) {
+            // DF1 observes the normal fixed host-cache path without enabling
+            // lifecycle authority or its accounting/lease machinery.
+            cache_retention_shadow->configure(nullptr, {}, nullptr);
+            for (auto & slot : slots) {
+                slot.retention_obs = cache_retention_shadow.get();
+                slot.retention_pool =
+                    (llama_model_is_recurrent(model_tgt) ||
+                     llama_model_is_hybrid(model_tgt))
+                        ? common_retention_pool::recurrent
+                        : common_retention_pool::attention;
+            }
+            prompt_cache->retention_obs = cache_retention_shadow.get();
         }
 
         std::vector<std::string> gpu_descs;
@@ -8001,14 +8095,57 @@ private:
         const bool append_continuity =
             !slot.prompt.tokens.empty() &&
             retained_prefix == slot.prompt.tokens.size();
-        if (slot.retention_obs && !append_continuity) {
+        const auto live_retention_key =
+            server_retention_instance_key::for_slot(slot.id);
+        const bool prepared_host_restore = slot.retention_obs &&
+            slot.retention_obs->prepared_for_launch(live_retention_key);
+        const bool reused_live_prefix =
+            !prepared_host_restore && retained_prefix != 0 &&
+            slot.retention_obs &&
+            slot.retention_obs->acquire_lineage_ticket(
+                live_retention_key, slot.retention_reuse_source);
+        slot.retention_reuse_pending = reused_live_prefix;
+        slot.retention_reuse_tokens = reused_live_prefix
+            ? uint64_t(retained_prefix) : 0;
+        slot.retention_branch_pending =
+            reused_live_prefix && !append_continuity;
+        slot.retention_request_succeeded = false;
+        slot.retention_geometry_failed = false;
+        if (slot.retention_obs && !append_continuity &&
+            !prepared_host_restore) {
             slot.retention_obs->retire(
-                server_retention_instance_key::for_slot(slot.id));
+                live_retention_key);
         }
         slot.cache_family = common_cache_family_follow_lineage(
             slot.cache_family, incoming_family, retained_prefix,
             slot.prompt.tokens.size());
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        if (prepared_host_restore) {
+            server_retention_lineage_ticket restored_source;
+            if (slot.retention_obs->consume_prepared_launch(
+                    live_retention_key, restored_source)) {
+                (void) slot.retention_obs->credit_reuse(restored_source);
+                slot.retention_obs->release_lineage_ticket(restored_source);
+                server_retention_lineage_ticket restored_destination;
+                const bool acquired_destination =
+                    slot.retention_obs->acquire_lineage_ticket(
+                        live_retention_key, restored_destination);
+                const bool admitted_destination = acquired_destination &&
+                    slot.retention_obs->activate_lineage_ticket(
+                        restored_destination);
+                if (acquired_destination) {
+                    slot.retention_obs->release_lineage_ticket(
+                        restored_destination);
+                }
+                if (!admitted_destination) {
+                    // Observation must never compromise a launched request.
+                    // Drop the unpublishable provisional shadow state and
+                    // continue with the already-restored live KV.
+                    slot.retention_obs->retire_slot(slot.id);
+                }
+            }
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -8290,6 +8427,9 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // Inspection and launch do not count as reuse. Publish the pending
+        // live-prefix credit only at the successful final-response boundary.
+        slot.commit_retention_reuse();
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -8921,6 +9061,7 @@ private:
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        slot->abandon_retention_prepared_launch();
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -8934,6 +9075,7 @@ private:
                             server_cache_plan_disarm_unlaunched(
                                 slot->cache_plan_execution, slot->cache_plan,
                                 slot->cache_plan_destruction_recovery_pin);
+                            slot->abandon_retention_prepared_launch();
                             queue_tasks.defer(std::move(task));
                             break;
                         }
@@ -8942,6 +9084,7 @@ private:
                             server_cache_plan_disarm_unlaunched(
                                 slot->cache_plan_execution, slot->cache_plan,
                                 slot->cache_plan_destruction_recovery_pin);
+                            slot->abandon_retention_prepared_launch();
                             break; // drop the task
                         }
                     } else {
@@ -8967,6 +9110,7 @@ private:
                                         slot->cache_plan_execution,
                                         slot->cache_plan,
                                         slot->cache_plan_destruction_recovery_pin);
+                                    slot->abandon_retention_prepared_launch();
                                     break; // drop the task
                                 }
                                 SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
@@ -8975,6 +9119,7 @@ private:
                                     slot->cache_plan_execution,
                                     slot->cache_plan,
                                     slot->cache_plan_destruction_recovery_pin);
+                                slot->abandon_retention_prepared_launch();
                                 queue_tasks.defer(std::move(task));
                                 break;
                             }
@@ -8995,6 +9140,7 @@ private:
                             server_cache_plan_disarm_unlaunched(
                                 slot->cache_plan_execution, slot->cache_plan,
                                 slot->cache_plan_destruction_recovery_pin);
+                            slot->abandon_retention_prepared_launch();
                             break; // drop the task
                         }
                     }
@@ -12089,7 +12235,8 @@ private:
                                 slot.checkpoint_ring_changed();
                             }
                             const auto & cur = slot.prompt.checkpoints.back();
-                            if (slot.retention_obs) {
+                            if (slot.retention_obs &&
+                                !slot.retention_geometry_failed) {
                                 const bool frontier_valid =
                                     cur.computation_frontier.valid() &&
                                     cur.computation_frontier.token_count ==
@@ -12105,6 +12252,9 @@ private:
                                     checkpoint_identity.media_content_identity =
                                         cur.computation_frontier.media_content_identity;
                                 }
+                                const auto live_lineage_source =
+                                    server_retention_instance_key::for_slot(
+                                        slot.id);
                                 const bool published =
                                     slot.retention_obs->publish(
                                         server_retention_instance_key::
@@ -12118,7 +12268,24 @@ private:
                                             : 0,
                                         frontier_valid,
                                         checkpoint_identity.valid()
-                                            ? &checkpoint_identity : nullptr);
+                                            ? &checkpoint_identity : nullptr,
+                                        nullptr,
+                                        &live_lineage_source,
+                                        slot.retention_destination.valid()
+                                            ? &slot.retention_destination
+                                            : nullptr,
+                                        slot.retention_branch_pending);
+                                if (!published) {
+                                    slot.retention_geometry_failed = true;
+                                }
+                                if (published &&
+                                    !slot.retention_destination.valid()) {
+                                    (void) slot.retention_obs->
+                                        acquire_lineage_ticket(
+                                            server_retention_instance_key::
+                                                for_checkpoint(slot.id, &cur),
+                                            slot.retention_destination);
+                                }
                                 if (published && slot.lifecycle_authority) {
                                     const auto key =
                                         server_retention_instance_key::
@@ -12467,6 +12634,7 @@ private:
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
+                    slot.commit_retention_reuse();
                     // B0: no first generated token exists — TTFT stays typed unavailable
                     cache_plan_finalize(slot, /*ttft_known=*/false);
                     slot.release();
@@ -12476,6 +12644,7 @@ private:
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                     send_rerank(slot, batch_view);
+                    slot.commit_retention_reuse();
                     cache_plan_finalize(slot, /*ttft_known=*/false);
                     slot.release();
                     slot.i_batch = -1;
