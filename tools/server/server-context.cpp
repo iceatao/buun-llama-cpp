@@ -1706,12 +1706,17 @@ struct server_slot {
                         server_retention_instance_key::for_slot(id);
                     const auto prior_artifact =
                         retention_obs->artifact_id(live_key);
+                    std::string adapter_identity;
+                    if ((lease_obs && lease_execution_identity) ||
+                        retention_obs->prefix_tracking_enabled()) {
+                        adapter_identity = lora_config_identity(lora);
+                    }
                     server_cache_lease_identity identity;
                     const bool identity_known = lease_obs &&
                         lease_execution_identity &&
                         server_cache_lease_build_identity(
                             *lease_execution_identity,
-                            lora_config_identity(lora), prompt.tokens,
+                            adapter_identity, prompt.tokens,
                             prompt.n_tokens(), identity);
                     const server_cache_lease_frontier frontier {
                         prompt.sequence_epoch,
@@ -1739,6 +1744,11 @@ struct server_slot {
                             nullptr,
                             retention_destination.valid()
                                 ? &retention_destination : nullptr);
+                    if (published) {
+                        (void) server_prompt_retention_publish_exact_prefix(
+                            *retention_obs, live_key, prompt,
+                            adapter_identity, prompt.n_tokens());
+                    }
                     if (published) {
                         // The historical automatic-main/family signal becomes
                         // one bounded cold-start prior. It does not stack with
@@ -5751,7 +5761,10 @@ private:
                 prompt_cache->lease_execution_identity =
                     &frontier_execution_identity;
                 if (!params_base.cache_lifecycle) {
-                    (void) prompt_cache->enable_retention_shadow();
+                    if (prompt_cache->enable_retention_shadow()) {
+                        (void) cache_authority->retention.
+                            enable_prefix_tracking();
+                    }
                 }
             }
             if (params_base.cache_lifecycle) {
@@ -5794,7 +5807,9 @@ private:
                         : common_retention_pool::attention;
             }
             prompt_cache->retention_obs = cache_retention_shadow.get();
-            (void) prompt_cache->enable_retention_shadow();
+            if (prompt_cache->enable_retention_shadow()) {
+                (void) cache_retention_shadow->enable_prefix_tracking();
+            }
         }
 
         std::vector<std::string> gpu_descs;
@@ -9929,14 +9944,23 @@ private:
                     slot->prompt.tokens.insert(tokens);
                     if (slot->retention_obs) {
                         const common_chat_msg_spans unavailable_spans;
-                        (void) slot->retention_obs->publish(
-                            server_retention_instance_key::for_slot(slot->id),
+                        const auto live_key =
+                            server_retention_instance_key::for_slot(slot->id);
+                        const bool published = slot->retention_obs->publish(
+                            live_key,
                             slot->retention_pool,
                             unavailable_spans,
                             false,
                             uint64_t(slot->prompt.n_tokens()),
                             uint64_t(slot->prompt.n_tokens()),
                             true);
+                        if (published &&
+                            slot->retention_obs->prefix_tracking_enabled()) {
+                            (void) server_prompt_retention_publish_exact_prefix(
+                                *slot->retention_obs, live_key, slot->prompt,
+                                lora_config_identity(slot->lora),
+                                slot->prompt.n_tokens());
+                        }
                     }
 
                     const int64_t t_end = ggml_time_us();

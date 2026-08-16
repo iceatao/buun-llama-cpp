@@ -1998,6 +1998,85 @@ bool server_cache_lease_build_identity(
            out.valid();
 }
 
+static bool server_prompt_retention_exact_scope(
+        const server_prompt & prompt,
+        const std::string & adapter_config_key,
+        int64_t coverage_tokens,
+        std::string & out) noexcept {
+    out.clear();
+    if (coverage_tokens < 0 ||
+        uint64_t(coverage_tokens) > prompt.tokens.size()) {
+        return false;
+    }
+    std::string media_identity;
+    if (!prompt.tokens.media_content_identity(
+            coverage_tokens, media_identity)) {
+        return false;
+    }
+    try {
+        const uint64_t adapter_size = adapter_config_key.size();
+        const uint64_t media_size = media_identity.size();
+        size_t total = sizeof(adapter_size);
+        if (adapter_size > SIZE_MAX - total) {
+            return false;
+        }
+        total += size_t(adapter_size);
+        if (sizeof(media_size) > SIZE_MAX - total) {
+            return false;
+        }
+        total += sizeof(media_size);
+        if (media_size > SIZE_MAX - total) {
+            return false;
+        }
+        total += size_t(media_size);
+        out.reserve(total);
+        out.append(
+            reinterpret_cast<const char *>(&adapter_size),
+            sizeof(adapter_size));
+        out.append(adapter_config_key);
+        out.append(
+            reinterpret_cast<const char *>(&media_size),
+            sizeof(media_size));
+        out.append(media_identity);
+        return true;
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
+bool server_prompt_retention_publish_exact_prefix(
+        server_retention_sidecar_store & retention,
+        const server_retention_instance_key & key,
+        const server_prompt & prompt,
+        const std::string & adapter_identity,
+        int64_t coverage_tokens) noexcept {
+    if (!retention.prefix_tracking_enabled()) {
+        return true;
+    }
+    std::string scope;
+    if (!server_prompt_retention_exact_scope(
+            prompt, adapter_identity, coverage_tokens, scope)) {
+        return retention.publish_prefix(
+            key, {}, prompt.tokens.retention_token_ids());
+    }
+    return retention.publish_prefix(
+        key, scope, prompt.tokens.retention_token_ids());
+}
+
+static void server_prompt_cache_mirror_prefix(
+        server_prompt_cache & cache,
+        const server_retention_instance_key & key,
+        const server_prompt & prompt,
+        const std::string & adapter_identity,
+        int64_t coverage_tokens) noexcept {
+    if (cache.retention_obs) {
+        (void) server_prompt_retention_publish_exact_prefix(
+            *cache.retention_obs, key, prompt, adapter_identity,
+            coverage_tokens);
+    }
+}
+
 static void server_prompt_cache_mirror_lease(
         server_prompt_cache & cache,
         bool mirrored,
@@ -2044,6 +2123,12 @@ static void server_prompt_cache_mirror_artifact_clone(
 
     const bool cloned = cache.retention_obs->clone(
         source_key, destination_key);
+    if (cloned &&
+        destination_kind != common_retention_artifact_kind::checkpoint) {
+        server_prompt_cache_mirror_prefix(
+            cache, destination_key, prompt, adapter_identity,
+            coverage_tokens);
+    }
     const server_cache_lease_subject source {
         cache.retention_obs->artifact_id(source_key),
         source_kind,
@@ -3485,6 +3570,7 @@ void server_prompt_cache::observe_retention_pressure_choice(
             value.kind,
             value.stamp,
             value.lineage,
+            value.external_shared_coverage_tokens,
             0,
             false,
             false,
@@ -3606,9 +3692,15 @@ void server_prompt_cache::observe_retention_pressure_choice(
                 continue;
             }
             const uint64_t coverage = begin[i].stamp.coverage_tokens;
+            if (begin[i].external_shared_coverage_tokens > coverage) {
+                unavailable();
+                return;
+            }
+            const uint64_t retained = std::max(
+                second, begin[i].external_shared_coverage_tokens);
             const uint64_t lost_work =
                 coverage == maximum && n_maximum == 1
-                    ? coverage - second : 0;
+                    ? coverage - retained : 0;
             common_retention_shadow_value quote;
             if (!common_retention_shadow_quote(
                     begin[i].lineage, event.competition_epoch,
@@ -3675,7 +3767,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
         iterator & legacy_floor,
         common_cache_plan_destruction_reason & floor_reason,
         bool & recovery_pin_excluded,
-        bool competition_wave_valid) {
+        bool competition_wave_valid,
+        bool observe_retention_shadow) {
     legacy_floor = states.end();
     floor_reason = common_cache_plan_destruction_reason::capacity_refused;
     recovery_pin_excluded = false;
@@ -3844,8 +3937,10 @@ bool server_prompt_cache::destroy_priced_host_entry(
         const auto admission = server_prompt_cache_observe_drop(
             *this, *chosen->victim, reason);
         const std::thread::id scheduler_owner = std::this_thread::get_id();
-        observe_retention_pressure_choice(
-            reason, incoming, chosen->victim, competition_wave_valid);
+        if (observe_retention_shadow) {
+            observe_retention_pressure_choice(
+                reason, incoming, chosen->victim, competition_wave_valid);
+        }
         SRV_WRN(
             " - removing priced host entry source_id=%d (size = %.3f MiB)\n",
             chosen->victim->cache_plan_source_id,
@@ -3916,7 +4011,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
 bool server_prompt_cache::evict_front_under_pressure(
         server_cache_destruction_reason reason,
         iterator incoming,
-        bool competition_wave_valid) {
+        bool competition_wave_valid,
+        bool observe_retention_shadow) {
     GGML_ASSERT(!states.empty());
     iterator legacy_floor = states.end();
     common_cache_plan_destruction_reason floor_reason =
@@ -3924,7 +4020,8 @@ bool server_prompt_cache::evict_front_under_pressure(
     bool recovery_pin_excluded = false;
     if (destroy_priced_host_entry(
             reason, incoming, legacy_floor, floor_reason,
-            recovery_pin_excluded, competition_wave_valid)) {
+            recovery_pin_excluded, competition_wave_valid,
+            observe_retention_shadow)) {
         return true;
     }
 
@@ -3938,8 +4035,10 @@ bool server_prompt_cache::evict_front_under_pressure(
         const auto floor_artifact = host_entry_artifact_id(
             *this, *legacy_floor);
         const int32_t floor_source_id = legacy_floor->cache_plan_source_id;
-        observe_retention_pressure_choice(
-            reason, incoming, legacy_floor, competition_wave_valid);
+        if (observe_retention_shadow) {
+            observe_retention_pressure_choice(
+                reason, incoming, legacy_floor, competition_wave_valid);
+        }
         SRV_WRN(
             " - removing fallback host entry source_id=%d (size = %.3f MiB)\n",
             legacy_floor->cache_plan_source_id,
@@ -3965,8 +4064,10 @@ bool server_prompt_cache::evict_front_under_pressure(
         observe_host_trade_refusal(*this, sequence, floor_reason);
     }
     if (incoming != states.end()) {
-        observe_retention_pressure_choice(
-            reason, incoming, incoming, competition_wave_valid);
+        if (observe_retention_shadow) {
+            observe_retention_pressure_choice(
+                reason, incoming, incoming, competition_wave_valid);
+        }
         destroy_entry(incoming, reason);
     }
     if (recovery_pin_excluded) {
@@ -4253,8 +4354,13 @@ static void server_prompt_cache_mirror_restore_retention(
             destination, source->adapter_config_key,
             destination.n_tokens());
     } else {
-        (void) cache.retention_obs->branch(
+        const bool branched = cache.retention_obs->branch(
             host_key, live_key, nullptr, true);
+        if (branched) {
+            server_prompt_cache_mirror_prefix(
+                cache, live_key, destination,
+                source->adapter_config_key, destination.n_tokens());
+        }
     }
     // Selection does not count as reuse. Carry the immutable host source in a
     // scheduler-consumed transition receipt so successful launch credits it
@@ -4662,6 +4768,7 @@ void server_prompt_cache::update() {
 bool server_prompt_cache::update_impl(iterator incoming) {
     bool pressure_wave_started = false;
     bool competition_wave_valid = true;
+    bool retention_shadow_observed = false;
     const auto begin_pressure_wave = [&]() noexcept {
         if (pressure_wave_started) {
             return;
@@ -4682,11 +4789,13 @@ bool server_prompt_cache::update_impl(iterator incoming) {
             SRV_WRN(" - cache size limit reached (size = %.3f MiB)\n",
                     size() / (1024.0 * 1024.0));
 
+            const bool observe_shadow = !retention_shadow_observed;
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_capacity,
-                    incoming, competition_wave_valid)) {
+                    incoming, competition_wave_valid, observe_shadow)) {
                 return false;
             }
+            retention_shadow_observed |= observe_shadow;
         }
     }
 
@@ -4703,11 +4812,13 @@ bool server_prompt_cache::update_impl(iterator incoming) {
                     limit_tokens, limit_tokens_cur,
                     size() / (1024.0 * 1024.0));
 
+            const bool observe_shadow = !retention_shadow_observed;
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_token_limit,
-                    incoming, competition_wave_valid)) {
+                    incoming, competition_wave_valid, observe_shadow)) {
                 return false;
             }
+            retention_shadow_observed |= observe_shadow;
         }
     }
 

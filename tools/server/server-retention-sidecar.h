@@ -91,6 +91,7 @@ struct server_retention_value_snapshot {
         common_retention_artifact_kind::live_slot;
     common_retention_stamp stamp;
     common_retention_lineage_record lineage;
+    uint64_t external_shared_coverage_tokens = 0;
 };
 
 enum class server_retention_value_snapshot_status : uint8_t {
@@ -183,7 +184,7 @@ class server_retention_sidecar_store {
 public:
     ~server_retention_sidecar_store();
 
-    server_retention_sidecar_store() = default;
+    server_retention_sidecar_store();
     server_retention_sidecar_store(const server_retention_sidecar_store &) = delete;
     server_retention_sidecar_store & operator=(const server_retention_sidecar_store &) = delete;
 
@@ -191,6 +192,15 @@ public:
         llama_cache_acct_ledger * ledger,
         const llama_cache_acct_resource_domain & domain,
         server_cache_lease_table * leases = nullptr) noexcept;
+    // The optional seam deterministically exercises allocation refusal; no
+    // production caller passes it.
+    bool enable_prefix_tracking(bool force_failure_for_test = false) noexcept;
+    bool publish_prefix(
+        const server_retention_instance_key & key,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens) noexcept;
+    bool prefix_tracking_enabled() const noexcept;
+    bool prefix_tracking_available() const noexcept;
     bool publish(
         const server_retention_instance_key & key,
         common_retention_pool pool,
@@ -307,6 +317,7 @@ public:
     }
 
 private:
+    struct prefix_tracking;
     struct catalog_entry {
         common_retention_artifact_record record;
         server_cache_lease_identity checkpoint_identity;
@@ -317,6 +328,7 @@ private:
         server_retention_sidecar_store * owner = nullptr;
         llama_cache_acct_artifact_id artifact;
         bool checkpoint_identity_known = false;
+        bool prefix_indexed = false;
         bool retire_pending = false;
         server_retention_lineage_ticket prepared_source;
     };
@@ -378,6 +390,8 @@ private:
     lineage_map lineages;
     turn_table_map turn_tables;
     common_retention_frequency_config frequency_config;
+    std::unique_ptr<prefix_tracking> prefixes;
+    bool prefix_tracking_requested = false;
     uint64_t competition_epoch = 1;
     uint64_t bytes_live = 0;
     uint64_t turn_table_bytes_live = 0;

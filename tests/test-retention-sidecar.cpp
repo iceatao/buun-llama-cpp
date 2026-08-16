@@ -281,6 +281,53 @@ static void test_prefix_index_branch_churn_recompresses() {
     CHECK(index.token_bytes() == 0);
 }
 
+static void test_pinned_replacement_retires_prefix_evidence() {
+    server_retention_sidecar_store store;
+    store.configure(nullptr, {}, nullptr);
+    CHECK(store.enable_prefix_tracking());
+
+    const auto source_key = server_retention_instance_key::for_slot(6);
+    const auto destination_key = server_retention_instance_key::for_slot(7);
+    const auto old_tokens = prefix_tokens(10, 2, 20, 2);
+    const auto new_tokens = prefix_tokens(10, 2, 30, 2);
+    CHECK(store.publish(
+        source_key, common_retention_pool::attention, make_spans(), true,
+        44, new_tokens.size(), true));
+    CHECK(store.publish_prefix(source_key, "scope", new_tokens));
+    CHECK(store.publish(
+        destination_key, common_retention_pool::attention, make_spans(), true,
+        44, old_tokens.size(), true));
+    const auto old_artifact = store.artifact_id(destination_key);
+    CHECK(store.publish_prefix(destination_key, "scope", old_tokens));
+    CHECK(store.attach_release_ops(
+        destination_key, { llama_cache_acct_op_id { 77 } }));
+    auto old_pin = store.acquire_recovery_pin(destination_key);
+    CHECK(old_pin.valid());
+
+    CHECK(store.clone(source_key, destination_key));
+    CHECK(store.artifact_id(destination_key) != old_artifact);
+    CHECK(store.publish_prefix(destination_key, "scope", new_tokens));
+    store.retire(source_key);
+
+    uint64_t external_coverage = UINT64_MAX;
+    const auto inventory = store.value_snapshots(
+        &external_coverage,
+        [](void * context,
+           const server_retention_value_snapshot & value) noexcept {
+            *static_cast<uint64_t *>(context) =
+                value.external_shared_coverage_tokens;
+            return true;
+        });
+    CHECK(inventory.status ==
+          server_retention_value_snapshot_status::complete);
+    CHECK(inventory.size == 1);
+    CHECK(external_coverage == 0);
+    CHECK(store.prefix_tracking_available());
+
+    old_pin = {};
+    store.retire(destination_key);
+}
+
 static void test_turn_table_and_geometry() {
     common_retention_turn_table turns;
     CHECK(common_retention_build_turn_table(make_spans(), true, 44, turns));
@@ -1114,6 +1161,7 @@ int main() {
     test_prefix_index_oversized_input_fail_closed();
     test_prefix_index_matches_exhaustive_oracle();
     test_prefix_index_branch_churn_recompresses();
+    test_pinned_replacement_retires_prefix_evidence();
     test_turn_table_and_geometry();
     test_codec();
     test_store_and_allocator_import();

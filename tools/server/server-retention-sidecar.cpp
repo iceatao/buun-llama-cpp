@@ -13,6 +13,7 @@ constexpr uint64_t MAX_PREFIX_INDEX_TOKEN_BYTES = 16ull*1024*1024;
 constexpr uint64_t MAX_PREFIX_INDEX_EDGE_BYTES = 16ull*1024*1024;
 constexpr size_t MAX_PREFIX_INDEX_NODES = 2*SERVER_RETENTION_MAX_CANDIDATES + 1;
 constexpr size_t MAX_PREFIX_INDEX_LINEAGE_REFS = 65536;
+constexpr uint64_t MAX_PREFIX_TRACKING_SCOPE_BYTES = 2ull*1024*1024;
 constexpr uint64_t TURN_BOUNDARY_BYTES =
     sizeof(common_retention_turn_boundary);
 
@@ -457,6 +458,170 @@ uint64_t server_retention_prefix_index::token_bytes() const noexcept {
     return available() ? pimpl->artifact_token_bytes + pimpl->edge_token_bytes : 0;
 }
 
+struct server_retention_sidecar_store::prefix_tracking {
+    struct scope_entry {
+        std::string exact_scope;
+        server_retention_prefix_index index;
+        uint32_t refs = 0;
+    };
+
+    struct artifact_entry {
+        scope_entry * scope = nullptr;
+        uint64_t token_bytes = 0;
+    };
+
+    std::unordered_map<std::string, std::unique_ptr<scope_entry>> scopes;
+    std::unordered_map<uint64_t, artifact_entry> artifacts;
+    uint64_t source_token_bytes = 0;
+    uint64_t scope_bytes = 0;
+    bool healthy = true;
+
+    void poison() noexcept {
+        healthy = false;
+        artifacts.clear();
+        scopes.clear();
+        source_token_bytes = 0;
+        scope_bytes = 0;
+    }
+
+    bool publish(
+            llama_cache_acct_artifact_id artifact,
+            common_retention_pool pool,
+            uint64_t lineage_id,
+            const std::string & exact_scope,
+            const std::vector<llama_token> & tokens) noexcept {
+        if (!healthy) {
+            return false;
+        }
+        if (artifact.v == 0 || lineage_id == 0 ||
+            pool >= common_retention_pool::_count || exact_scope.empty() ||
+            tokens.empty() || artifacts.count(artifact.v) != 0) {
+            poison();
+            return false;
+        }
+        if (exact_scope.size() >
+            MAX_PREFIX_TRACKING_SCOPE_BYTES/2 - 1) {
+            poison();
+            return false;
+        }
+        if (artifacts.size() == SERVER_RETENTION_MAX_CANDIDATES ||
+            tokens.size() > MAX_PREFIX_INDEX_TOKEN_BYTES/sizeof(llama_token)) {
+            poison();
+            return false;
+        }
+        const uint64_t token_bytes =
+            uint64_t(tokens.size())*sizeof(llama_token);
+        if (token_bytes > MAX_PREFIX_INDEX_TOKEN_BYTES - source_token_bytes) {
+            poison();
+            return false;
+        }
+        try {
+            std::string scope_key;
+            scope_key.reserve(1 + exact_scope.size());
+            scope_key.push_back(char(pool));
+            scope_key.append(exact_scope);
+            auto scope = scopes.find(scope_key);
+            if (scope == scopes.end()) {
+                if (exact_scope.size() + 1 >
+                    (MAX_PREFIX_TRACKING_SCOPE_BYTES - scope_bytes)/2) {
+                    poison();
+                    return false;
+                }
+                auto value = std::make_unique<scope_entry>();
+                value->exact_scope = scope_key;
+                auto inserted = scopes.emplace(scope_key, std::move(value));
+                if (!inserted.second) {
+                    poison();
+                    return false;
+                }
+                scope = inserted.first;
+                const uint64_t added_scope_bytes =
+                    uint64_t(scope->first.capacity()) +
+                    uint64_t(scope->second->exact_scope.capacity());
+                if (added_scope_bytes >
+                    MAX_PREFIX_TRACKING_SCOPE_BYTES - scope_bytes) {
+                    poison();
+                    return false;
+                }
+                scope_bytes += added_scope_bytes;
+            }
+            auto * owner = scope->second.get();
+            if (!owner || owner->refs == UINT32_MAX ||
+                !owner->index.publish(artifact, lineage_id, tokens)) {
+                poison();
+                return false;
+            }
+            const auto inserted_artifact = artifacts.emplace(
+                artifact.v, artifact_entry { owner, token_bytes });
+            if (!inserted_artifact.second) {
+                poison();
+                return false;
+            }
+            owner->refs++;
+            source_token_bytes += token_bytes;
+            return true;
+        } catch (...) {
+            poison();
+            return false;
+        }
+    }
+
+    void retire(llama_cache_acct_artifact_id artifact) noexcept {
+        if (!healthy || artifact.v == 0) {
+            return;
+        }
+        const auto found = artifacts.find(artifact.v);
+        if (found == artifacts.end()) {
+            poison();
+            return;
+        }
+        auto * owner = found->second.scope;
+        if (!owner || owner->refs == 0 ||
+            found->second.token_bytes > source_token_bytes) {
+            poison();
+            return;
+        }
+        const size_t indexed_before = owner->index.size();
+        owner->index.retire(artifact);
+        if (!owner->index.available() || indexed_before == 0 ||
+            owner->index.size() + 1 != indexed_before) {
+            poison();
+            return;
+        }
+        source_token_bytes -= found->second.token_bytes;
+        artifacts.erase(found);
+        owner->refs--;
+        if (owner->refs == 0) {
+            const auto scope = scopes.find(owner->exact_scope);
+            if (scope == scopes.end() || scope->second.get() != owner) {
+                poison();
+                return;
+            }
+            const uint64_t removed_scope_bytes =
+                uint64_t(scope->first.capacity()) +
+                uint64_t(owner->exact_scope.capacity());
+            if (removed_scope_bytes > scope_bytes) {
+                poison();
+                return;
+            }
+            scope_bytes -= removed_scope_bytes;
+            scopes.erase(scope);
+        }
+    }
+
+    bool coverage(
+            llama_cache_acct_artifact_id artifact,
+            uint64_t & out) const noexcept {
+        out = 0;
+        if (!healthy || artifact.v == 0) {
+            return false;
+        }
+        const auto found = artifacts.find(artifact.v);
+        return found != artifacts.end() && found->second.scope &&
+            found->second.scope->index.external_shared_coverage(artifact, out);
+    }
+};
+
 void server_cache_acct_mark_shadow_unavailable(
         llama_cache_acct_ledger & ledger,
         llama_cache_acct_category category,
@@ -507,6 +672,8 @@ size_t server_retention_instance_key_hash::operator()(
     return result;
 }
 
+server_retention_sidecar_store::server_retention_sidecar_store() = default;
+
 server_retention_sidecar_store::~server_retention_sidecar_store() {
     while (!associations.empty()) {
         retire_association(associations.begin());
@@ -520,6 +687,65 @@ void server_retention_sidecar_store::configure(
     ledger = ledger_in;
     domain = domain_in;
     leases = leases_in;
+}
+
+bool server_retention_sidecar_store::enable_prefix_tracking(
+        bool force_failure_for_test) noexcept {
+    prefix_tracking_requested = true;
+    if (prefixes) {
+        return prefixes->healthy;
+    }
+    if (force_failure_for_test) {
+        return false;
+    }
+    try {
+        prefixes = std::make_unique<prefix_tracking>();
+    } catch (...) {
+    }
+    return prefixes && prefixes->healthy;
+}
+
+bool server_retention_sidecar_store::publish_prefix(
+        const server_retention_instance_key & key,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens) noexcept {
+    if (!prefixes) {
+        return !prefix_tracking_requested;
+    }
+    const auto association = associations.find(key);
+    if (association == associations.end()) {
+        prefixes->poison();
+        return false;
+    }
+    const auto artifact = catalog.find(association->second.v);
+    if (artifact == catalog.end() ||
+        artifact->second.record.kind ==
+            common_retention_artifact_kind::checkpoint ||
+        artifact->second.record.stamp.coverage_tokens != tokens.size()) {
+        prefixes->poison();
+        return false;
+    }
+    if (artifact->second.prefix_indexed) {
+        return false;
+    }
+    if (!prefixes->publish(
+        association->second,
+        artifact->second.record.stamp.pool,
+        artifact->second.record.stamp.lineage_id,
+        exact_scope,
+        tokens)) {
+        return false;
+    }
+    artifact->second.prefix_indexed = true;
+    return true;
+}
+
+bool server_retention_sidecar_store::prefix_tracking_available() const noexcept {
+    return !prefix_tracking_requested || (prefixes && prefixes->healthy);
+}
+
+bool server_retention_sidecar_store::prefix_tracking_enabled() const noexcept {
+    return prefix_tracking_requested;
 }
 
 llama_cache_acct_artifact_id
@@ -849,6 +1075,14 @@ bool server_retention_sidecar_store::install(
             if (old_entry == catalog.end()) {
                 mark_unavailable();
             } else if (old_entry->second.recovery_pins != 0) {
+                // Replacement detaches the old artifact just as surely as an
+                // explicit association retirement. A recovery pin preserves
+                // its payload, not its authority to contribute shared-prefix
+                // coverage after the key has moved to a new artifact.
+                if (prefixes && old_entry->second.prefix_indexed) {
+                    prefixes->retire(old_artifact);
+                    old_entry->second.prefix_indexed = false;
+                }
                 old_entry->second.retire_pending = true;
             } else {
                 retire_catalog_entry(old_entry);
@@ -1383,6 +1617,9 @@ server_retention_sidecar_store::value_snapshots(
         void * context,
         server_retention_value_snapshot_visitor visitor) const noexcept {
     server_retention_value_snapshot_result result;
+    if (!prefix_tracking_available()) {
+        return result;
+    }
     if (!visitor ||
         associations.size() > SERVER_RETENTION_MAX_CANDIDATES) {
         result.status = server_retention_value_snapshot_status::overflow;
@@ -1412,12 +1649,18 @@ server_retention_sidecar_store::value_snapshots(
         if (!lineage->second.record.valid(competition_epoch)) {
             return result;
         }
-        const server_retention_value_snapshot value {
+        server_retention_value_snapshot value {
             association.second,
             record.kind,
             record.stamp,
             lineage->second.record,
+            0,
         };
+        if (prefixes && !prefixes->coverage(
+                association.second,
+                value.external_shared_coverage_tokens)) {
+            return result;
+        }
         if (!visitor(context, value)) {
             result = {};
             result.status = server_retention_value_snapshot_status::overflow;
@@ -1446,6 +1689,10 @@ void server_retention_sidecar_store::retire_association(
     // detach the stale association, and defer catalog/accounting retirement
     // until the final pin closes. The pin callback owns that terminal.
     if (entry->second.recovery_pins != 0) {
+        if (prefixes && entry->second.prefix_indexed) {
+            prefixes->retire(artifact);
+            entry->second.prefix_indexed = false;
+        }
         entry->second.retire_pending = true;
         associations.erase(it);
         if (leases) {
@@ -1463,6 +1710,10 @@ void server_retention_sidecar_store::retire_association(
 
 void server_retention_sidecar_store::retire_catalog_entry(
         catalog_map::iterator entry) noexcept {
+    if (prefixes && entry->second.prefix_indexed) {
+        prefixes->retire(entry->second.artifact);
+        entry->second.prefix_indexed = false;
+    }
     if (ledger && !entry->second.release_ops.empty()) {
         auto release = llama_cache_prepare_release_set(
             *ledger, entry->second.release_ops,

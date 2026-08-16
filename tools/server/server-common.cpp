@@ -517,6 +517,10 @@ const llama_tokens & server_tokens::get_tokens() const {
     return tokens;
 }
 
+const llama_tokens & server_tokens::retention_token_ids() const {
+    return tokens;
+}
+
 llama_tokens server_tokens::get_text_tokens() const {
     llama_tokens res;
     res.reserve(tokens.size());

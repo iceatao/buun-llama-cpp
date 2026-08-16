@@ -229,6 +229,12 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const llama_tokens & get_tokens() const;
 
+    // Exact logical token ids for process-local retention identity. Unlike
+    // get_tokens(), this deliberately preserves LLAMA_TOKEN_NULL media cells;
+    // callers must pair it with media_content_identity() so placeholders from
+    // distinct media can never compare as reusable content.
+    const llama_tokens & retention_token_ids() const;
+
     llama_tokens get_text_tokens() const;
 
     // for compatibility with speculative decoding

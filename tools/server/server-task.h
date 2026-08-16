@@ -903,10 +903,18 @@ struct server_prompt_cache_shadow_row {
         common_retention_artifact_kind::live_slot;
     common_retention_stamp stamp;
     common_retention_lineage_record lineage;
+    uint64_t external_shared_coverage_tokens = 0;
     uint64_t resource = 0;
     bool backing_known = false;
     bool releasable = false;
 };
+
+bool server_prompt_retention_publish_exact_prefix(
+    server_retention_sidecar_store & retention,
+    const server_retention_instance_key & key,
+    const server_prompt & prompt,
+    const std::string & adapter_config_key,
+    int64_t coverage_tokens) noexcept;
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
@@ -1062,11 +1070,13 @@ private:
             iterator & legacy_floor,
             common_cache_plan_destruction_reason & floor_reason,
             bool & recovery_pin_excluded,
-            bool competition_wave_valid);
+            bool competition_wave_valid,
+            bool observe_retention_shadow);
     bool evict_front_under_pressure(
             server_cache_destruction_reason reason,
             iterator incoming,
-            bool competition_wave_valid);
+            bool competition_wave_valid,
+            bool observe_retention_shadow);
     bool update_impl(iterator incoming);
     void observe_retention_pressure_choice(
             server_cache_destruction_reason reason,

@@ -6,6 +6,7 @@
 
 #include "llama.h"
 #include "log.h"
+#include "mtmd.h"
 
 #include <algorithm>
 #include <chrono>
@@ -101,6 +102,49 @@ std::list<server_prompt_cache_state> make_retention_entry(
     return entry;
 }
 
+std::list<server_prompt_cache_state> make_shared_stem_entry(
+        const char * adapter,
+        size_t stem_tokens,
+        llama_token tail_base,
+        size_t tail_tokens,
+        size_t bytes) {
+    auto entry = make_entry(adapter, bytes);
+    llama_tokens tokens;
+    tokens.reserve(stem_tokens + tail_tokens);
+    for (size_t i = 0; i < stem_tokens; ++i) {
+        tokens.push_back(1000 + llama_token(i));
+    }
+    for (size_t i = 0; i < tail_tokens; ++i) {
+        tokens.push_back(tail_base + llama_token(i));
+    }
+    entry.front().prompt.tokens = server_tokens(std::move(tokens), false);
+    return entry;
+}
+
+std::list<server_prompt_cache_state> make_shared_media_stem_entry(
+        const char * adapter,
+        const char * media_id,
+        llama_token tail_base,
+        size_t tail_tokens,
+        size_t bytes) {
+    auto entry = make_entry(adapter, bytes);
+    server_tokens tokens(llama_tokens {}, true);
+    for (llama_token i = 0; i < 80; ++i) {
+        tokens.push_back(1000 + i);
+    }
+    mtmd_input_chunk * chunk = mtmd_test_create_image_chunk(media_id, 2);
+    CHECK(chunk != nullptr);
+    if (chunk != nullptr) {
+        tokens.push_back(chunk);
+        mtmd_input_chunk_free(chunk);
+    }
+    for (size_t i = 0; i < tail_tokens; ++i) {
+        tokens.push_back(tail_base + llama_token(i));
+    }
+    entry.front().prompt.tokens = std::move(tokens);
+    return entry;
+}
+
 llama_cache_acct_artifact_id publish_host_retention(
         server_cache_authority & authority,
         server_prompt_cache::iterator state) {
@@ -138,16 +182,214 @@ llama_cache_acct_artifact_id publish_host_retention(
 llama_cache_acct_artifact_id publish_live_retention(
         server_retention_sidecar_store & retention,
         const server_prompt & prompt,
-        int32_t id_slot) {
+        int32_t id_slot,
+        common_retention_pool pool = common_retention_pool::attention) {
     common_chat_msg_spans spans;
     spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
     const auto key = server_retention_instance_key::for_slot(id_slot);
     CHECK(retention.publish(
-        key, common_retention_pool::attention, spans, true,
+        key, pool, spans, true,
         prompt.n_tokens(), prompt.n_tokens(), true));
     const auto artifact = retention.artifact_id(key);
     CHECK(artifact.v != 0);
     return artifact;
+}
+
+server_prompt_cache::iterator publish_indexed_host_from_live(
+        server_prompt_cache & cache,
+        server_retention_sidecar_store & retention,
+        std::list<server_prompt_cache_state> entry,
+        int32_t slot_id,
+        common_retention_pool pool = common_retention_pool::attention) {
+    server_prompt source = entry.front().prompt.clone();
+    (void) publish_live_retention(retention, source, slot_id, pool);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        retention,
+        server_retention_instance_key::for_slot(slot_id),
+        source, entry.front().adapter_config_key, source.n_tokens()));
+    server_prompt_cache::iterator published;
+    CHECK(cache.publish(std::move(entry), &source, slot_id, &published));
+    CHECK(published != cache.states.end());
+    retention.retire(server_retention_instance_key::for_slot(slot_id));
+    return published;
+}
+
+void test_fixed_host_shadow_uses_exact_cross_lineage_prefix() {
+    const auto run = [](const char * child_adapter) {
+        server_retention_sidecar_store retention;
+        retention.configure(nullptr, {}, nullptr);
+        CHECK(retention.enable_prefix_tracking());
+        server_prompt_cache cache(0, 0);
+        cache.retention_obs = &retention;
+        CHECK(cache.enable_retention_shadow());
+
+        const auto main = publish_indexed_host_from_live(
+            cache, retention,
+            make_shared_stem_entry("adapter-a", 80, 2000, 40, 100), 1);
+        const auto main_artifact = retention.artifact_id(
+            server_retention_instance_key::for_host_entry(&*main));
+        const auto child = publish_indexed_host_from_live(
+            cache, retention,
+            make_shared_stem_entry(child_adapter, 80, 3000, 2, 100), 2);
+        const auto child_artifact = retention.artifact_id(
+            server_retention_instance_key::for_host_entry(&*child));
+
+        cache.limit_size = 150;
+        cache.update();
+        const auto shadow = cache.retention_shadow_snapshot();
+        CHECK(shadow.complete == 1);
+        CHECK(shadow.unavailable == 0);
+        CHECK(shadow.last.incumbent_artifact == main_artifact);
+        CHECK(shadow.last.proposed_artifact == child_artifact);
+        CHECK(shadow.last.proposed_lost_work ==
+            (std::string(child_adapter) == "adapter-a" ? 2 : 82));
+        // Prefix evidence remains counterfactual: historical FIFO still
+        // removes the oldest main entry in both exact-scope cases.
+        CHECK(cache.states.size() == 1);
+        CHECK(cache.states.front().adapter_config_key == child_adapter);
+    };
+
+    run("adapter-a");
+    run("adapter-b");
+}
+
+void test_fixed_host_shadow_prefix_namespace_is_exact() {
+    const auto run_pool = [](common_retention_pool child_pool) {
+        server_retention_sidecar_store retention;
+        retention.configure(nullptr, {}, nullptr);
+        CHECK(retention.enable_prefix_tracking());
+        server_prompt_cache cache(0, 0);
+        cache.retention_obs = &retention;
+        CHECK(cache.enable_retention_shadow());
+
+        (void) publish_indexed_host_from_live(
+            cache, retention,
+            make_shared_stem_entry("adapter-a", 80, 2000, 40, 100), 1);
+        const auto child = publish_indexed_host_from_live(
+            cache, retention,
+            make_shared_stem_entry("adapter-a", 80, 3000, 2, 100), 2,
+            child_pool);
+        const auto child_artifact = retention.artifact_id(
+            server_retention_instance_key::for_host_entry(&*child));
+
+        cache.limit_size = 150;
+        cache.update();
+        const auto shadow = cache.retention_shadow_snapshot();
+        CHECK(shadow.complete == 1);
+        CHECK(shadow.last.proposed_artifact == child_artifact);
+        CHECK(shadow.last.proposed_lost_work ==
+              (child_pool == common_retention_pool::attention ? 2 : 82));
+    };
+
+    const auto run_media = [](const char * child_media_id) {
+        server_retention_sidecar_store retention;
+        retention.configure(nullptr, {}, nullptr);
+        CHECK(retention.enable_prefix_tracking());
+        server_prompt_cache cache(0, 0);
+        cache.retention_obs = &retention;
+        CHECK(cache.enable_retention_shadow());
+
+        (void) publish_indexed_host_from_live(
+            cache, retention,
+            make_shared_media_stem_entry(
+                "adapter-a", "image-a", 2000, 40, 100), 1);
+        const auto child = publish_indexed_host_from_live(
+            cache, retention,
+            make_shared_media_stem_entry(
+                "adapter-a", child_media_id, 3000, 2, 100), 2);
+        const auto child_artifact = retention.artifact_id(
+            server_retention_instance_key::for_host_entry(&*child));
+
+        cache.limit_size = 150;
+        cache.update();
+        const auto shadow = cache.retention_shadow_snapshot();
+        CHECK(shadow.complete == 1);
+        CHECK(shadow.last.proposed_artifact == child_artifact);
+        CHECK(shadow.last.proposed_lost_work ==
+              (std::string(child_media_id) == "image-a" ? 2 : 84));
+    };
+
+    run_pool(common_retention_pool::attention);
+    run_pool(common_retention_pool::recurrent);
+    run_media("image-a");
+    run_media("image-b");
+}
+
+void test_fixed_host_shadow_rejects_partial_prefix_inventory() {
+    server_retention_sidecar_store retention;
+    retention.configure(nullptr, {}, nullptr);
+    CHECK(retention.enable_prefix_tracking());
+    server_prompt_cache cache(0, 0);
+    cache.retention_obs = &retention;
+    CHECK(cache.enable_retention_shadow());
+
+    server_prompt_cache::iterator oldest;
+    server_prompt_cache::iterator newest;
+    CHECK(cache.publish(
+        make_retention_entry("indexed", 7000, 10, 100),
+        nullptr, -1, &oldest));
+    (void) publish_host_retention(retention, oldest);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        retention,
+        server_retention_instance_key::for_host_entry(&*oldest),
+        oldest->prompt, oldest->adapter_config_key,
+        oldest->prompt.n_tokens()));
+
+    CHECK(cache.publish(
+        make_retention_entry("missing-prefix", 8000, 10, 100),
+        nullptr, -1, &newest));
+    (void) publish_host_retention(retention, newest);
+    cache.limit_size = 150;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.complete == 0);
+    CHECK(shadow.unavailable == 1);
+    CHECK(shadow.last.proposed_artifact.v == 0);
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "missing-prefix");
+}
+
+void test_fixed_host_shadow_prefix_enable_failure_is_unavailable() {
+    server_retention_sidecar_store retention;
+    retention.configure(nullptr, {}, nullptr);
+    CHECK(!retention.enable_prefix_tracking(true));
+    CHECK(retention.prefix_tracking_enabled());
+    CHECK(!retention.prefix_tracking_available());
+    const auto inventory = retention.value_snapshots(
+        nullptr,
+        [](void *, const server_retention_value_snapshot &) noexcept {
+            return true;
+        });
+    CHECK(inventory.status ==
+          server_retention_value_snapshot_status::unavailable);
+    server_prompt_cache cache(0, 0);
+    cache.retention_obs = &retention;
+    CHECK(cache.enable_retention_shadow());
+
+    server_prompt_cache::iterator oldest;
+    server_prompt_cache::iterator newest;
+    CHECK(cache.publish(
+        make_retention_entry("enable-failed-old", 9000, 10, 100),
+        nullptr, -1, &oldest));
+    (void) publish_host_retention(retention, oldest);
+    CHECK(cache.publish(
+        make_retention_entry("enable-failed-new", 10000, 10, 100),
+        nullptr, -1, &newest));
+    (void) publish_host_retention(retention, newest);
+    CHECK(!server_prompt_retention_publish_exact_prefix(
+        retention,
+        server_retention_instance_key::for_host_entry(&*oldest),
+        oldest->prompt, oldest->adapter_config_key,
+        oldest->prompt.n_tokens()));
+
+    cache.limit_size = 150;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.complete == 0);
+    CHECK(shadow.unavailable == 1);
+    CHECK(shadow.last.proposed_artifact.v == 0);
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "enable-failed-new");
 }
 
 void test_fixed_host_pressure_shadow_records_counterfactual() {
@@ -325,8 +567,11 @@ void test_fixed_host_pressure_shadow_advances_one_wave() {
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(cache.states.empty());
     CHECK(shadow.pressure_waves == 1);
-    CHECK(shadow.choices == 3);
-    CHECK(shadow.complete == 3);
+    // DF1 is a counterfactual observer, not authority. It samples the first
+    // decision once per pressure wave so an N-victim FIFO cleanup cannot
+    // multiply the full inventory/sort cost by N.
+    CHECK(shadow.choices == 1);
+    CHECK(shadow.complete == 1);
     CHECK(shadow.unavailable == 0);
     CHECK(retention.competition_epoch_value() == epoch_before + 1);
 }
@@ -466,8 +711,10 @@ bool retention_shadow_benchmark_arm(
     retention.configure(nullptr, {}, nullptr);
     server_prompt_cache cache(0, 0);
     cache.retention_obs = &retention;
-    if (shadow_enabled && !cache.enable_retention_shadow()) {
-        return fail("workspace");
+    if (shadow_enabled &&
+        (!cache.enable_retention_shadow() ||
+         !retention.enable_prefix_tracking())) {
+        return fail("workspace-or-prefix-index");
     }
     for (size_t i = 0; i < cardinality; ++i) {
         server_prompt_cache::iterator published;
@@ -482,6 +729,14 @@ bool retention_shadow_benchmark_arm(
         }
         if (!publish_host_retention(retention, published).v) {
             return fail("sidecar");
+        }
+        if (shadow_enabled &&
+            !server_prompt_retention_publish_exact_prefix(
+                retention,
+                server_retention_instance_key::for_host_entry(&*published),
+                published->prompt, published->adapter_config_key,
+                published->prompt.n_tokens())) {
+                return fail("prefix-index");
         }
     }
     cache.limit_size = cardinality - 1;
@@ -539,6 +794,7 @@ bool run_retention_shadow_benchmark(size_t cardinality, size_t trials) {
     }
     std::printf(
         "RETENTION_SHADOW_BENCH cardinality=%zu trials=%zu "
+        "sampled_choices_per_wave=1 evictions_per_wave=1 "
         "baseline_p50_ns=%" PRIu64 " baseline_p95_ns=%" PRIu64 " "
         "total_p50_ns=%" PRIu64 " total_p95_ns=%" PRIu64 " "
         "added_p50_ns=%" PRId64 " added_p95_ns=%" PRId64 "\n",
@@ -3107,6 +3363,10 @@ int main(int argc, char ** argv) {
     }
     test_lifecycle_full_cache_rotates();
     test_fixed_host_pressure_shadow_records_counterfactual();
+    test_fixed_host_shadow_uses_exact_cross_lineage_prefix();
+    test_fixed_host_shadow_prefix_namespace_is_exact();
+    test_fixed_host_shadow_rejects_partial_prefix_inventory();
+    test_fixed_host_shadow_prefix_enable_failure_is_unavailable();
     test_fixed_host_pressure_shadow_counts_live_alias_coverage();
     test_fixed_host_pressure_shadow_agrees_and_fails_closed();
     test_fixed_host_pressure_shadow_advances_one_wave();
