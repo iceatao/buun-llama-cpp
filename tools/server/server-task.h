@@ -899,6 +899,7 @@ struct server_prompt_cache_shadow_snapshot {
 
 struct server_prompt_cache_shadow_row {
     llama_cache_acct_artifact_id artifact_id;
+    server_retention_instance_key instance_key;
     common_retention_artifact_kind kind =
         common_retention_artifact_kind::live_slot;
     common_retention_stamp stamp;

@@ -964,39 +964,174 @@ server_prompt_cache::iterator install_host_trade_entry(
         spans,
         true,
         3,
-        1,
+        3,
         true));
     return installed;
 }
 
-void test_lifecycle_pressure_skips_fixed_shadow_deliberately() {
+void test_lifecycle_pressure_records_decayed_shadow() {
     server_cache_authority authority;
-    const std::string execution = "lifecycle-shadow-skip";
+    const std::string execution = "lifecycle-decayed-shadow";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
 
-    (void) install_host_trade_entry(cache, authority, "oldest", 100);
-    (void) install_host_trade_entry(cache, authority, "newest", 100);
+    const auto oldest =
+        install_host_trade_entry(cache, authority, "oldest", 100);
+    const auto newest =
+        install_host_trade_entry(cache, authority, "newest", 100);
+    const auto oldest_key =
+        server_retention_instance_key::for_host_entry(&*oldest);
+    const auto newest_key =
+        server_retention_instance_key::for_host_entry(&*newest);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, oldest_key, oldest->prompt,
+        oldest->adapter_config_key, oldest->prompt.n_tokens()));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, newest_key, newest->prompt,
+        newest->adapter_config_key, newest->prompt.n_tokens()));
+    const auto oldest_artifact = authority.retention.artifact_id(oldest_key);
+    const auto newest_artifact = authority.retention.artifact_id(newest_key);
+    CHECK(authority.retention.begin_competition_wave());
+    CHECK(authority.retention.credit_reuse(oldest_key) ==
+          common_retention_credit_result::credited);
+    CHECK(authority.retention.begin_competition_wave());
+    CHECK(authority.retention.credit_reuse(oldest_key) ==
+          common_retention_credit_result::credited);
     const uint64_t epoch_before =
         authority.retention.competition_epoch_value();
     cache.limit_size = 150;
     cache.update();
 
-    // Lifecycle retains its existing certified pricing authority. The fixed
-    // FIFO shadow workspace is deliberately absent, but the real pressure
-    // wave still advances frequency currency exactly once.
+    // Lifecycle retains its existing certified pricing authority and removes
+    // the equally sized oldest entry. DF1 uses the same evaluated lease and
+    // serial-bound accounting evidence to record that the credited oldest
+    // lineage should have survived; it still cannot authorize destruction.
     CHECK(cache.states.size() == 1);
     CHECK(cache.states.front().adapter_config_key == "newest");
     CHECK(cache.size() == 100);
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(shadow.pressure_waves == 1);
     CHECK(shadow.choices == 1);
-    CHECK(shadow.complete == 0);
-    CHECK(shadow.unavailable == 1);
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.unavailable == 0);
+    CHECK(shadow.agreements == 0);
+    CHECK(shadow.disagreements == 1);
     CHECK(shadow.last.status ==
-          server_prompt_cache_shadow_status::unavailable);
+          server_prompt_cache_shadow_status::complete);
+    CHECK(shadow.last.incumbent_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_artifact == newest_artifact);
+    CHECK(shadow.last.proposed_resource == 100);
+    CHECK(!shadow.last.agrees);
     CHECK(authority.retention.competition_epoch_value() ==
           epoch_before + 1);
+}
+
+void test_lifecycle_shadow_retains_live_alias_coverage() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-live-alias-shadow";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
+
+    const auto oldest =
+        install_host_trade_entry(cache, authority, "alias-host", 100);
+    const auto newest =
+        install_host_trade_entry(cache, authority, "alias-other", 100);
+    const auto oldest_key =
+        server_retention_instance_key::for_host_entry(&*oldest);
+    const auto newest_key =
+        server_retention_instance_key::for_host_entry(&*newest);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, oldest_key, oldest->prompt,
+        oldest->adapter_config_key, oldest->prompt.n_tokens()));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, newest_key, newest->prompt,
+        newest->adapter_config_key, newest->prompt.n_tokens()));
+    const auto live_key = server_retention_instance_key::for_slot(17);
+    CHECK(authority.retention.clone(oldest_key, live_key));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, live_key, oldest->prompt,
+        oldest->adapter_config_key, oldest->prompt.n_tokens()));
+
+    const auto oldest_artifact = authority.retention.artifact_id(oldest_key);
+    cache.limit_size = 150;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "alias-other");
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.unavailable == 0);
+    CHECK(shadow.last.incumbent_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_lost_work == 0);
+    CHECK(shadow.last.agrees);
+    authority.retention.retire(live_key);
+}
+
+void test_lifecycle_shadow_token_pressure_is_unavailable() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-token-shadow";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
+
+    const auto oldest =
+        install_host_trade_entry(cache, authority, "token-old", 100);
+    const auto newest =
+        install_host_trade_entry(cache, authority, "token-new", 100);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention,
+        server_retention_instance_key::for_host_entry(&*oldest),
+        oldest->prompt, oldest->adapter_config_key,
+        oldest->prompt.n_tokens()));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention,
+        server_retention_instance_key::for_host_entry(&*newest),
+        newest->prompt, newest->adapter_config_key,
+        newest->prompt.n_tokens()));
+
+    cache.limit_tokens = 3;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "token-new");
+    CHECK(shadow.complete == 0);
+    CHECK(shadow.unavailable == 1);
+    CHECK(shadow.last.reason ==
+          server_cache_destruction_reason::host_token_limit);
+    CHECK(shadow.last.proposed_artifact.v == 0);
+}
+
+void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-prefix-failure";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    CHECK(!authority.retention.enable_prefix_tracking(true));
+    CHECK(cache.enable_retention_shadow());
+
+    const auto oldest =
+        install_host_trade_entry(cache, authority, "failed-old", 100);
+    (void) install_host_trade_entry(
+        cache, authority, "failed-new", 100);
+    CHECK(!server_prompt_retention_publish_exact_prefix(
+        authority.retention,
+        server_retention_instance_key::for_host_entry(&*oldest),
+        oldest->prompt, oldest->adapter_config_key,
+        oldest->prompt.n_tokens()));
+
+    cache.limit_size = 150;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "failed-new");
+    CHECK(shadow.complete == 0);
+    CHECK(shadow.unavailable == 1);
+    CHECK(shadow.last.proposed_artifact.v == 0);
 }
 
 void make_host_trade_pair(
@@ -2683,9 +2818,19 @@ void test_host_trade_hard_lease_veto() {
     const std::string execution = "trade-hard";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution, &hard_leases);
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
 
     auto hard = install_host_trade_entry(cache, authority, "h-v", 64);
     auto open = install_host_trade_entry(cache, authority, "o-v", 64);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention,
+        server_retention_instance_key::for_host_entry(&*hard),
+        hard->prompt, hard->adapter_config_key, hard->prompt.n_tokens()));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention,
+        server_retention_instance_key::for_host_entry(&*open),
+        open->prompt, open->adapter_config_key, open->prompt.n_tokens()));
     hard->cache_plan_source_id = 1;
     open->cache_plan_source_id = 2;
     CHECK(grant_host_lease(
@@ -2694,7 +2839,7 @@ void test_host_trade_hard_lease_veto() {
     // Neither victim has durable recovery evidence, so the ranked ladder
     // refuses. The legacy floor must still honor the hard veto and evict the
     // next-oldest known-nonhard entry.
-    cache.limit_tokens = 3;
+    cache.limit_size = cache.size() - open->size() + 1;
     cache.update();
     CHECK(host_source_present(cache, 1));
     CHECK(!host_source_present(cache, 2));
@@ -2703,6 +2848,12 @@ void test_host_trade_hard_lease_veto() {
     CHECK(authority.destruction.host_trade_refused == 1);
     CHECK(authority.destruction.host_trade_executed == 0);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.unavailable == 0);
+    CHECK(shadow.agreements == 1);
+    CHECK(shadow.last.candidate_count == 1);
+    CHECK(shadow.last.incumbent_artifact == shadow.last.proposed_artifact);
     CHECK(authority.destruction_counters.refused
               [size_t(common_cache_plan_selection::none)]
               [size_t(common_cache_plan_destruction_reason::
@@ -3222,6 +3373,9 @@ void test_checkpoint_effect_matrix_consistency() {
 void test_live_checkpoint_payload_ownership() {
     server_cache_authority authority;
     configure_host_accounting(authority, true);
+    // Prefix tracking is prompt-payload evidence only. Enabling it must not
+    // make the canonical lifecycle checkpoint candidate unavailable.
+    CHECK(authority.retention.enable_prefix_tracking());
     const auto * checkpoint =
         reinterpret_cast<const common_prompt_checkpoint *>(uintptr_t(0x1234));
     const auto live =
@@ -3372,7 +3526,10 @@ int main(int argc, char ** argv) {
     test_fixed_host_pressure_shadow_advances_one_wave();
     test_fixed_host_token_pressure_uses_tokens_as_resource();
     test_fixed_host_pressure_observes_incoming_publication();
-    test_lifecycle_pressure_skips_fixed_shadow_deliberately();
+    test_lifecycle_pressure_records_decayed_shadow();
+    test_lifecycle_shadow_retains_live_alias_coverage();
+    test_lifecycle_shadow_token_pressure_is_unavailable();
+    test_lifecycle_shadow_prefix_failure_does_not_change_authority();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();

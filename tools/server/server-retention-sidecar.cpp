@@ -1651,6 +1651,7 @@ server_retention_sidecar_store::value_snapshots(
         }
         server_retention_value_snapshot value {
             association.second,
+            association.first,
             record.kind,
             record.stamp,
             lineage->second.record,

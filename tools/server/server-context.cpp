@@ -5760,7 +5760,10 @@ private:
                 prompt_cache->lease_obs = &cache_authority->leases;
                 prompt_cache->lease_execution_identity =
                     &frontier_execution_identity;
-                if (!params_base.cache_lifecycle) {
+                // Debug shadow observes whichever fixed-host authority is
+                // active. Lifecycle keeps its certified price selector; DF1
+                // only compares the decayed projection against that choice.
+                if (params_base.cache_debug) {
                     if (prompt_cache->enable_retention_shadow()) {
                         (void) cache_authority->retention.
                             enable_prefix_tracking();

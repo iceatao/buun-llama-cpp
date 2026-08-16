@@ -87,6 +87,7 @@ struct server_retention_candidate {
 // shared turn table while a request is making room.
 struct server_retention_value_snapshot {
     llama_cache_acct_artifact_id artifact_id;
+    server_retention_instance_key instance_key;
     common_retention_artifact_kind kind =
         common_retention_artifact_kind::live_slot;
     common_retention_stamp stamp;
