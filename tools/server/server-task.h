@@ -915,6 +915,13 @@ struct server_prompt_cache_df2_live_transition {
     bool preserve_source = false;
 };
 
+inline uint32_t server_prompt_cache_retention_prior_milli(
+        const common_cache_family_binding & family,
+        bool automatic_main) noexcept {
+    return common_cache_family_main_family(family, automatic_main)
+        ? 2000 : 1000;
+}
+
 inline server_prompt_cache_df2_live_transition
 server_prompt_cache_df2_live_transition_for(
         bool enabled,

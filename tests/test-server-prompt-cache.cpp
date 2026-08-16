@@ -1557,6 +1557,79 @@ void test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin() {
     }
 }
 
+void test_lifecycle_df2_cold_start_prior_ages_to_recency() {
+    const auto run = [](bool age_prior) {
+        server_cache_authority authority;
+        const std::string execution = age_prior
+            ? "lifecycle-df2-prior-aged"
+            : "lifecycle-df2-prior-fresh";
+        server_prompt_cache cache(0, 0);
+        configure_host_trade(authority, cache, execution);
+        cache.retention_df2_capacity_authority = true;
+        CHECK(authority.retention.enable_prefix_tracking());
+        CHECK(cache.enable_retention_shadow());
+
+        const auto main =
+            install_host_trade_entry(cache, authority, "prior-main", 100);
+        const auto ordinary = install_host_trade_entry(
+            cache, authority, "prior-ordinary", 100);
+        const auto main_key =
+            server_retention_instance_key::for_host_entry(&*main);
+        const auto ordinary_key =
+            server_retention_instance_key::for_host_entry(&*ordinary);
+        for (const auto entry : { main, ordinary }) {
+            CHECK(server_prompt_retention_publish_exact_prefix(
+                authority.retention,
+                server_retention_instance_key::for_host_entry(&*entry),
+                entry->prompt, entry->adapter_config_key,
+                entry->prompt.n_tokens()));
+        }
+        const common_cache_family_binding family {
+            { 0xdecaf }, common_cache_family_role::main,
+        };
+        const common_cache_family_binding branch {
+            family.family, common_cache_family_role::branch,
+        };
+        const uint32_t main_prior =
+            server_prompt_cache_retention_prior_milli(family, true);
+        const uint32_t ordinary_prior =
+            server_prompt_cache_retention_prior_milli(branch, true);
+        CHECK(main_prior == 2000);
+        CHECK(ordinary_prior == 1000);
+        CHECK(server_prompt_cache_retention_prior_milli({}, true) == 2000);
+        CHECK(server_prompt_cache_retention_prior_milli({}, false) == 1000);
+        CHECK(authority.retention.set_lineage_prior(main_key, main_prior));
+        CHECK(authority.retention.set_lineage_prior(
+            ordinary_key, ordinary_prior));
+        if (age_prior) {
+            for (int i = 0; i < 512; ++i) {
+                CHECK(authority.retention.begin_competition_wave());
+            }
+        }
+
+        const auto main_artifact =
+            authority.retention.artifact_id(main_key);
+        const auto ordinary_artifact =
+            authority.retention.artifact_id(ordinary_key);
+        cache.limit_size = 100;
+        cache.update();
+        CHECK(cache.states.size() == 1);
+        CHECK(authority.destruction.host_trade_df2_executed == 1);
+        CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+        const auto shadow = cache.retention_shadow_snapshot();
+        CHECK(shadow.complete == 1);
+        CHECK(shadow.last.proposed_artifact ==
+              (age_prior ? main_artifact : ordinary_artifact));
+        return cache.states.front().adapter_config_key;
+    };
+
+    // The bounded automatic-main prior protects the older entry at cold
+    // start. Once both priors have shifted fully away, the same equal-value
+    // pair returns to the deterministic oldest-first recency floor.
+    CHECK(run(false) == "prior-main");
+    CHECK(run(true) == "prior-ordinary");
+}
+
 void make_host_trade_pair(
         server_prompt_cache::iterator victim,
         server_prompt_cache::iterator recovery,
@@ -3963,6 +4036,7 @@ int main(int argc, char ** argv) {
     test_lifecycle_df2_phase_change_forgets_old_reuse();
     test_lifecycle_df2_all_one_shot_converges_to_fifo();
     test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin();
+    test_lifecycle_df2_cold_start_prior_ages_to_recency();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();

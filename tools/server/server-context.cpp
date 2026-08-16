@@ -1770,8 +1770,8 @@ struct server_slot {
                         // the implicit soft lease and decays with competition.
                         (void) retention_obs->set_lineage_prior(
                             live_key,
-                            common_cache_family_main_family(
-                                cache_family, true) ? 2000 : 1000);
+                            server_prompt_cache_retention_prior_milli(
+                                cache_family, true));
                     }
                     if (published && lease_obs) {
                         const auto artifact = retention_obs->artifact_id(
