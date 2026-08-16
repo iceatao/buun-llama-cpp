@@ -1076,6 +1076,7 @@ void test_lifecycle_shadow_token_pressure_is_unavailable() {
     const std::string execution = "lifecycle-token-shadow";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
+    cache.retention_df2_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -1111,6 +1112,7 @@ void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
     const std::string execution = "lifecycle-prefix-failure";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
+    cache.retention_df2_capacity_authority = true;
     CHECK(!authority.retention.enable_prefix_tracking(true));
     CHECK(cache.enable_retention_shadow());
 
@@ -1132,6 +1134,229 @@ void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
     CHECK(shadow.complete == 0);
     CHECK(shadow.unavailable == 1);
     CHECK(shadow.last.proposed_artifact.v == 0);
+    CHECK(authority.destruction.host_trade_df2_executed == 0);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+}
+
+void test_lifecycle_df2_capacity_executes_decayed_fallback() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-df2-capacity";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    cache.retention_df2_capacity_authority = true;
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
+
+    const auto oldest =
+        install_host_trade_entry(cache, authority, "df2-hot", 100);
+    const auto newest =
+        install_host_trade_entry(cache, authority, "df2-cold", 100);
+    const auto oldest_key =
+        server_retention_instance_key::for_host_entry(&*oldest);
+    const auto newest_key =
+        server_retention_instance_key::for_host_entry(&*newest);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, oldest_key, oldest->prompt,
+        oldest->adapter_config_key, oldest->prompt.n_tokens()));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, newest_key, newest->prompt,
+        newest->adapter_config_key, newest->prompt.n_tokens()));
+    CHECK(authority.retention.begin_competition_wave());
+    CHECK(authority.retention.credit_reuse(oldest_key) ==
+          common_retention_credit_result::credited);
+    CHECK(authority.retention.begin_competition_wave());
+    CHECK(authority.retention.credit_reuse(oldest_key) ==
+          common_retention_credit_result::credited);
+    const auto oldest_artifact = authority.retention.artifact_id(oldest_key);
+    const auto newest_artifact = authority.retention.artifact_id(newest_key);
+
+    cache.limit_size = 150;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "df2-hot");
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.unavailable == 0);
+    CHECK(shadow.disagreements == 1);
+    CHECK(shadow.last.incumbent_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_artifact == newest_artifact);
+}
+
+void test_lifecycle_df2_capacity_handles_incoming_publication() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-df2-incoming";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    cache.retention_df2_capacity_authority = true;
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
+
+    const auto incumbent =
+        install_host_trade_entry(cache, authority, "df2-incumbent", 100);
+    const auto incumbent_key =
+        server_retention_instance_key::for_host_entry(&*incumbent);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, incumbent_key, incumbent->prompt,
+        incumbent->adapter_config_key, incumbent->prompt.n_tokens()));
+    const auto incumbent_artifact =
+        authority.retention.artifact_id(incumbent_key);
+
+    auto incoming = make_retention_entry("df2-incoming", 9000, 3, 100);
+    server_prompt source = incoming.front().prompt.clone();
+    const auto source_artifact = publish_live_retention(
+        authority.retention, source, 31);
+    const auto source_key = server_retention_instance_key::for_slot(31);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, source_key, source,
+        incoming.front().adapter_config_key, source.n_tokens()));
+    CHECK(source_artifact.v != 0);
+
+    cache.limit_size = 150;
+    server_prompt_cache::iterator published;
+    CHECK(cache.publish(std::move(incoming), &source, 31, &published));
+    CHECK(published != cache.states.end());
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "df2-incoming");
+    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.last.candidate_count == 1);
+    CHECK(shadow.last.proposed_artifact == incumbent_artifact);
+}
+
+void test_lifecycle_df2_capacity_counts_recovery_pinned_coverage() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-df2-pinned";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    cache.retention_df2_capacity_authority = true;
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
+
+    const auto pinned =
+        install_host_trade_entry(cache, authority, "df2-pinned", 100);
+    const auto alias =
+        install_host_trade_entry(cache, authority, "df2-alias", 100);
+    const auto pinned_key =
+        server_retention_instance_key::for_host_entry(&*pinned);
+    const auto alias_key =
+        server_retention_instance_key::for_host_entry(&*alias);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, pinned_key, pinned->prompt,
+        pinned->adapter_config_key, pinned->prompt.n_tokens()));
+    CHECK(authority.retention.clone(pinned_key, alias_key));
+    alias->adapter_config_key = pinned->adapter_config_key;
+    alias->prompt = pinned->prompt.clone();
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, alias_key, alias->prompt,
+        alias->adapter_config_key, alias->prompt.n_tokens()));
+    pinned->recovery_pins = 1;
+
+    cache.limit_size = 100;
+    cache.update();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "df2-pinned");
+    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.last.proposed_lost_work == 0);
+    cache.states.front().recovery_pins = 0;
+}
+
+void test_lifecycle_df2_live_transition_matrix() {
+    common_retention_lineage_record never_reused;
+    never_reused.reuse_hits = 0;
+    common_retention_lineage_record reused;
+    reused.reuse_hits = 1;
+
+    const auto off = server_prompt_cache_df2_live_transition_for(
+        false, true, false, 100, 80, &reused);
+    CHECK(!off.lookup_host);
+    CHECK(!off.preserve_source);
+
+    const auto probationary = server_prompt_cache_df2_live_transition_for(
+        true, true, false, 100, 80, &never_reused);
+    CHECK(probationary.lookup_host);
+    CHECK(!probationary.preserve_source);
+
+    const auto reused_branch = server_prompt_cache_df2_live_transition_for(
+        true, true, false, 100, 80, &reused);
+    CHECK(reused_branch.lookup_host);
+    CHECK(reused_branch.preserve_source);
+
+    for (const auto unchanged : {
+            server_prompt_cache_df2_live_transition_for(
+                true, true, false, 100, 100, &reused),
+            server_prompt_cache_df2_live_transition_for(
+                true, false, false, 100, 80, &reused),
+            server_prompt_cache_df2_live_transition_for(
+                true, true, true, 100, 80, &reused),
+            server_prompt_cache_df2_live_transition_for(
+                true, true, false, 0, 0, &reused) }) {
+        CHECK(!unchanged.lookup_host);
+        CHECK(!unchanged.preserve_source);
+    }
+}
+
+void test_lifecycle_df2_reprojects_each_multi_victim_wave() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-df2-multi";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    cache.retention_df2_capacity_authority = true;
+    CHECK(authority.retention.enable_prefix_tracking());
+    CHECK(cache.enable_retention_shadow());
+
+    const auto install = [&](const char * adapter, llama_tokens tokens,
+            const server_retention_instance_key * lineage_source = nullptr) {
+        auto entry = make_entry(adapter, 100);
+        const uint8_t payload_tag = uint8_t(tokens.back());
+        entry.front().data.main.assign(100, payload_tag);
+        entry.front().prompt.tokens = server_tokens(std::move(tokens), false);
+        CHECK(cache.publish(std::move(entry)));
+        auto installed = std::prev(cache.states.end());
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, installed->prompt.n_tokens());
+        const auto key =
+            server_retention_instance_key::for_host_entry(&*installed);
+        CHECK(authority.retention.publish(
+            key, common_retention_pool::attention, spans, true,
+            installed->prompt.n_tokens(), installed->prompt.n_tokens(), true,
+            nullptr, nullptr, lineage_source));
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            authority.retention,
+            key, installed->prompt, installed->adapter_config_key,
+            installed->prompt.n_tokens()));
+        return installed;
+    };
+
+    // A and B share one lineage. Initially B is a zero-loss redundant alias;
+    // A and the independent C tie at two lost tokens, so the older A ranks
+    // next. Once B is removed, A's loss rises to three and a fresh projection
+    // must remove C instead. Reusing one precomputed order would leave C.
+    const auto a = install("multi-shared", { 700, 701, 702 });
+    const auto a_key =
+        server_retention_instance_key::for_host_entry(&*a);
+    const auto b = install("multi-shared", { 700 }, &a_key);
+    (void) install("multi-independent", { 800, 801 });
+    const auto b_artifact = authority.retention.artifact_id(
+        server_retention_instance_key::for_host_entry(&*b));
+    CHECK(b_artifact.v != 0);
+
+    cache.limit_size = 100;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "multi-shared");
+    CHECK(cache.states.front().prompt.n_tokens() == 3);
+    CHECK(shadow.pressure_waves == 1);
+    CHECK(shadow.choices == 1);
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.last.proposed_artifact == b_artifact);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+    CHECK(authority.destruction.host_trade_df2_executed == 2);
 }
 
 void make_host_trade_pair(
@@ -2818,6 +3043,7 @@ void test_host_trade_hard_lease_veto() {
     const std::string execution = "trade-hard";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution, &hard_leases);
+    cache.retention_df2_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -2837,8 +3063,8 @@ void test_host_trade_hard_lease_veto() {
         cache, hard_leases, hard, server_cache_lease_class::hard));
 
     // Neither victim has durable recovery evidence, so the ranked ladder
-    // refuses. The legacy floor must still honor the hard veto and evict the
-    // next-oldest known-nonhard entry.
+    // refuses. DF2 must still honor the hard veto and evict only the open
+    // known-nonhard entry.
     cache.limit_size = cache.size() - open->size() + 1;
     cache.update();
     CHECK(host_source_present(cache, 1));
@@ -2847,7 +3073,8 @@ void test_host_trade_hard_lease_veto() {
     CHECK(authority.destruction.host_trade_hard_lease_vetoes == 1);
     CHECK(authority.destruction.host_trade_refused == 1);
     CHECK(authority.destruction.host_trade_executed == 0);
-    CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+    CHECK(authority.destruction.host_trade_df2_executed == 1);
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(shadow.complete == 1);
     CHECK(shadow.unavailable == 0);
@@ -3530,6 +3757,11 @@ int main(int argc, char ** argv) {
     test_lifecycle_shadow_retains_live_alias_coverage();
     test_lifecycle_shadow_token_pressure_is_unavailable();
     test_lifecycle_shadow_prefix_failure_does_not_change_authority();
+    test_lifecycle_df2_capacity_executes_decayed_fallback();
+    test_lifecycle_df2_capacity_handles_incoming_publication();
+    test_lifecycle_df2_capacity_counts_recovery_pinned_coverage();
+    test_lifecycle_df2_live_transition_matrix();
+    test_lifecycle_df2_reprojects_each_multi_victim_wave();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();

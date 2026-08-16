@@ -145,6 +145,21 @@ static uint64_t server_frontier_ratchet_min_agreements() {
     return (uint64_t) parsed;
 }
 
+// Internal per-boot rollout switch for the first behavior-changing DF2
+// slice. Only the host-capacity fallback is eligible; token pressure and the
+// certified lifecycle ladder remain unchanged until their own gates pass.
+static bool server_retention_df2_capacity_authority() {
+    const char * env = std::getenv("LLAMA_RETENTION_DF2_CAPACITY");
+    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0) {
+        return false;
+    }
+    if (std::strcmp(env, "1") != 0) {
+        SRV_WRN("invalid LLAMA_RETENTION_DF2_CAPACITY='%s'; using 0\n", env);
+        return false;
+    }
+    return true;
+}
+
 // WS-6: keep the C-style memory API balanced across every server early return. A scope only
 // becomes active for a dynamic-VBR memory; non-VBR checkpoints preserve their old path exactly.
 class server_vbr_retier_freeze_scope {
@@ -5754,7 +5769,12 @@ private:
                         : common_retention_pool::attention;
             }
             if (prompt_cache) {
+                const bool retention_df2_capacity =
+                    params_base.cache_lifecycle &&
+                    server_retention_df2_capacity_authority();
                 prompt_cache->debug_observability = params_base.cache_debug;
+                prompt_cache->retention_df2_capacity_authority =
+                    retention_df2_capacity;
                 prompt_cache->destruction_obs = &cache_authority->destruction;
                 prompt_cache->retention_obs = &cache_authority->retention;
                 prompt_cache->lease_obs = &cache_authority->leases;
@@ -5763,11 +5783,14 @@ private:
                 // Debug shadow observes whichever fixed-host authority is
                 // active. Lifecycle keeps its certified price selector; DF1
                 // only compares the decayed projection against that choice.
-                if (params_base.cache_debug) {
+                if (params_base.cache_debug || retention_df2_capacity) {
                     if (prompt_cache->enable_retention_shadow()) {
                         (void) cache_authority->retention.
                             enable_prefix_tracking();
                     }
+                }
+                if (retention_df2_capacity) {
+                    SRV_INF("%s\n", "experimental DF2 host-capacity fallback authority is enabled");
                 }
             }
             if (params_base.cache_lifecycle) {
@@ -7671,6 +7694,44 @@ private:
                 ret->cache_plan = std::move(plan_rec);
             }
 
+            const bool legacy_update_cache = update_cache;
+            server_prompt_cache_df2_live_transition df2_transition;
+
+            // The DF2 capacity policy can preserve only payloads that
+            // actually reach the host catalog. Evaluate the final selected
+            // slot after any cache-plan retarget: the legacy 50%-loss
+            // heuristic skips the common case where an agent branch keeps
+            // most of a reused live prefix while replacing its tail. A
+            // demonstrated reuse is sufficient here; coalesced exact hits in
+            // one competition epoch need not wait for full promotion.
+            // Append/resume and never-reused branches stay on the existing
+            // allocation-free path, and a failed save remains a soft miss.
+            const bool df2_enabled = prompt_cache &&
+                prompt_cache->retention_df2_capacity_authority;
+            if (df2_enabled) {
+                common_retention_lineage_record source_lineage;
+                const common_retention_lineage_record * source_lineage_ptr =
+                    ret->retention_obs &&
+                        ret->retention_obs->lineage_for_instance(
+                            server_retention_instance_key::for_slot(ret->id),
+                            source_lineage)
+                        ? &source_lineage : nullptr;
+                df2_transition = server_prompt_cache_df2_live_transition_for(
+                    true,
+                    task.type == SERVER_TASK_TYPE_COMPLETION,
+                    selection_deferred_busy,
+                    ret->prompt.tokens.size(),
+                    ret->prompt.tokens.get_common_prefix(task.tokens),
+                    source_lineage_ptr);
+            }
+            if (df2_transition.lookup_host) {
+                // Lookup and source preservation are distinct. A returning
+                // lineage must be allowed to find an existing exact host
+                // image even when the currently selected one-shot branch is
+                // not worth serializing.
+                update_cache = true;
+            }
+
             recurrent_shrink_for_prefill("before prompt cache save/load");
 
             // note: prompt_save() itself is a no-op when the slot's context is empty
@@ -7697,7 +7758,9 @@ private:
                 // side effect of the shipped path. Authority changes which
                 // complete reuse plan runs; it does not gain D-A destruction
                 // authority to skip this save.
-                ret->prompt_save(*prompt_cache);
+                if (legacy_update_cache || df2_transition.preserve_source) {
+                    ret->prompt_save(*prompt_cache);
+                }
 
                 if (!incoming_adapter_ready) {
                     cache_plan_derive_incoming_adapter(

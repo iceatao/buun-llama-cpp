@@ -910,6 +910,29 @@ struct server_prompt_cache_shadow_row {
     bool releasable = false;
 };
 
+struct server_prompt_cache_df2_live_transition {
+    bool lookup_host = false;
+    bool preserve_source = false;
+};
+
+inline server_prompt_cache_df2_live_transition
+server_prompt_cache_df2_live_transition_for(
+        bool enabled,
+        bool completion,
+        bool selection_deferred_busy,
+        size_t live_tokens,
+        size_t retained_prefix,
+        const common_retention_lineage_record * lineage) noexcept {
+    if (!enabled || !completion || selection_deferred_busy ||
+        live_tokens == 0 || retained_prefix >= live_tokens) {
+        return {};
+    }
+    return {
+        true,
+        lineage && lineage->reuse_hits != 0,
+    };
+}
+
 bool server_prompt_retention_publish_exact_prefix(
     server_retention_sidecar_store & retention,
     const server_retention_instance_key & key,
@@ -1028,6 +1051,7 @@ struct server_prompt_cache {
     // Explicit emission gate. An observed load also exists under B authority,
     // so rec != nullptr is not evidence that --cache-debug was enabled.
     bool debug_observability = false;
+    bool retention_df2_capacity_authority = false;
     uint64_t debug_lifecycle_emissions = 0;
     uint64_t debug_destruction_emissions = 0;
     uint64_t debug_recovery_pin_exclusions = 0;
@@ -1072,7 +1096,7 @@ private:
             common_cache_plan_destruction_reason & floor_reason,
             bool & recovery_pin_excluded,
             bool competition_wave_valid,
-            bool observe_retention_shadow);
+            bool & observe_retention_shadow);
     bool evict_front_under_pressure(
             server_cache_destruction_reason reason,
             iterator incoming,

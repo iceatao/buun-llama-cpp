@@ -3007,6 +3007,8 @@ void server_prompt_cache_observe_host_destruction(
             : json(nullptr);
         payload["legacy_fallbacks"] = cache.destruction_obs
             ? cache.destruction_obs->host_trade_legacy_fallbacks : uint64_t(0);
+        payload["df2_executed"] = cache.destruction_obs
+            ? cache.destruction_obs->host_trade_df2_executed : uint64_t(0);
         payload["publication_skips"] = cache.destruction_obs
             ? cache.destruction_obs->host_trade_publication_skips : uint64_t(0);
         cache.debug_destruction_emissions++;
@@ -3389,6 +3391,216 @@ bool host_trade_price(
     }
 }
 
+struct host_trade_df2_projection {
+    bool complete = false;
+    uint64_t candidate_count = 0;
+    llama_cache_acct_artifact_id artifact;
+    uint64_t lineage_id = 0;
+    common_retention_pool pool = common_retention_pool::attention;
+    uint64_t lost_work = 0;
+    uint64_t resource = 0;
+};
+
+// Allocation-free singleton projection for DF2's synchronous authority seam.
+// Host artifacts currently own independent three-leaf payload allocations;
+// a zero singleton yield is therefore not executable here and remains on the
+// legacy floor. The broader counterfactual projector retains compound support
+// for debug/model-free analysis.
+host_trade_df2_projection project_host_trade_df2(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator incoming,
+        const std::vector<host_trade_candidate> & candidates,
+        server_prompt_cache_shadow_row * rows) noexcept {
+    host_trade_df2_projection result;
+    if (!rows || !cache.retention_obs || !cache.acct ||
+        candidates.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
+        return result;
+    }
+
+    struct fill_context {
+        server_prompt_cache_shadow_row * rows = nullptr;
+        size_t size = 0;
+    } fill { rows, 0 };
+    const auto fill_value = [](void * opaque,
+            const server_retention_value_snapshot & value) noexcept {
+        auto & context = *static_cast<fill_context *>(opaque);
+        if (context.size == SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
+            return false;
+        }
+        context.rows[context.size++] = {
+            value.artifact_id,
+            value.instance_key,
+            value.kind,
+            value.stamp,
+            value.lineage,
+            value.external_shared_coverage_tokens,
+            0,
+            false,
+            false,
+        };
+        return true;
+    };
+    const auto inventory = cache.retention_obs->value_snapshots(
+        &fill, fill_value);
+    if (inventory.status !=
+            server_retention_value_snapshot_status::complete ||
+        inventory.size != fill.size || fill.size == 0) {
+        return result;
+    }
+
+    auto * begin = rows;
+    auto * end = rows + fill.size;
+    std::sort(begin, end, [](const auto & a, const auto & b) {
+        return a.artifact_id.v < b.artifact_id.v;
+    });
+    const auto find_artifact = [&](llama_cache_acct_artifact_id id) {
+        const auto found = std::lower_bound(
+            begin, end, id.v, [](const auto & row, uint64_t value) {
+                return row.artifact_id.v < value;
+            });
+        return found != end && found->artifact_id == id ? found : end;
+    };
+
+    // Join every physical host entry before considering which ones are
+    // releasable. Incoming publications and recovery-pinned entries are
+    // intentionally absent from the priced-candidate vector, but their
+    // retained prefix coverage still changes every other entry's marginal
+    // lost work.
+    for (auto state = cache.states.begin(); state != cache.states.end();
+            ++state) {
+        const auto artifact = cache.retention_obs->artifact_id(
+            server_retention_instance_key::for_host_entry(&*state));
+        auto * row = find_artifact(artifact);
+        if (!artifact.v || row == end ||
+            row->kind != common_retention_artifact_kind::host_entry ||
+            row->backing_known) {
+            return {};
+        }
+        row->backing_known = true;
+    }
+
+    const auto host_domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+    for (const auto & candidate : candidates) {
+        auto * row = find_artifact(candidate.ranking.artifact_id);
+        if (!candidate.ranking.artifact_id.v || row == end ||
+            row->kind != common_retention_artifact_kind::host_entry ||
+            !row->backing_known || row->releasable ||
+            !candidate.lease_known) {
+            return {};
+        }
+        row->releasable = !candidate.hard_leased &&
+            candidate.victim != incoming &&
+            candidate.victim->recovery_pins == 0;
+        if (!row->releasable) {
+            continue;
+        }
+        result.candidate_count++;
+        for (const auto op : candidate.victim->release_ops()) {
+            llama_cache_acct_release_preview preview;
+            if (!op || !cache.acct->preview_release(op, preview) ||
+                preview.resident_allocated.state !=
+                    llama_cache_acct_known::known) {
+                return {};
+            }
+            if (preview.domain != host_domain) {
+                continue;
+            }
+            if (preview.resident_allocated.value >
+                    UINT64_MAX - row->resource) {
+                return {};
+            }
+            row->resource += preview.resident_allocated.value;
+        }
+    }
+    for (const auto * row = begin; row != end; ++row) {
+        if (row->kind == common_retention_artifact_kind::host_entry &&
+            !row->backing_known) {
+            return {};
+        }
+    }
+
+    std::sort(begin, end, [](const auto & a, const auto & b) {
+        return std::tie(
+                   a.stamp.pool, a.stamp.lineage_id,
+                   a.stamp.coverage_tokens, a.stamp.recency_ordinal,
+                   a.artifact_id.v) <
+               std::tie(
+                   b.stamp.pool, b.stamp.lineage_id,
+                   b.stamp.coverage_tokens, b.stamp.recency_ordinal,
+                   b.artifact_id.v);
+    });
+
+    bool have_best = false;
+    common_retention_shadow_value best;
+    for (size_t first = 0; first < fill.size;) {
+        size_t last = first + 1;
+        while (last < fill.size &&
+               begin[last].stamp.pool == begin[first].stamp.pool &&
+               begin[last].stamp.lineage_id ==
+                   begin[first].stamp.lineage_id) {
+            last++;
+        }
+        uint64_t maximum_coverage = 0;
+        uint64_t second_coverage = 0;
+        size_t maximum_count = 0;
+        for (size_t i = first; i < last; ++i) {
+            const uint64_t coverage = begin[i].stamp.coverage_tokens;
+            if (coverage > maximum_coverage) {
+                second_coverage = maximum_coverage;
+                maximum_coverage = coverage;
+                maximum_count = 1;
+            } else if (coverage == maximum_coverage) {
+                maximum_count++;
+            } else {
+                second_coverage = std::max(second_coverage, coverage);
+            }
+        }
+        for (size_t i = first; i < last; ++i) {
+            const auto & row = begin[i];
+            if (!row.releasable || row.resource == 0) {
+                continue;
+            }
+            uint64_t retained = row.external_shared_coverage_tokens;
+            retained = std::max(
+                retained,
+                row.stamp.coverage_tokens == maximum_coverage &&
+                        maximum_count == 1
+                    ? second_coverage : maximum_coverage);
+            const uint64_t lost_work = row.stamp.coverage_tokens > retained
+                ? row.stamp.coverage_tokens - retained : 0;
+            common_retention_shadow_value quote;
+            if (!common_retention_shadow_quote(
+                    row.lineage,
+                    cache.retention_obs->competition_epoch_value(),
+                    lost_work, row.resource, row.stamp.recency_ordinal,
+                    {}, quote)) {
+                return {};
+            }
+            const bool lower = !have_best ||
+                common_retention_shadow_compare(quote, best) < 0;
+            const bool tied = have_best &&
+                common_retention_shadow_compare(quote, best) == 0;
+            if (lower || (tied &&
+                    std::tie(row.stamp.pool, row.stamp.lineage_id,
+                             row.artifact_id.v) <
+                    std::tie(result.pool, result.lineage_id,
+                             result.artifact.v))) {
+                have_best = true;
+                best = quote;
+                result.artifact = row.artifact_id;
+                result.lineage_id = row.stamp.lineage_id;
+                result.pool = row.stamp.pool;
+                result.lost_work = lost_work;
+                result.resource = row.resource;
+            }
+        }
+        first = last;
+    }
+    result.complete = have_best;
+    return result;
+}
+
 void observe_host_trade_refusal(
         server_prompt_cache & cache,
         uint64_t admission_sequence,
@@ -3706,12 +3918,12 @@ void server_prompt_cache::observe_retention_pressure_choice(
                 unavailable();
                 return;
             }
-            const auto & proposed = projection.alternatives.front();
-            event.proposed_artifact = proposed.artifact_ids.front();
-            event.proposed_lineage = proposed.lineage_id;
-            event.proposed_pool = proposed.pool;
-            event.proposed_lost_work = proposed.lost_work_units;
-            event.proposed_resource = proposed.value.marginal_resource;
+            const auto & alternative = projection.alternatives.front();
+            event.proposed_artifact = alternative.artifact_ids.front();
+            event.proposed_lineage = alternative.lineage_id;
+            event.proposed_pool = alternative.pool;
+            event.proposed_lost_work = alternative.lost_work_units;
+            event.proposed_resource = alternative.value.marginal_resource;
             event.status = server_prompt_cache_shadow_status::complete;
             event.agrees =
                 event.incumbent_artifact == event.proposed_artifact;
@@ -3940,7 +4152,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
         common_cache_plan_destruction_reason & floor_reason,
         bool & recovery_pin_excluded,
         bool competition_wave_valid,
-        bool observe_retention_shadow) {
+        bool & observe_retention_shadow) {
     legacy_floor = states.end();
     floor_reason = common_cache_plan_destruction_reason::capacity_refused;
     recovery_pin_excluded = false;
@@ -4174,6 +4386,97 @@ bool server_prompt_cache::destroy_priced_host_entry(
         floor_reason =
             common_cache_plan_destruction_reason::hard_lease_blocked;
     }
+
+    // First DF2 execution ratchet: only replace the lawful lifecycle
+    // host-capacity fallback. The calibrated/certified ladder above, hard
+    // leases, pins, incoming publication, and token pressure remain exactly
+    // where they were. Reproject on every victim; record only the first
+    // decision in a multi-removal competition wave.
+    if (retention_df2_capacity_authority &&
+        reason == server_cache_destruction_reason::host_capacity &&
+        legacy_floor != states.end()) {
+        const auto projection = competition_wave_valid
+            ? project_host_trade_df2(
+                  *this, incoming, candidates, retention_shadow_rows.get())
+            : host_trade_df2_projection {};
+        const auto proposed = projection.artifact;
+        if (observe_retention_shadow) {
+            const auto increment = [](uint64_t & value) noexcept {
+                if (value != UINT64_MAX) {
+                    value++;
+                }
+            };
+            increment(retention_shadow.choices);
+            auto & event = retention_shadow.last;
+            event = {};
+            event.reason = reason;
+            event.competition_epoch =
+                retention_obs->competition_epoch_value();
+            event.candidate_count = projection.candidate_count;
+            event.incumbent_artifact = host_entry_artifact_id(
+                *this, *legacy_floor);
+            if (projection.complete && proposed.v != 0 &&
+                event.incumbent_artifact.v != 0) {
+                event.proposed_artifact = proposed;
+                event.proposed_lineage = projection.lineage_id;
+                event.proposed_pool = projection.pool;
+                event.proposed_lost_work = projection.lost_work;
+                event.proposed_resource = projection.resource;
+                event.status = server_prompt_cache_shadow_status::complete;
+                event.agrees = event.incumbent_artifact == proposed;
+                increment(retention_shadow.complete);
+                increment(event.agrees
+                    ? retention_shadow.agreements
+                    : retention_shadow.disagreements);
+                if (debug_observability) {
+                    SRV_INF(
+                        "CACHE_RETENTION_SHADOW status=complete reason=%u "
+                        "epoch=%" PRIu64 " candidates=%" PRIu64
+                        " incumbent=%" PRIu64 " proposed=%" PRIu64
+                        " agrees=%s lost_work=%" PRIu64
+                        " resource=%" PRIu64 "\n",
+                        unsigned(reason), event.competition_epoch,
+                        event.candidate_count,
+                        event.incumbent_artifact.v,
+                        event.proposed_artifact.v,
+                        event.agrees ? "true" : "false",
+                        event.proposed_lost_work,
+                        event.proposed_resource);
+                }
+            } else {
+                increment(retention_shadow.unavailable);
+                if (debug_observability) {
+                    SRV_INF(
+                        "CACHE_RETENTION_SHADOW status=unavailable "
+                        "reason=%u epoch=%" PRIu64
+                        " candidates=%" PRIu64 "\n",
+                        unsigned(reason), event.competition_epoch,
+                        event.candidate_count);
+                }
+            }
+        }
+        observe_retention_shadow = false;
+        if (proposed.v != 0) {
+            const auto selected = std::find_if(
+                candidates.begin(), candidates.end(), [&](const auto & value) {
+                    return value.ranking.artifact_id == proposed &&
+                        value.lease_known && !value.hard_leased &&
+                        value.victim != incoming &&
+                        value.victim->recovery_pins == 0;
+                });
+            if (selected != candidates.end()) {
+                if (destruction_obs) {
+                    destruction_obs->host_trade_df2_executed++;
+                }
+                SRV_WRN(
+                    " - removing DF2 host entry source_id=%d (size = %.3f MiB)\n",
+                    selected->victim->cache_plan_source_id,
+                    selected->victim->size() / (1024.0 * 1024.0));
+                destroy_entry(selected->victim, reason);
+                return true;
+            }
+        }
+    }
     if (destruction_obs) {
         destruction_obs->host_trade_legacy_fallbacks++;
     }
@@ -4254,10 +4557,10 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
         server_cache_destruction_reason reason,
         iterator recovery) {
     const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
-    // Legacy pass-through owns exactly one accounting terminal outside the
-    // raw physical primitive. Under D-A1 lifecycle mode, the existing legacy
-    // eviction order is unchanged, but the exact accounting terminal executes
-    // through a freshly prepared capability.
+    // This pass-through owns exactly one accounting terminal outside the raw
+    // physical primitive. Victim ordering belongs to the caller (historical
+    // lifecycle floor or the gated DF2 authority); either route executes the
+    // same exact terminal through a freshly prepared capability.
     const auto release_ops = it->release_ops();
     const std::thread::id scheduler_owner = std::this_thread::get_id();
 

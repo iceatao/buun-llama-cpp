@@ -225,6 +225,7 @@ struct server_cache_destruction_observer {
     uint64_t host_trade_refused = 0;
     uint64_t host_trade_unpriced = 0;
     uint64_t host_trade_legacy_fallbacks = 0;
+    uint64_t host_trade_df2_executed = 0;
     uint64_t host_trade_hard_lease_vetoes = 0;
     uint64_t host_trade_publication_skips = 0;
     uint64_t host_trade_substrate_unavailable = 0;
