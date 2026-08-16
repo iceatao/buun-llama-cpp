@@ -215,6 +215,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/tools/server)
 
     llama_build_and_test(
+        test-retention-policy-corpus.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-retention-policy-corpus PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
         test-cache-destruction-quote.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
