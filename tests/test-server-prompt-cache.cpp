@@ -993,6 +993,192 @@ server_prompt_cache::iterator install_host_trade_retention_entry(
     return installed;
 }
 
+struct retention_df2_benchmark_fixture {
+    size_t cardinality;
+    size_t trial;
+    bool df2_enabled;
+    server_cache_authority authority;
+    std::string execution;
+    server_prompt_cache cache;
+    server_retention_instance_key oldest_key;
+
+    retention_df2_benchmark_fixture(
+            size_t cardinality,
+            size_t trial,
+            bool df2_enabled) :
+        cardinality(cardinality),
+        trial(trial),
+        df2_enabled(df2_enabled),
+        execution(
+            "df2-bench-" + std::to_string(trial)),
+        cache(0, 0) {
+    }
+
+    bool fail(const char * reason) const {
+        std::fprintf(stderr,
+            "RETENTION_DF2_BENCH failed cardinality=%zu trial=%zu "
+            "df2=%d reason=%s\n",
+            cardinality, trial, df2_enabled, reason);
+        return false;
+    }
+
+    bool prepare() {
+        configure_host_trade(authority, cache, execution);
+        authority.calibration_profile = {};
+        cache.retention_df2_capacity_authority = df2_enabled;
+        if (df2_enabled &&
+            (!authority.retention.enable_prefix_tracking() ||
+             !cache.enable_retention_shadow())) {
+            return fail("workspace-or-prefix-index");
+        }
+        for (size_t i = 0; i < cardinality; ++i) {
+            const auto identity =
+                "df2-bench-" + std::to_string(trial) + "-" +
+                std::to_string(i);
+            (void) install_host_trade_retention_entry(
+                cache, authority, identity.c_str(),
+                llama_token(30000 + i), 1, 1);
+        }
+        if (cache.size() == 0) {
+            return fail("empty-cache");
+        }
+        oldest_key = server_retention_instance_key::for_host_entry(
+            &cache.states.front());
+        if (!authority.retention.artifact_id(oldest_key).v) {
+            return fail("oldest-artifact");
+        }
+        cache.limit_size = cache.size() - 1;
+        return true;
+    }
+
+    bool run(uint64_t & elapsed_ns) {
+        const auto begin = std::chrono::steady_clock::now();
+        cache.update();
+        const auto end = std::chrono::steady_clock::now();
+        elapsed_ns = uint64_t(std::chrono::duration_cast<
+            std::chrono::nanoseconds>(end - begin).count());
+        if (cache.states.size() != cardinality - 1 ||
+            cache.states.empty() ||
+            cache.states.front().adapter_config_key !=
+                "df2-bench-" + std::to_string(trial) + "-1" ||
+            authority.retention.artifact_id(oldest_key).v != 0 ||
+            authority.destruction.prepared_release_commits != 1 ||
+            authority.destruction.prepared_release_fallbacks != 0) {
+            return fail("survivor-or-terminal");
+        }
+        if (df2_enabled) {
+            if (authority.destruction.host_trade_df2_executed != 1 ||
+                authority.destruction.host_trade_legacy_fallbacks != 0) {
+                return fail("df2-terminal");
+            }
+        } else if (authority.destruction.host_trade_df2_executed != 0 ||
+                   authority.destruction.host_trade_legacy_fallbacks != 1) {
+            return fail("baseline-terminal");
+        }
+        return true;
+    }
+};
+
+bool run_retention_df2_benchmark(size_t cardinality, size_t trials) {
+    std::vector<uint64_t> baseline_samples;
+    std::vector<uint64_t> total_samples;
+    std::vector<int64_t> added_samples;
+    std::array<std::vector<int64_t>, 4> order_samples;
+    baseline_samples.reserve(trials);
+    total_samples.reserve(trials);
+    added_samples.reserve(trials);
+    for (size_t trial = 0; trial < trials; ++trial) {
+        retention_df2_benchmark_fixture baseline(
+            cardinality, trial, false);
+        retention_df2_benchmark_fixture total(
+            cardinality, trial, true);
+        uint64_t baseline_ns = 0;
+        uint64_t total_ns = 0;
+        const size_t order = trial % order_samples.size();
+        const bool prepare_df2_first = order >= 2;
+        const bool run_df2_first = order % 2 != 0;
+        if (prepare_df2_first) {
+            if (!total.prepare() || !baseline.prepare()) {
+                return false;
+            }
+        } else {
+            if (!baseline.prepare() || !total.prepare()) {
+                return false;
+            }
+        }
+        if (run_df2_first) {
+            if (!total.run(total_ns) || !baseline.run(baseline_ns)) {
+                return false;
+            }
+        } else {
+            if (!baseline.run(baseline_ns) || !total.run(total_ns)) {
+                return false;
+            }
+        }
+        baseline_samples.push_back(baseline_ns);
+        total_samples.push_back(total_ns);
+        const int64_t added =
+            int64_t(total_ns) - int64_t(baseline_ns);
+        added_samples.push_back(added);
+        order_samples[order].push_back(added);
+    }
+    const uint64_t baseline_p50 =
+        percentile_nearest_rank(baseline_samples, 1, 2);
+    const uint64_t baseline_p95 =
+        percentile_nearest_rank(baseline_samples, 95, 100);
+    const uint64_t total_p50 =
+        percentile_nearest_rank(total_samples, 1, 2);
+    const uint64_t total_p95 =
+        percentile_nearest_rank(total_samples, 95, 100);
+    const int64_t added_p50 =
+        percentile_nearest_rank(added_samples, 1, 2);
+    const int64_t added_p95 =
+        percentile_nearest_rank(added_samples, 95, 100);
+    const uint64_t allowance_ns = std::max<uint64_t>(
+        2'000'000, baseline_p95/10);
+    const int64_t allowance_i64 = allowance_ns > uint64_t(INT64_MAX)
+        ? INT64_MAX : int64_t(allowance_ns);
+    std::array<int64_t, 4> order_p50 {};
+    bool order_accepted = true;
+    for (size_t i = 0; i < order_samples.size(); ++i) {
+        order_p50[i] = percentile_nearest_rank(
+            order_samples[i], 1, 2);
+        order_accepted &= order_p50[i] <= allowance_i64;
+    }
+    const bool marginal_accepted =
+        total_p95 <= baseline_p95 ||
+        total_p95 - baseline_p95 <= allowance_ns;
+    const bool accepted = added_p95 <= allowance_i64 &&
+        order_accepted && marginal_accepted;
+    std::printf(
+        "RETENTION_DF2_BENCH cardinality=%zu trials=%zu "
+        "evictions_per_wave=1 "
+        "baseline_p50_ns=%" PRIu64 " baseline_p95_ns=%" PRIu64 " "
+        "total_p50_ns=%" PRIu64 " total_p95_ns=%" PRIu64 " "
+        "added_p50_ns=%" PRId64 " added_p95_ns=%" PRId64 " "
+        "order_p50_ns=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "p95_allowance_ns=%" PRIu64 " marginal_accepted=%s accepted=%s\n",
+        cardinality, trials,
+        baseline_p50, baseline_p95, total_p50, total_p95,
+        added_p50, added_p95,
+        order_p50[0], order_p50[1], order_p50[2], order_p50[3],
+        allowance_ns,
+        marginal_accepted ? "true" : "false",
+        accepted ? "true" : "false");
+    return accepted;
+}
+
+int retention_df2_benchmark() {
+    const int old_verbosity = common_log_get_verbosity_thold();
+    common_log_set_verbosity_thold(LOG_LEVEL_OUTPUT);
+    const bool ok =
+        run_retention_df2_benchmark(1024, 21) &&
+        run_retention_df2_benchmark(
+            SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES, 21);
+    common_log_set_verbosity_thold(old_verbosity);
+    return ok ? 0 : 1;
+}
+
 void test_lifecycle_pressure_records_decayed_shadow() {
     server_cache_authority authority;
     const std::string execution = "lifecycle-decayed-shadow";
@@ -4002,6 +4188,12 @@ int main(int argc, char ** argv) {
     if (argc == 2 &&
         std::string(argv[1]) == "--retention-shadow-bench") {
         const int result = retention_shadow_benchmark();
+        llama_backend_free();
+        return result;
+    }
+    if (argc == 2 &&
+        std::string(argv[1]) == "--retention-df2-bench") {
+        const int result = retention_df2_benchmark();
         llama_backend_free();
         return result;
     }
