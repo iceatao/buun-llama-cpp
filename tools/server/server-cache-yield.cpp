@@ -186,19 +186,7 @@ server_retention_shadow_projection server_retention_shadow_project(
             } else {
                 found = &groups[indexed->second];
             }
-            if (found->lineage.state != candidate.lineage.state ||
-                found->lineage.reuse_hits !=
-                    candidate.lineage.reuse_hits ||
-                found->lineage.frequency_q !=
-                    candidate.lineage.frequency_q ||
-                found->lineage.admission_epoch !=
-                    candidate.lineage.admission_epoch ||
-                found->lineage.frequency_epoch !=
-                    candidate.lineage.frequency_epoch ||
-                found->lineage.last_credit_epoch !=
-                    candidate.lineage.last_credit_epoch ||
-                found->lineage.prior_milli !=
-                    candidate.lineage.prior_milli) {
+            if (found->lineage != candidate.lineage) {
                 complete = false;
                 continue;
             }

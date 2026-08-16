@@ -6,6 +6,8 @@
 
 #include <unordered_map>
 
+constexpr size_t SERVER_RETENTION_MAX_CANDIDATES = 8192;
+
 struct common_prompt_checkpoint;
 struct server_prompt_cache_state;
 class server_cache_recovery_pin;
@@ -77,6 +79,32 @@ struct server_retention_candidate {
     server_retention_candidate_availability avail =
         server_retention_candidate_availability::backing_missing_or_stale;
 };
+
+// Allocation-free DF1 value view. Pressure observation needs only immutable
+// score/lineage scalars; it must not copy accounting-operation vectors or the
+// shared turn table while a request is making room.
+struct server_retention_value_snapshot {
+    llama_cache_acct_artifact_id artifact_id;
+    common_retention_artifact_kind kind =
+        common_retention_artifact_kind::live_slot;
+    common_retention_stamp stamp;
+    common_retention_lineage_record lineage;
+};
+
+enum class server_retention_value_snapshot_status : uint8_t {
+    complete = 0,
+    overflow,
+    unavailable,
+};
+
+struct server_retention_value_snapshot_result {
+    server_retention_value_snapshot_status status =
+        server_retention_value_snapshot_status::unavailable;
+    size_t size = 0;
+};
+
+using server_retention_value_snapshot_visitor = bool (*)(
+    void *, const server_retention_value_snapshot &) noexcept;
 
 struct server_retention_lineage_ticket {
     common_retention_pool pool = common_retention_pool::attention;
@@ -189,6 +217,9 @@ public:
     bool lineage_for_instance(
         const server_retention_instance_key & key,
         common_retention_lineage_record & out) const noexcept;
+    server_retention_value_snapshot_result value_snapshots(
+        void * context,
+        server_retention_value_snapshot_visitor visitor) const noexcept;
     // Interim D-S bridge: lifecycle choke points retire associations directly.
     // D-S5/D-S6 can consolidate this onto retire-by-artifact-id once D-S4 admission
     // owns the catalog mutation rather than merely carrying the strong id.

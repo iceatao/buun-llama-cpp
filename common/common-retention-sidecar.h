@@ -82,6 +82,26 @@ struct common_retention_lineage_record {
     bool valid(uint64_t competition_epoch) const noexcept;
 };
 
+inline bool operator==(
+        const common_retention_lineage_record & a,
+        const common_retention_lineage_record & b) noexcept {
+    return a.pool == b.pool &&
+           a.state == b.state &&
+           a.lineage_id == b.lineage_id &&
+           a.reuse_hits == b.reuse_hits &&
+           a.frequency_q == b.frequency_q &&
+           a.admission_epoch == b.admission_epoch &&
+           a.frequency_epoch == b.frequency_epoch &&
+           a.last_credit_epoch == b.last_credit_epoch &&
+           a.prior_milli == b.prior_milli;
+}
+
+inline bool operator!=(
+        const common_retention_lineage_record & a,
+        const common_retention_lineage_record & b) noexcept {
+    return !(a == b);
+}
+
 enum class common_retention_credit_result : uint8_t {
     credited = 0,
     coalesced,

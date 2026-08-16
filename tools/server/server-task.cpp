@@ -19,6 +19,7 @@
 
 #include <limits>
 #include <cmath>
+#include <new>
 #include <thread>
 #include <tuple>
 
@@ -1753,6 +1754,22 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+server_prompt_cache::server_prompt_cache(
+        int32_t limit_size_mib,
+        size_t limit_tokens) {
+    limit_size = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens = limit_tokens;
+}
+
+bool server_prompt_cache::enable_retention_shadow() noexcept {
+    if (!retention_shadow_rows) {
+        retention_shadow_rows.reset(new (std::nothrow)
+            server_prompt_cache_shadow_row[
+                SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES]);
+    }
+    return bool(retention_shadow_rows);
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -3412,12 +3429,253 @@ bool server_prompt_cache::exactly_redundant(
     }
 }
 
+void server_prompt_cache::observe_retention_pressure_choice(
+        server_cache_destruction_reason reason,
+        iterator incoming,
+        iterator incumbent,
+        bool competition_wave_valid) noexcept {
+    if (!retention_obs) {
+        return;
+    }
+    const auto increment = [](uint64_t & value) noexcept {
+        if (value != UINT64_MAX) {
+            value++;
+        }
+    };
+    increment(retention_shadow.choices);
+    auto & event = retention_shadow.last;
+    event = {};
+    event.reason = reason;
+    event.competition_epoch = retention_obs->competition_epoch_value();
+
+    const auto unavailable = [&]() noexcept {
+        increment(retention_shadow.unavailable);
+        if (debug_observability) {
+            SRV_INF(
+                "CACHE_RETENTION_SHADOW status=unavailable reason=%u "
+                "epoch=%" PRIu64 " candidates=%" PRIu64 "\n",
+                unsigned(reason), event.competition_epoch,
+                event.candidate_count);
+        }
+    };
+
+    // This slice observes the ordinary fixed-cache FIFO route. Lifecycle
+    // pricing has its own lease/certification strata and remains a later
+    // lowering; never emit a partial comparison that omitted those facts.
+    if (!competition_wave_valid || publish_authority ||
+        !retention_shadow_rows || incumbent == states.end() ||
+        states.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
+        unavailable();
+        return;
+    }
+
+    struct fill_context {
+        server_prompt_cache_shadow_row * rows = nullptr;
+        size_t size = 0;
+    } fill { retention_shadow_rows.get(), 0 };
+    const auto fill_value = [](void * opaque,
+            const server_retention_value_snapshot & value) noexcept {
+        auto & context = *static_cast<fill_context *>(opaque);
+        if (context.size ==
+                SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
+            return false;
+        }
+        context.rows[context.size++] = {
+            value.artifact_id,
+            value.kind,
+            value.stamp,
+            value.lineage,
+            0,
+            false,
+            false,
+        };
+        return true;
+    };
+    const auto inventory = retention_obs->value_snapshots(
+        &fill, fill_value);
+    if (inventory.status !=
+            server_retention_value_snapshot_status::complete ||
+        inventory.size != fill.size) {
+        unavailable();
+        return;
+    }
+    const size_t n_rows = fill.size;
+    if (n_rows == 0) {
+        unavailable();
+        return;
+    }
+
+    auto * begin = retention_shadow_rows.get();
+    auto * end = begin + n_rows;
+    std::sort(begin, end, [](const auto & a, const auto & b) {
+        return a.artifact_id.v < b.artifact_id.v;
+    });
+    const auto find_artifact = [&](llama_cache_acct_artifact_id id) {
+        const auto found = std::lower_bound(
+            begin, end, id.v, [](const auto & row, uint64_t value) {
+                return row.artifact_id.v < value;
+            });
+        return found != end && found->artifact_id == id ? found : end;
+    };
+    uint64_t n_candidates = 0;
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const auto artifact = retention_obs->artifact_id(
+            server_retention_instance_key::for_host_entry(&*it));
+        auto * row = find_artifact(artifact);
+        const uint64_t resource =
+            reason == server_cache_destruction_reason::host_token_limit
+                ? uint64_t(it->prompt.n_tokens())
+                : uint64_t(it->size());
+        if (!artifact.v || row == end ||
+            row->kind != common_retention_artifact_kind::host_entry ||
+            row->backing_known || resource == 0) {
+            unavailable();
+            return;
+        }
+        row->backing_known = true;
+        row->resource = resource;
+        row->releasable = it != incoming && it->recovery_pins == 0;
+        if (row->releasable) {
+            n_candidates++;
+        }
+    }
+    for (const auto * row = begin; row != end; ++row) {
+        if (row->kind == common_retention_artifact_kind::host_entry &&
+            !row->backing_known) {
+            unavailable();
+            return;
+        }
+    }
+    event.candidate_count = n_candidates;
+    const auto incumbent_artifact = retention_obs->artifact_id(
+        server_retention_instance_key::for_host_entry(&*incumbent));
+    const auto * incumbent_row = find_artifact(incumbent_artifact);
+    if (!incumbent_artifact.v || incumbent_row == end ||
+        incumbent_row->kind != common_retention_artifact_kind::host_entry ||
+        !incumbent_row->backing_known || !incumbent_row->releasable) {
+        unavailable();
+        return;
+    }
+    event.incumbent_artifact = incumbent_artifact;
+    event.incumbent_lineage = incumbent_row->lineage.lineage_id;
+
+    std::sort(begin, end, [](const auto & a, const auto & b) {
+        return std::tie(
+                   a.stamp.pool, a.stamp.lineage_id,
+                   a.stamp.coverage_tokens, a.stamp.recency_ordinal,
+                   a.artifact_id.v) <
+               std::tie(
+                   b.stamp.pool, b.stamp.lineage_id,
+                   b.stamp.coverage_tokens, b.stamp.recency_ordinal,
+                   b.artifact_id.v);
+    });
+
+    bool have_proposed = false;
+    common_retention_shadow_value proposed_value;
+    for (size_t first = 0; first < n_rows;) {
+        size_t last = first + 1;
+        while (last < n_rows &&
+               begin[last].stamp.pool == begin[first].stamp.pool &&
+               begin[last].stamp.lineage_id ==
+                   begin[first].stamp.lineage_id) {
+            if (begin[last].lineage != begin[first].lineage) {
+                unavailable();
+                return;
+            }
+            last++;
+        }
+
+        uint64_t maximum = 0;
+        uint64_t second = 0;
+        size_t n_maximum = 0;
+        for (size_t i = first; i < last; ++i) {
+            const uint64_t coverage = begin[i].stamp.coverage_tokens;
+            if (coverage > maximum) {
+                second = maximum;
+                maximum = coverage;
+                n_maximum = 1;
+            } else if (coverage == maximum) {
+                n_maximum++;
+            } else if (coverage > second) {
+                second = coverage;
+            }
+        }
+
+        for (size_t i = first; i < last; ++i) {
+            if (!begin[i].releasable) {
+                continue;
+            }
+            const uint64_t coverage = begin[i].stamp.coverage_tokens;
+            const uint64_t lost_work =
+                coverage == maximum && n_maximum == 1
+                    ? coverage - second : 0;
+            common_retention_shadow_value quote;
+            if (!common_retention_shadow_quote(
+                    begin[i].lineage, event.competition_epoch,
+                    lost_work, begin[i].resource,
+                    begin[i].stamp.recency_ordinal, {}, quote)) {
+                unavailable();
+                return;
+            }
+            const bool lower = !have_proposed ||
+                common_retention_shadow_compare(
+                    quote, proposed_value) < 0;
+            const bool tied = have_proposed &&
+                common_retention_shadow_compare(
+                    quote, proposed_value) == 0;
+            if (lower || (tied &&
+                    std::tie(begin[i].stamp.pool,
+                             begin[i].stamp.lineage_id,
+                             begin[i].artifact_id.v) <
+                    std::tie(event.proposed_pool,
+                             event.proposed_lineage,
+                             event.proposed_artifact.v))) {
+                have_proposed = true;
+                proposed_value = quote;
+                event.proposed_artifact = begin[i].artifact_id;
+                event.proposed_lineage = begin[i].stamp.lineage_id;
+                event.proposed_pool = begin[i].stamp.pool;
+                event.proposed_lost_work = lost_work;
+                event.proposed_resource = begin[i].resource;
+            }
+        }
+        first = last;
+    }
+
+    if (!have_proposed) {
+        unavailable();
+        return;
+    }
+    event.status = server_prompt_cache_shadow_status::complete;
+    event.agrees = event.incumbent_artifact == event.proposed_artifact;
+    increment(retention_shadow.complete);
+    if (event.agrees) {
+        increment(retention_shadow.agreements);
+    } else {
+        increment(retention_shadow.disagreements);
+    }
+    if (debug_observability) {
+        SRV_INF(
+            "CACHE_RETENTION_SHADOW status=complete reason=%u "
+            "epoch=%" PRIu64 " candidates=%" PRIu64
+            " incumbent=%" PRIu64 " proposed=%" PRIu64
+            " agrees=%s lost_work=%" PRIu64
+            " resource=%" PRIu64 "\n",
+            unsigned(reason), event.competition_epoch,
+            event.candidate_count, event.incumbent_artifact.v,
+            event.proposed_artifact.v,
+            event.agrees ? "true" : "false",
+            event.proposed_lost_work, event.proposed_resource);
+    }
+}
+
 bool server_prompt_cache::destroy_priced_host_entry(
         server_cache_destruction_reason reason,
         iterator incoming,
         iterator & legacy_floor,
         common_cache_plan_destruction_reason & floor_reason,
-        bool & recovery_pin_excluded) {
+        bool & recovery_pin_excluded,
+        bool competition_wave_valid) {
     legacy_floor = states.end();
     floor_reason = common_cache_plan_destruction_reason::capacity_refused;
     recovery_pin_excluded = false;
@@ -3586,6 +3844,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
         const auto admission = server_prompt_cache_observe_drop(
             *this, *chosen->victim, reason);
         const std::thread::id scheduler_owner = std::this_thread::get_id();
+        observe_retention_pressure_choice(
+            reason, incoming, chosen->victim, competition_wave_valid);
         SRV_WRN(
             " - removing priced host entry source_id=%d (size = %.3f MiB)\n",
             chosen->victim->cache_plan_source_id,
@@ -3655,7 +3915,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
 
 bool server_prompt_cache::evict_front_under_pressure(
         server_cache_destruction_reason reason,
-        iterator incoming) {
+        iterator incoming,
+        bool competition_wave_valid) {
     GGML_ASSERT(!states.empty());
     iterator legacy_floor = states.end();
     common_cache_plan_destruction_reason floor_reason =
@@ -3663,7 +3924,7 @@ bool server_prompt_cache::evict_front_under_pressure(
     bool recovery_pin_excluded = false;
     if (destroy_priced_host_entry(
             reason, incoming, legacy_floor, floor_reason,
-            recovery_pin_excluded)) {
+            recovery_pin_excluded, competition_wave_valid)) {
         return true;
     }
 
@@ -3677,6 +3938,8 @@ bool server_prompt_cache::evict_front_under_pressure(
         const auto floor_artifact = host_entry_artifact_id(
             *this, *legacy_floor);
         const int32_t floor_source_id = legacy_floor->cache_plan_source_id;
+        observe_retention_pressure_choice(
+            reason, incoming, legacy_floor, competition_wave_valid);
         SRV_WRN(
             " - removing fallback host entry source_id=%d (size = %.3f MiB)\n",
             legacy_floor->cache_plan_source_id,
@@ -3702,6 +3965,8 @@ bool server_prompt_cache::evict_front_under_pressure(
         observe_host_trade_refusal(*this, sequence, floor_reason);
     }
     if (incoming != states.end()) {
+        observe_retention_pressure_choice(
+            reason, incoming, incoming, competition_wave_valid);
         destroy_entry(incoming, reason);
     }
     if (recovery_pin_excluded) {
@@ -4395,14 +4660,31 @@ void server_prompt_cache::update() {
 }
 
 bool server_prompt_cache::update_impl(iterator incoming) {
+    bool pressure_wave_started = false;
+    bool competition_wave_valid = true;
+    const auto begin_pressure_wave = [&]() noexcept {
+        if (pressure_wave_started) {
+            return;
+        }
+        pressure_wave_started = true;
+        if (!retention_obs) {
+            return;
+        }
+        if (retention_shadow.pressure_waves != UINT64_MAX) {
+            retention_shadow.pressure_waves++;
+        }
+        competition_wave_valid =
+            retention_obs->begin_competition_wave();
+    };
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
+            begin_pressure_wave();
             SRV_WRN(" - cache size limit reached (size = %.3f MiB)\n",
                     size() / (1024.0 * 1024.0));
 
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_capacity,
-                    incoming)) {
+                    incoming, competition_wave_valid)) {
                 return false;
             }
         }
@@ -4416,13 +4698,14 @@ bool server_prompt_cache::update_impl(iterator incoming) {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
+            begin_pressure_wave();
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur,
                     size() / (1024.0 * 1024.0));
 
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_token_limit,
-                    incoming)) {
+                    incoming, competition_wave_valid)) {
                 return false;
             }
         }

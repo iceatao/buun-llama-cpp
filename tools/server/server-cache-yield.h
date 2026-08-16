@@ -11,7 +11,8 @@
 struct common_cache_plan_yield_domain;
 
 constexpr uint32_t SERVER_CACHE_YIELD_POLICY_VERSION = 1;
-constexpr size_t SERVER_CACHE_YIELD_MAX_CANDIDATES = 8192;
+constexpr size_t SERVER_CACHE_YIELD_MAX_CANDIDATES =
+    SERVER_RETENTION_MAX_CANDIDATES;
 // Exhaustive compound enumeration is intentionally small and fail-closed.
 // Larger zero-marginal alias groups remain shadow-unavailable until the
 // accounting ledger can expose their allocation dependency graph directly.

@@ -7,7 +7,7 @@
 #include <utility>
 
 namespace {
-constexpr size_t MAX_CATALOG_ARTIFACTS = 8192;
+constexpr size_t MAX_CATALOG_ARTIFACTS = SERVER_RETENTION_MAX_CANDIDATES;
 constexpr uint64_t MAX_TURN_TABLE_BYTES = 16ull*1024*1024;
 constexpr uint64_t TURN_BOUNDARY_BYTES =
     sizeof(common_retention_turn_boundary);
@@ -940,6 +940,57 @@ bool server_retention_sidecar_store::lineage_for_instance(
     }
     out = lineage->second.record;
     return out.valid(competition_epoch);
+}
+
+server_retention_value_snapshot_result
+server_retention_sidecar_store::value_snapshots(
+        void * context,
+        server_retention_value_snapshot_visitor visitor) const noexcept {
+    server_retention_value_snapshot_result result;
+    if (!visitor ||
+        associations.size() > SERVER_RETENTION_MAX_CANDIDATES) {
+        result.status = server_retention_value_snapshot_status::overflow;
+        return result;
+    }
+    for (const auto & association : associations) {
+        const auto artifact = catalog.find(association.second.v);
+        if (artifact == catalog.end() || !artifact->second.record.valid()) {
+            return result;
+        }
+        const auto & record = artifact->second.record;
+        if (record.kind == common_retention_artifact_kind::checkpoint) {
+            continue;
+        }
+        if (record.stamp.state != common_retention_score_state::known) {
+            return result;
+        }
+        const auto lineage_key = qualified_lineage_id(
+            record.stamp.pool, record.stamp.lineage_id);
+        const auto lineage = lineages.find(lineage_key);
+        if (lineage_key == 0 || lineage == lineages.end()) {
+            return result;
+        }
+        if (!lineage->second.admitted) {
+            continue;
+        }
+        if (!lineage->second.record.valid(competition_epoch)) {
+            return result;
+        }
+        const server_retention_value_snapshot value {
+            association.second,
+            record.kind,
+            record.stamp,
+            lineage->second.record,
+        };
+        if (!visitor(context, value)) {
+            result = {};
+            result.status = server_retention_value_snapshot_status::overflow;
+            return result;
+        }
+        result.size++;
+    }
+    result.status = server_retention_value_snapshot_status::complete;
+    return result;
 }
 
 void server_retention_sidecar_store::retire_association(

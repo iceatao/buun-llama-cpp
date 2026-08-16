@@ -5750,6 +5750,9 @@ private:
                 prompt_cache->lease_obs = &cache_authority->leases;
                 prompt_cache->lease_execution_identity =
                     &frontier_execution_identity;
+                if (!params_base.cache_lifecycle) {
+                    (void) prompt_cache->enable_retention_shadow();
+                }
             }
             if (params_base.cache_lifecycle) {
                 llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set(
@@ -5791,6 +5794,7 @@ private:
                         : common_retention_pool::attention;
             }
             prompt_cache->retention_obs = cache_retention_shadow.get();
+            (void) prompt_cache->enable_retention_shadow();
         }
 
         std::vector<std::string> gpu_descs;

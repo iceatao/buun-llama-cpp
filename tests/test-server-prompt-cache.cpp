@@ -85,6 +85,21 @@ std::list<server_prompt_cache_state> make_prompt_entry(
     return entry;
 }
 
+std::list<server_prompt_cache_state> make_retention_entry(
+        const char * identity,
+        llama_token token_base,
+        size_t n_tokens,
+        size_t bytes) {
+    auto entry = make_entry(identity, bytes);
+    llama_tokens tokens;
+    tokens.reserve(n_tokens);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        tokens.push_back(token_base + llama_token(i));
+    }
+    entry.front().prompt.tokens = server_tokens(std::move(tokens), false);
+    return entry;
+}
+
 llama_cache_acct_artifact_id publish_host_retention(
         server_cache_authority & authority,
         server_prompt_cache::iterator state) {
@@ -100,6 +115,321 @@ llama_cache_acct_artifact_id publish_host_retention(
     const auto artifact = authority.retention.artifact_id(key);
     CHECK(artifact.v != 0);
     return artifact;
+}
+
+llama_cache_acct_artifact_id publish_host_retention(
+        server_retention_sidecar_store & retention,
+        server_prompt_cache::iterator state) {
+    common_chat_msg_spans spans;
+    spans.add(
+        COMMON_CHAT_ROLE_USER, 0,
+        int32_t(state->prompt.n_tokens()));
+    const auto key =
+        server_retention_instance_key::for_host_entry(&*state);
+    CHECK(retention.publish(
+        key, common_retention_pool::attention, spans, true,
+        state->prompt.n_tokens(), state->prompt.n_tokens(), true));
+    const auto artifact = retention.artifact_id(key);
+    CHECK(artifact.v != 0);
+    return artifact;
+}
+
+llama_cache_acct_artifact_id publish_live_retention(
+        server_retention_sidecar_store & retention,
+        const server_prompt & prompt,
+        int32_t id_slot) {
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+    const auto key = server_retention_instance_key::for_slot(id_slot);
+    CHECK(retention.publish(
+        key, common_retention_pool::attention, spans, true,
+        prompt.n_tokens(), prompt.n_tokens(), true));
+    const auto artifact = retention.artifact_id(key);
+    CHECK(artifact.v != 0);
+    return artifact;
+}
+
+void test_fixed_host_pressure_shadow_records_counterfactual() {
+    server_retention_sidecar_store retention;
+    retention.configure(nullptr, {}, nullptr);
+    server_prompt_cache cache(0, 0);
+    cache.retention_obs = &retention;
+    CHECK(cache.enable_retention_shadow());
+
+    server_prompt_cache::iterator hot;
+    server_prompt_cache::iterator cold;
+    CHECK(cache.publish(
+        make_retention_entry("hot", 1000, 100, 100),
+        nullptr, -1, &hot));
+    const auto hot_artifact = publish_host_retention(retention, hot);
+    CHECK(cache.publish(
+        make_retention_entry("cold", 2000, 10, 100),
+        nullptr, -1, &cold));
+    const auto cold_artifact = publish_host_retention(retention, cold);
+
+    CHECK(retention.begin_competition_wave());
+    CHECK(retention.credit_reuse(
+        server_retention_instance_key::for_host_entry(&*hot)) ==
+        common_retention_credit_result::credited);
+    CHECK(retention.begin_competition_wave());
+    CHECK(retention.credit_reuse(
+        server_retention_instance_key::for_host_entry(&*hot)) ==
+        common_retention_credit_result::credited);
+
+    // Two 100-byte entries exceed this bound by one victim. Shipping remains
+    // FIFO and removes the hot oldest entry; DF1 records that the cold newer
+    // lineage would have been the lower-value victim.
+    cache.limit_size = 150;
+    cache.update();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "cold");
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.pressure_waves == 1);
+    CHECK(shadow.choices == 1);
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.unavailable == 0);
+    CHECK(shadow.agreements == 0);
+    CHECK(shadow.disagreements == 1);
+    CHECK(shadow.last.status ==
+          server_prompt_cache_shadow_status::complete);
+    CHECK(shadow.last.incumbent_artifact == hot_artifact);
+    CHECK(shadow.last.proposed_artifact == cold_artifact);
+    CHECK(!shadow.last.agrees);
+    CHECK(shadow.last.candidate_count == 2);
+    CHECK(shadow.last.proposed_lost_work == 10);
+    CHECK(shadow.last.proposed_resource == 100);
+}
+
+void test_fixed_host_pressure_shadow_counts_live_alias_coverage() {
+    server_retention_sidecar_store retention;
+    retention.configure(nullptr, {}, nullptr);
+    server_prompt_cache cache(0, 0);
+    cache.retention_obs = &retention;
+    CHECK(cache.enable_retention_shadow());
+    server_prompt_cache::iterator oldest;
+    server_prompt_cache::iterator aliased;
+    CHECK(cache.publish(
+        make_retention_entry("old", 2500, 10, 100),
+        nullptr, -1, &oldest));
+    const auto oldest_artifact = publish_host_retention(retention, oldest);
+    CHECK(cache.publish(
+        make_retention_entry("aliased", 2600, 10, 100),
+        nullptr, -1, &aliased));
+    const auto aliased_artifact =
+        publish_host_retention(retention, aliased);
+    CHECK(retention.clone(
+        server_retention_instance_key::for_host_entry(&*aliased),
+        server_retention_instance_key::for_slot(7)));
+
+    cache.limit_size = 150;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.disagreements == 1);
+    CHECK(shadow.last.incumbent_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_artifact == aliased_artifact);
+    CHECK(shadow.last.proposed_lost_work == 0);
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "aliased");
+}
+
+void test_fixed_host_pressure_shadow_agrees_and_fails_closed() {
+    {
+        server_retention_sidecar_store retention;
+        retention.configure(nullptr, {}, nullptr);
+        server_prompt_cache cache(0, 0);
+        cache.retention_obs = &retention;
+        CHECK(cache.enable_retention_shadow());
+        server_prompt_cache::iterator oldest;
+        server_prompt_cache::iterator newest;
+        CHECK(cache.publish(
+            make_retention_entry("old", 3000, 10, 100),
+            nullptr, -1, &oldest));
+        const auto oldest_artifact =
+            publish_host_retention(retention, oldest);
+        CHECK(cache.publish(
+            make_retention_entry("new", 4000, 10, 100),
+            nullptr, -1, &newest));
+        (void) publish_host_retention(retention, newest);
+        cache.limit_size = 150;
+        cache.update();
+        const auto shadow = cache.retention_shadow_snapshot();
+        CHECK(shadow.pressure_waves == 1);
+        CHECK(shadow.choices == 1);
+        CHECK(shadow.complete == 1);
+        CHECK(shadow.agreements == 1);
+        CHECK(shadow.disagreements == 0);
+        CHECK(shadow.last.incumbent_artifact == oldest_artifact);
+        CHECK(shadow.last.proposed_artifact == oldest_artifact);
+        CHECK(shadow.last.agrees);
+        CHECK(cache.states.size() == 1);
+        CHECK(cache.states.front().adapter_config_key == "new");
+    }
+
+    {
+        server_retention_sidecar_store retention;
+        retention.configure(nullptr, {}, nullptr);
+        server_prompt_cache cache(0, 0);
+        cache.retention_obs = &retention;
+        CHECK(cache.enable_retention_shadow());
+        server_prompt_cache::iterator known;
+        server_prompt_cache::iterator unavailable;
+        CHECK(cache.publish(
+            make_retention_entry("known", 5000, 10, 100),
+            nullptr, -1, &known));
+        (void) publish_host_retention(retention, known);
+        CHECK(cache.publish(
+            make_retention_entry("unavailable", 6000, 10, 100),
+            nullptr, -1, &unavailable));
+        common_chat_msg_spans unavailable_spans;
+        unavailable_spans.add(COMMON_CHAT_ROLE_USER, 0, 10);
+        CHECK(retention.publish(
+            server_retention_instance_key::for_host_entry(&*unavailable),
+            common_retention_pool::attention,
+            unavailable_spans, true, 10, 10, false));
+        cache.limit_size = 150;
+        cache.update();
+        const auto shadow = cache.retention_shadow_snapshot();
+        CHECK(shadow.pressure_waves == 1);
+        CHECK(shadow.choices == 1);
+        CHECK(shadow.complete == 0);
+        CHECK(shadow.unavailable == 1);
+        CHECK(shadow.last.status ==
+              server_prompt_cache_shadow_status::unavailable);
+        CHECK(shadow.last.proposed_artifact.v == 0);
+        // Unavailable shadow evidence cannot perturb the FIFO terminal.
+        CHECK(cache.states.size() == 1);
+        CHECK(cache.states.front().adapter_config_key == "unavailable");
+    }
+}
+
+void test_fixed_host_pressure_shadow_advances_one_wave() {
+    server_retention_sidecar_store retention;
+    retention.configure(nullptr, {}, nullptr);
+    server_prompt_cache cache(0, 0);
+    cache.retention_obs = &retention;
+    CHECK(cache.enable_retention_shadow());
+    for (int32_t i = 0; i < 3; ++i) {
+        server_prompt_cache::iterator published;
+        CHECK(cache.publish(
+            make_retention_entry(
+                ("wave-" + std::to_string(i)).c_str(),
+                7000 + 100*i, 10, 100),
+            nullptr, -1, &published));
+        (void) publish_host_retention(retention, published);
+    }
+    const uint64_t epoch_before = retention.competition_epoch_value();
+    cache.limit_size = 50;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(cache.states.empty());
+    CHECK(shadow.pressure_waves == 1);
+    CHECK(shadow.choices == 3);
+    CHECK(shadow.complete == 3);
+    CHECK(shadow.unavailable == 0);
+    CHECK(retention.competition_epoch_value() == epoch_before + 1);
+}
+
+void test_fixed_host_token_pressure_uses_tokens_as_resource() {
+    server_retention_sidecar_store retention;
+    retention.configure(nullptr, {}, nullptr);
+    server_prompt_cache cache(0, 0);
+    cache.retention_obs = &retention;
+    CHECK(cache.enable_retention_shadow());
+
+    server_prompt_cache::iterator oldest;
+    server_prompt_cache::iterator newest;
+    CHECK(cache.publish(
+        make_retention_entry("many-tokens-few-bytes", 8000, 100, 10),
+        nullptr, -1, &oldest));
+    const auto oldest_artifact = publish_host_retention(retention, oldest);
+    CHECK(cache.publish(
+        make_retention_entry("few-tokens-many-bytes", 9000, 10, 100),
+        nullptr, -1, &newest));
+    (void) publish_host_retention(retention, newest);
+
+    // Token density ties (100/100 versus 10/10), so recency agrees with FIFO
+    // on the oldest entry. Byte density would incorrectly select the newer
+    // 10-token/100-byte entry instead.
+    cache.limit_tokens = 105;
+    cache.update();
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key ==
+          "few-tokens-many-bytes");
+    CHECK(shadow.pressure_waves == 1);
+    CHECK(shadow.choices == 1);
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.agreements == 1);
+    CHECK(shadow.last.reason ==
+          server_cache_destruction_reason::host_token_limit);
+    CHECK(shadow.last.incumbent_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_resource == 100);
+}
+
+void test_fixed_host_pressure_observes_incoming_publication() {
+    server_retention_sidecar_store retention;
+    retention.configure(nullptr, {}, nullptr);
+    server_prompt_cache cache(0, 0);
+    cache.retention_obs = &retention;
+    CHECK(cache.enable_retention_shadow());
+
+    server_prompt_cache::iterator incumbent;
+    CHECK(cache.publish(
+        make_retention_entry("incumbent", 10000, 10, 100),
+        nullptr, -1, &incumbent));
+    const auto incumbent_artifact =
+        publish_host_retention(retention, incumbent);
+
+    auto incoming = make_retention_entry("incoming", 11000, 10, 100);
+    server_prompt source = incoming.front().prompt.clone();
+    (void) publish_live_retention(retention, source, 7);
+    cache.limit_size = 150;
+    server_prompt_cache::iterator published;
+    CHECK(cache.publish(std::move(incoming), &source, 7, &published));
+    CHECK(published != cache.states.end());
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "incoming");
+    CHECK(retention.artifact_id(
+        server_retention_instance_key::for_host_entry(&*published)).v != 0);
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.pressure_waves == 1);
+    CHECK(shadow.choices == 1);
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.unavailable == 0);
+    CHECK(shadow.last.candidate_count == 1);
+    CHECK(shadow.last.incumbent_artifact == incumbent_artifact);
+    CHECK(shadow.last.proposed_artifact == incumbent_artifact);
+
+    // With no incumbent, an oversized incoming publication is still refused
+    // by the historical path. The shadow must not price that incoming node as
+    // its own victim or expose a partial counterfactual.
+    server_cache_authority single_authority;
+    configure_host_accounting(single_authority, true);
+    const std::string single_execution = "oversized-incoming";
+    server_prompt_cache single(0, 0);
+    single.acct = &single_authority.ledger;
+    single.publish_authority = &single_authority;
+    single.destruction_obs = &single_authority.destruction;
+    single.retention_obs = &single_authority.retention;
+    single.lease_obs = &single_authority.leases;
+    single.lease_execution_identity = &single_execution;
+    auto oversized = make_retention_entry("oversized", 12000, 10, 100);
+    server_prompt oversized_source = oversized.front().prompt.clone();
+    (void) publish_live_retention(
+        single_authority.retention, oversized_source, 9);
+    single.limit_size = 50;
+    CHECK(!single.publish(std::move(oversized), &oversized_source, 9));
+    CHECK(single.states.empty());
+    const auto refused = single.retention_shadow_snapshot();
+    CHECK(refused.pressure_waves == 1);
+    CHECK(refused.choices == 1);
+    CHECK(refused.complete == 0);
+    CHECK(refused.unavailable == 1);
+    CHECK(refused.last.status ==
+          server_prompt_cache_shadow_status::unavailable);
+    CHECK(refused.last.proposed_artifact.v == 0);
 }
 
 std::list<server_prompt_cache_state> make_redundant_entry() {
@@ -250,6 +580,36 @@ server_prompt_cache::iterator install_host_trade_entry(
         1,
         true));
     return installed;
+}
+
+void test_lifecycle_pressure_skips_fixed_shadow_deliberately() {
+    server_cache_authority authority;
+    const std::string execution = "lifecycle-shadow-skip";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+
+    (void) install_host_trade_entry(cache, authority, "oldest", 100);
+    (void) install_host_trade_entry(cache, authority, "newest", 100);
+    const uint64_t epoch_before =
+        authority.retention.competition_epoch_value();
+    cache.limit_size = 150;
+    cache.update();
+
+    // Lifecycle retains its existing certified pricing authority. The fixed
+    // FIFO shadow workspace is deliberately absent, but the real pressure
+    // wave still advances frequency currency exactly once.
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().adapter_config_key == "newest");
+    CHECK(cache.size() == 100);
+    const auto shadow = cache.retention_shadow_snapshot();
+    CHECK(shadow.pressure_waves == 1);
+    CHECK(shadow.choices == 1);
+    CHECK(shadow.complete == 0);
+    CHECK(shadow.unavailable == 1);
+    CHECK(shadow.last.status ==
+          server_prompt_cache_shadow_status::unavailable);
+    CHECK(authority.retention.competition_epoch_value() ==
+          epoch_before + 1);
 }
 
 void make_host_trade_pair(
@@ -2609,6 +2969,13 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
     test_lifecycle_full_cache_rotates();
+    test_fixed_host_pressure_shadow_records_counterfactual();
+    test_fixed_host_pressure_shadow_counts_live_alias_coverage();
+    test_fixed_host_pressure_shadow_agrees_and_fails_closed();
+    test_fixed_host_pressure_shadow_advances_one_wave();
+    test_fixed_host_token_pressure_uses_tokens_as_resource();
+    test_fixed_host_pressure_observes_incoming_publication();
+    test_lifecycle_pressure_skips_fixed_shadow_deliberately();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();

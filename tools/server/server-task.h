@@ -11,6 +11,7 @@
 #include "server-retention-sidecar.h"
 
 #include <array>
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -861,11 +862,54 @@ struct server_prompt_cache_restore_delivery {
     bool retains_source = false;
 };
 
+constexpr size_t SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES =
+    SERVER_RETENTION_MAX_CANDIDATES;
+
+enum class server_prompt_cache_shadow_status : uint8_t {
+    unavailable = 0,
+    complete,
+};
+
+struct server_prompt_cache_shadow_event {
+    server_prompt_cache_shadow_status status =
+        server_prompt_cache_shadow_status::unavailable;
+    server_cache_destruction_reason reason =
+        server_cache_destruction_reason::host_capacity;
+    uint64_t competition_epoch = 0;
+    uint64_t candidate_count = 0;
+    llama_cache_acct_artifact_id incumbent_artifact;
+    llama_cache_acct_artifact_id proposed_artifact;
+    uint64_t incumbent_lineage = 0;
+    uint64_t proposed_lineage = 0;
+    common_retention_pool proposed_pool = common_retention_pool::attention;
+    uint64_t proposed_lost_work = 0;
+    uint64_t proposed_resource = 0;
+    bool agrees = false;
+};
+
+struct server_prompt_cache_shadow_snapshot {
+    uint64_t pressure_waves = 0;
+    uint64_t choices = 0;
+    uint64_t complete = 0;
+    uint64_t unavailable = 0;
+    uint64_t agreements = 0;
+    uint64_t disagreements = 0;
+    server_prompt_cache_shadow_event last;
+};
+
+struct server_prompt_cache_shadow_row {
+    llama_cache_acct_artifact_id artifact_id;
+    common_retention_artifact_kind kind =
+        common_retention_artifact_kind::live_slot;
+    common_retention_stamp stamp;
+    common_retention_lineage_record lineage;
+    uint64_t resource = 0;
+    bool backing_known = false;
+    bool releasable = false;
+};
+
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
 
     std::list<server_prompt_cache_state> states;
     using iterator = std::list<server_prompt_cache_state>::iterator;
@@ -999,6 +1043,12 @@ struct server_prompt_cache {
             server_prompt_cache_state & st,
             std::array<server_prompt_cache_payload_leaf, 3> & leaves) noexcept;
 
+    bool enable_retention_shadow() noexcept;
+
+    server_prompt_cache_shadow_snapshot retention_shadow_snapshot() const noexcept {
+        return retention_shadow;
+    }
+
 private:
     iterator find_state_exact(
         const server_tokens & tokens,
@@ -1011,15 +1061,25 @@ private:
             iterator incoming,
             iterator & legacy_floor,
             common_cache_plan_destruction_reason & floor_reason,
-            bool & recovery_pin_excluded);
+            bool & recovery_pin_excluded,
+            bool competition_wave_valid);
     bool evict_front_under_pressure(
             server_cache_destruction_reason reason,
-            iterator incoming);
+            iterator incoming,
+            bool competition_wave_valid);
     bool update_impl(iterator incoming);
+    void observe_retention_pressure_choice(
+            server_cache_destruction_reason reason,
+            iterator incoming,
+            iterator incumbent,
+            bool competition_wave_valid) noexcept;
     iterator destroy_entry_impl(
             iterator it,
             server_cache_destruction_reason reason,
             iterator recovery);
+
+    std::unique_ptr<server_prompt_cache_shadow_row[]> retention_shadow_rows;
+    server_prompt_cache_shadow_snapshot retention_shadow;
 };
 
 // E1.1a proof adapter over the same list-node recovery counter consulted by
