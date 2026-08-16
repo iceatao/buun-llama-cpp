@@ -38,6 +38,11 @@ struct server_cache_yield_candidate {
         server_retention_candidate_availability::backing_missing_or_stale;
     server_cache_lease_evaluation lease;
     bool identity_known = false;
+    // Exact prefix coverage retained by a different lineage if this
+    // candidate's lineage is removed. The prefix-index owner computes this
+    // from authenticated content identity; the pure projector only consumes
+    // the bounded scalar. Zero preserves the pre-prefix-index behavior.
+    uint64_t external_shared_coverage_tokens = 0;
     std::vector<llama_cache_acct_op_id> release_ops;
     bool has_unsupported_host_spill = false;
 };

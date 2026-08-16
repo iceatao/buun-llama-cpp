@@ -37,6 +37,7 @@ struct corpus_candidate {
     uint64_t hits = 0;
     uint64_t frequency_q = 0;
     uint32_t prior_milli = 1000;
+    uint64_t external_shared_coverage = 0;
     bool hard = false;
     bool available = true;
 };
@@ -75,6 +76,8 @@ server_cache_yield_candidate lower(const corpus_candidate & source) {
     out.lineage.reuse_hits = source.hits;
     out.lineage.frequency_q = source.frequency_q;
     out.lineage.prior_milli = source.prior_milli;
+    out.external_shared_coverage_tokens =
+        source.external_shared_coverage;
     out.lineage.state = source.hits >= 2
         ? common_retention_frequency_state::promoted
         : common_retention_frequency_state::probation;
@@ -391,6 +394,56 @@ std::vector<corpus_result> execute_corpus() {
     CHECK(shared.lost_work == 20000);
     CHECK(shared.released_bytes == 200);
     report.push_back(std::move(shared));
+
+    // C7c: A prefix retained by another lineage reduces only avoided work;
+    // it does not merge frequency ledgers or physical release ownership.
+    auto shared_stem_child = item(62, 82000, 100, 1);
+    shared_stem_child.external_shared_coverage = 80000;
+    report.push_back(run("external_shared_child", {
+        shared_stem_child, item(63, 10000, 100, 2),
+    }, 1));
+    require_victim(report.back(), shared_stem_child.lineage);
+    CHECK(report.back().lost_work == 2000);
+
+    auto shared_stem_main = item(64, 120000, 100, 1);
+    shared_stem_main.external_shared_coverage = 80000;
+    report.push_back(run("external_shared_main", {
+        shared_stem_main, item(65, 50000, 100, 2),
+    }, 1));
+    require_victim(report.back(), shared_stem_main.lineage);
+    CHECK(report.back().lost_work == 40000);
+
+    auto external_alias_a = lower(item(73, 82000, 0, 1));
+    auto external_alias_b = lower(item(74, 82000, 0, 2));
+    external_alias_b.record.stamp.lineage_id =
+        external_alias_a.lineage.lineage_id;
+    external_alias_b.lineage = external_alias_a.lineage;
+    external_alias_a.external_shared_coverage_tokens = 80000;
+    external_alias_b.external_shared_coverage_tokens = 80000;
+    auto external_compound = project(
+        "external_shared_compound",
+        { external_alias_b, external_alias_a }, 1, shared_preview);
+    require_victim(
+        external_compound, external_alias_a.lineage.lineage_id);
+    CHECK(external_compound.selected_artifacts == 2);
+    CHECK(external_compound.lost_work == 2000);
+    CHECK(external_compound.released_bytes == 200);
+    report.push_back(std::move(external_compound));
+
+    auto invalid_shared = item(66, 82000, 100, 1);
+    invalid_shared.external_shared_coverage = 82001;
+    report.push_back(run("external_shared_invalid", {
+        invalid_shared, item(67, 10000, 100, 2),
+    }, 1));
+    CHECK(!report.back().complete);
+    CHECK(report.back().selected_artifacts == 0);
+
+    invalid_shared.hard = true;
+    report.push_back(run("external_shared_invalid_protected", {
+        invalid_shared, item(68, 10000, 100, 2),
+    }, 1));
+    CHECK(!report.back().complete);
+    CHECK(report.back().selected_artifacts == 0);
 
     // C8: Hard protection is an eligibility stratum above frequency.
     auto hard = item(30, 1000, 100, 1);

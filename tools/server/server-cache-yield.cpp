@@ -165,6 +165,8 @@ server_retention_shadow_projection server_retention_shadow_project(
                 !candidate.record.valid() ||
                 candidate.record.stamp.state !=
                     common_retention_score_state::known ||
+                candidate.external_shared_coverage_tokens >
+                    candidate.record.stamp.coverage_tokens ||
                 !candidate.lineage.valid(competition_epoch) ||
                 candidate.record.stamp.pool != candidate.lineage.pool ||
                 candidate.record.stamp.lineage_id !=
@@ -231,6 +233,7 @@ server_retention_shadow_projection server_retention_shadow_project(
                 std::vector<llama_cache_acct_op_id> ops;
                 std::vector<llama_cache_acct_artifact_id> artifacts;
                 uint64_t removed_coverage = 0;
+                uint64_t external_retained_coverage = 0;
                 uint64_t recency = 0;
                 std::vector<bool> is_removed(group.members.size(), false);
                 for (const size_t index : removed) {
@@ -246,6 +249,9 @@ server_retention_shadow_projection server_retention_shadow_project(
                     const uint64_t coverage =
                         candidate.record.stamp.coverage_tokens;
                     removed_coverage = std::max(removed_coverage, coverage);
+                    external_retained_coverage = std::max(
+                        external_retained_coverage,
+                        candidate.external_shared_coverage_tokens);
                     recency = std::max(
                         recency, candidate.record.stamp.recency_ordinal);
                 }
@@ -286,6 +292,8 @@ server_retention_shadow_projection server_retention_shadow_project(
                                 coverage_tokens);
                     }
                 }
+                retained_coverage = std::max(
+                    retained_coverage, external_retained_coverage);
                 const uint64_t lost_work = removed_coverage > retained_coverage
                     ? removed_coverage - retained_coverage : 0;
                 common_retention_shadow_value quote;
