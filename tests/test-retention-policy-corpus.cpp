@@ -482,7 +482,247 @@ std::vector<corpus_result> execute_corpus() {
     return report;
 }
 
-void emit_json(const std::vector<corpus_result> & report) {
+enum class contention_policy : uint8_t {
+    retained_fifo = 0,
+    decayed_frequency,
+};
+
+struct contention_request {
+    const char * key = nullptr;
+    uint64_t prompt_tokens = 0;
+};
+
+struct contention_entry {
+    std::string key;
+    server_retention_instance_key instance;
+    uint64_t prompt_tokens = 0;
+    uint64_t recency = 0;
+};
+
+struct contention_result {
+    const char * policy = nullptr;
+    uint64_t requests = 0;
+    uint64_t prompt_tokens = 0;
+    uint64_t avoided_prefill_tokens = 0;
+    uint64_t fresh_prefill_tokens = 0;
+    uint64_t pressure_waves = 0;
+    uint64_t evictions = 0;
+    uint64_t main_evictions = 0;
+    uint64_t tool_evictions = 0;
+    uint64_t main_return_reused_tokens = 0;
+    uint64_t tool_return_reused_tokens = 0;
+    uint64_t final_competition_epoch = 0;
+    bool complete = true;
+};
+
+common_chat_msg_spans contention_spans(uint64_t prompt_tokens) {
+    common_chat_msg_spans out;
+    out.add(COMMON_CHAT_ROLE_USER, 0, prompt_tokens);
+    return out;
+}
+
+contention_result run_contention_workload(contention_policy policy) {
+    static const std::array<contention_request, 18> requests = {{
+        { "main",    120000 },
+        { "seed-a",   80000 },
+        { "seed-b",   80000 },
+        { "main",    120000 },
+        { "seed-c",   80000 },
+        { "main",    120000 },
+        { "agent-1",  82000 },
+        { "agent-1",  82000 },
+        { "agent-2",  82000 },
+        { "agent-1",  82000 },
+        { "agent-3",  82000 },
+        { "agent-4",  82000 },
+        { "agent-5",  82000 },
+        { "agent-6",  82000 },
+        { "agent-7",  82000 },
+        { "agent-8",  82000 },
+        { "main",    120000 },
+        { "agent-1",  82000 },
+    }};
+
+    constexpr size_t capacity_entries = 4;
+    constexpr uint64_t resident_bytes = 100;
+    server_retention_sidecar_store store;
+    store.configure(nullptr, {}, nullptr);
+    std::vector<contention_entry> cache;
+    int32_t next_slot = 10000;
+    uint64_t next_recency = 1;
+    contention_result result;
+    result.policy = policy == contention_policy::retained_fifo
+        ? "retained_fifo" : "decayed_frequency";
+
+    const auto find = [&](const char * key) {
+        return std::find_if(cache.begin(), cache.end(),
+            [&](const auto & entry) { return entry.key == key; });
+    };
+    const auto evict = [&](const server_retention_instance_key & incoming) {
+        if (!store.begin_competition_wave()) {
+            result.complete = false;
+            return;
+        }
+        result.pressure_waves++;
+        auto victim = cache.end();
+        if (policy == contention_policy::retained_fifo) {
+            victim = std::min_element(cache.begin(), cache.end(),
+                [&](const auto & a, const auto & b) {
+                    if (a.instance == incoming) {
+                        return false;
+                    }
+                    if (b.instance == incoming) {
+                        return true;
+                    }
+                    return a.recency < b.recency;
+                });
+        } else {
+            const auto catalog = store.candidate_snapshot();
+            std::vector<server_cache_yield_candidate> candidates;
+            std::unordered_map<uint64_t, uint64_t> bytes;
+            candidates.reserve(catalog.size());
+            bytes.reserve(catalog.size());
+            for (const auto & source : catalog) {
+                server_cache_yield_candidate candidate;
+                candidate.artifact_id = source.artifact_id;
+                candidate.record = source.record;
+                candidate.lineage = source.lineage;
+                candidate.availability = source.avail;
+                candidate.identity_known = true;
+                candidate.lease.state =
+                    server_cache_lease_eval_state::known;
+                candidate.lease.cls = source.instance_key == incoming
+                    ? server_cache_lease_class::hard
+                    : server_cache_lease_class::none;
+                candidate.lease.eligibility =
+                    source.instance_key == incoming
+                        ? server_cache_lease_eligibility::hard_blocked
+                        : server_cache_lease_eligibility::eligible;
+                candidate.release_ops = {
+                    llama_cache_acct_op_id { source.artifact_id.v },
+                };
+                candidates.push_back(std::move(candidate));
+                bytes.emplace(source.artifact_id.v, resident_bytes);
+            }
+            const auto projected = run("contention", std::move(candidates),
+                std::move(bytes), store.competition_epoch_value());
+            if (!projected.complete || projected.victim_artifact == 0) {
+                result.complete = false;
+                return;
+            }
+            victim = std::find_if(cache.begin(), cache.end(),
+                [&](const auto & entry) {
+                    return store.artifact_id(entry.instance).v ==
+                           projected.victim_artifact;
+                });
+        }
+        if (victim == cache.end() || victim->instance == incoming) {
+            result.complete = false;
+            return;
+        }
+        result.main_evictions += victim->key == "main";
+        result.tool_evictions += victim->key == "agent-1";
+        result.evictions++;
+        store.retire(victim->instance);
+        cache.erase(victim);
+    };
+
+    for (size_t request_index = 0;
+         request_index < requests.size(); ++request_index) {
+        const auto & request = requests[request_index];
+        result.requests++;
+        result.prompt_tokens += request.prompt_tokens;
+        auto exact = find(request.key);
+        const uint64_t hit_tokens = exact == cache.end()
+            ? 0 : request.prompt_tokens;
+        if (exact != cache.end() &&
+            store.credit_reuse(exact->instance) ==
+                common_retention_credit_result::unavailable) {
+            result.complete = false;
+            break;
+        }
+        if (request_index == requests.size() - 2) {
+            result.main_return_reused_tokens = hit_tokens;
+        }
+        if (request_index == requests.size() - 1) {
+            result.tool_return_reused_tokens = hit_tokens;
+        }
+        result.avoided_prefill_tokens += hit_tokens;
+        result.fresh_prefill_tokens += request.prompt_tokens - hit_tokens;
+
+        if (exact == cache.end()) {
+            const auto destination =
+                server_retention_instance_key::for_slot(next_slot++);
+            const bool admitted = store.publish(destination,
+                common_retention_pool::attention,
+                contention_spans(request.prompt_tokens), true,
+                request.prompt_tokens, request.prompt_tokens, true);
+            if (!admitted) {
+                result.complete = false;
+                break;
+            }
+            cache.push_back({ request.key, destination,
+                request.prompt_tokens, next_recency++ });
+            if (cache.size() > capacity_entries) {
+                evict(destination);
+            }
+        }
+        if (!result.complete) {
+            break;
+        }
+    }
+    result.final_competition_epoch = store.competition_epoch_value();
+    return result;
+}
+
+void test_stateful_contention_workload(
+        contention_result & fifo,
+        contention_result & decayed) {
+    fifo = run_contention_workload(contention_policy::retained_fifo);
+    decayed = run_contention_workload(
+        contention_policy::decayed_frequency);
+    CHECK(fifo.complete);
+    CHECK(decayed.complete);
+    CHECK(fifo.requests == 18);
+    CHECK(fifo.prompt_tokens == 1622000);
+    CHECK(fifo.avoided_prefill_tokens == 404000);
+    CHECK(fifo.fresh_prefill_tokens == 1218000);
+    CHECK(fifo.pressure_waves == 10);
+    CHECK(fifo.evictions == 10);
+    CHECK(fifo.main_evictions == 1);
+    CHECK(fifo.tool_evictions == 1);
+    CHECK(fifo.main_return_reused_tokens == 0);
+    CHECK(fifo.tool_return_reused_tokens == 0);
+    CHECK(fifo.final_competition_epoch == 25);
+
+    CHECK(decayed.requests == 18);
+    CHECK(decayed.prompt_tokens == 1622000);
+    CHECK(decayed.avoided_prefill_tokens == 606000);
+    CHECK(decayed.fresh_prefill_tokens == 1016000);
+    CHECK(decayed.pressure_waves == 8);
+    CHECK(decayed.evictions == 8);
+    CHECK(decayed.main_evictions == 0);
+    CHECK(decayed.tool_evictions == 0);
+    CHECK(decayed.main_return_reused_tokens == 120000);
+    CHECK(decayed.tool_return_reused_tokens == 82000);
+    CHECK(decayed.final_competition_epoch == 21);
+
+    // This is a retained-source counterfactual for the planned
+    // non-consuming policy, not an efficacy replay of today's consuming
+    // fixed-host default. Both arms run identical production-owned
+    // admission, reuse-credit, pressure-wave, and retirement transitions;
+    // only the pressure victim comparator differs. The separate branch-flood
+    // corpus above owns branch/source-credit isolation.
+    CHECK(fifo.avoided_prefill_tokens + fifo.fresh_prefill_tokens ==
+          fifo.prompt_tokens);
+    CHECK(decayed.avoided_prefill_tokens +
+          decayed.fresh_prefill_tokens == decayed.prompt_tokens);
+}
+
+void emit_json(
+        const std::vector<corpus_result> & report,
+        const contention_result & fifo,
+        const contention_result & decayed) {
     std::printf("{\"version\":1,\"scenarios\":[");
     for (size_t i = 0; i < report.size(); ++i) {
         const auto & value = report[i];
@@ -499,13 +739,45 @@ void emit_json(const std::vector<corpus_result> & report) {
             (unsigned long long) value.lost_work,
             (unsigned long long) value.released_bytes);
     }
-    std::printf("]}\n");
+    const auto emit_workload = [](const contention_result & value) {
+        std::printf(
+            "{\"policy\":\"%s\",\"complete\":%s,"
+            "\"requests\":%llu,\"prompt_tokens\":%llu,"
+            "\"avoided_prefill_tokens\":%llu,"
+            "\"fresh_prefill_tokens\":%llu,"
+            "\"pressure_waves\":%llu,\"evictions\":%llu,"
+            "\"main_evictions\":%llu,\"tool_evictions\":%llu,"
+            "\"main_return_reused_tokens\":%llu,"
+            "\"tool_return_reused_tokens\":%llu,"
+            "\"final_competition_epoch\":%llu}",
+            value.policy, value.complete ? "true" : "false",
+            (unsigned long long) value.requests,
+            (unsigned long long) value.prompt_tokens,
+            (unsigned long long) value.avoided_prefill_tokens,
+            (unsigned long long) value.fresh_prefill_tokens,
+            (unsigned long long) value.pressure_waves,
+            (unsigned long long) value.evictions,
+            (unsigned long long) value.main_evictions,
+            (unsigned long long) value.tool_evictions,
+            (unsigned long long) value.main_return_reused_tokens,
+            (unsigned long long) value.tool_return_reused_tokens,
+            (unsigned long long) value.final_competition_epoch);
+    };
+    std::printf("],\"contention_workload\":{");
+    std::printf("\"baseline\":");
+    emit_workload(fifo);
+    std::printf(",\"candidate\":");
+    emit_workload(decayed);
+    std::printf("}}\n");
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
     const auto report = execute_corpus();
+    contention_result fifo;
+    contention_result decayed;
+    test_stateful_contention_workload(fifo, decayed);
     const bool json = argc == 2 && std::string(argv[1]) == "--json";
     if (!json && argc != 1) {
         std::fprintf(stderr, "usage: %s [--json]\n", argv[0]);
@@ -516,11 +788,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (json) {
-        emit_json(report);
+        emit_json(report, fifo, decayed);
     } else {
         std::printf(
-            "retention policy corpus: PASS (%zu scenarios)\n",
-            report.size());
+            "retention policy corpus: PASS (%zu scenarios, "
+            "synthetic retained-source delta %llu modeled "
+            "fresh-prefill tokens)\n",
+            report.size(),
+            (unsigned long long) (fifo.fresh_prefill_tokens -
+                decayed.fresh_prefill_tokens));
     }
     return 0;
 }

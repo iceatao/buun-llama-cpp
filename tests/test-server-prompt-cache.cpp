@@ -5,6 +5,7 @@
 #include "server-task.h"
 
 #include "llama.h"
+#include "log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -430,6 +431,136 @@ void test_fixed_host_pressure_observes_incoming_publication() {
     CHECK(refused.last.status ==
           server_prompt_cache_shadow_status::unavailable);
     CHECK(refused.last.proposed_artifact.v == 0);
+}
+
+template <typename T>
+T percentile_nearest_rank(
+        std::vector<T> samples,
+        size_t numerator,
+        size_t denominator) {
+    CHECK(!samples.empty());
+    CHECK(denominator != 0);
+    if (samples.empty() || denominator == 0) {
+        return 0;
+    }
+    std::sort(samples.begin(), samples.end());
+    const size_t rank = std::max<size_t>(1,
+        (samples.size()*numerator + denominator - 1)/denominator);
+    const size_t index = std::min(samples.size() - 1, rank - 1);
+    return samples[index];
+}
+
+bool retention_shadow_benchmark_arm(
+        size_t cardinality,
+        size_t trial,
+        bool shadow_enabled,
+        uint64_t & elapsed_ns) {
+    const auto fail = [&](const char * reason) {
+        std::fprintf(stderr,
+            "RETENTION_SHADOW_BENCH failed cardinality=%zu trial=%zu "
+            "shadow=%d reason=%s\n",
+            cardinality, trial, shadow_enabled, reason);
+        return false;
+    };
+    server_retention_sidecar_store retention;
+    retention.configure(nullptr, {}, nullptr);
+    server_prompt_cache cache(0, 0);
+    cache.retention_obs = &retention;
+    if (shadow_enabled && !cache.enable_retention_shadow()) {
+        return fail("workspace");
+    }
+    for (size_t i = 0; i < cardinality; ++i) {
+        server_prompt_cache::iterator published;
+        const auto identity =
+            "shadow-bench-" + std::to_string(trial) + "-" +
+            std::to_string(i);
+        if (!cache.publish(
+                make_retention_entry(
+                    identity.c_str(), llama_token(20000 + i), 1, 1),
+                nullptr, -1, &published)) {
+            return fail("publish");
+        }
+        if (!publish_host_retention(retention, published).v) {
+            return fail("sidecar");
+        }
+    }
+    cache.limit_size = cardinality - 1;
+    const auto begin = std::chrono::steady_clock::now();
+    cache.update();
+    const auto end = std::chrono::steady_clock::now();
+    elapsed_ns = uint64_t(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(end - begin).count());
+    if (cache.states.size() != cardinality - 1 ||
+        cache.states.empty() ||
+        cache.states.front().adapter_config_key !=
+            "shadow-bench-" + std::to_string(trial) + "-1") {
+        return fail("survivor");
+    }
+    const auto shadow = cache.retention_shadow_snapshot();
+    if (shadow_enabled) {
+        if (shadow.pressure_waves != 1 || shadow.choices != 1 ||
+            shadow.complete != 1 || shadow.unavailable != 0) {
+            return fail("shadow-result");
+        }
+    } else if (shadow.pressure_waves != 1 || shadow.choices != 1 ||
+               shadow.complete != 0 || shadow.unavailable != 1) {
+        return fail("baseline-result");
+    }
+    return true;
+}
+
+bool run_retention_shadow_benchmark(size_t cardinality, size_t trials) {
+    std::vector<uint64_t> baseline_samples;
+    std::vector<uint64_t> total_samples;
+    std::vector<int64_t> added_samples;
+    baseline_samples.reserve(trials);
+    total_samples.reserve(trials);
+    added_samples.reserve(trials);
+    for (size_t trial = 0; trial < trials; ++trial) {
+        uint64_t baseline_ns = 0;
+        uint64_t total_ns = 0;
+        const bool shadow_first = trial % 2 != 0;
+        if (shadow_first) {
+            if (!retention_shadow_benchmark_arm(
+                    cardinality, trial, true, total_ns) ||
+                !retention_shadow_benchmark_arm(
+                    cardinality, trial, false, baseline_ns)) {
+                return false;
+            }
+        } else if (!retention_shadow_benchmark_arm(
+                       cardinality, trial, false, baseline_ns) ||
+                   !retention_shadow_benchmark_arm(
+                       cardinality, trial, true, total_ns)) {
+            return false;
+        }
+        baseline_samples.push_back(baseline_ns);
+        total_samples.push_back(total_ns);
+        added_samples.push_back(int64_t(total_ns) - int64_t(baseline_ns));
+    }
+    std::printf(
+        "RETENTION_SHADOW_BENCH cardinality=%zu trials=%zu "
+        "baseline_p50_ns=%" PRIu64 " baseline_p95_ns=%" PRIu64 " "
+        "total_p50_ns=%" PRIu64 " total_p95_ns=%" PRIu64 " "
+        "added_p50_ns=%" PRId64 " added_p95_ns=%" PRId64 "\n",
+        cardinality, trials,
+        percentile_nearest_rank(baseline_samples, 1, 2),
+        percentile_nearest_rank(baseline_samples, 95, 100),
+        percentile_nearest_rank(total_samples, 1, 2),
+        percentile_nearest_rank(total_samples, 95, 100),
+        percentile_nearest_rank(added_samples, 1, 2),
+        percentile_nearest_rank(added_samples, 95, 100));
+    return true;
+}
+
+int retention_shadow_benchmark() {
+    const int old_verbosity = common_log_get_verbosity_thold();
+    common_log_set_verbosity_thold(LOG_LEVEL_OUTPUT);
+    const bool ok =
+        run_retention_shadow_benchmark(1024, 21) &&
+        run_retention_shadow_benchmark(
+            SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES, 21);
+    common_log_set_verbosity_thold(old_verbosity);
+    return ok ? 0 : 1;
 }
 
 std::list<server_prompt_cache_state> make_redundant_entry() {
@@ -2960,6 +3091,12 @@ void test_live_checkpoint_batch_admission() {
 
 int main(int argc, char ** argv) {
     llama_backend_init();
+    if (argc == 2 &&
+        std::string(argv[1]) == "--retention-shadow-bench") {
+        const int result = retention_shadow_benchmark();
+        llama_backend_free();
+        return result;
+    }
     if (argc == 2 && std::string(argv[1]) == "--clone-fault") {
         test_lifecycle_restore_clone_fault();
         llama_backend_free();
