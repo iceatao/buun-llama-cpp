@@ -969,6 +969,30 @@ server_prompt_cache::iterator install_host_trade_entry(
     return installed;
 }
 
+server_prompt_cache::iterator install_host_trade_retention_entry(
+        server_prompt_cache & cache,
+        server_cache_authority & authority,
+        const char * adapter,
+        llama_token token_base,
+        size_t n_tokens,
+        size_t bytes) {
+    auto entry = make_retention_entry(
+        adapter, token_base, n_tokens, bytes);
+    CHECK(cache.publish(std::move(entry)));
+    auto installed = std::prev(cache.states.end());
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, installed->prompt.n_tokens());
+    const auto key =
+        server_retention_instance_key::for_host_entry(&*installed);
+    CHECK(authority.retention.publish(
+        key, common_retention_pool::attention, spans, true,
+        installed->prompt.n_tokens(), installed->prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, key, installed->prompt,
+        installed->adapter_config_key, installed->prompt.n_tokens()));
+    return installed;
+}
+
 void test_lifecycle_pressure_records_decayed_shadow() {
     server_cache_authority authority;
     const std::string execution = "lifecycle-decayed-shadow";
@@ -1462,6 +1486,75 @@ void test_lifecycle_df2_all_one_shot_converges_to_fifo() {
     CHECK(shadow.last.incumbent_artifact == oldest_artifact);
     CHECK(shadow.last.proposed_artifact == oldest_artifact);
     CHECK(shadow.last.agrees);
+}
+
+void test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin() {
+    {
+        server_cache_authority authority;
+        const std::string execution = "lifecycle-df2-expensive-infrequent";
+        server_prompt_cache cache(0, 0);
+        configure_host_trade(authority, cache, execution);
+        cache.retention_df2_capacity_authority = true;
+        CHECK(authority.retention.enable_prefix_tracking());
+        CHECK(cache.enable_retention_shadow());
+
+        const auto expensive = install_host_trade_retention_entry(
+            cache, authority, "density-expensive", 10000, 100, 100);
+        const auto cheap_hot = install_host_trade_retention_entry(
+            cache, authority, "density-cheap-hot", 20000, 1, 100);
+        const auto cheap_key =
+            server_retention_instance_key::for_host_entry(&*cheap_hot);
+        for (int i = 0; i < 4; ++i) {
+            CHECK(authority.retention.begin_competition_wave());
+            CHECK(authority.retention.credit_reuse(cheap_key) ==
+                  common_retention_credit_result::credited);
+        }
+        const auto cheap_artifact =
+            authority.retention.artifact_id(cheap_key);
+
+        cache.limit_size = std::max(expensive->size(), cheap_hot->size());
+        cache.update();
+        CHECK(cache.states.size() == 1);
+        CHECK(cache.states.front().adapter_config_key ==
+              "density-expensive");
+        CHECK(authority.destruction.host_trade_df2_executed == 1);
+        CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+        CHECK(cache.retention_shadow_snapshot().last.proposed_artifact ==
+              cheap_artifact);
+    }
+
+    {
+        server_cache_authority authority;
+        const std::string execution = "lifecycle-df2-cheap-frequent";
+        server_prompt_cache cache(0, 0);
+        configure_host_trade(authority, cache, execution);
+        cache.retention_df2_capacity_authority = true;
+        CHECK(authority.retention.enable_prefix_tracking());
+        CHECK(cache.enable_retention_shadow());
+
+        const auto large_hot = install_host_trade_retention_entry(
+            cache, authority, "density-large-hot", 30000, 100, 10000);
+        const auto compact = install_host_trade_retention_entry(
+            cache, authority, "density-compact", 40000, 100, 100);
+        const auto large_key =
+            server_retention_instance_key::for_host_entry(&*large_hot);
+        for (int i = 0; i < 4; ++i) {
+            CHECK(authority.retention.begin_competition_wave());
+            CHECK(authority.retention.credit_reuse(large_key) ==
+                  common_retention_credit_result::credited);
+        }
+        const auto large_artifact =
+            authority.retention.artifact_id(large_key);
+
+        cache.limit_size = std::max(large_hot->size(), compact->size());
+        cache.update();
+        CHECK(cache.states.size() == 1);
+        CHECK(cache.states.front().adapter_config_key == "density-compact");
+        CHECK(authority.destruction.host_trade_df2_executed == 1);
+        CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+        CHECK(cache.retention_shadow_snapshot().last.proposed_artifact ==
+              large_artifact);
+    }
 }
 
 void make_host_trade_pair(
@@ -3869,6 +3962,7 @@ int main(int argc, char ** argv) {
     test_lifecycle_df2_reprojects_each_multi_victim_wave();
     test_lifecycle_df2_phase_change_forgets_old_reuse();
     test_lifecycle_df2_all_one_shot_converges_to_fifo();
+    test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();
