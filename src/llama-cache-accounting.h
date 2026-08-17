@@ -628,6 +628,10 @@ struct llama_cache_acct_ledger {
     // telemetry, not versioned accounting state.
     uint64_t serial_conflicts() const noexcept;
 
+    // Current optimistic-concurrency fence without materializing the
+    // allocation/certification rows carried by snapshot().
+    uint64_t serial() const noexcept;
+
     // Process-local registry size for lifecycle diagnostics/tests. This is deliberately absent
     // from the schema-v2 snapshot: allocation-map storage is an implementation detail, not a
     // serialized accounting measure.

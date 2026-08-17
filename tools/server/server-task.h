@@ -910,6 +910,22 @@ struct server_prompt_cache_shadow_row {
     bool releasable = false;
 };
 
+constexpr size_t SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY =
+    2*SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES;
+
+struct server_prompt_cache_shadow_artifact_slot {
+    uint64_t artifact_id = 0;
+    uint32_t row_index = 0;
+};
+
+struct server_prompt_cache_shadow_lineage_slot {
+    uint64_t lineage_id = 0;
+    uint64_t maximum_coverage = 0;
+    uint64_t second_coverage = 0;
+    uint32_t maximum_count = 0;
+    common_retention_pool pool = common_retention_pool::attention;
+};
+
 struct server_prompt_cache_df2_live_transition {
     bool lookup_host = false;
     bool preserve_source = false;
@@ -1105,10 +1121,13 @@ private:
             bool competition_wave_valid,
             bool & observe_retention_shadow);
     bool evict_front_under_pressure(
-            server_cache_destruction_reason reason,
-            iterator incoming,
-            bool competition_wave_valid,
-            bool observe_retention_shadow);
+        server_cache_destruction_reason reason,
+        iterator incoming,
+        bool competition_wave_valid,
+        bool observe_retention_shadow);
+    bool destroy_df2_entry(
+        iterator it,
+        server_cache_destruction_reason reason);
     bool update_impl(iterator incoming);
     void observe_retention_pressure_choice(
             server_cache_destruction_reason reason,
@@ -1121,6 +1140,10 @@ private:
             iterator recovery);
 
     std::unique_ptr<server_prompt_cache_shadow_row[]> retention_shadow_rows;
+    std::unique_ptr<server_prompt_cache_shadow_artifact_slot[]>
+        retention_shadow_artifacts;
+    std::unique_ptr<server_prompt_cache_shadow_lineage_slot[]>
+        retention_shadow_lineages;
     server_prompt_cache_shadow_snapshot retention_shadow;
 };
 

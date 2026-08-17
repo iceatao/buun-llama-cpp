@@ -608,6 +608,11 @@ uint64_t llama_cache_acct_ledger::serial_conflicts() const noexcept {
     return serial_conflicts_;
 }
 
+uint64_t llama_cache_acct_ledger::serial() const noexcept {
+    std::lock_guard<std::mutex> lock(mtx);
+    return state.serial;
+}
+
 size_t llama_cache_acct_ledger::allocation_registry_size() const noexcept {
     std::lock_guard<std::mutex> lock(mtx);
     return allocs.size();

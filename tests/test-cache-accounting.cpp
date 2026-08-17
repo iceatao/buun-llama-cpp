@@ -521,13 +521,16 @@ static void test_snapshot_serial() {
     configure_default(ledger);
 
     const auto s0 = ledger.snapshot();
+    CHECK(ledger.serial() == s0.serial);
     const auto op = ledger.reserve(CAT, DOM, {}, 1, 1);
     const auto s1 = ledger.snapshot();
     CHECK(s1.serial > s0.serial);
+    CHECK(ledger.serial() == s1.serial);
     CHECK(ledger.stage(op, ledger.new_alloc(), 1));
     CHECK(ledger.commit(op, 1));
     const auto s2 = ledger.snapshot();
     CHECK(s2.serial > s1.serial);
+    CHECK(ledger.serial() == s2.serial);
     // the earlier snapshot is an unchanged copy, not a view
     CHECK(cell(s1, CAT, DOM, llama_cache_acct_measure::logical_payload).state ==
           llama_cache_acct_known::unknown);

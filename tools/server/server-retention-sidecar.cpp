@@ -617,8 +617,17 @@ struct server_retention_sidecar_store::prefix_tracking {
             return false;
         }
         const auto found = artifacts.find(artifact.v);
-        return found != artifacts.end() && found->second.scope &&
-            found->second.scope->index.external_shared_coverage(artifact, out);
+        if (found == artifacts.end() || !found->second.scope) {
+            return false;
+        }
+        // A scope with one artifact cannot contain cross-lineage coverage.
+        // Avoid walking its private radix tree on every pressure projection;
+        // the index is still the authority as soon as the scope is shared.
+        if (found->second.scope->refs == 1) {
+            return true;
+        }
+        return found->second.scope->index.external_shared_coverage(
+            artifact, out);
     }
 };
 
@@ -1718,7 +1727,7 @@ void server_retention_sidecar_store::retire_catalog_entry(
     if (ledger && !entry->second.release_ops.empty()) {
         auto release = llama_cache_prepare_release_set(
             *ledger, entry->second.release_ops,
-            ledger->snapshot().serial);
+            ledger->serial());
         if (!release.ready() || release.commit() !=
                 llama_cache_conditional_release_status::released) {
             // A failed conditional commit never releases a member. The
