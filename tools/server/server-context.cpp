@@ -849,7 +849,9 @@ struct server_slot {
             server_prompt_cache_apply_family(
                 entry, cache_family, !task || !task->is_child());
 
-            size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            size_t n_tgt = llama_state_seq_get_data_ext(
+                ctx_tgt, entry.payload.fixed.main.data(), cur_size_tgt,
+                id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (server_fault("save_short")) { n_tgt = cur_size_tgt > 0 ? cur_size_tgt - 1 : 0; } // [P0 gate]
             if (n_tgt != cur_size_tgt) {
                 SLT_WRN(*this, "prompt cache save aborted: target state write %zu != %zu bytes\n", n_tgt, cur_size_tgt);
@@ -857,7 +859,9 @@ struct server_slot {
             }
 
             if (ctx_dft) {
-                const size_t n_dft = llama_state_seq_get_data_ext(ctx_dft, entry.data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                const size_t n_dft = llama_state_seq_get_data_ext(
+                    ctx_dft, entry.payload.fixed.drft.data(), cur_size_dft,
+                    id, LLAMA_STATE_SEQ_FLAGS_NONE);
                 if (n_dft != cur_size_dft) {
                     SLT_WRN(*this, "prompt cache save aborted: draft state write %zu != %zu bytes\n", n_dft, cur_size_dft);
                     return prompt_save_result::failed;
@@ -6958,7 +6962,8 @@ private:
             for (const auto & state : prompt_cache->states) {
                 hash = server_cache_plan_capability_fold(hash, state.prompt.tokens.size());
                 hash = server_cache_plan_capability_fold(hash, state.prompt.checkpoints.size());
-                hash = server_cache_plan_capability_fold(hash, state.data.size());
+                hash = server_cache_plan_capability_fold(
+                    hash, state.payload.size());
                 hash = server_cache_plan_capability_fold(hash,
                     std::hash<std::string>{}(state.adapter_config_key));
             }
@@ -7099,10 +7104,10 @@ private:
             }
             const uint64_t lcp = state.prompt.tokens.get_common_prefix(task.tokens);
             const auto host_eval = server_cache_plan_evaluate_host(
-                !state.data.main.empty(),
+                state.payload.publishable(),
                 state.adapter_config_key == incoming_adapter,
                 lcp, task.tokens.size(), state.prompt.tokens.size(),
-                state.data.size());
+                state.payload.size());
             std::vector<server_cache_plan_checkpoint_evaluation> checkpoint_evals;
             checkpoint_evals.reserve(state.prompt.checkpoints.size());
             for (const auto & checkpoint : state.prompt.checkpoints) {
@@ -7309,7 +7314,7 @@ private:
             for (auto & state : prompt_cache->states) {
                 int32_t observed = -1;
                 if (prompt_cache->cache_plan_get_source_id(state, observed) &&
-                    observed == source_id && !state.data.main.empty() &&
+                    observed == source_id && state.payload.publishable() &&
                     state.adapter_config_key == incoming_adapter) {
                     return &state;
                 }

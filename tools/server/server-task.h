@@ -788,9 +788,37 @@ struct server_prompt_data {
     }
 };
 
+// H1 host-payload discriminator. The fixed state image remains the only
+// publishable backend in this slice; the VBR tag reserves the common logical
+// entry boundary without pretending that an unimplemented artifact is
+// restorable. Later H1 slices attach immutable/refcounted VBR storage here.
+enum class server_prompt_cache_payload_kind : uint8_t {
+    fixed_state = 0,
+    vbr_artifact,
+    _count,
+};
+
+struct server_prompt_cache_payload {
+    server_prompt_cache_payload_kind kind =
+        server_prompt_cache_payload_kind::fixed_state;
+    server_prompt_data fixed;
+
+    bool fixed_state() const noexcept {
+        return kind == server_prompt_cache_payload_kind::fixed_state;
+    }
+
+    bool publishable() const noexcept {
+        return fixed_state() && !fixed.main.empty();
+    }
+
+    size_t size() const noexcept {
+        return fixed_state() ? fixed.size() : 0;
+    }
+};
+
 struct server_prompt_cache_state {
     server_prompt prompt;
-    server_prompt_data data;
+    server_prompt_cache_payload payload;
 
     // canonical identity of the adapter configuration this state was computed under [I6]; a load is
     // only served from an entry whose key matches the requesting slot's current adapter config
@@ -823,7 +851,7 @@ struct server_prompt_cache_state {
     int32_t cache_plan_source_id = -1;
 
     size_t size() const {
-        size_t res = data.size();
+        size_t res = payload.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();
