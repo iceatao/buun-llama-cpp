@@ -1446,6 +1446,19 @@ void test_lifecycle_df2_rollout_and_reuse_thresholds() {
     CHECK(vbr_reclaim.stopped_at_sufficiency);
     CHECK(vbr_reclaim.fallback_removed_oldest);
     CHECK(vbr_reclaim.zero_yield_fell_back);
+    available_host_fallback vbr_selection_fallback;
+    const auto vbr_selection = server_vbr_slot_selection_for_test(
+        &vbr_selection_fallback);
+    CHECK(vbr_selection.learned_selected_cold);
+    CHECK(vbr_selection.learned_kept_hot);
+    CHECK(vbr_selection.selection_was_pure);
+    CHECK(vbr_selection.incomplete_used_lru);
+    CHECK(vbr_selection.protected_fallback_was_safe);
+    CHECK(vbr_selection.all_protected_has_no_target);
+    CHECK(vbr_selection.empty_slot_was_preferred);
+    CHECK(vbr_selection.capability_tier_was_preserved);
+    CHECK(vbr_selection.exhausted_tier_used_alternate);
+    CHECK(vbr_selection.route_home_unchanged);
     CHECK(!server_prompt_cache_retention_reuse_is_useful(
         SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS - 1));
     CHECK(server_prompt_cache_retention_reuse_is_useful(

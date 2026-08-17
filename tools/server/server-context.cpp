@@ -2400,6 +2400,9 @@ struct server_context_impl {
         server_rejected_prompt_preservation_for_test();
     friend server_vbr_reclaim_policy_result
         server_vbr_reclaim_policy_for_test();
+    friend server_vbr_slot_selection_result
+        server_vbr_slot_selection_for_test(
+            server_cache_lease_fallback_provider * lease_fallback);
 
 public:
     // only use these pointers outside of this class:
@@ -2505,6 +2508,7 @@ private:
     std::vector<server_live_retention_candidate> vbr_retention_candidates;
     std::vector<uint32_t> vbr_exclusive_cells_by_seq;
     size_t vbr_retention_candidate_count = 0;
+    uint64_t vbr_retention_projection_epoch = 0;
     const std::vector<uint32_t> * vbr_exclusive_cells_for_test = nullptr;
     int64_t vbr_reclaim_cells_needed_for_test = -1;
     uint64_t vbr_reclaim_initial_cells_for_test = 0;
@@ -4260,27 +4264,50 @@ private:
         return found == slots.end() ? nullptr : &*found;
     }
 
+    struct vbr_live_retention_filter {
+        int except_id = -1;
+        int spec_tier = -1;
+    };
+
     bool vbr_idle_reclaim_eligible(
             const server_slot & slot,
-            int except_id) noexcept {
-        return slot.id != except_id && !slot.is_processing() &&
+            const vbr_live_retention_filter & filter) noexcept {
+        return slot.id != filter.except_id && !slot.is_processing() &&
             slot.prompt.n_tokens() > 0 &&
             !slot.hard_lease_blocks_live_prefix() &&
-            !queue_tasks.has_deferred_for_slot(slot.id);
+            !queue_tasks.has_deferred_for_slot(slot.id) &&
+            (filter.spec_tier < 0 ||
+                slot.can_speculate() == (filter.spec_tier != 0));
     }
 
-    bool vbr_prepare_retention_wave(int except_id) noexcept {
+    bool vbr_prepare_retention_wave(
+            const vbr_live_retention_filter & filter,
+            bool advance_epoch = true) noexcept {
         auto * owner = live_retention_owner();
         vbr_retention_candidate_count = 0;
-        if (!owner || vbr_retention_candidates.size() != slots.size() ||
-            !owner->begin_competition_wave()) {
+        vbr_retention_projection_epoch = 0;
+        if (!owner || vbr_retention_candidates.size() != slots.size()) {
             return false;
+        }
+        if (advance_epoch) {
+            if (!owner->begin_competition_wave()) {
+                return false;
+            }
+            vbr_retention_projection_epoch = owner->competition_epoch_value();
+        } else {
+            // Slot selection is a read-only forecast. A new lineage is not
+            // admitted until a later checkpoint/final publication, and that
+            // transition owns its competition epoch. Quote at the current
+            // epoch here so retries, overlapping launches, and appends cannot
+            // predict an epoch they do not commit.
+            vbr_retention_projection_epoch =
+                owner->competition_epoch_value();
         }
         struct inventory_context {
             server_context_impl * self;
-            int except_id;
+            const vbr_live_retention_filter * filter;
             bool complete = true;
-        } context { this, except_id, true };
+        } context { this, &filter, true };
         const auto snapshot = owner->value_snapshots(
             &context,
             +[](void * opaque,
@@ -4312,7 +4339,7 @@ private:
                     row.external_shared_coverage_tokens;
                 candidate.present = true;
                 candidate.eligible = state.self->vbr_idle_reclaim_eligible(
-                    *slot, state.except_id);
+                    *slot, *state.filter);
                 return true;
             });
         if (!context.complete ||
@@ -4340,10 +4367,11 @@ private:
             server_live_retention_prepare(
                 vbr_retention_candidates.data(),
                 vbr_retention_candidate_count,
-                owner->competition_epoch_value());
+                vbr_retention_projection_epoch);
     }
 
-    bool vbr_refresh_retention_wave(int except_id) noexcept {
+    bool vbr_refresh_retention_wave(
+            const vbr_live_retention_filter & filter) noexcept {
         auto * owner = live_retention_owner();
         if (!owner || vbr_retention_candidate_count == 0) {
             return false;
@@ -4357,7 +4385,7 @@ private:
             }
             candidate.present = slot->prompt.n_tokens() > 0;
             candidate.eligible = candidate.present &&
-                vbr_idle_reclaim_eligible(*slot, except_id);
+                vbr_idle_reclaim_eligible(*slot, filter);
             candidate.marginal_cells = 0;
             needs_exclusive_cells |= candidate.eligible;
             candidate.external_shared_coverage_tokens = candidate.present
@@ -4431,10 +4459,11 @@ private:
             snapshot.size == present && context.rows == present;
     }
 
-    server_slot * vbr_oldest_idle_slot(int except_id) noexcept {
+    server_slot * vbr_oldest_idle_slot(
+            const vbr_live_retention_filter & filter) noexcept {
         server_slot * oldest = nullptr;
         for (auto & slot : slots) {
-            if (!vbr_idle_reclaim_eligible(slot, except_id)) {
+            if (!vbr_idle_reclaim_eligible(slot, filter)) {
                 continue;
             }
             if (!oldest ||
@@ -4447,27 +4476,27 @@ private:
     }
 
     server_slot * vbr_retention_victim(
-            int except_id,
-            bool & learned_available) noexcept {
-        if (learned_available && !vbr_refresh_retention_wave(except_id)) {
+            bool & learned_available,
+            const vbr_live_retention_filter & filter) noexcept {
+        if (learned_available &&
+            !vbr_refresh_retention_wave(filter)) {
             learned_available = false;
         }
         if (learned_available) {
-            auto * owner = live_retention_owner();
             const auto projection = server_live_retention_project_prepared(
                 vbr_retention_candidates.data(),
                 vbr_retention_candidate_count,
-                owner->competition_epoch_value());
+                vbr_retention_projection_epoch);
             if (projection.complete) {
                 auto * selected = find_slot_by_id(projection.slot_id);
                 if (selected &&
-                    vbr_idle_reclaim_eligible(*selected, except_id)) {
+                    vbr_idle_reclaim_eligible(*selected, filter)) {
                     return selected;
                 }
             }
             learned_available = false;
         }
-        return vbr_oldest_idle_slot(except_id);
+        return vbr_oldest_idle_slot(filter);
     }
 
     // dynamic VBR: clear-only reclaim of idle slots (the prompt cache is disabled under the VBR
@@ -4512,13 +4541,14 @@ private:
         if (st.deficit_raw <= 0 || st.bpv_if_degraded >= (double) params_base.vbr_reclaim_floor_bpv) {
             return;
         }
-        bool learned_available = vbr_prepare_retention_wave(except_id);
+        const vbr_live_retention_filter filter { except_id };
+        bool learned_available = vbr_prepare_retention_wave(filter);
         int cleared = 0;
         while (st.deficit_raw > 0 &&
                st.bpv_if_degraded <
                     (double) params_base.vbr_reclaim_floor_bpv) {
             auto * victim = vbr_retention_victim(
-                except_id, learned_available);
+                learned_available, filter);
             if (!victim) {
                 break;
             }
@@ -7687,6 +7717,7 @@ private:
         // prefer spec-capable (DFlash) slots so requests get speculative decoding
         if (ret == nullptr) {
             int64_t t_last = -1;
+            bool vbr_learned_lru = false;
 
             const auto lru_scan = [&](auto obs_c) {
                 constexpr bool Obs = decltype(obs_c)::value;
@@ -7729,10 +7760,77 @@ private:
             };
             plan_rec ? lru_scan(std::true_type{}) : lru_scan(std::false_type{});
 
+            // A genuinely new VBR stream has no reusable home. Once its legacy capability
+            // tier has no empty slot, choose which resident conversation pays for the slot by
+            // the same decayed value/cell policy used at the quality-floor pressure boundary.
+            // Both preflight and selection quote the current epoch without mutating it.
+            // A later checkpoint/final publication owns any distinct-lineage admission
+            // epoch; retries, appends, and overlapping launches cannot age sleeping
+            // conversations speculatively. Incomplete/domain-ambiguous evidence uses
+            // the protection-aware historical order within the same capability tier.
+            if (ret != nullptr && server_vbr_dynamic_active(params_base) &&
+                ret->prompt.n_tokens() > 0) {
+                const auto select_tier = [&](bool spec_tier,
+                        bool & learned) -> server_slot * {
+                    server_slot * empty = nullptr;
+                    for (auto & slot : slots) {
+                        if (slot.is_processing() ||
+                            slot.prompt.n_tokens() != 0 ||
+                            slot.can_speculate() != spec_tier) {
+                            continue;
+                        }
+                        if (!empty ||
+                            std::tie(slot.t_last_used, slot.id) <
+                                std::tie(empty->t_last_used, empty->id)) {
+                            empty = &slot;
+                        }
+                    }
+                    if (empty) {
+                        learned = false;
+                        return empty;
+                    }
+                    const vbr_live_retention_filter filter {
+                        -1, spec_tier ? 1 : 0,
+                    };
+                    bool available = vbr_prepare_retention_wave(
+                        filter, false);
+                    auto * selected = vbr_retention_victim(
+                        available, filter);
+                    learned = available && selected != nullptr;
+                    return selected;
+                };
+
+                const bool preferred_tier = ret->can_speculate();
+                bool selected_by_value = false;
+                auto * selected = select_tier(
+                    preferred_tier, selected_by_value);
+                if (!selected) {
+                    // Speculation is a preference, not a hard partition. A
+                    // protected preferred tier must not strand a request when
+                    // the alternate tier still has a lawful empty/resident
+                    // slot.
+                    selected = select_tier(
+                        !preferred_tier, selected_by_value);
+                }
+                // The fallback returned by vbr_retention_victim is the
+                // protection-aware LRU floor. Always adopt it: retaining the
+                // raw scan winner here could overwrite a hard-leased or
+                // deferred slot exactly when learned evidence is incomplete
+                // (including iSWA/alias cases).
+                ret = selected;
+                if (ret) {
+                    t_last = ret->t_last_used;
+                }
+                vbr_learned_lru = selected_by_value && ret != nullptr;
+            }
+
             if (ret != nullptr) {
                 if (!is_preflight) {
-                    SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 " (best rejected sim = %.3f)\n",
-                            t_last, sim_best_any);
+                    SLT_INF(*ret,
+                        "selected slot by %s, t_last = %" PRId64
+                        " (best rejected sim = %.3f)\n",
+                        vbr_learned_lru ? "decayed VBR value" : "LRU",
+                        t_last, sim_best_any);
                 }
 
                 if (plan_rec) {
@@ -14193,6 +14291,215 @@ server_vbr_reclaim_policy_for_test() {
     result.zero_yield_fell_back =
         zero_yield[0] && !zero_yield[1] && !zero_yield[2] &&
         zero_yield[3] && zero_yield[4];
+    return result;
+}
+
+server_vbr_slot_selection_result
+server_vbr_slot_selection_for_test(
+        server_cache_lease_fallback_provider * lease_fallback) {
+    server_vbr_slot_selection_result result;
+    enum class protection_mode {
+        none,
+        deferred_oldest,
+        hard_oldest,
+        deferred_all,
+        deferred_spec,
+    };
+    struct outcome {
+        bool published = false;
+        int32_t preflight_slot = -1;
+        int32_t actual_slot = -1;
+        bool preflight_pure = false;
+        bool actual_was_pure = false;
+        int32_t home_slot = -1;
+        bool reuse_selection_was_pure = false;
+    };
+    const auto run = [lease_fallback](
+            bool complete_evidence,
+            protection_mode protection = protection_mode::none,
+            int32_t empty_slot = -1,
+            bool mixed_capability = false) {
+        server_context_impl context;
+        context.sleeping = true;
+        context.slots.resize(3);
+        for (int32_t i = 0; i < 3; ++i) {
+            auto & slot = context.slots[size_t(i)];
+            slot.id = i;
+            slot.t_last_used = i + 1;
+            if (i != empty_slot) {
+                slot.prompt.tokens = server_tokens(
+                    llama_tokens { 1, 2, llama_token(3 + i) }, false);
+                slot.prompt.sequence_epoch = 1;
+            }
+            if (mixed_capability && i != 0) {
+                // can_speculate() only observes non-nullness in this
+                // model-free door; the sentinel is never dereferenced.
+                slot.spec_shared = reinterpret_cast<common_speculative *>(
+                    uintptr_t(1));
+            }
+        }
+        context.cache_retention_metadata =
+            std::make_unique<server_retention_sidecar_store>();
+        const auto plan = server_retention_owner_plan_for(
+            false, false, false, true, false);
+        server_wire_standalone_retention_metadata(
+            *context.cache_retention_metadata, context.slots, nullptr,
+            common_retention_pool::attention, plan);
+
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, 3);
+        bool published = true;
+        for (int32_t i = 0; i < 3; ++i) {
+            if (i == empty_slot || (!complete_evidence && i == 2)) {
+                continue;
+            }
+            const auto key = server_retention_instance_key::for_slot(i);
+            published = published &&
+                context.cache_retention_metadata->publish(
+                    key, common_retention_pool::attention, spans,
+                    true, 3, 3, true);
+            published = published &&
+                context.cache_retention_metadata->publish_prefix(
+                    key, "vbr-selection-test",
+                    llama_tokens { 1, 2, llama_token(3 + i) });
+            if (!mixed_capability && i == 0) {
+                published = published &&
+                    context.cache_retention_metadata->set_lineage_prior(
+                        key, 2000);
+            } else if (mixed_capability && i == 0) {
+                published = published &&
+                    context.cache_retention_metadata->set_lineage_prior(
+                        key, 1);
+            } else if (mixed_capability && i == 1) {
+                published = published &&
+                    context.cache_retention_metadata->set_lineage_prior(
+                        key, 2000);
+            }
+        }
+
+        server_cache_authority lease_authority;
+        server_cache_lease_table lease_table(nullptr, lease_fallback);
+        const std::string execution_identity = "vbr-selection-test";
+        if (protection == protection_mode::deferred_oldest ||
+            protection == protection_mode::deferred_all ||
+            protection == protection_mode::deferred_spec) {
+            const int32_t first = protection == protection_mode::deferred_spec
+                ? 1 : 0;
+            const int32_t end = protection == protection_mode::deferred_oldest
+                ? 1 : 3;
+            for (int32_t i = first; i < end; ++i) {
+                server_task pinned(SERVER_TASK_TYPE_COMPLETION);
+                pinned.id = 100 + i;
+                pinned.id_slot = i;
+                context.queue_tasks.defer(std::move(pinned));
+            }
+        } else if (protection == protection_mode::hard_oldest) {
+            auto & slot = context.slots[0];
+            slot.lifecycle_authority = &lease_authority;
+            slot.lease_obs = &lease_table;
+            slot.lease_execution_identity = &execution_identity;
+            const auto artifact = context.cache_retention_metadata->artifact_id(
+                server_retention_instance_key::for_slot(slot.id));
+            server_cache_lease_identity identity;
+            published = published && artifact.v != 0 &&
+                server_cache_lease_build_identity(
+                    execution_identity, lora_config_identity(slot.lora),
+                    slot.prompt.tokens, slot.prompt.n_tokens(), identity);
+            if (published) {
+                const auto lease = lease_table.grant_hard_owned(
+                    { artifact, common_retention_artifact_kind::live_slot,
+                        slot.id },
+                    server_cache_lease_scope::from(
+                        server_cache_explicit_lease_scope_id { 1 }),
+                    identity,
+                    server_cache_lease_owner_id { 1 },
+                    { slot.prompt.sequence_epoch,
+                        uint64_t(slot.prompt.n_tokens()),
+                        slot.prompt.n_tokens() },
+                    server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
+                published = bool(lease);
+            }
+        }
+
+        context.vbr_retention_candidates.resize(context.slots.size());
+        context.vbr_exclusive_cells_by_seq.resize(context.slots.size());
+        const std::vector<uint32_t> exclusive { 100, 100, 100 };
+        context.vbr_exclusive_cells_for_test = &exclusive;
+
+        server_task fresh(SERVER_TASK_TYPE_COMPLETION);
+        fresh.id = 90;
+        fresh.tokens = server_tokens(llama_tokens { 9, 10 }, false);
+        const uint64_t epoch_before =
+            context.cache_retention_metadata->competition_epoch_value();
+        auto preflight = context.cache_plan_select_before_mutation(
+            fresh, nullptr, true);
+        const uint64_t epoch_after_preflight =
+            context.cache_retention_metadata->competition_epoch_value();
+        auto actual = context.cache_plan_select_before_mutation(
+            fresh, nullptr, false);
+        const uint64_t epoch_after_actual =
+            context.cache_retention_metadata->competition_epoch_value();
+
+        const uint64_t epoch_before_reuse =
+            context.cache_retention_metadata->competition_epoch_value();
+        server_task returning(SERVER_TASK_TYPE_COMPLETION);
+        returning.id = 92;
+        returning.tokens = server_tokens(
+            llama_tokens { 1, 2, 3, 99 }, false);
+        auto home = context.cache_plan_select_before_mutation(
+            returning, nullptr, false);
+        const uint64_t epoch_after_reuse =
+            context.cache_retention_metadata->competition_epoch_value();
+
+        return outcome {
+            published,
+            preflight.target ? preflight.target->id : -1,
+            actual.target ? actual.target->id : -1,
+            epoch_before == epoch_after_preflight,
+            epoch_after_preflight == epoch_after_actual,
+            home.target ? home.target->id : -1,
+            epoch_before_reuse == epoch_after_reuse,
+        };
+    };
+
+    const auto learned = run(true);
+    result.learned_selected_cold =
+        learned.published && learned.preflight_slot == 1 &&
+        learned.actual_slot == 1;
+    result.learned_kept_hot =
+        learned.published && learned.actual_slot != 0;
+    result.selection_was_pure =
+        learned.published && learned.preflight_pure &&
+        learned.actual_was_pure;
+    const auto incomplete = run(false);
+    result.incomplete_used_lru =
+        incomplete.published && incomplete.actual_slot == 0;
+    const auto deferred = run(false, protection_mode::deferred_oldest);
+    const auto hard = run(false, protection_mode::hard_oldest);
+    result.protected_fallback_was_safe =
+        deferred.published && deferred.actual_slot == 1 &&
+        hard.published && hard.actual_slot == 1;
+    const auto all_protected = run(false, protection_mode::deferred_all);
+    result.all_protected_has_no_target =
+        all_protected.published && all_protected.actual_slot == -1;
+    const auto empty = run(true, protection_mode::none, 2);
+    result.empty_slot_was_preferred =
+        empty.published && empty.actual_slot == 2;
+    const auto mixed = run(
+        true, protection_mode::none, -1, true);
+    result.capability_tier_was_preserved =
+        mixed.published && mixed.actual_slot == 2;
+    const auto alternate_resident = run(
+        true, protection_mode::deferred_spec, -1, true);
+    const auto alternate_empty = run(
+        true, protection_mode::deferred_spec, 0, true);
+    result.exhausted_tier_used_alternate =
+        alternate_resident.published &&
+        alternate_resident.actual_slot == 0 &&
+        alternate_empty.published && alternate_empty.actual_slot == 0;
+    result.route_home_unchanged =
+        learned.published && learned.home_slot == 0 &&
+        learned.reuse_selection_was_pure;
     return result;
 }
 

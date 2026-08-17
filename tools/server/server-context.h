@@ -69,6 +69,23 @@ struct server_vbr_reclaim_policy_result {
 server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test();
 
+struct server_vbr_slot_selection_result {
+    bool learned_selected_cold = false;
+    bool learned_kept_hot = false;
+    bool selection_was_pure = false;
+    bool incomplete_used_lru = false;
+    bool protected_fallback_was_safe = false;
+    bool all_protected_has_no_target = false;
+    bool empty_slot_was_preferred = false;
+    bool capability_tier_was_preserved = false;
+    bool exhausted_tier_used_alternate = false;
+    bool route_home_unchanged = false;
+};
+
+server_vbr_slot_selection_result
+server_vbr_slot_selection_for_test(
+    server_cache_lease_fallback_provider * lease_fallback);
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;
