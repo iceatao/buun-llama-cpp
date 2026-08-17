@@ -46,6 +46,18 @@ struct server_rejected_prompt_preservation_result {
 server_rejected_prompt_preservation_result
 server_rejected_prompt_preservation_for_test();
 
+struct server_vbr_retention_wiring_result {
+    bool slot_metadata_wired = false;
+    bool slot_lifecycle_absent = false;
+    bool slot_lease_absent = false;
+    bool prefix_tracking_enabled = false;
+    bool authority_prefix_tracking_enabled = false;
+    bool external_coverage_exact = false;
+};
+
+server_vbr_retention_wiring_result
+server_vbr_retention_wiring_for_test();
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;

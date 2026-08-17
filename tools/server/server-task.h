@@ -991,6 +991,39 @@ inline bool server_prompt_cache_lifecycle_default(
     return explicitly_enabled || prompt_cache_enabled;
 }
 
+// Retention metadata is payload-independent. Fixed host caching and dynamic VBR both need the
+// same lineage/prefix owner even though VBR cannot serialize tier-changing KV state yet.
+enum class server_retention_owner_kind : uint8_t {
+    none = 0,
+    standalone_metadata,
+    authority,
+};
+
+struct server_retention_owner_plan {
+    server_retention_owner_kind owner = server_retention_owner_kind::none;
+    bool prompt_shadow_workspace = false;
+    bool prefix_tracking = false;
+};
+
+inline server_retention_owner_plan server_retention_owner_plan_for(
+        bool cache_debug,
+        bool cache_lifecycle,
+        bool prompt_cache_enabled,
+        bool vbr_dynamic,
+        bool retention_df2) noexcept {
+    server_retention_owner_plan out;
+    if (cache_debug || cache_lifecycle) {
+        out.owner = server_retention_owner_kind::authority;
+    } else if (prompt_cache_enabled || vbr_dynamic) {
+        out.owner = server_retention_owner_kind::standalone_metadata;
+    }
+    out.prompt_shadow_workspace = prompt_cache_enabled &&
+        (out.owner == server_retention_owner_kind::standalone_metadata ||
+         cache_debug || retention_df2);
+    out.prefix_tracking = vbr_dynamic || out.prompt_shadow_workspace;
+    return out;
+}
+
 inline uint32_t server_prompt_cache_retention_prior_milli(
         const common_cache_family_binding & family,
         bool automatic_main) noexcept {

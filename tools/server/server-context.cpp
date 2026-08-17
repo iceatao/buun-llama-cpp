@@ -2355,6 +2355,45 @@ struct server_metrics {
 // server_context_impl (private implementation)
 //
 
+static void server_wire_live_retention_metadata(
+        server_retention_sidecar_store & owner,
+        std::vector<server_slot> & slots,
+        common_retention_pool pool) {
+    for (auto & slot : slots) {
+        slot.retention_obs = &owner;
+        slot.retention_pool = pool;
+    }
+}
+
+static void server_request_retention_prefix_tracking(
+        server_retention_sidecar_store & owner,
+        server_prompt_cache * prompt_cache,
+        const server_retention_owner_plan & plan) {
+    bool workspace_ready = !plan.prompt_shadow_workspace;
+    if (prompt_cache && plan.prompt_shadow_workspace) {
+        workspace_ready = prompt_cache->enable_retention_shadow();
+    }
+    if (plan.prefix_tracking && workspace_ready) {
+        (void) owner.enable_prefix_tracking();
+    }
+}
+
+static void server_wire_standalone_retention_metadata(
+        server_retention_sidecar_store & owner,
+        std::vector<server_slot> & slots,
+        server_prompt_cache * prompt_cache,
+        common_retention_pool pool,
+        const server_retention_owner_plan & plan) {
+    GGML_ASSERT(plan.owner ==
+        server_retention_owner_kind::standalone_metadata);
+    owner.configure(nullptr, {}, nullptr);
+    server_wire_live_retention_metadata(owner, slots, pool);
+    if (prompt_cache) {
+        prompt_cache->retention_obs = &owner;
+    }
+    server_request_retention_prefix_tracking(owner, prompt_cache, plan);
+}
+
 struct server_context_impl {
     friend struct server_context;
     friend server_rejected_prompt_preservation_result
@@ -2453,12 +2492,12 @@ private:
     // prompt_cache so it outlives both the observer that references it and the cache's
     // accounting-release destructor.
     std::unique_ptr<server_cache_authority> cache_authority;
-    // DF1 shadow owner for ordinary cache-enabled runs that do not enable the
-    // lifecycle/debug authority. It carries only bounded lineage/retention
-    // metadata: no ledger, lease table, observer serialization, or victim
-    // authority. Declared after cache_authority so it is destroyed first if a
-    // future migration temporarily references authority-owned state.
-    std::unique_ptr<server_retention_sidecar_store> cache_retention_shadow;
+    // DF1 metadata owner for ordinary fixed-cache or dynamic-VBR runs that do not enable the
+    // lifecycle/debug authority. It carries only bounded lineage/retention metadata: no ledger,
+    // lease table, observer serialization, payload storage, or victim authority. Declared after
+    // cache_authority so it is destroyed first if a future migration temporarily references
+    // authority-owned state.
+    std::unique_ptr<server_retention_sidecar_store> cache_retention_metadata;
     // F3 artifact machinery is a lifecycle-authority sibling: it references
     // the frozen ledger but is destroyed before it. It exists only for an
     // armed dynamic-VBR memory after the one-shot manifest and ring admission.
@@ -5757,6 +5796,19 @@ private:
             server_retention_df2_authority_enabled();
         params_base.cache_lifecycle = server_prompt_cache_lifecycle_default(
             params_base.cache_lifecycle, prompt_cache != nullptr);
+        const bool retention_df2 =
+            params_base.cache_lifecycle && retention_df2_default;
+        const auto retention_owner_plan = server_retention_owner_plan_for(
+            params_base.cache_debug,
+            params_base.cache_lifecycle,
+            prompt_cache != nullptr,
+            server_vbr_dynamic_active(params_base),
+            retention_df2);
+        const auto live_retention_pool =
+            (llama_model_is_recurrent(model_tgt) ||
+             llama_model_is_hybrid(model_tgt))
+                ? common_retention_pool::recurrent
+                : common_retention_pool::attention;
 
         // P2 F0b authority substrate: constructed and configured under
         // (cache_debug || cache_lifecycle). Neither flag remains the strictly-zero-work legacy
@@ -5765,10 +5817,12 @@ private:
         if (params_base.cache_debug) {
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
         }
-        if (params_base.cache_debug || params_base.cache_lifecycle) {
+        if (retention_owner_plan.owner ==
+                server_retention_owner_kind::authority) {
             cache_authority = std::make_unique<server_cache_authority>();
-        } else if (prompt_cache) {
-            cache_retention_shadow =
+        } else if (retention_owner_plan.owner ==
+                server_retention_owner_kind::standalone_metadata) {
+            cache_retention_metadata =
                 std::make_unique<server_retention_sidecar_store>();
         }
 
@@ -5782,7 +5836,9 @@ private:
                 std::make_unique<server_cache_plan_authority>(plan_authority_level);
         }
 
-        if (params_base.cache_debug || params_base.cache_lifecycle) {
+        if (retention_owner_plan.owner ==
+                server_retention_owner_kind::authority) {
+            GGML_ASSERT(cache_authority);
             // Policy substrate is live under either gate. CACHE_PLAN JSON/log
             // emission remains below behind cache_plan_obs/cache_debug, but
             // lifecycle-only operation must still inspect WS-D leases before
@@ -5790,24 +5846,18 @@ private:
             cache_authority->destruction.lease_context = &cache_authority->leases;
             cache_authority->destruction.lease_evaluator =
                 server_cache_lease_evaluate_request;
+            server_wire_live_retention_metadata(
+                cache_authority->retention, slots, live_retention_pool);
             for (auto & slot : slots) {
                 slot.destruction_obs = &cache_authority->destruction;
-                slot.retention_obs = &cache_authority->retention;
                 slot.lease_obs = &cache_authority->leases;
                 slot.lease_execution_identity = &frontier_execution_identity;
                 slot.lifecycle_authority = params_base.cache_lifecycle
                     ? cache_authority.get()
                     : nullptr;
                 slot.cache_debug_observability = params_base.cache_debug;
-                slot.retention_pool =
-                    (llama_model_is_recurrent(model_tgt) ||
-                     llama_model_is_hybrid(model_tgt))
-                        ? common_retention_pool::recurrent
-                        : common_retention_pool::attention;
             }
             if (prompt_cache) {
-                const bool retention_df2 =
-                    params_base.cache_lifecycle && retention_df2_default;
                 prompt_cache->debug_observability = params_base.cache_debug;
                 prompt_cache->retention_df2_authority = retention_df2;
                 prompt_cache->destruction_obs = &cache_authority->destruction;
@@ -5818,15 +5868,16 @@ private:
                 // Debug shadow observes whichever fixed-host authority is
                 // active. Lifecycle keeps its certified price selector; DF1
                 // only compares the decayed projection against that choice.
-                if (params_base.cache_debug || retention_df2) {
-                    if (prompt_cache->enable_retention_shadow()) {
-                        (void) cache_authority->retention.
-                            enable_prefix_tracking();
-                    }
-                }
+                server_request_retention_prefix_tracking(
+                    cache_authority->retention, prompt_cache.get(),
+                    retention_owner_plan);
                 if (retention_df2) {
                     SRV_INF("%s\n", "decayed-frequency host-cache authority is enabled");
                 }
+            } else if (retention_owner_plan.prefix_tracking) {
+                server_request_retention_prefix_tracking(
+                    cache_authority->retention, nullptr,
+                    retention_owner_plan);
             }
             if (params_base.cache_lifecycle) {
                 llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set(
@@ -5855,22 +5906,13 @@ private:
                     });
             }
         }
-        if (cache_retention_shadow) {
-            // DF1 observes the normal fixed host-cache path without enabling
-            // lifecycle authority or its accounting/lease machinery.
-            cache_retention_shadow->configure(nullptr, {}, nullptr);
-            for (auto & slot : slots) {
-                slot.retention_obs = cache_retention_shadow.get();
-                slot.retention_pool =
-                    (llama_model_is_recurrent(model_tgt) ||
-                     llama_model_is_hybrid(model_tgt))
-                        ? common_retention_pool::recurrent
-                        : common_retention_pool::attention;
-            }
-            prompt_cache->retention_obs = cache_retention_shadow.get();
-            if (prompt_cache->enable_retention_shadow()) {
-                (void) cache_retention_shadow->enable_prefix_tracking();
-            }
+        if (cache_retention_metadata) {
+            // DF1 owns payload-independent live lineage metadata for both the normal fixed
+            // host-cache path and dynamic VBR. This does not enable lifecycle accounting,
+            // leases, host-state serialization, or victim authority.
+            server_wire_standalone_retention_metadata(
+                *cache_retention_metadata, slots, prompt_cache.get(),
+                live_retention_pool, retention_owner_plan);
         }
 
         std::vector<std::string> gpu_descs;
@@ -13675,6 +13717,74 @@ private:
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
 };
+
+server_vbr_retention_wiring_result
+server_vbr_retention_wiring_for_test() {
+    server_vbr_retention_wiring_result result;
+    std::vector<server_slot> slots(2);
+    slots[0].id = 0;
+    slots[1].id = 1;
+
+    server_retention_sidecar_store metadata;
+    const auto metadata_plan = server_retention_owner_plan_for(
+        false, false, false, true, false);
+    server_wire_standalone_retention_metadata(
+        metadata, slots, nullptr, common_retention_pool::attention,
+        metadata_plan);
+    result.slot_metadata_wired =
+        slots[0].retention_obs == &metadata &&
+        slots[1].retention_obs == &metadata;
+    result.slot_lifecycle_absent =
+        slots[0].lifecycle_authority == nullptr &&
+        slots[1].lifecycle_authority == nullptr;
+    result.slot_lease_absent =
+        slots[0].lease_obs == nullptr && slots[1].lease_obs == nullptr;
+    result.prefix_tracking_enabled = metadata.prefix_tracking_enabled();
+
+    common_chat_msg_spans spans0;
+    spans0.add(COMMON_CHAT_ROLE_USER, 0, 4);
+    common_chat_msg_spans spans1;
+    spans1.add(COMMON_CHAT_ROLE_USER, 0, 3);
+    const auto key0 = server_retention_instance_key::for_slot(0);
+    const auto key1 = server_retention_instance_key::for_slot(1);
+    const llama_tokens tokens0 { 1, 2, 3, 4 };
+    const llama_tokens tokens1 { 1, 2, 9 };
+    const bool published =
+        metadata.publish(
+            key0, common_retention_pool::attention, spans0,
+            true, 4, 4, true) &&
+        metadata.publish_prefix(key0, "vbr-test", tokens0) &&
+        metadata.publish(
+            key1, common_retention_pool::attention, spans1,
+            true, 3, 3, true) &&
+        metadata.publish_prefix(key1, "vbr-test", tokens1);
+    struct coverage_capture {
+        size_t rows = 0;
+        bool exact = true;
+    } capture;
+    const auto snapshot = metadata.value_snapshots(
+        &capture,
+        +[](void * context,
+            const server_retention_value_snapshot & row) noexcept {
+            auto & value = *static_cast<coverage_capture *>(context);
+            value.rows++;
+            value.exact = value.exact &&
+                row.external_shared_coverage_tokens == 2;
+            return true;
+        });
+    result.external_coverage_exact = published &&
+        snapshot.status == server_retention_value_snapshot_status::complete &&
+        snapshot.size == 2 && capture.rows == 2 && capture.exact;
+
+    server_retention_sidecar_store authority_metadata;
+    const auto authority_plan = server_retention_owner_plan_for(
+        false, true, false, true, false);
+    server_request_retention_prefix_tracking(
+        authority_metadata, nullptr, authority_plan);
+    result.authority_prefix_tracking_enabled =
+        authority_metadata.prefix_tracking_enabled();
+    return result;
+}
 
 server_rejected_prompt_preservation_result
 server_rejected_prompt_preservation_for_test() {

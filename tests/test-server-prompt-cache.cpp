@@ -1403,6 +1403,43 @@ void test_lifecycle_df2_rollout_and_reuse_thresholds() {
         false, false));
     CHECK(server_prompt_cache_lifecycle_default(
         true, false));
+    const auto fully_off = server_retention_owner_plan_for(
+        false, false, false, false, false);
+    CHECK(fully_off.owner == server_retention_owner_kind::none);
+    CHECK(!fully_off.prompt_shadow_workspace);
+    CHECK(!fully_off.prefix_tracking);
+    const auto vbr_metadata = server_retention_owner_plan_for(
+        false, false, false, true, false);
+    CHECK(vbr_metadata.owner ==
+          server_retention_owner_kind::standalone_metadata);
+    CHECK(!vbr_metadata.prompt_shadow_workspace);
+    CHECK(vbr_metadata.prefix_tracking);
+    const auto vbr_lifecycle = server_retention_owner_plan_for(
+        false, true, false, true, false);
+    CHECK(vbr_lifecycle.owner == server_retention_owner_kind::authority);
+    CHECK(!vbr_lifecycle.prompt_shadow_workspace);
+    CHECK(vbr_lifecycle.prefix_tracking);
+    const auto vbr_debug = server_retention_owner_plan_for(
+        true, false, false, true, false);
+    CHECK(vbr_debug.owner == server_retention_owner_kind::authority);
+    CHECK(vbr_debug.prefix_tracking);
+    const auto fixed_df2 = server_retention_owner_plan_for(
+        false, true, true, false, true);
+    CHECK(fixed_df2.owner == server_retention_owner_kind::authority);
+    CHECK(fixed_df2.prompt_shadow_workspace);
+    CHECK(fixed_df2.prefix_tracking);
+    const auto fixed_rollback = server_retention_owner_plan_for(
+        false, true, true, false, false);
+    CHECK(fixed_rollback.owner == server_retention_owner_kind::authority);
+    CHECK(!fixed_rollback.prompt_shadow_workspace);
+    CHECK(!fixed_rollback.prefix_tracking);
+    const auto vbr_wiring = server_vbr_retention_wiring_for_test();
+    CHECK(vbr_wiring.slot_metadata_wired);
+    CHECK(vbr_wiring.slot_lifecycle_absent);
+    CHECK(vbr_wiring.slot_lease_absent);
+    CHECK(vbr_wiring.prefix_tracking_enabled);
+    CHECK(vbr_wiring.authority_prefix_tracking_enabled);
+    CHECK(vbr_wiring.external_coverage_exact);
     CHECK(!server_prompt_cache_retention_reuse_is_useful(
         SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS - 1));
     CHECK(server_prompt_cache_retention_reuse_is_useful(
