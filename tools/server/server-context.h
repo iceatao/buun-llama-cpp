@@ -58,6 +58,17 @@ struct server_vbr_retention_wiring_result {
 server_vbr_retention_wiring_result
 server_vbr_retention_wiring_for_test();
 
+struct server_vbr_reclaim_policy_result {
+    bool learned_kept_hot = false;
+    bool learned_removed_cold = false;
+    bool stopped_at_sufficiency = false;
+    bool fallback_removed_oldest = false;
+    bool zero_yield_fell_back = false;
+};
+
+server_vbr_reclaim_policy_result
+server_vbr_reclaim_policy_for_test();
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;

@@ -70,6 +70,11 @@ public:
         return mem_attn->memory_vbr_state_v2(seq_id, n_tokens_extra);
     }
 
+    bool vbr_accumulate_exclusive_cells(
+            uint32_t * counts, size_t size) const override {
+        return mem_attn->vbr_accumulate_exclusive_cells(counts, size);
+    }
+
     bool vbr_operation_armed() const override {
         return mem_attn->vbr_operation_armed();
     }

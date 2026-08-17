@@ -5,6 +5,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -2186,6 +2187,21 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "PRECONDITION failed: alias test had no exclusively owned VBR cells\n");
         return 1;
     }
+    std::array<uint32_t, 2> exclusive_base = {};
+    std::array<uint32_t, 2> exclusive_swa  = {};
+    std::array<uint32_t, 2> exclusive_parent = {};
+    if (!base->vbr_accumulate_exclusive_cells(
+            exclusive_base.data(), exclusive_base.size()) ||
+        !swa->vbr_accumulate_exclusive_cells(
+            exclusive_swa.data(), exclusive_swa.size()) ||
+        exclusive_base[0] + exclusive_swa[0] !=
+            exclusive_before_alias.used_cells_exclusive ||
+        exclusive_base[1] != 0 || exclusive_swa[1] != 0 ||
+        mem->vbr_accumulate_exclusive_cells(
+            exclusive_parent.data(), exclusive_parent.size())) {
+        fprintf(stderr, "batched VBR ownership did not preserve iSWA pressure domains\n");
+        return 1;
+    }
     llama_memory_seq_cp(mem, 0, 1, -1, -1);
     const auto shared_for_0 = llama_memory_vbr_state_v2(mem, 0, 0);
     const auto shared_for_1 = llama_memory_vbr_state_v2(mem, 1, 0);
@@ -2196,6 +2212,17 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "shared VBR cells were incorrectly counted as exclusively reclaimable\n");
         return 1;
     }
+    exclusive_base = {};
+    exclusive_swa  = {};
+    if (!base->vbr_accumulate_exclusive_cells(
+            exclusive_base.data(), exclusive_base.size()) ||
+        !swa->vbr_accumulate_exclusive_cells(
+            exclusive_swa.data(), exclusive_swa.size()) ||
+        exclusive_base[0] != 0 || exclusive_base[1] != 0 ||
+        exclusive_swa[0] != 0 || exclusive_swa[1] != 0) {
+        fprintf(stderr, "batched VBR ownership counted shared aliases as exclusive\n");
+        return 1;
+    }
     if (!llama_memory_seq_rm(mem, 0, -1, -1)) {
         fprintf(stderr, "alias test could not remove the first sequence membership\n");
         return 1;
@@ -2204,6 +2231,18 @@ int main(int argc, char ** argv) {
     if (exclusive_for_1.used_cells_exclusive != exclusive_before_alias.used_cells_exclusive ||
         exclusive_for_1.state.used_cells_other != 0) {
         fprintf(stderr, "last alias did not inherit exact exclusive VBR cell ownership\n");
+        return 1;
+    }
+    exclusive_base = {};
+    exclusive_swa  = {};
+    if (!base->vbr_accumulate_exclusive_cells(
+            exclusive_base.data(), exclusive_base.size()) ||
+        !swa->vbr_accumulate_exclusive_cells(
+            exclusive_swa.data(), exclusive_swa.size()) ||
+        exclusive_base[0] != 0 || exclusive_swa[0] != 0 ||
+        exclusive_base[1] + exclusive_swa[1] !=
+            exclusive_before_alias.used_cells_exclusive) {
+        fprintf(stderr, "batched VBR ownership did not transfer to the last alias\n");
         return 1;
     }
     const bool removed_last_alias = llama_memory_seq_rm(mem, 1, -1, -1);

@@ -7783,6 +7783,40 @@ llama_memory_vbr_state_data_v2 llama_kv_cache::memory_vbr_state_v2(
     return result;
 }
 
+bool llama_kv_cache::vbr_accumulate_exclusive_cells(
+        uint32_t * counts, size_t size) const {
+    if (other) {
+        return other->vbr_accumulate_exclusive_cells(counts, size);
+    }
+    if (!counts || size > LLAMA_MAX_SEQ) {
+        return false;
+    }
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        const uint32_t top = cells.used_max_p1();
+        for (uint32_t i = 0; i < top; ++i) {
+            if (cells.is_empty(i) || cells.seq_count(i) != 1) {
+                continue;
+            }
+            bool valid = true;
+            cells.seq_for_each(i, [&](llama_seq_id seq_id) {
+                if (seq_id < 0 || size_t(seq_id) >= size) {
+                    return;
+                }
+                if (counts[size_t(seq_id)] == UINT32_MAX) {
+                    valid = false;
+                    return;
+                }
+                counts[size_t(seq_id)]++;
+            });
+            if (!valid) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache::vbr_operation_armed() const {
     if (other) {
         return other->vbr_operation_armed();

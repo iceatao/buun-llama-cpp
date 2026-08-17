@@ -170,6 +170,16 @@ struct llama_memory_i {
         return {};
     }
 
+    // Add the physical cells owned by exactly one sequence to caller-owned counters indexed by
+    // sequence ID. This is the allocation-free pressure-policy view; unlike memory_vbr_state_v2,
+    // it does not simulate the representation controller. A composite with independently
+    // pressured children must preserve those domains or return false; summing them would rank
+    // cells that cannot satisfy the active child's deficit as useful reclaim.
+    virtual bool vbr_accumulate_exclusive_cells(
+            uint32_t * /*counts*/, size_t /*size*/) const {
+        return false;
+    }
+
     // Scoped dynamic-VBR representation freeze. The public top-level wrapper mints the
     // process-global operation ID once; composites only forward it. Non-VBR memories stay inert.
     virtual bool vbr_operation_armed() const { return false; }

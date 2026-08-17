@@ -1440,6 +1440,12 @@ void test_lifecycle_df2_rollout_and_reuse_thresholds() {
     CHECK(vbr_wiring.prefix_tracking_enabled);
     CHECK(vbr_wiring.authority_prefix_tracking_enabled);
     CHECK(vbr_wiring.external_coverage_exact);
+    const auto vbr_reclaim = server_vbr_reclaim_policy_for_test();
+    CHECK(vbr_reclaim.learned_kept_hot);
+    CHECK(vbr_reclaim.learned_removed_cold);
+    CHECK(vbr_reclaim.stopped_at_sufficiency);
+    CHECK(vbr_reclaim.fallback_removed_oldest);
+    CHECK(vbr_reclaim.zero_yield_fell_back);
     CHECK(!server_prompt_cache_retention_reuse_is_useful(
         SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS - 1));
     CHECK(server_prompt_cache_retention_reuse_is_useful(

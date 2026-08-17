@@ -225,6 +225,8 @@ public:
 
     llama_memory_vbr_state_data_v2 memory_vbr_state_v2(
             llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
+    bool vbr_accumulate_exclusive_cells(
+            uint32_t * counts, size_t size) const override;
     bool vbr_operation_armed() const override;
     // C4 boundary service: true while this cache's tracker is latched unavailable or its pool
     // has unresolved recovery-ring work. The update context reports an update NEEDED in this
