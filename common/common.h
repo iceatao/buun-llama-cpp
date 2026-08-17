@@ -828,9 +828,10 @@ struct common_params {
     // closed spelling without another flag migration.
     common_cache_plan_authority_level cache_plan_authority{}; // zero = off
 
-    // P2 F: cache-lifecycle authority substrate (accounting-gated admission). Constructs the
-    // authority (ledger/coordinator/leases/retention) independent of --cache-debug; enforcement
-    // is default-off and wired into no mutation path until F0b.
+    // Cache-lifecycle authority substrate (accounting-gated admission). The
+    // parser value records an explicit request; server initialization also
+    // enables it automatically when the prompt cache is present. It remains
+    // independent of --cache-debug.
     bool cache_lifecycle = false;
 
     // enable built-in tools

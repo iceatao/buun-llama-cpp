@@ -1025,7 +1025,7 @@ struct retention_df2_benchmark_fixture {
     bool prepare() {
         configure_host_trade(authority, cache, execution);
         authority.calibration_profile = {};
-        cache.retention_df2_capacity_authority = df2_enabled;
+        cache.retention_df2_authority = df2_enabled;
         if (df2_enabled &&
             (!authority.retention.enable_prefix_tracking() ||
              !cache.enable_retention_shadow())) {
@@ -1287,40 +1287,59 @@ void test_lifecycle_shadow_retains_live_alias_coverage() {
     authority.retention.retire(live_key);
 }
 
-void test_lifecycle_shadow_token_pressure_is_unavailable() {
+void test_lifecycle_df2_token_pressure_uses_tokens() {
     server_cache_authority authority;
     const std::string execution = "lifecycle-token-shadow";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
-    const auto oldest =
-        install_host_trade_entry(cache, authority, "token-old", 100);
-    const auto newest =
-        install_host_trade_entry(cache, authority, "token-new", 100);
-    CHECK(server_prompt_retention_publish_exact_prefix(
-        authority.retention,
-        server_retention_instance_key::for_host_entry(&*oldest),
-        oldest->prompt, oldest->adapter_config_key,
-        oldest->prompt.n_tokens()));
-    CHECK(server_prompt_retention_publish_exact_prefix(
-        authority.retention,
-        server_retention_instance_key::for_host_entry(&*newest),
-        newest->prompt, newest->adapter_config_key,
-        newest->prompt.n_tokens()));
+    const auto oldest = install_host_trade_retention_entry(
+        cache, authority, "token-many", 1000, 100, 10);
+    (void) install_host_trade_retention_entry(
+        cache, authority, "token-few", 2000, 10, 100);
+    const auto oldest_artifact = authority.retention.artifact_id(
+        server_retention_instance_key::for_host_entry(&*oldest));
 
-    cache.limit_tokens = 3;
+    cache.limit_tokens = 105;
     cache.update();
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(cache.states.size() == 1);
-    CHECK(cache.states.front().adapter_config_key == "token-new");
-    CHECK(shadow.complete == 0);
-    CHECK(shadow.unavailable == 1);
+    CHECK(cache.states.front().adapter_config_key == "token-few");
+    CHECK(shadow.complete == 1);
+    CHECK(shadow.unavailable == 0);
     CHECK(shadow.last.reason ==
           server_cache_destruction_reason::host_token_limit);
-    CHECK(shadow.last.proposed_artifact.v == 0);
+    CHECK(shadow.last.proposed_artifact == oldest_artifact);
+    CHECK(shadow.last.proposed_resource == 100);
+    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+    CHECK(authority.destruction.host_trade_unpriced == 0);
+}
+
+void test_lifecycle_df2_rollout_and_reuse_thresholds() {
+    CHECK(server_prompt_cache_df2_rollout_parse(nullptr) ==
+          server_prompt_cache_df2_rollout::enabled);
+    CHECK(server_prompt_cache_df2_rollout_parse("") ==
+          server_prompt_cache_df2_rollout::enabled);
+    CHECK(server_prompt_cache_df2_rollout_parse("1") ==
+          server_prompt_cache_df2_rollout::enabled);
+    CHECK(server_prompt_cache_df2_rollout_parse("0") ==
+          server_prompt_cache_df2_rollout::disabled);
+    CHECK(server_prompt_cache_df2_rollout_parse("garbage") ==
+          server_prompt_cache_df2_rollout::invalid);
+    CHECK(server_prompt_cache_lifecycle_default(
+        false, true));
+    CHECK(!server_prompt_cache_lifecycle_default(
+        false, false));
+    CHECK(server_prompt_cache_lifecycle_default(
+        true, false));
+    CHECK(!server_prompt_cache_retention_reuse_is_useful(
+        SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS - 1));
+    CHECK(server_prompt_cache_retention_reuse_is_useful(
+        SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS));
 }
 
 void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
@@ -1328,7 +1347,7 @@ void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
     const std::string execution = "lifecycle-prefix-failure";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(!authority.retention.enable_prefix_tracking(true));
     CHECK(cache.enable_retention_shadow());
 
@@ -1359,7 +1378,7 @@ void test_lifecycle_df2_capacity_executes_decayed_fallback() {
     const std::string execution = "lifecycle-df2-capacity";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -1403,7 +1422,7 @@ void test_lifecycle_df2_accounting_fault_falls_back_to_fifo() {
     const std::string execution = "lifecycle-df2-accounting-fault";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -1450,7 +1469,7 @@ void test_lifecycle_df2_capacity_handles_incoming_publication() {
     const std::string execution = "lifecycle-df2-incoming";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -1493,7 +1512,7 @@ void test_lifecycle_df2_capacity_counts_recovery_pinned_coverage() {
     const std::string execution = "lifecycle-df2-pinned";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -1535,27 +1554,33 @@ void test_lifecycle_df2_live_transition_matrix() {
     reused.reuse_hits = 1;
 
     const auto off = server_prompt_cache_df2_live_transition_for(
-        false, true, false, 100, 80, &reused);
+        false, true, false, 1000, 800, &reused);
     CHECK(!off.lookup_host);
     CHECK(!off.preserve_source);
 
     const auto probationary = server_prompt_cache_df2_live_transition_for(
-        true, true, false, 100, 80, &never_reused);
+        true, true, false, 1000, 800, &never_reused);
     CHECK(probationary.lookup_host);
     CHECK(!probationary.preserve_source);
 
     const auto reused_branch = server_prompt_cache_df2_live_transition_for(
-        true, true, false, 100, 80, &reused);
+        true, true, false, 1000, 800, &reused);
     CHECK(reused_branch.lookup_host);
     CHECK(reused_branch.preserve_source);
 
+    const auto tiny_reused_branch = server_prompt_cache_df2_live_transition_for(
+        true, true, false, 1000,
+        SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS - 1, &reused);
+    CHECK(tiny_reused_branch.lookup_host);
+    CHECK(!tiny_reused_branch.preserve_source);
+
     for (const auto unchanged : {
             server_prompt_cache_df2_live_transition_for(
-                true, true, false, 100, 100, &reused),
+                true, true, false, 1000, 1000, &reused),
             server_prompt_cache_df2_live_transition_for(
-                true, false, false, 100, 80, &reused),
+                true, false, false, 1000, 800, &reused),
             server_prompt_cache_df2_live_transition_for(
-                true, true, true, 100, 80, &reused),
+                true, true, true, 1000, 800, &reused),
             server_prompt_cache_df2_live_transition_for(
                 true, true, false, 0, 0, &reused) }) {
         CHECK(!unchanged.lookup_host);
@@ -1568,7 +1593,7 @@ void test_lifecycle_df2_reprojects_each_multi_victim_wave() {
     const std::string execution = "lifecycle-df2-multi";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -1630,7 +1655,7 @@ void test_lifecycle_df2_phase_change_forgets_old_reuse() {
             : "lifecycle-df2-phase-fresh";
         server_prompt_cache cache(0, 0);
         configure_host_trade(authority, cache, execution);
-        cache.retention_df2_capacity_authority = true;
+        cache.retention_df2_authority = true;
         CHECK(authority.retention.enable_prefix_tracking());
         CHECK(cache.enable_retention_shadow());
 
@@ -1693,7 +1718,7 @@ void test_lifecycle_df2_all_one_shot_converges_to_fifo() {
     const std::string execution = "lifecycle-df2-all-one-shot";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -1733,7 +1758,7 @@ void test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin() {
         const std::string execution = "lifecycle-df2-expensive-infrequent";
         server_prompt_cache cache(0, 0);
         configure_host_trade(authority, cache, execution);
-        cache.retention_df2_capacity_authority = true;
+        cache.retention_df2_authority = true;
         CHECK(authority.retention.enable_prefix_tracking());
         CHECK(cache.enable_retention_shadow());
 
@@ -1767,7 +1792,7 @@ void test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin() {
         const std::string execution = "lifecycle-df2-cheap-frequent";
         server_prompt_cache cache(0, 0);
         configure_host_trade(authority, cache, execution);
-        cache.retention_df2_capacity_authority = true;
+        cache.retention_df2_authority = true;
         CHECK(authority.retention.enable_prefix_tracking());
         CHECK(cache.enable_retention_shadow());
 
@@ -1804,7 +1829,7 @@ void test_lifecycle_df2_cold_start_prior_ages_to_recency() {
             : "lifecycle-df2-prior-fresh";
         server_prompt_cache cache(0, 0);
         configure_host_trade(authority, cache, execution);
-        cache.retention_df2_capacity_authority = true;
+        cache.retention_df2_authority = true;
         CHECK(authority.retention.enable_prefix_tracking());
         CHECK(cache.enable_retention_shadow());
 
@@ -3528,7 +3553,7 @@ void test_host_trade_all_refuse_falls_back_to_legacy() {
     auto newer = install_host_trade_entry(cache, authority, "new", 64);
     oldest->cache_plan_source_id = 1;
     newer->cache_plan_source_id = 2;
-    cache.limit_tokens = 3;
+    cache.limit_size = cache.size() - oldest->size() + 1;
     cache.update();
     CHECK(!host_source_present(cache, 1));
     CHECK(host_source_present(cache, 2));
@@ -3553,7 +3578,7 @@ void test_host_trade_hard_lease_veto() {
     const std::string execution = "trade-hard";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution, &hard_leases);
-    cache.retention_df2_capacity_authority = true;
+    cache.retention_df2_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -3695,7 +3720,7 @@ void test_host_trade_floor_skips_recovery_pin() {
     CHECK(pinned_artifact.v != 0);
     cache.debug_observability = true;
 
-    cache.limit_tokens = 3;
+    cache.limit_size = cache.size() - open->size() + 1;
     cache.update();
     CHECK(host_source_present(cache, 21));
     CHECK(!host_source_present(cache, 22));
@@ -4271,7 +4296,8 @@ int main(int argc, char ** argv) {
     test_fixed_host_pressure_observes_incoming_publication();
     test_lifecycle_pressure_records_decayed_shadow();
     test_lifecycle_shadow_retains_live_alias_coverage();
-    test_lifecycle_shadow_token_pressure_is_unavailable();
+    test_lifecycle_df2_token_pressure_uses_tokens();
+    test_lifecycle_df2_rollout_and_reuse_thresholds();
     test_lifecycle_shadow_prefix_failure_does_not_change_authority();
     test_lifecycle_df2_capacity_executes_decayed_fallback();
     test_lifecycle_df2_accounting_fault_falls_back_to_fifo();

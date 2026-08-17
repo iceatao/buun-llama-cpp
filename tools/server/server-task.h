@@ -13,6 +13,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -931,6 +932,40 @@ struct server_prompt_cache_df2_live_transition {
     bool preserve_source = false;
 };
 
+// Match the fork's established useful cache-reuse granularity. Tiny shared
+// prefixes remain valid LCP hits, but cannot earn durable frequency credit or
+// authorize copying a much larger displaced live state into host RAM.
+constexpr size_t SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS = 256;
+
+inline bool server_prompt_cache_retention_reuse_is_useful(
+        size_t reused_tokens) noexcept {
+    return reused_tokens >= SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS;
+}
+
+enum class server_prompt_cache_df2_rollout : uint8_t {
+    enabled,
+    disabled,
+    invalid,
+};
+
+inline server_prompt_cache_df2_rollout
+server_prompt_cache_df2_rollout_parse(const char * value) noexcept {
+    if (value == nullptr || value[0] == '\0' ||
+        std::string_view(value) == "1") {
+        return server_prompt_cache_df2_rollout::enabled;
+    }
+    if (std::string_view(value) == "0") {
+        return server_prompt_cache_df2_rollout::disabled;
+    }
+    return server_prompt_cache_df2_rollout::invalid;
+}
+
+inline bool server_prompt_cache_lifecycle_default(
+        bool explicitly_enabled,
+        bool prompt_cache_enabled) noexcept {
+    return explicitly_enabled || prompt_cache_enabled;
+}
+
 inline uint32_t server_prompt_cache_retention_prior_milli(
         const common_cache_family_binding & family,
         bool automatic_main) noexcept {
@@ -952,7 +987,8 @@ server_prompt_cache_df2_live_transition_for(
     }
     return {
         true,
-        lineage && lineage->reuse_hits != 0,
+        server_prompt_cache_retention_reuse_is_useful(retained_prefix) &&
+            lineage && lineage->reuse_hits != 0,
     };
 }
 
@@ -1074,7 +1110,7 @@ struct server_prompt_cache {
     // Explicit emission gate. An observed load also exists under B authority,
     // so rec != nullptr is not evidence that --cache-debug was enabled.
     bool debug_observability = false;
-    bool retention_df2_capacity_authority = false;
+    bool retention_df2_authority = false;
     uint64_t debug_lifecycle_emissions = 0;
     uint64_t debug_destruction_emissions = 0;
     uint64_t debug_recovery_pin_exclusions = 0;

@@ -145,17 +145,17 @@ static uint64_t server_frontier_ratchet_min_agreements() {
     return (uint64_t) parsed;
 }
 
-// Internal per-boot rollout switch for the first behavior-changing DF2
-// slice. Only the host-capacity fallback is eligible; token pressure and the
-// certified lifecycle ladder remain unchanged until their own gates pass.
-static bool server_retention_df2_capacity_authority() {
+// Internal rollback switch for the default cache-retention policy. An
+// explicit 0 restores the retained lifecycle/FIFO floor without changing the
+// public CLI; unset and 1 select DF2 for cache-enabled operation.
+static bool server_retention_df2_authority_enabled() {
     const char * env = std::getenv("LLAMA_RETENTION_DF2_CAPACITY");
-    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0) {
+    const auto rollout = server_prompt_cache_df2_rollout_parse(env);
+    if (rollout == server_prompt_cache_df2_rollout::disabled) {
         return false;
     }
-    if (std::strcmp(env, "1") != 0) {
-        SRV_WRN("invalid LLAMA_RETENTION_DF2_CAPACITY='%s'; using 0\n", env);
-        return false;
+    if (rollout == server_prompt_cache_df2_rollout::invalid) {
+        SRV_WRN("invalid LLAMA_RETENTION_DF2_CAPACITY='%s'; using 1\n", env);
     }
     return true;
 }
@@ -5721,6 +5721,16 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        // Successful DF2 gates make the lifecycle transaction substrate the
+        // normal fixed-cache owner. Explicit --cache-lifecycle still enables
+        // that substrate without a host cache; cache-disabled defaults remain
+        // zero-state. The internal switch is a rollback to the lawful FIFO
+        // lifecycle floor, not a second public policy mode.
+        const bool retention_df2_default = prompt_cache &&
+            server_retention_df2_authority_enabled();
+        params_base.cache_lifecycle = server_prompt_cache_lifecycle_default(
+            params_base.cache_lifecycle, prompt_cache != nullptr);
+
         // P2 F0b authority substrate: constructed and configured under
         // (cache_debug || cache_lifecycle). Neither flag remains the strictly-zero-work legacy
         // path; debug alone observes the shared substrate, while lifecycle enables publication
@@ -5769,12 +5779,10 @@ private:
                         : common_retention_pool::attention;
             }
             if (prompt_cache) {
-                const bool retention_df2_capacity =
-                    params_base.cache_lifecycle &&
-                    server_retention_df2_capacity_authority();
+                const bool retention_df2 =
+                    params_base.cache_lifecycle && retention_df2_default;
                 prompt_cache->debug_observability = params_base.cache_debug;
-                prompt_cache->retention_df2_capacity_authority =
-                    retention_df2_capacity;
+                prompt_cache->retention_df2_authority = retention_df2;
                 prompt_cache->destruction_obs = &cache_authority->destruction;
                 prompt_cache->retention_obs = &cache_authority->retention;
                 prompt_cache->lease_obs = &cache_authority->leases;
@@ -5783,14 +5791,14 @@ private:
                 // Debug shadow observes whichever fixed-host authority is
                 // active. Lifecycle keeps its certified price selector; DF1
                 // only compares the decayed projection against that choice.
-                if (params_base.cache_debug || retention_df2_capacity) {
+                if (params_base.cache_debug || retention_df2) {
                     if (prompt_cache->enable_retention_shadow()) {
                         (void) cache_authority->retention.
                             enable_prefix_tracking();
                     }
                 }
-                if (retention_df2_capacity) {
-                    SRV_INF("%s\n", "experimental DF2 host-capacity fallback authority is enabled");
+                if (retention_df2) {
+                    SRV_INF("%s\n", "decayed-frequency host-cache authority is enabled");
                 }
             }
             if (params_base.cache_lifecycle) {
@@ -7702,12 +7710,13 @@ private:
             // slot after any cache-plan retarget: the legacy 50%-loss
             // heuristic skips the common case where an agent branch keeps
             // most of a reused live prefix while replacing its tail. A
-            // demonstrated reuse is sufficient here; coalesced exact hits in
-            // one competition epoch need not wait for full promotion.
-            // Append/resume and never-reused branches stay on the existing
-            // allocation-free path, and a failed save remains a soft miss.
+            // demonstrated reuse plus a useful retained prefix is sufficient
+            // here; coalesced exact hits in one competition epoch need not
+            // wait for full promotion. Append/resume, tiny overlaps, and
+            // never-reused branches stay on the existing allocation-free
+            // path, and a failed save remains a soft miss.
             const bool df2_enabled = prompt_cache &&
-                prompt_cache->retention_df2_capacity_authority;
+                prompt_cache->retention_df2_authority;
             if (df2_enabled) {
                 common_retention_lineage_record source_lineage;
                 const common_retention_lineage_record * source_lineage_ptr =
@@ -8184,8 +8193,10 @@ private:
             server_retention_instance_key::for_slot(slot.id);
         const bool prepared_host_restore = slot.retention_obs &&
             slot.retention_obs->prepared_for_launch(live_retention_key);
+        const bool useful_reused_prefix =
+            server_prompt_cache_retention_reuse_is_useful(retained_prefix);
         const bool reused_live_prefix =
-            !prepared_host_restore && retained_prefix != 0 &&
+            !prepared_host_restore && useful_reused_prefix &&
             slot.retention_obs &&
             slot.retention_obs->acquire_lineage_ticket(
                 live_retention_key, slot.retention_reuse_source);
@@ -8210,7 +8221,9 @@ private:
             server_retention_lineage_ticket restored_source;
             if (slot.retention_obs->consume_prepared_launch(
                     live_retention_key, restored_source)) {
-                (void) slot.retention_obs->credit_reuse(restored_source);
+                if (useful_reused_prefix) {
+                    (void) slot.retention_obs->credit_reuse(restored_source);
+                }
                 slot.retention_obs->release_lineage_ticket(restored_source);
                 server_retention_lineage_ticket restored_destination;
                 const bool acquired_destination =

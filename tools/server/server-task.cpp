@@ -1767,7 +1767,7 @@ bool server_prompt_cache::enable_retention_shadow() noexcept {
             server_prompt_cache_shadow_row[
                 SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES]);
     }
-    if (!retention_shadow_rows || !retention_df2_capacity_authority) {
+    if (!retention_shadow_rows || !retention_df2_authority) {
         return bool(retention_shadow_rows);
     }
     if (retention_shadow_artifacts && retention_shadow_lineages) {
@@ -3438,6 +3438,7 @@ struct host_trade_df2_projection {
 // for debug/model-free analysis.
 host_trade_df2_projection project_host_trade_df2(
         server_prompt_cache & cache,
+        server_cache_destruction_reason reason,
         server_prompt_cache::iterator incoming,
         const std::vector<host_trade_candidate> & candidates,
         server_prompt_cache_shadow_row * rows,
@@ -3588,23 +3589,29 @@ host_trade_df2_projection project_host_trade_df2(
             continue;
         }
         result.candidate_count++;
-        // Published host entries own three independent accounting leaves.
-        // Their immutable payload sizes are the exact resident bytes charged
-        // at publication; the selected victim is still re-previewed and
-        // serial-certified immediately before destruction.
-        uint64_t snapshot_bytes = 0;
-        uint64_t checkpoint_bytes = 0;
-        uint64_t accelerator_bytes = 0;
-        if (!server_prompt_cache::payload_bytes(
-                *candidate.victim, snapshot_bytes,
-                checkpoint_bytes, accelerator_bytes) ||
-            checkpoint_bytes > UINT64_MAX - snapshot_bytes ||
-            accelerator_bytes >
-                UINT64_MAX - snapshot_bytes - checkpoint_bytes) {
-            return {};
+        if (reason == server_cache_destruction_reason::host_token_limit) {
+            row->resource = candidate.victim->prompt.n_tokens();
+        } else {
+            // Published host entries own three independent accounting leaves.
+            // Their immutable payload sizes are the exact resident bytes
+            // charged at publication; the selected victim is still
+            // re-previewed and serial-certified immediately before
+            // destruction.
+            uint64_t snapshot_bytes = 0;
+            uint64_t checkpoint_bytes = 0;
+            uint64_t accelerator_bytes = 0;
+            if (reason != server_cache_destruction_reason::host_capacity ||
+                !server_prompt_cache::payload_bytes(
+                    *candidate.victim, snapshot_bytes,
+                    checkpoint_bytes, accelerator_bytes) ||
+                checkpoint_bytes > UINT64_MAX - snapshot_bytes ||
+                accelerator_bytes >
+                    UINT64_MAX - snapshot_bytes - checkpoint_bytes) {
+                return {};
+            }
+            row->resource =
+                snapshot_bytes + checkpoint_bytes + accelerator_bytes;
         }
-        row->resource =
-            snapshot_bytes + checkpoint_bytes + accelerator_bytes;
     }
     for (auto state = cache.states.begin(); state != cache.states.end();
             ++state) {
@@ -4290,8 +4297,14 @@ bool server_prompt_cache::destroy_priced_host_entry(
     // candidate fails certification, the caller deliberately executes the
     // historical FIFO victim so the user's configured bound remains real.
     lease_obs->lifecycle_point();
-    const auto * calib = common_cache_plan_calib_find(
-        publish_authority->calibration_profile);
+    // The retained calibration profile prices pageable-host bytes. It has no
+    // lawful token-yield currency, so token pressure proceeds directly to
+    // DF2's exact token denominator (or the deterministic FIFO floor).
+    const auto * calib = reason ==
+            server_cache_destruction_reason::host_capacity
+        ? common_cache_plan_calib_find(
+              publish_authority->calibration_profile)
+        : nullptr;
     std::vector<host_trade_candidate> candidates;
     try {
         candidates.reserve(states.size());
@@ -4450,20 +4463,22 @@ bool server_prompt_cache::destroy_priced_host_entry(
     // optimum. Emit one typed refusal per skipped victim, then retain the
     // exact historical FIFO terminal. No new request is refused merely
     // because D-A evidence is incomplete.
-    for (auto & candidate : candidates) {
-        if (candidate.attempted || candidate.ranking.price_known) {
-            continue;
-        }
-        candidate.attempted = true;
-        const uint64_t quote_sequence =
-            ++publish_authority->destruction_quote_sequence;
-        observe_host_trade_refusal(
-            *this,
-            quote_sequence,
-            common_cache_plan_destruction_reason::capacity_refused,
-            &candidate.ranking);
-        if (destruction_obs) {
-            destruction_obs->note_host_trade_unpriced();
+    if (reason == server_cache_destruction_reason::host_capacity) {
+        for (auto & candidate : candidates) {
+            if (candidate.attempted || candidate.ranking.price_known) {
+                continue;
+            }
+            candidate.attempted = true;
+            const uint64_t quote_sequence =
+                ++publish_authority->destruction_quote_sequence;
+            observe_host_trade_refusal(
+                *this,
+                quote_sequence,
+                common_cache_plan_destruction_reason::capacity_refused,
+                &candidate.ranking);
+            if (destruction_obs) {
+                destruction_obs->note_host_trade_unpriced();
+            }
         }
     }
     for (const auto & candidate : candidates) {
@@ -4481,17 +4496,19 @@ bool server_prompt_cache::destroy_priced_host_entry(
             common_cache_plan_destruction_reason::hard_lease_blocked;
     }
 
-    // First DF2 execution ratchet: only replace the lawful lifecycle
-    // host-capacity fallback. The calibrated/certified ladder above, hard
-    // leases, pins, incoming publication, and token pressure remain exactly
-    // where they were. Reproject on every victim; record only the first
-    // decision in a multi-removal competition wave.
-    if (retention_df2_capacity_authority &&
-        reason == server_cache_destruction_reason::host_capacity &&
+    // DF2 replaces only the lawful lifecycle fallback. Host capacity uses
+    // exact resident payload bytes; token pressure uses exact prompt tokens.
+    // The calibrated/certified byte ladder above, hard leases, pins, and
+    // incoming publication retain precedence. Reproject on every victim;
+    // record only the first decision in a multi-removal competition wave.
+    if (retention_df2_authority &&
+        (reason == server_cache_destruction_reason::host_capacity ||
+         reason == server_cache_destruction_reason::host_token_limit) &&
         legacy_floor != states.end()) {
         const auto projection = competition_wave_valid
             ? project_host_trade_df2(
-                  *this, incoming, candidates, retention_shadow_rows.get(),
+                  *this, reason, incoming, candidates,
+                  retention_shadow_rows.get(),
                   retention_shadow_artifacts.get(),
                   retention_shadow_lineages.get())
             : host_trade_df2_projection {};
