@@ -133,6 +133,9 @@ public:
     vbr_artifact_package_view & operator=(const vbr_artifact_package_view &) = delete;
 
     explicit operator bool() const noexcept { return owner_ != nullptr; }
+    bool same_catalog(const vbr_artifact_package_view & other) const noexcept {
+        return owner_ != nullptr && owner_ == other.owner_;
+    }
     llama_cache_acct_artifact_id reference_artifact() const noexcept;
     const std::vector<vbr_artifact_portable_topology> & topologies() const noexcept;
     const vbr_artifact_reference_manifest & manifest() const noexcept;

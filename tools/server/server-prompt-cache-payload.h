@@ -62,6 +62,37 @@ private:
     std::unique_ptr<impl> impl_;
 };
 
+using server_prompt_cache_vbr_owner =
+    std::shared_ptr<const server_prompt_cache_vbr_payload>;
+
+// Immutable same-frontier VBR variants for one logical prefix node. Compact
+// current is required; a higher-quality anchor is optional and never replaces
+// it. Shared catalog allocations are charged once across the set.
+class server_prompt_cache_vbr_variant_set {
+public:
+    static std::shared_ptr<const server_prompt_cache_vbr_variant_set> create(
+        server_prompt_cache_vbr_owner compact_current,
+        server_prompt_cache_vbr_owner quality_anchor = {}) noexcept;
+
+    ~server_prompt_cache_vbr_variant_set();
+    server_prompt_cache_vbr_variant_set(
+        const server_prompt_cache_vbr_variant_set &) = delete;
+    server_prompt_cache_vbr_variant_set & operator=(
+        const server_prompt_cache_vbr_variant_set &) = delete;
+
+    const server_prompt_cache_vbr_owner & compact_current() const noexcept;
+    const server_prompt_cache_vbr_owner & quality_anchor() const noexcept;
+    uint64_t logical_bytes() const noexcept;
+    uint64_t resident_bytes() const noexcept;
+    size_t allocation_count() const noexcept;
+
+private:
+    struct impl;
+    explicit server_prompt_cache_vbr_variant_set(
+        std::unique_ptr<impl> state) noexcept;
+    std::unique_ptr<impl> impl_;
+};
+
 enum class server_prompt_cache_payload_kind : uint8_t {
     fixed_state = 0,
     vbr_artifact,
@@ -74,17 +105,22 @@ enum class server_prompt_cache_payload_kind : uint8_t {
 // owner can now cross this boundary without copying its sealed segments.
 class server_prompt_cache_payload {
 public:
-    using vbr_owner =
-        std::shared_ptr<const server_prompt_cache_vbr_payload>;
+    using vbr_owner = server_prompt_cache_vbr_owner;
+    using vbr_variant_owner =
+        std::shared_ptr<const server_prompt_cache_vbr_variant_set>;
 
     server_prompt_cache_payload() = default;
 
     static server_prompt_cache_payload from_vbr(vbr_owner owner) noexcept;
+    static server_prompt_cache_payload from_vbr_variants(
+        vbr_variant_owner variants) noexcept;
 
     server_prompt_cache_payload_kind kind() const noexcept;
     server_prompt_data * fixed_state() noexcept;
     const server_prompt_data * fixed_state() const noexcept;
     const server_prompt_cache_vbr_payload * vbr_artifact() const noexcept;
+    const server_prompt_cache_vbr_variant_set *
+        vbr_variants() const noexcept;
 
     bool valid() const noexcept;
     bool publishable() const noexcept;
@@ -92,5 +128,5 @@ public:
     bool same_storage(const server_prompt_cache_payload & other) const noexcept;
 
 private:
-    std::variant<server_prompt_data, vbr_owner> storage_;
+    std::variant<server_prompt_data, vbr_variant_owner> storage_;
 };

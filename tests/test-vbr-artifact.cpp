@@ -5,6 +5,8 @@
 #include "server-prompt-cache-payload.h"
 #include "llama-vbr-artifact-stage.h"
 #include "llama-vbr-artifact-validate.h"
+#include "llama-vbr-downward.h"
+#include "llama-vbr-identity-digest.h"
 #include "llama-sha256.h"
 
 #include <algorithm>
@@ -2294,6 +2296,483 @@ static void test_prompt_cache_vbr_payload_fanout_lifetime() {
     CHECK(!server_prompt_cache_vbr_payload::adopt(std::move(empty)));
 }
 
+static void test_prompt_cache_vbr_same_frontier_variants() {
+    catalog_fixture f;
+    const auto compact_reference = f.catalog->publish(
+        f.package, f.completions(), f.budget);
+
+    const auto with_quality = [](const vbr_artifact_package & source,
+                                 ggml_type type) {
+        auto result = source;
+        auto & descriptor = result.unit_blobs[0].descriptor;
+        descriptor.repr_gen++;
+        descriptor.current_type = type;
+        descriptor.last_source_type = type == GGML_TYPE_TURBO8_0
+            ? GGML_TYPE_F16
+            : GGML_TYPE_TURBO4_0;
+        descriptor.promote_hops = type == GGML_TYPE_TURBO8_0 ? 0 : 2;
+        descriptor.last_transition = type == GGML_TYPE_TURBO8_0
+            ? vbr_repr_transition::degrade_f16_to_t8_admitted
+            : vbr_repr_transition::degrade_other;
+        descriptor.representation.source_loss_history =
+            type == GGML_TYPE_TURBO8_0 ? 0 : 2;
+        auto & generation =
+            result.manifest.generation.controllers[0].units[0];
+        generation.repr_gen = descriptor.repr_gen;
+        generation.current_type = type;
+        generation.last_source_type = descriptor.last_source_type;
+        generation.domain = vbr_downward_tier_domain(type);
+        generation.promote_hops = descriptor.promote_hops;
+        generation.last_transition = descriptor.last_transition;
+        auto & reference = result.manifest.unit_references[0];
+        reference.repr_gen = descriptor.repr_gen;
+        const ggml_type types[] = { type };
+        result.manifest.controller_policy[0]
+            .current_type_vector_digest =
+                vbr_type_vector_digest(types, 1);
+        result.manifest.manifest_digest = {};
+        result.manifest.capture_generation_id = {};
+        result.manifest.consistency = {};
+        return result;
+    };
+
+    auto anchor_package = with_quality(
+        f.package, GGML_TYPE_TURBO8_0);
+    CHECK(f.catalog->configure_accounting(anchor_package));
+    const auto anchor_reference = f.catalog->publish(
+        anchor_package, f.completions(), f.budget);
+    CHECK(compact_reference.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(anchor_reference.status ==
+          llama_vbr_artifact_publish_status::published);
+
+    vbr_artifact_package_view compact_view;
+    vbr_artifact_package_view anchor_view;
+    CHECK(f.catalog->resolve_reference(
+              compact_reference.reference_artifact, compact_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(f.catalog->resolve_reference(
+              anchor_reference.reference_artifact, anchor_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto compact =
+        server_prompt_cache_vbr_payload::adopt(std::move(compact_view));
+    auto anchor =
+        server_prompt_cache_vbr_payload::adopt(std::move(anchor_view));
+    CHECK(compact && anchor);
+    if (!compact || !anchor) {
+        return;
+    }
+
+    auto variants = server_prompt_cache_vbr_variant_set::create(
+        compact, anchor);
+    CHECK(variants);
+    if (!variants) {
+        return;
+    }
+    CHECK(variants->compact_current() == compact);
+    CHECK(variants->quality_anchor() == anchor);
+
+    // Independently flatten and exact-dedup the two sealed packages. This
+    // catches both double charging shared rows and accidentally omitting an
+    // anchor-exclusive allocation from the union.
+    std::vector<vbr_artifact_allocation_view> expected_rows;
+    const auto append_expected = [&](const auto & package) {
+        expected_rows.insert(
+            expected_rows.end(), package.reference_allocations().begin(),
+            package.reference_allocations().end());
+        for (const auto & unit : package.units()) {
+            expected_rows.insert(
+                expected_rows.end(), unit.payload_allocations.begin(),
+                unit.payload_allocations.end());
+            expected_rows.insert(
+                expected_rows.end(), unit.stash_allocations.begin(),
+                unit.stash_allocations.end());
+        }
+    };
+    append_expected(compact->package());
+    const size_t compact_row_count = expected_rows.size();
+    append_expected(anchor->package());
+    bool anchor_exclusive = false;
+    for (size_t i = compact_row_count; i < expected_rows.size(); ++i) {
+        anchor_exclusive |= std::none_of(
+            expected_rows.begin(),
+            expected_rows.begin() + compact_row_count,
+            [&](const auto & compact_row) {
+                return compact_row.allocation ==
+                    expected_rows[i].allocation;
+            });
+    }
+    std::sort(
+        expected_rows.begin(), expected_rows.end(),
+        [](const auto & lhs, const auto & rhs) {
+            return lhs.allocation.v < rhs.allocation.v;
+        });
+    uint64_t expected_logical = 0;
+    uint64_t expected_resident = 0;
+    size_t expected_allocations = 0;
+    llama_cache_acct_alloc_id previous;
+    for (const auto & row : expected_rows) {
+        if (!row.allocation || row.allocation == previous) {
+            continue;
+        }
+        previous = row.allocation;
+        expected_logical += row.logical;
+        expected_resident += row.resident;
+        expected_allocations++;
+    }
+    CHECK(anchor_exclusive);
+    CHECK(expected_allocations < expected_rows.size());
+    CHECK(variants->allocation_count() == expected_allocations);
+    CHECK(variants->logical_bytes() == expected_logical);
+    CHECK(variants->resident_bytes() == expected_resident);
+
+    auto typed = server_prompt_cache_payload::from_vbr_variants(variants);
+    CHECK(typed.valid());
+    CHECK(!typed.publishable());
+    CHECK(typed.vbr_variants() == variants.get());
+    CHECK(typed.vbr_artifact() == compact.get());
+    CHECK(typed.size() == variants->resident_bytes());
+    auto alias = typed;
+    CHECK(alias.same_storage(typed));
+    auto independently_wrapped =
+        server_prompt_cache_payload::from_vbr(compact);
+    auto independently_wrapped_again =
+        server_prompt_cache_payload::from_vbr(compact);
+    CHECK(independently_wrapped.same_storage(
+        independently_wrapped_again));
+    auto same_variants = server_prompt_cache_vbr_variant_set::create(
+        compact, anchor);
+    CHECK(same_variants);
+    auto independently_bundled =
+        server_prompt_cache_payload::from_vbr_variants(same_variants);
+    CHECK(typed.same_storage(independently_bundled));
+    CHECK(!typed.same_storage(independently_wrapped));
+
+    // Equal, lower-quality, or reversed roles are not anchors.
+    const auto equal_reference = f.catalog->publish(
+        f.package, f.completions(), f.budget);
+    CHECK(equal_reference.status ==
+          llama_vbr_artifact_publish_status::adopted);
+    vbr_artifact_package_view equal_view;
+    CHECK(f.catalog->resolve_reference(
+              equal_reference.reference_artifact, equal_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto equal_owner =
+        server_prompt_cache_vbr_payload::adopt(std::move(equal_view));
+    CHECK(equal_owner);
+    CHECK(!server_prompt_cache_vbr_variant_set::create(
+        compact, equal_owner));
+    CHECK(!server_prompt_cache_vbr_variant_set::create(
+        anchor, compact));
+
+    auto lower_package = with_quality(
+        f.package, GGML_TYPE_TURBO3_TCQ);
+    CHECK(f.catalog->configure_accounting(lower_package));
+    const auto lower_reference = f.catalog->publish(
+        lower_package, f.completions(), f.budget);
+    CHECK(lower_reference.status ==
+          llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view lower_view;
+    CHECK(f.catalog->resolve_reference(
+              lower_reference.reference_artifact, lower_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto lower_owner =
+        server_prompt_cache_vbr_payload::adopt(std::move(lower_view));
+    CHECK(lower_owner);
+    CHECK(!server_prompt_cache_vbr_variant_set::create(
+        compact, lower_owner));
+
+    // A nominally higher tier reconstructed through a worse lossy history is
+    // not a quality anchor.
+    auto lossy_anchor_package = anchor_package;
+    auto & lossy_descriptor =
+        lossy_anchor_package.unit_blobs[0].descriptor;
+    lossy_descriptor.last_source_type = GGML_TYPE_TURBO4_0;
+    lossy_descriptor.promote_hops = 2;
+    lossy_descriptor.last_transition = vbr_repr_transition::promote;
+    lossy_descriptor.representation.source_loss_history = 2;
+    lossy_descriptor.representation.checkpoint_codec_hops = 1;
+    auto & lossy_generation = lossy_anchor_package.manifest.generation
+        .controllers[0].units[0];
+    lossy_generation.last_source_type = lossy_descriptor.last_source_type;
+    lossy_generation.promote_hops = lossy_descriptor.promote_hops;
+    lossy_generation.last_transition = lossy_descriptor.last_transition;
+    lossy_anchor_package.manifest.manifest_digest = {};
+    lossy_anchor_package.manifest.capture_generation_id = {};
+    lossy_anchor_package.manifest.consistency = {};
+    CHECK(f.catalog->configure_accounting(lossy_anchor_package));
+    const auto lossy_anchor_reference = f.catalog->publish(
+        lossy_anchor_package, f.completions(), f.budget);
+    CHECK(lossy_anchor_reference.status ==
+          llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view lossy_anchor_view;
+    CHECK(f.catalog->resolve_reference(
+              lossy_anchor_reference.reference_artifact,
+              lossy_anchor_view) == vbr_artifact_resolve_status::ok);
+    auto lossy_anchor = server_prompt_cache_vbr_payload::adopt(
+        std::move(lossy_anchor_view));
+    CHECK(lossy_anchor);
+    CHECK(!server_prompt_cache_vbr_variant_set::create(
+        compact, lossy_anchor));
+
+    // A multi-unit candidate may not trade quality between units: improving
+    // one while degrading another is incomparable, not an anchor.
+    catalog_fixture mixed;
+    auto compact_pair_package = mixed.package;
+    auto second = compact_pair_package.unit_blobs.front();
+    second.descriptor.logical_unit_id = 1;
+    second.descriptor.clean_stash_state =
+        vbr_artifact_clean_stash_state::absent_at_source;
+    second.descriptor.clean_stash = {};
+    second.unit_version_id = {};
+    second.payload_digest = {};
+    compact_pair_package.unit_blobs.push_back(second);
+    compact_pair_package.manifest.generation.controllers[0].units.push_back(
+        compact_pair_package.manifest.generation.controllers[0].units.front());
+    auto second_reference =
+        compact_pair_package.manifest.unit_references.front();
+    second_reference.logical_unit_id = 1;
+    second_reference.unit_version_id = {};
+    second_reference.payload_digest = {};
+    second_reference.has_stash_reference = false;
+    second_reference.stash_reference = {};
+    compact_pair_package.manifest.unit_references.push_back(second_reference);
+    for (auto & row : compact_pair_package.manifest.accounting) {
+        if (row.role == vbr_artifact_accounting_role::unit_payload) {
+            row.logical_bytes *= 2;
+            row.resident_bytes *= 2;
+        }
+    }
+    compact_pair_package.manifest.manifest_digest = {};
+    compact_pair_package.manifest.capture_generation_id = {};
+    compact_pair_package.manifest.consistency = {};
+
+    auto high_pair_package = compact_pair_package;
+    for (size_t i = 0; i < 2; ++i) {
+        auto & descriptor = high_pair_package.unit_blobs[i].descriptor;
+        descriptor.repr_gen++;
+        descriptor.current_type = GGML_TYPE_TURBO8_0;
+        descriptor.last_source_type = GGML_TYPE_F16;
+        descriptor.promote_hops = 0;
+        descriptor.last_transition =
+            vbr_repr_transition::degrade_f16_to_t8_admitted;
+        descriptor.representation.source_loss_history = 0;
+        auto & generation = high_pair_package.manifest.generation
+            .controllers[0].units[i];
+        generation.repr_gen = descriptor.repr_gen;
+        generation.current_type = descriptor.current_type;
+        generation.last_source_type = descriptor.last_source_type;
+        generation.domain = vbr_repr_domain::full;
+        generation.promote_hops = descriptor.promote_hops;
+        generation.last_transition = descriptor.last_transition;
+        high_pair_package.manifest.unit_references[i].repr_gen =
+            descriptor.repr_gen;
+    }
+    const ggml_type high_types[] = {
+        GGML_TYPE_TURBO8_0,
+        GGML_TYPE_TURBO8_0,
+    };
+    high_pair_package.manifest.controller_policy[0]
+        .current_type_vector_digest =
+            vbr_type_vector_digest(high_types, 2);
+    high_pair_package.manifest.manifest_digest = {};
+    high_pair_package.manifest.capture_generation_id = {};
+    high_pair_package.manifest.consistency = {};
+    // Unit blob order is producer-local; logical tuple matching must make it
+    // irrelevant to the variant relation.
+    std::reverse(
+        high_pair_package.unit_blobs.begin(),
+        high_pair_package.unit_blobs.end());
+
+    auto mixed_anchor_package = compact_pair_package;
+    const ggml_type mixed_types[] = {
+        GGML_TYPE_TURBO8_0,
+        GGML_TYPE_TURBO3_TCQ,
+    };
+    for (size_t i = 0; i < 2; ++i) {
+        auto & descriptor = mixed_anchor_package.unit_blobs[i].descriptor;
+        descriptor.repr_gen++;
+        descriptor.current_type = mixed_types[i];
+        descriptor.last_source_type = mixed_types[i] ==
+                GGML_TYPE_TURBO8_0
+            ? GGML_TYPE_F16
+            : GGML_TYPE_TURBO4_0;
+        descriptor.promote_hops = mixed_types[i] ==
+                GGML_TYPE_TURBO8_0 ? 0 : 2;
+        descriptor.last_transition = mixed_types[i] ==
+                GGML_TYPE_TURBO8_0
+            ? vbr_repr_transition::degrade_f16_to_t8_admitted
+            : vbr_repr_transition::degrade_other;
+        descriptor.representation.source_loss_history =
+            mixed_types[i] == GGML_TYPE_TURBO8_0 ? 0 : 2;
+        auto & generation = mixed_anchor_package.manifest.generation
+            .controllers[0].units[i];
+        generation.repr_gen = descriptor.repr_gen;
+        generation.current_type = descriptor.current_type;
+        generation.last_source_type = descriptor.last_source_type;
+        generation.domain = vbr_downward_tier_domain(mixed_types[i]);
+        generation.promote_hops = descriptor.promote_hops;
+        generation.last_transition = descriptor.last_transition;
+        mixed_anchor_package.manifest.unit_references[i].repr_gen =
+            descriptor.repr_gen;
+    }
+    mixed_anchor_package.manifest.controller_policy[0]
+        .current_type_vector_digest =
+            vbr_type_vector_digest(mixed_types, 2);
+    mixed_anchor_package.manifest.manifest_digest = {};
+    mixed_anchor_package.manifest.capture_generation_id = {};
+    mixed_anchor_package.manifest.consistency = {};
+
+    const auto publish_pair = [&](vbr_artifact_package & package) {
+        CHECK(mixed.catalog->configure_accounting(package));
+        vbr_capture_stream_status status;
+        auto build = mixed.catalog->begin_capture(
+            package, mixed.budget, {}, status);
+        CHECK(build && status == vbr_capture_stream_status::ok);
+        if (!build) {
+            return llama_cache_acct_artifact_id {};
+        }
+        for (size_t unit_index = 0; unit_index < 2; ++unit_index) {
+            auto unit = build->begin_unit(unit_index, status);
+            CHECK(unit && status == vbr_capture_stream_status::ok);
+            if (!unit) {
+                return llama_cache_acct_artifact_id {};
+            }
+            for (const auto & completion : mixed.completions()) {
+                if (completion.clean_stash &&
+                    package.unit_blobs[unit_index].descriptor
+                        .clean_stash_state !=
+                        vbr_artifact_clean_stash_state::present) {
+                    continue;
+                }
+                auto copy = completion;
+                copy.unit_index = unit_index;
+                CHECK(unit->accept_verified_segment(
+                          verified_segment(copy, 2)) ==
+                      vbr_capture_stream_status::ok);
+            }
+            CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+        }
+        const auto published = build->publish_reference();
+        CHECK(published.status == vbr_capture_stream_status::ok);
+        return published.reference_artifact;
+    };
+    const auto compact_pair_reference =
+        publish_pair(compact_pair_package);
+    const auto high_pair_reference =
+        publish_pair(high_pair_package);
+    const auto mixed_anchor_reference =
+        publish_pair(mixed_anchor_package);
+    CHECK(compact_pair_reference.v != 0 &&
+          high_pair_reference.v != 0 &&
+          mixed_anchor_reference.v != 0);
+    vbr_artifact_package_view compact_pair_view;
+    vbr_artifact_package_view high_pair_view;
+    vbr_artifact_package_view mixed_anchor_view;
+    CHECK(mixed.catalog->resolve_reference(
+              compact_pair_reference, compact_pair_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(mixed.catalog->resolve_reference(
+              high_pair_reference, high_pair_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(mixed.catalog->resolve_reference(
+              mixed_anchor_reference, mixed_anchor_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto compact_pair = server_prompt_cache_vbr_payload::adopt(
+        std::move(compact_pair_view));
+    auto high_pair = server_prompt_cache_vbr_payload::adopt(
+        std::move(high_pair_view));
+    auto mixed_anchor = server_prompt_cache_vbr_payload::adopt(
+        std::move(mixed_anchor_view));
+    CHECK(compact_pair && high_pair && mixed_anchor);
+    CHECK(server_prompt_cache_vbr_variant_set::create(
+        compact_pair, high_pair));
+    CHECK(!server_prompt_cache_vbr_variant_set::create(
+        compact_pair, mixed_anchor));
+
+    // Same semantic frontier is necessary but not sufficient: allocation IDs
+    // are catalog-local, so one variant set may not span catalog namespaces.
+    catalog_fixture other;
+    auto other_anchor_package = with_quality(
+        other.package, GGML_TYPE_TURBO8_0);
+    CHECK(other.catalog->configure_accounting(other_anchor_package));
+    const auto other_reference = other.catalog->publish(
+        other_anchor_package, other.completions(), other.budget);
+    CHECK(other_reference.status ==
+          llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view other_view;
+    CHECK(other.catalog->resolve_reference(
+              other_reference.reference_artifact, other_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto other_owner =
+        server_prompt_cache_vbr_payload::adopt(std::move(other_view));
+    CHECK(other_owner);
+    CHECK(!server_prompt_cache_vbr_variant_set::create(
+        compact, other_owner));
+
+    // A reference from the same catalog but a different authenticated token
+    // frontier cannot be mislabeled as a quality variant.
+    auto different = anchor_package;
+    different.manifest.token_block.tokens[0] += 1;
+    different.manifest.token_block.digest = {};
+    different.manifest.manifest_digest = {};
+    different.manifest.capture_generation_id = {};
+    different.manifest.consistency = {};
+    const auto different_reference = f.catalog->publish(
+        different, f.completions(), f.budget);
+    CHECK(different_reference.status ==
+              llama_vbr_artifact_publish_status::adopted ||
+          different_reference.status ==
+              llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view different_view;
+    CHECK(f.catalog->resolve_reference(
+              different_reference.reference_artifact, different_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto different_owner =
+        server_prompt_cache_vbr_payload::adopt(std::move(different_view));
+    CHECK(different_owner);
+    CHECK(!server_prompt_cache_vbr_variant_set::create(
+        compact, different_owner));
+
+    alias = {};
+    typed = {};
+    independently_wrapped = {};
+    independently_wrapped_again = {};
+    independently_bundled = {};
+    same_variants.reset();
+    variants.reset();
+    compact.reset();
+    anchor.reset();
+    equal_owner.reset();
+    lower_owner.reset();
+    lossy_anchor.reset();
+    different_owner.reset();
+    other_owner.reset();
+    compact_pair.reset();
+    high_pair.reset();
+    mixed_anchor.reset();
+    CHECK(f.catalog->retire(compact_reference.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(f.catalog->retire(anchor_reference.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(f.catalog->retire(equal_reference.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(f.catalog->retire(lower_reference.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(f.catalog->retire(lossy_anchor_reference.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(f.catalog->retire(different_reference.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(other.catalog->retire(other_reference.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(mixed.catalog->retire(compact_pair_reference) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(mixed.catalog->retire(high_pair_reference) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(mixed.catalog->retire(mixed_anchor_reference) ==
+          vbr_artifact_retire_status::retired);
+}
+
 class validator_companion_image final : public vbr_parsed_companion_image {
 public:
     validator_companion_image(
@@ -3110,6 +3589,7 @@ int main() {
     test_catalog_capacity_sequential_and_temporaries();
     test_catalog_package_lease_and_reference_placement();
     test_prompt_cache_vbr_payload_fanout_lifetime();
+    test_prompt_cache_vbr_same_frontier_variants();
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
     if (failures != 0) {
