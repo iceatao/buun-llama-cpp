@@ -214,6 +214,73 @@ server_prompt_cache::iterator publish_indexed_host_from_live(
     return published;
 }
 
+void test_host_save_missing_checkpoint_mirror_fails_locally() {
+    server_cache_authority authority;
+    configure_host_accounting(authority, true);
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.retention_obs = &authority.retention;
+    cache.destruction_obs = &authority.destruction;
+
+    constexpr int32_t slot_id = 2;
+    const auto make_checkpoint_entry = []() {
+        auto value = make_prompt_entry("same", { 1, 2, 3 });
+        value.front().data.main.assign(16, 7);
+        value.front().prompt.checkpoints.emplace_back();
+        auto & checkpoint = value.front().prompt.checkpoints.back();
+        checkpoint.n_tokens = 2;
+        checkpoint.pos_min = 0;
+        checkpoint.pos_max = 1;
+        checkpoint.data_tgt.assign(8, 9);
+        return value;
+    };
+    auto entry = make_checkpoint_entry();
+    server_prompt source = entry.front().prompt.clone();
+    const auto live_key = server_retention_instance_key::for_slot(slot_id);
+    (void) publish_live_retention(authority.retention, source, slot_id);
+    CHECK(authority.retention.clone_source_available(live_key));
+
+    // The physical checkpoint exists, but its optional lifecycle-sidecar
+    // publication does not. The old post-publication clone path poisoned the
+    // entire producer here and made every later host/checkpoint admission
+    // budget_unavailable.
+    const auto checkpoint_key = server_retention_instance_key::for_checkpoint(
+        slot_id, &source.checkpoints.front());
+    CHECK(!authority.retention.clone_source_available(checkpoint_key));
+    CHECK(!cache.retention_sources_available(source, slot_id));
+    server_prompt_cache::iterator published;
+    const auto serial_before = authority.ledger.snapshot().serial;
+    CHECK(!cache.publish(std::move(entry), &source, slot_id, &published));
+    CHECK(published == cache.states.end());
+    CHECK(cache.states.empty());
+    CHECK(authority.admission_commits == 0);
+    CHECK(authority.admission_refusals == 0);
+    CHECK(authority.ledger.snapshot().serial == serial_before);
+    CHECK(authority.retention.clone_source_available(live_key));
+
+    // Once the missing source record exists, the exact same compound save
+    // succeeds. This proves the refusal did not poison the sidecar or budget
+    // producer and did not consume the live source.
+    common_chat_msg_spans spans;
+    CHECK(authority.retention.publish(
+        checkpoint_key, common_retention_pool::attention, spans,
+        false, source.n_tokens(), source.checkpoints.front().n_tokens,
+        true, nullptr, nullptr, &live_key));
+    CHECK(authority.retention.clone_source_available(checkpoint_key));
+    CHECK(cache.retention_sources_available(source, slot_id));
+    auto retry = make_checkpoint_entry();
+    CHECK(cache.publish(std::move(retry), &source, slot_id, &published));
+    CHECK(published != cache.states.end());
+    CHECK(cache.states.size() == 1);
+    CHECK(authority.admission_commits == 1);
+    CHECK(authority.admission_refusals == 0);
+    cache.clear_accounting();
+    cache.states.clear();
+    authority.retention.retire_slot(slot_id);
+    CHECK(authority.ledger.snapshot().live_ops == 0);
+}
+
 void test_fixed_host_shadow_uses_exact_cross_lineage_prefix() {
     const auto run = [](const char * child_adapter) {
         server_retention_sidecar_store retention;
@@ -3312,22 +3379,34 @@ void test_exact_redundant_host_eviction() {
     cache.lease_obs = &authority.leases;
     cache.lease_execution_identity = &execution_identity;
 
-    server_prompt source;
-    source.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+    auto first = make_redundant_entry();
+    server_prompt source = first.front().prompt.clone();
     common_chat_msg_spans spans;
     spans.add(COMMON_CHAT_ROLE_USER, 0, 1);
     spans.add(COMMON_CHAT_ROLE_USER, 1, 1);
     spans.add(COMMON_CHAT_ROLE_USER, 2, 1);
+    const auto live_key = server_retention_instance_key::for_slot(0);
     CHECK(authority.retention.publish(
-        server_retention_instance_key::for_slot(0),
+        live_key,
         common_retention_pool::attention,
         spans,
         true,
         3,
         1,
         true));
+    CHECK(authority.retention.publish(
+        server_retention_instance_key::for_checkpoint(
+            0, &source.checkpoints.front()),
+        common_retention_pool::attention,
+        spans,
+        true,
+        3,
+        source.checkpoints.front().n_tokens,
+        true,
+        nullptr,
+        nullptr,
+        &live_key));
 
-    auto first = make_redundant_entry();
     CHECK(cache.publish(std::move(first), &source, 0));
     CHECK(cache.states.size() == 1);
     const auto live_ops_before = authority.ledger.snapshot().live_ops;
@@ -4286,6 +4365,7 @@ int main(int argc, char ** argv) {
     test_lifecycle_full_cache_rotates();
     test_fixed_host_pressure_shadow_records_counterfactual();
     test_fixed_host_shadow_uses_exact_cross_lineage_prefix();
+    test_host_save_missing_checkpoint_mirror_fails_locally();
     test_fixed_host_shadow_prefix_namespace_is_exact();
     test_fixed_host_shadow_rejects_partial_prefix_inventory();
     test_fixed_host_shadow_prefix_enable_failure_is_unavailable();

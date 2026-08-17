@@ -4845,6 +4845,26 @@ void server_prompt_cache::clear_accounting() {
     }
 }
 
+bool server_prompt_cache::retention_sources_available(
+        const server_prompt & source_prompt,
+        int32_t source_slot) const noexcept {
+    if (!retention_obs || source_slot < 0) {
+        return true;
+    }
+    if (!retention_obs->clone_source_available(
+            server_retention_instance_key::for_slot(source_slot))) {
+        return false;
+    }
+    for (const auto & checkpoint : source_prompt.checkpoints) {
+        if (!retention_obs->clone_source_available(
+                server_retention_instance_key::for_checkpoint(
+                    source_slot, &checkpoint))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool server_prompt_cache::publish(
         std::list<server_prompt_cache_state> entry,
         const server_prompt * source_prompt,
@@ -4855,6 +4875,22 @@ bool server_prompt_cache::publish(
     }
     if (entry.empty()) {
         return false;
+    }
+
+    // A host save is one compound payload: the host entry plus every copied
+    // checkpoint. Validate all lineage sources before the payload admission
+    // and allocation-free list splice below. A restored/trimmed ring can
+    // legitimately reach this seam with a checkpoint whose optional sidecar
+    // publication was refused; that makes this save a local soft miss, not a
+    // reason to poison the complete retention/accounting catalog. The bound
+    // is the configured checkpoint-ring size (default 32), and this runs only
+    // on the host-save path.
+    if (retention_obs && source_prompt && source_slot >= 0) {
+        if (source_prompt->checkpoints.size() !=
+                entry.front().prompt.checkpoints.size() ||
+            !retention_sources_available(*source_prompt, source_slot)) {
+            return false;
+        }
     }
 
     // F0b authority boundary: the detached entry is complete, but no shipped cache state has

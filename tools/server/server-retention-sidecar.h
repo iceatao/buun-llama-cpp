@@ -218,6 +218,11 @@ public:
     bool clone(
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept;
+    // Read-only half of clone() used to keep compound payload publication
+    // outside a partial sidecar transition. This performs bounded catalog
+    // lookups only; it neither allocates nor changes availability.
+    bool clone_source_available(
+        const server_retention_instance_key & source) const noexcept;
     // Divergent reuse credits the immutable source separately, then admits
     // the destination on probation without copied frequency or leases.
     bool branch(
@@ -358,6 +363,8 @@ private:
         common_retention_artifact_record && record,
         const server_cache_lease_identity * checkpoint_identity,
         const server_cache_lease_frontier * replacement_frontier) noexcept;
+    const catalog_entry * find_clone_source(
+        const server_retention_instance_key & source) const noexcept;
     void retire_catalog_entry(catalog_map::iterator entry) noexcept;
     bool retain_lineage(
         common_retention_pool pool,

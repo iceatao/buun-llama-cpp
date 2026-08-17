@@ -787,18 +787,6 @@ struct server_slot {
             return prompt_save_result::failed;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        // A zero-size declared state is never a valid snapshot [I10]: an empty target would publish
-        // an entry that "restores" as a 0 == 0 false success, and an empty draft alongside a valid
-        // target would restore target-only, leaving the two sides on different states. Require a
-        // non-empty target, and a non-empty draft whenever a draft context exists.
-        if (cur_size_tgt == 0 || (ctx_dft && cur_size_dft == 0)) {
-            SLT_WRN(*this, "prompt cache save skipped: zero-size state (target %zu, draft %zu)\n", cur_size_tgt, cur_size_dft);
-            return prompt_save_result::failed;
-        }
-
         // Everything below allocates (identity key, staged node, token/checkpoint clones). Any OOM
         // must degrade the save to `failed` (the caller keeps the live slot) rather than escape and
         // abort the server. stage() is already allocation-neutral internally; this catch also covers
@@ -813,6 +801,32 @@ struct server_slot {
             if (!refresh_exact &&
                 prompt_cache.contains(prompt.tokens, adapter_key)) {
                 return prompt_save_result::already_durable;
+            }
+
+            // Missing optional retention metadata is a local save miss. Check
+            // it before sizing, allocating, or writing what can be a multi-GiB
+            // host image; publish() repeats the check immediately before its
+            // first mutation.
+            if (!prompt_cache.retention_sources_available(prompt, id)) {
+                SLT_WRN(*this, "%s",
+                        "prompt cache save skipped: retention source incomplete\n");
+                return prompt_save_result::failed;
+            }
+
+            const size_t cur_size_tgt = llama_state_seq_get_size_ext(
+                ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t cur_size_dft = ctx_dft
+                ? llama_state_seq_get_size_ext(
+                    ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE)
+                : 0;
+
+            // A zero-size declared state is never a valid snapshot [I10]: an empty target would publish
+            // an entry that "restores" as a 0 == 0 false success, and an empty draft alongside a valid
+            // target would restore target-only, leaving the two sides on different states. Require a
+            // non-empty target, and a non-empty draft whenever a draft context exists.
+            if (cur_size_tgt == 0 || (ctx_dft && cur_size_dft == 0)) {
+                SLT_WRN(*this, "prompt cache save skipped: zero-size state (target %zu, draft %zu)\n", cur_size_tgt, cur_size_dft);
+                return prompt_save_result::failed;
             }
 
             const size_t cur_size = cur_size_tgt + cur_size_dft;

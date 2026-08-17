@@ -1235,32 +1235,17 @@ bool server_retention_sidecar_store::clone(
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept {
     try {
-        const auto assoc = associations.find(source);
-        if (assoc == associations.end()) {
+        const auto * item = find_clone_source(source);
+        if (!item) {
             retire(destination);
             mark_unavailable();
             return false;
         }
-        const auto item = catalog.find(assoc->second.v);
-        if (item == catalog.end()) {
-            retire(destination);
-            mark_unavailable();
-            return false;
-        }
-        const auto source_lineage = lineages.find(qualified_lineage_id(
-            item->second.record.stamp.pool,
-            item->second.record.stamp.lineage_id));
-        if (source_lineage == lineages.end() ||
-            !source_lineage->second.admitted) {
-            retire(destination);
-            mark_unavailable();
-            return false;
-        }
-        auto record = item->second.record;
+        auto record = item->record;
         server_cache_lease_identity checkpoint_identity;
         const server_cache_lease_identity * checkpoint_identity_ptr = nullptr;
-        if (item->second.checkpoint_identity_known) {
-            checkpoint_identity = item->second.checkpoint_identity;
+        if (item->checkpoint_identity_known) {
+            checkpoint_identity = item->checkpoint_identity;
             checkpoint_identity_ptr = &checkpoint_identity;
         }
         record.kind = destination.kind;
@@ -1281,6 +1266,32 @@ bool server_retention_sidecar_store::clone(
         mark_unavailable();
         return false;
     }
+}
+
+const server_retention_sidecar_store::catalog_entry *
+server_retention_sidecar_store::find_clone_source(
+        const server_retention_instance_key & source) const noexcept {
+    const auto assoc = associations.find(source);
+    if (assoc == associations.end()) {
+        return nullptr;
+    }
+    const auto item = catalog.find(assoc->second.v);
+    if (item == catalog.end()) {
+        return nullptr;
+    }
+    const auto source_lineage = lineages.find(qualified_lineage_id(
+        item->second.record.stamp.pool,
+        item->second.record.stamp.lineage_id));
+    if (source_lineage == lineages.end() ||
+        !source_lineage->second.admitted) {
+        return nullptr;
+    }
+    return &item->second;
+}
+
+bool server_retention_sidecar_store::clone_source_available(
+        const server_retention_instance_key & source) const noexcept {
+    return find_clone_source(source) != nullptr;
 }
 
 bool server_retention_sidecar_store::branch(

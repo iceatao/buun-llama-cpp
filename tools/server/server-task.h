@@ -1052,6 +1052,13 @@ struct server_prompt_cache {
     // publish() may also return false after removing only its just-spliced incoming node; every
     // previously retained hard-leased/recovery-pinned entry remains untouched.
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
+    // Allocation-free preflight for the live lineage records that a compound
+    // host save must mirror. The production save path calls this before
+    // allocating or writing its state image; publish() rechecks it at the
+    // mutation boundary.
+    bool retention_sources_available(
+            const server_prompt & source_prompt,
+            int32_t source_slot) const noexcept;
     bool publish(
             std::list<server_prompt_cache_state> entry,
             const server_prompt * source_prompt = nullptr,
