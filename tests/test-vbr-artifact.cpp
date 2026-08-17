@@ -2,6 +2,7 @@
 #include "llama-vbr-artifact-catalog.h"
 #include "server-cache-lease.h"
 #include "server-cache-vbr-proof.h"
+#include "server-prompt-cache-payload.h"
 #include "llama-vbr-artifact-stage.h"
 #include "llama-vbr-artifact-validate.h"
 #include "llama-sha256.h"
@@ -11,6 +12,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -2056,6 +2058,242 @@ static void test_catalog_package_lease_and_reference_placement() {
     }
 }
 
+static void test_prompt_cache_vbr_payload_fanout_lifetime() {
+    catalog_fixture f;
+    auto & package = f.package;
+    auto second = package.unit_blobs.front();
+    second.descriptor.logical_unit_id = 1;
+    second.unit_version_id = {};
+    second.payload_digest = {};
+    package.unit_blobs.push_back(second);
+    package.manifest.generation.controllers[0].units.push_back(
+        package.manifest.generation.controllers[0].units.front());
+    auto second_reference = package.manifest.unit_references.front();
+    second_reference.logical_unit_id = 1;
+    second_reference.unit_version_id = {};
+    second_reference.payload_digest = {};
+    package.manifest.unit_references.push_back(second_reference);
+    for (auto & row : package.manifest.accounting) {
+        if (row.role == vbr_artifact_accounting_role::unit_payload ||
+            row.role ==
+                vbr_artifact_accounting_role::clean_stash_payload) {
+            row.logical_bytes *= 2;
+            row.resident_bytes *= 2;
+        }
+    }
+    package.manifest.manifest_digest = {};
+    package.manifest.capture_generation_id = {};
+    package.manifest.consistency = {};
+    CHECK(f.catalog->configure_accounting(package));
+
+    vbr_capture_stream_status status;
+    auto build = f.catalog->begin_capture(
+        package, f.budget, {}, status);
+    CHECK(build);
+    if (!build) {
+        return;
+    }
+    const auto completions = f.completions();
+    for (size_t unit_index = 0; unit_index < 2; ++unit_index) {
+        auto unit = build->begin_unit(unit_index, status);
+        CHECK(unit);
+        if (!unit) {
+            return;
+        }
+        for (const auto & completion : completions) {
+            auto copy = completion;
+            copy.unit_index = unit_index;
+            CHECK(unit->accept_verified_segment(
+                      verified_segment(copy, uint8_t(2 + unit_index))) ==
+                  vbr_capture_stream_status::ok);
+        }
+        CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+    }
+    const auto streamed = build->publish_reference();
+    CHECK(streamed.status == vbr_capture_stream_status::ok);
+    CHECK(streamed.reference_artifact.v != 0);
+    build.reset();
+    const auto published_artifact = streamed.reference_artifact;
+
+    vbr_artifact_package_view view;
+    CHECK(f.catalog->resolve_reference(
+              published_artifact, view) ==
+          vbr_artifact_resolve_status::ok);
+
+    std::vector<vbr_artifact_allocation_view> rows;
+    rows.insert(rows.end(), view.reference_allocations().begin(),
+                view.reference_allocations().end());
+    for (const auto & unit : view.units()) {
+        rows.insert(rows.end(), unit.payload_allocations.begin(),
+                    unit.payload_allocations.end());
+        rows.insert(rows.end(), unit.stash_allocations.begin(),
+                    unit.stash_allocations.end());
+    }
+    uint64_t naive_logical = 0;
+    uint64_t naive_resident = 0;
+    for (const auto & row : rows) {
+        naive_logical += row.logical;
+        naive_resident += row.resident;
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+        return a.allocation.v < b.allocation.v;
+    });
+    uint64_t expected_logical = 0;
+    uint64_t expected_resident = 0;
+    size_t expected_allocations = 0;
+    uint64_t previous_allocation = 0;
+    for (const auto & row : rows) {
+        if (!row.allocation || row.allocation.v == previous_allocation) {
+            continue;
+        }
+        expected_logical += row.logical;
+        expected_resident += row.resident;
+        ++expected_allocations;
+        previous_allocation = row.allocation.v;
+    }
+    CHECK(expected_allocations == rows.size());
+    CHECK(expected_logical == naive_logical);
+    CHECK(expected_resident == naive_resident);
+
+    // Exercise the same production accounting kernel with a physical alias.
+    // Catalog references currently expose unique rows, while future composed
+    // variants may repeat one allocation. Naive per-view summation must not
+    // double-charge that backing allocation.
+    auto aliased_rows = rows;
+    const auto duplicate = std::find_if(
+        rows.begin(), rows.end(), [](const auto & row) {
+            return row.category ==
+                llama_cache_acct_category::clean_stash_payload;
+        });
+    CHECK(duplicate != rows.end());
+    if (duplicate != rows.end()) {
+        aliased_rows.push_back(*duplicate);
+    }
+    server_prompt_cache_vbr_accounting_summary aliased_summary;
+    CHECK(server_prompt_cache_summarize_vbr_allocations(
+        std::move(aliased_rows), aliased_summary));
+    CHECK(aliased_summary.allocation_count == expected_allocations);
+    CHECK(aliased_summary.logical_bytes == expected_logical);
+    CHECK(aliased_summary.resident_bytes == expected_resident);
+
+    if (duplicate != rows.end()) {
+        auto conflicting = *duplicate;
+        ++conflicting.resident;
+        server_prompt_cache_vbr_accounting_summary refused {
+            1, 1, 1,
+        };
+        CHECK(!server_prompt_cache_summarize_vbr_allocations(
+            { *duplicate, conflicting }, refused));
+        CHECK(refused.logical_bytes == 0);
+        CHECK(refused.resident_bytes == 0);
+        CHECK(refused.allocation_count == 0);
+
+        auto maximum = *duplicate;
+        auto one_more = *duplicate;
+        maximum.allocation.v = UINT64_MAX - 1;
+        maximum.logical = UINT64_MAX;
+        maximum.resident = UINT64_MAX;
+        one_more.allocation.v = UINT64_MAX;
+        one_more.logical = 1;
+        one_more.resident = 1;
+        refused = { 1, 1, 1 };
+        CHECK(!server_prompt_cache_summarize_vbr_allocations(
+            { maximum, one_more }, refused));
+        CHECK(refused.logical_bytes == 0);
+        CHECK(refused.resident_bytes == 0);
+        CHECK(refused.allocation_count == 0);
+    }
+
+    auto owner = server_prompt_cache_vbr_payload::adopt(std::move(view));
+    CHECK(owner);
+    if (!owner) {
+        return;
+    }
+    CHECK(!view);
+    CHECK(owner->reference_artifact() == published_artifact);
+    CHECK(owner->logical_bytes() == expected_logical);
+    CHECK(owner->resident_bytes() == expected_resident);
+    CHECK(owner->allocation_count() == expected_allocations);
+    CHECK(owner->package().units().size() == 2);
+
+    auto payload = server_prompt_cache_payload::from_vbr(owner);
+    CHECK(payload.kind() ==
+          server_prompt_cache_payload_kind::vbr_artifact);
+    CHECK(payload.valid());
+    CHECK(!payload.publishable());
+    CHECK(payload.size() == expected_resident);
+    CHECK(payload.vbr_artifact() == owner.get());
+
+    std::vector<server_prompt_cache_payload> aliases(8, payload);
+    for (const auto & alias : aliases) {
+        CHECK(alias.same_storage(payload));
+        CHECK(alias.vbr_artifact() == owner.get());
+    }
+
+    // Numeric artifact IDs are catalog-local. Independently retained owners
+    // must not become exact-redundancy evidence merely because each catalog
+    // issued its first reference.
+    catalog_fixture identity_a;
+    catalog_fixture identity_b;
+    const auto identity_a_published = identity_a.catalog->publish(
+        identity_a.package, identity_a.completions(), identity_a.budget);
+    const auto identity_b_published = identity_b.catalog->publish(
+        identity_b.package, identity_b.completions(), identity_b.budget);
+    CHECK(identity_a_published.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(identity_b_published.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(identity_a_published.reference_artifact ==
+          identity_b_published.reference_artifact);
+    vbr_artifact_package_view identity_a_view;
+    vbr_artifact_package_view identity_b_view;
+    CHECK(identity_a.catalog->resolve_reference(
+              identity_a_published.reference_artifact,
+              identity_a_view) == vbr_artifact_resolve_status::ok);
+    CHECK(identity_b.catalog->resolve_reference(
+              identity_b_published.reference_artifact,
+              identity_b_view) == vbr_artifact_resolve_status::ok);
+    auto identity_a_owner = server_prompt_cache_vbr_payload::adopt(
+        std::move(identity_a_view));
+    auto identity_b_owner = server_prompt_cache_vbr_payload::adopt(
+        std::move(identity_b_view));
+    CHECK(identity_a_owner && identity_b_owner);
+    auto identity_a_payload =
+        server_prompt_cache_payload::from_vbr(identity_a_owner);
+    auto identity_b_payload =
+        server_prompt_cache_payload::from_vbr(identity_b_owner);
+    CHECK(!identity_a_payload.same_storage(identity_b_payload));
+    identity_a_payload = {};
+    identity_b_payload = {};
+    identity_a_owner.reset();
+    identity_b_owner.reset();
+    CHECK(identity_a.catalog->retire(
+              identity_a_published.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(identity_b.catalog->retire(
+              identity_b_published.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+
+    const uint64_t live_ops = f.ledger.snapshot().live_ops;
+    owner.reset();
+    payload = {};
+    CHECK(f.catalog->retire(published_artifact) ==
+          vbr_artifact_retire_status::busy);
+    while (aliases.size() > 1) {
+        aliases.pop_back();
+        CHECK(f.catalog->retire(published_artifact) ==
+              vbr_artifact_retire_status::busy);
+        CHECK(f.ledger.snapshot().live_ops == live_ops);
+    }
+    aliases.clear();
+    CHECK(f.catalog->retire(published_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+
+    vbr_artifact_package_view empty;
+    CHECK(!server_prompt_cache_vbr_payload::adopt(std::move(empty)));
+}
+
 class validator_companion_image final : public vbr_parsed_companion_image {
 public:
     validator_companion_image(
@@ -2871,6 +3109,7 @@ int main() {
     test_catalog_full_id_interning_and_stash_dedup();
     test_catalog_capacity_sequential_and_temporaries();
     test_catalog_package_lease_and_reference_placement();
+    test_prompt_cache_vbr_payload_fanout_lifetime();
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
     if (failures != 0) {

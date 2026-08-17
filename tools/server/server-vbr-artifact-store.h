@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+class server_prompt_cache_vbr_payload;
+
 enum class server_vbr_artifact_capture_status : uint8_t {
     ok = 0,
     unsupported,
@@ -295,6 +297,16 @@ public:
         const std::string & reference,
         const std::string & tenant_key,
         vbr_artifact_package_view & package) noexcept;
+
+    // H1 host-cache adapter. Authorization is identical to explicit import;
+    // the catalog's sealed publication is the validation proof, so retaining
+    // the immutable capability performs no payload read or rehash. The
+    // returned shared owner holds one catalog borrow for all host aliases.
+    bool retain_host_payload(
+        const std::string & reference,
+        const std::string & tenant_key,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        noexcept;
 
     const server_vbr_artifact_store_counters & counters() const noexcept;
     uint32_t attention_children() const noexcept;

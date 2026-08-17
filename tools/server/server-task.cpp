@@ -1874,9 +1874,11 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
     try {
         staged.emplace_back();
         auto & entry = staged.back();
+        auto * fixed = entry.payload.fixed_state();
+        GGML_ASSERT(fixed != nullptr);
 
-        entry.payload.fixed.main.resize(state_size_tgt);
-        entry.payload.fixed.drft.resize(state_size_dft);
+        fixed->main.resize(state_size_tgt);
+        fixed->drft.resize(state_size_dft);
         entry.prompt.tokens      = prompt.tokens.clone();
         entry.prompt.checkpoints = prompt.checkpoints;
         entry.prompt.sequence_epoch = prompt.sequence_epoch;
@@ -1895,10 +1897,11 @@ bool server_prompt_cache::payload_bytes(
         uint64_t & checkpoint_bytes,
         uint64_t & accelerator_bytes) noexcept {
     snapshot_bytes = checkpoint_bytes = accelerator_bytes = 0;
-    if (!st.payload.fixed_state()) {
+    const auto * fixed = st.payload.fixed_state();
+    if (!fixed) {
         return false;
     }
-    snapshot_bytes    = uint64_t(st.payload.fixed.size());
+    snapshot_bytes    = uint64_t(fixed->size());
     const auto add_checked = [](uint64_t & acc, size_t value) {
         if (uint64_t(value) > std::numeric_limits<uint64_t>::max() - acc) {
             return false;
@@ -3798,10 +3801,7 @@ bool server_prompt_cache::exactly_redundant(
             victim.prompt.n_tokens() > survivor.prompt.n_tokens() ||
             victim.prompt.tokens.get_common_prefix(survivor.prompt.tokens) !=
                 size_t(victim.prompt.n_tokens()) ||
-            victim.payload.kind != survivor.payload.kind ||
-            !victim.payload.fixed_state() ||
-            victim.payload.fixed.main != survivor.payload.fixed.main ||
-            victim.payload.fixed.drft != survivor.payload.fixed.drft ||
+            !victim.payload.same_storage(survivor.payload) ||
             victim.prompt.checkpoints.size() !=
                 survivor.prompt.checkpoints.size()) {
             return false;
@@ -5373,9 +5373,11 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     // BOTH sides succeed. On any failure the source remains fully intact and
     // the caller resets both target sequences, never leaving a half-restore.
     {
-        const size_t size_tgt = it_best->payload.fixed.main.size();
+        const auto * fixed = it_best->payload.fixed_state();
+        GGML_ASSERT(fixed != nullptr);
+        const size_t size_tgt = fixed->main.size();
         size_t n_tgt = llama_state_seq_set_data_ext(
-            ctx_tgt, it_best->payload.fixed.main.data(), size_tgt,
+            ctx_tgt, fixed->main.data(), size_tgt,
             id_slot, 0);
         if (server_fault("load_fail")) { n_tgt = size_tgt > 0 ? size_tgt - 1 : 0; } // [P0 gate]
         if (n_tgt != size_tgt) {
@@ -5391,10 +5393,12 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         }
     }
 
-    if (ctx_dft && !it_best->payload.fixed.drft.empty()) {
-        const size_t size_dft = it_best->payload.fixed.drft.size();
+    const auto * fixed = it_best->payload.fixed_state();
+    GGML_ASSERT(fixed != nullptr);
+    if (ctx_dft && !fixed->drft.empty()) {
+        const size_t size_dft = fixed->drft.size();
         const size_t n_dft = llama_state_seq_set_data_ext(
-            ctx_dft, it_best->payload.fixed.drft.data(), size_dft,
+            ctx_dft, fixed->drft.data(), size_dft,
             id_slot, 0);
         if (n_dft != size_dft) {
             SRV_WRN("failed to restore draft state (%zu != %zu bytes)\n", n_dft, size_dft);

@@ -1,5 +1,7 @@
 #include "server-vbr-artifact-store.h"
 
+#include "server-prompt-cache-payload.h"
+
 #include "build-info.h"
 
 #include "../../src/llama-sha256.h"
@@ -1120,6 +1122,28 @@ bool server_vbr_artifact_store::resolve_control_reference(
         package.reset();
         return false;
     }
+}
+
+bool server_vbr_artifact_store::retain_host_payload(
+        const std::string & reference,
+        const std::string & tenant_key,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        noexcept {
+    payload.reset();
+    vbr_artifact_package_view package;
+    llama_cache_acct_artifact_id artifact;
+    // A catalog view can only name a package that passed the sealed
+    // publication transaction. Retaining that immutable capability must not
+    // re-read and rehash multi-GiB payloads; explicit import/control remains
+    // the boundary that performs read-time validation.
+    if (!impl_->references.authorize(reference, tenant_key, artifact) ||
+        impl_->catalog.resolve_reference(artifact, package) !=
+            vbr_artifact_resolve_status::ok ||
+        !package) {
+        return false;
+    }
+    payload = server_prompt_cache_vbr_payload::adopt(std::move(package));
+    return bool(payload);
 }
 
 const server_vbr_artifact_store_counters &

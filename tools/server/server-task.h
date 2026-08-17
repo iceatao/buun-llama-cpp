@@ -8,6 +8,7 @@
 #include "server-cache-lease.h"
 #include "server-cache-plan-preflight.h"
 #include "server-cache-control.h"
+#include "server-prompt-cache-payload.h"
 #include "server-retention-sidecar.h"
 
 #include <array>
@@ -776,43 +777,6 @@ struct server_prompt {
             checkpoints,
             sequence_epoch,
         };
-    }
-};
-
-struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
-
-    size_t size() const {
-        return main.size() + drft.size();
-    }
-};
-
-// H1 host-payload discriminator. The fixed state image remains the only
-// publishable backend in this slice; the VBR tag reserves the common logical
-// entry boundary without pretending that an unimplemented artifact is
-// restorable. Later H1 slices attach immutable/refcounted VBR storage here.
-enum class server_prompt_cache_payload_kind : uint8_t {
-    fixed_state = 0,
-    vbr_artifact,
-    _count,
-};
-
-struct server_prompt_cache_payload {
-    server_prompt_cache_payload_kind kind =
-        server_prompt_cache_payload_kind::fixed_state;
-    server_prompt_data fixed;
-
-    bool fixed_state() const noexcept {
-        return kind == server_prompt_cache_payload_kind::fixed_state;
-    }
-
-    bool publishable() const noexcept {
-        return fixed_state() && !fixed.main.empty();
-    }
-
-    size_t size() const noexcept {
-        return fixed_state() ? fixed.size() : 0;
     }
 };
 

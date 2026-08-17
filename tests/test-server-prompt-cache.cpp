@@ -74,7 +74,9 @@ std::list<server_prompt_cache_state> make_entry(
     std::list<server_prompt_cache_state> entry;
     entry.emplace_back();
     entry.front().adapter_config_key = identity;
-    entry.front().payload.fixed.main.resize(bytes);
+    auto * fixed = entry.front().payload.fixed_state();
+    CHECK(fixed != nullptr);
+    fixed->main.resize(bytes);
     return entry;
 }
 
@@ -227,7 +229,7 @@ void test_typed_host_payload_boundary() {
     prompt.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
     auto fixed = cache.stage(prompt, 16, 4, "typed-fixed");
     CHECK(fixed.size() == 1);
-    CHECK(fixed.front().payload.kind ==
+    CHECK(fixed.front().payload.kind() ==
           server_prompt_cache_payload_kind::fixed_state);
     CHECK(fixed.front().payload.publishable());
     CHECK(fixed.front().payload.size() == 20);
@@ -262,8 +264,8 @@ void test_typed_host_payload_boundary() {
     CHECK(authority.retention.export_bytes(sidecar_before));
     auto unsupported = make_prompt_entry("typed-vbr", { 9, 10, 11 });
     unsupported.front().prompt = source.clone();
-    unsupported.front().payload.kind =
-        server_prompt_cache_payload_kind::vbr_artifact;
+    unsupported.front().payload =
+        server_prompt_cache_payload::from_vbr({});
     uint64_t snapshot_bytes = 1;
     uint64_t checkpoint_bytes = 1;
     uint64_t accelerator_bytes = 1;
@@ -295,8 +297,8 @@ void test_typed_host_payload_boundary() {
     auto mixed = make_prompt_entry("typed-vbr", { 9, 10, 11 });
     mixed.front().prompt = source.clone();
     auto hidden_vbr = make_prompt_entry("typed-vbr", { 9, 10, 11 });
-    hidden_vbr.front().payload.kind =
-        server_prompt_cache_payload_kind::vbr_artifact;
+    hidden_vbr.front().payload =
+        server_prompt_cache_payload::from_vbr({});
     mixed.splice(mixed.end(), hidden_vbr);
     CHECK(!cache.publish(std::move(mixed), &source, source_slot, &published));
     CHECK(published == cache.states.end());
@@ -312,11 +314,11 @@ void test_typed_host_payload_boundary() {
     CHECK(sidecar_after_mixed == sidecar_before);
 
     auto fixed_peer = make_prompt_entry("typed-fixed", { 1, 2, 3 });
-    fixed_peer.front().payload.fixed.main.assign(16, 0);
-    fixed_peer.front().payload.fixed.drft.assign(4, 0);
+    fixed_peer.front().payload.fixed_state()->main.assign(16, 0);
+    fixed_peer.front().payload.fixed_state()->drft.assign(4, 0);
     auto vbr_peer = make_prompt_entry("typed-fixed", { 1, 2, 3 });
-    vbr_peer.front().payload.kind =
-        server_prompt_cache_payload_kind::vbr_artifact;
+    vbr_peer.front().payload =
+        server_prompt_cache_payload::from_vbr({});
     CHECK(server_prompt_cache::exactly_redundant(
         cache.states.front(), fixed_peer.front()));
     CHECK(!server_prompt_cache::exactly_redundant(
@@ -339,7 +341,7 @@ void test_host_save_missing_checkpoint_mirror_fails_locally() {
     constexpr int32_t slot_id = 2;
     const auto make_checkpoint_entry = []() {
         auto value = make_prompt_entry("same", { 1, 2, 3 });
-        value.front().payload.fixed.main.assign(16, 7);
+        value.front().payload.fixed_state()->main.assign(16, 7);
         value.front().prompt.checkpoints.emplace_back();
         auto & checkpoint = value.front().prompt.checkpoints.back();
         checkpoint.n_tokens = 2;
@@ -1001,8 +1003,8 @@ int retention_shadow_benchmark() {
 
 std::list<server_prompt_cache_state> make_redundant_entry() {
     auto entry = make_prompt_entry("same", { 1, 2, 3 });
-    entry.front().payload.fixed.main.assign(16, 7);
-    entry.front().payload.fixed.drft.assign(4, 8);
+    entry.front().payload.fixed_state()->main.assign(16, 7);
+    entry.front().payload.fixed_state()->drft.assign(4, 8);
     entry.front().prompt.checkpoints.emplace_back();
     auto & checkpoint = entry.front().prompt.checkpoints.back();
     checkpoint.n_tokens = 2;
@@ -1131,7 +1133,8 @@ server_prompt_cache::iterator install_host_trade_entry(
     next_token += 3;
     auto entry = make_prompt_entry(
         unique_adapter, { first, first + 1, first + 2 });
-    entry.front().payload.fixed.main.assign(bytes, uint8_t(next_token));
+    entry.front().payload.fixed_state()->main.assign(
+        bytes, uint8_t(next_token));
     CHECK(cache.publish(std::move(entry)));
     auto installed = std::prev(cache.states.end());
     common_chat_msg_spans spans;
@@ -1866,7 +1869,7 @@ void test_lifecycle_df2_reprojects_each_multi_victim_wave() {
             const server_retention_instance_key * lineage_source = nullptr) {
         auto entry = make_entry(adapter, 100);
         const uint8_t payload_tag = uint8_t(tokens.back());
-        entry.front().payload.fixed.main.assign(100, payload_tag);
+        entry.front().payload.fixed_state()->main.assign(100, payload_tag);
         entry.front().prompt.tokens = server_tokens(std::move(tokens), false);
         CHECK(cache.publish(std::move(entry)));
         auto installed = std::prev(cache.states.end());
@@ -2174,7 +2177,8 @@ void make_host_trade_pair(
         llama_tokens { token, token + 1, token + 2 }, false);
     victim->prompt.sequence_epoch = uint64_t(token);
     recovery->prompt.sequence_epoch = uint64_t(token);
-    victim->payload.fixed.main = recovery->payload.fixed.main;
+    victim->payload.fixed_state()->main =
+        recovery->payload.fixed_state()->main;
     victim->cache_plan_source_id = source_id;
     recovery->cache_plan_source_id = source_id + 100;
     victim->main_family = main_family;
@@ -2494,7 +2498,7 @@ void test_lifecycle_restore_retains_immutable_source() {
     server_prompt_cache_apply_family(
         entry.front(), declared_branch, true);
     entry.front().prompt.sequence_epoch = 17;
-    entry.front().payload.fixed.main.assign(32, 7);
+    entry.front().payload.fixed_state()->main.assign(32, 7);
     entry.front().prompt.checkpoints.emplace_back();
     entry.front().prompt.checkpoints.back().n_tokens = 2;
     entry.front().prompt.checkpoints.back().data_tgt.assign(8, 9);
@@ -3063,7 +3067,7 @@ void test_lifecycle_restore_batch_timing() {
     std::iota(prompt_tokens.begin(), prompt_tokens.end(), 1);
     entry.front().prompt.tokens = server_tokens(
         std::move(prompt_tokens), false);
-    entry.front().payload.fixed.main.assign(32, 7);
+    entry.front().payload.fixed_state()->main.assign(32, 7);
     for (int i = 0; i < 8; ++i) {
         entry.front().prompt.checkpoints.emplace_back();
         auto & checkpoint = entry.front().prompt.checkpoints.back();
@@ -3672,12 +3676,12 @@ void test_exact_redundant_host_eviction() {
 
 void test_redundancy_payload_mismatch_and_missing_catalog() {
     auto victim = make_prompt_entry("same", { 1, 2, 3 });
-    victim.front().payload.fixed.main.assign(4, 1);
+    victim.front().payload.fixed_state()->main.assign(4, 1);
     victim.front().prompt.checkpoints.emplace_back();
     victim.front().prompt.checkpoints.back().n_tokens = 2;
     victim.front().prompt.checkpoints.back().data_tgt.assign(2, 3);
     auto survivor = make_prompt_entry("same", { 1, 2, 3 });
-    survivor.front().payload.fixed.main.assign(4, 1);
+    survivor.front().payload.fixed_state()->main.assign(4, 1);
     survivor.front().prompt.checkpoints.emplace_back();
     survivor.front().prompt.checkpoints.back().n_tokens = 2;
     survivor.front().prompt.checkpoints.back().data_tgt.assign(2, 3);

@@ -29,6 +29,8 @@ add_library(${TARGET} STATIC
     server-cache-vbr-proof.h
     server-cache-yield.cpp
     server-cache-yield.h
+    server-prompt-cache-payload.cpp
+    server-prompt-cache-payload.h
     server-vbr-artifact-store.cpp
     server-vbr-artifact-store.h
     server-retention-sidecar.cpp

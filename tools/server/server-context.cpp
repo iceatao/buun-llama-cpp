@@ -848,9 +848,11 @@ struct server_slot {
             // provisional automatic-main claim. A declaration overrides both.
             server_prompt_cache_apply_family(
                 entry, cache_family, !task || !task->is_child());
+            auto * fixed = entry.payload.fixed_state();
+            GGML_ASSERT(fixed != nullptr);
 
             size_t n_tgt = llama_state_seq_get_data_ext(
-                ctx_tgt, entry.payload.fixed.main.data(), cur_size_tgt,
+                ctx_tgt, fixed->main.data(), cur_size_tgt,
                 id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (server_fault("save_short")) { n_tgt = cur_size_tgt > 0 ? cur_size_tgt - 1 : 0; } // [P0 gate]
             if (n_tgt != cur_size_tgt) {
@@ -860,7 +862,7 @@ struct server_slot {
 
             if (ctx_dft) {
                 const size_t n_dft = llama_state_seq_get_data_ext(
-                    ctx_dft, entry.payload.fixed.drft.data(), cur_size_dft,
+                    ctx_dft, fixed->drft.data(), cur_size_dft,
                     id, LLAMA_STATE_SEQ_FLAGS_NONE);
                 if (n_dft != cur_size_dft) {
                     SLT_WRN(*this, "prompt cache save aborted: draft state write %zu != %zu bytes\n", n_dft, cur_size_dft);

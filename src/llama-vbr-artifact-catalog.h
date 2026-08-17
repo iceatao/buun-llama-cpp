@@ -117,8 +117,11 @@ struct vbr_artifact_companion_view {
 
 class llama_vbr_artifact_catalog;
 
-// A catalog lease exposes only immutable restore inputs. The catalog is the
-// single owner and must outlive every view.
+// A catalog lease exposes only immutable restore inputs that passed the
+// catalog's sealed publication transaction. Resolving or retaining a view is
+// therefore an O(metadata) capability operation, not a request to re-read and
+// rehash its payload. Explicit import boundaries may still validate bytes.
+// The catalog is the single owner and must outlive every view.
 class vbr_artifact_package_view {
 public:
     vbr_artifact_package_view() = default;
