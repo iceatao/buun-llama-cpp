@@ -64,6 +64,67 @@ struct server_retention_shadow_projection {
     std::vector<server_retention_shadow_alternative> alternatives;
 };
 
+// Allocation-free lowering used by live VBR fallback/reclaim. The caller owns a bounded
+// candidate array and supplies exact physical cells that would disappear with each sequence.
+// Preparation sorts that array once per pressure wave; every subsequent victim projection is
+// a linear scan over the immutable grouping. Eligibility is already the intersection of the
+// caller's hard strata (processing/incoming/pins/leases/speculative capability); ineligible
+// entries still contribute retained prefix coverage.
+struct server_live_retention_candidate {
+    int32_t slot_id = -1;
+    llama_cache_acct_artifact_id artifact_id;
+    common_retention_stamp stamp;
+    common_retention_lineage_record lineage;
+    uint64_t external_shared_coverage_tokens = 0;
+    uint64_t marginal_cells = 0;
+    bool present = true;
+    bool eligible = false;
+};
+
+struct server_live_retention_projection {
+    bool complete = false;
+    uint64_t candidate_count = 0;
+    int32_t slot_id = -1;
+    llama_cache_acct_artifact_id artifact_id;
+    common_retention_pool pool = common_retention_pool::attention;
+    uint64_t lineage_id = 0;
+    uint64_t lost_work_tokens = 0;
+    uint64_t marginal_cells = 0;
+};
+
+struct server_retention_singleton_quote {
+    uint64_t lost_work_units = 0;
+    common_retention_shadow_value value;
+};
+
+// Shared fixed-host/live-VBR policy kernel. Inventory owners separately derive the maximum and
+// second surviving frontiers, but this is the only owner of singleton lost-work and value math.
+bool server_retention_quote_singleton(
+    const common_retention_stamp & stamp,
+    const common_retention_lineage_record & lineage,
+    uint64_t maximum_coverage,
+    uint64_t second_coverage,
+    uint32_t maximum_count,
+    uint64_t external_shared_coverage,
+    uint64_t marginal_resource,
+    uint64_t competition_epoch,
+    const common_retention_frequency_config & config,
+    server_retention_singleton_quote & out) noexcept;
+
+// Prepare immutable identity/group order once per reclaim wave. Between projections the caller
+// may only refresh present/eligible/external coverage/marginal cells. A removed slot becomes
+// present=false; it no longer contributes retained coverage.
+bool server_live_retention_prepare(
+    server_live_retention_candidate * candidates,
+    size_t size,
+    uint64_t competition_epoch) noexcept;
+
+server_live_retention_projection server_live_retention_project_prepared(
+    const server_live_retention_candidate * candidates,
+    size_t size,
+    uint64_t competition_epoch,
+    const common_retention_frequency_config & config = {}) noexcept;
+
 struct server_cache_yield_result {
     server_cache_yield_status status =
         server_cache_yield_status::unavailable;

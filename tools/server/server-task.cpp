@@ -3667,34 +3667,28 @@ host_trade_df2_projection project_host_trade_df2(
         auto * lineage = find_lineage(
             row->stamp.pool, row->stamp.lineage_id);
         GGML_ASSERT(lineage != nullptr);
-        uint64_t retained = row->external_shared_coverage_tokens;
-        retained = std::max(
-            retained,
-            row->stamp.coverage_tokens == lineage->maximum_coverage &&
-                    lineage->maximum_count == 1
-                ? lineage->second_coverage : lineage->maximum_coverage);
-        const uint64_t lost_work = row->stamp.coverage_tokens > retained
-            ? row->stamp.coverage_tokens - retained : 0;
-        common_retention_shadow_value quote;
-        if (!common_retention_shadow_quote(
-                row->lineage, competition_epoch,
-                lost_work, row->resource, row->stamp.recency_ordinal,
-                {}, quote)) {
+        server_retention_singleton_quote quote;
+        if (!server_retention_quote_singleton(
+                row->stamp, row->lineage,
+                lineage->maximum_coverage, lineage->second_coverage,
+                lineage->maximum_count,
+                row->external_shared_coverage_tokens,
+                row->resource, competition_epoch, {}, quote)) {
             return {};
         }
         const int comparison = have_best
-            ? common_retention_shadow_compare(quote, best) : -1;
+            ? common_retention_shadow_compare(quote.value, best) : -1;
         if (!have_best || comparison < 0 || (comparison == 0 &&
                 std::tie(row->stamp.pool, row->stamp.lineage_id,
                          row->artifact_id.v) <
                 std::tie(result.pool, result.lineage_id,
                          result.artifact.v))) {
             have_best = true;
-            best = quote;
+            best = quote.value;
             result.artifact = row->artifact_id;
             result.lineage_id = row->stamp.lineage_id;
             result.pool = row->stamp.pool;
-            result.lost_work = lost_work;
+            result.lost_work = quote.lost_work_units;
             result.resource = row->resource;
         }
     }
@@ -4176,30 +4170,22 @@ void server_prompt_cache::observe_retention_pressure_choice(
             if (!begin[i].releasable) {
                 continue;
             }
-            const uint64_t coverage = begin[i].stamp.coverage_tokens;
-            if (begin[i].external_shared_coverage_tokens > coverage) {
-                unavailable();
-                return;
-            }
-            const uint64_t retained = std::max(
-                second, begin[i].external_shared_coverage_tokens);
-            const uint64_t lost_work =
-                coverage == maximum && n_maximum == 1
-                    ? coverage - retained : 0;
-            common_retention_shadow_value quote;
-            if (!common_retention_shadow_quote(
-                    begin[i].lineage, event.competition_epoch,
-                    lost_work, begin[i].resource,
-                    begin[i].stamp.recency_ordinal, {}, quote)) {
+            server_retention_singleton_quote quote;
+            if (!server_retention_quote_singleton(
+                    begin[i].stamp, begin[i].lineage,
+                    maximum, second, uint32_t(n_maximum),
+                    begin[i].external_shared_coverage_tokens,
+                    begin[i].resource, event.competition_epoch,
+                    {}, quote)) {
                 unavailable();
                 return;
             }
             const bool lower = !have_proposed ||
                 common_retention_shadow_compare(
-                    quote, proposed_value) < 0;
+                    quote.value, proposed_value) < 0;
             const bool tied = have_proposed &&
                 common_retention_shadow_compare(
-                    quote, proposed_value) == 0;
+                    quote.value, proposed_value) == 0;
             if (lower || (tied &&
                     std::tie(begin[i].stamp.pool,
                              begin[i].stamp.lineage_id,
@@ -4208,11 +4194,11 @@ void server_prompt_cache::observe_retention_pressure_choice(
                              event.proposed_lineage,
                              event.proposed_artifact.v))) {
                 have_proposed = true;
-                proposed_value = quote;
+                proposed_value = quote.value;
                 event.proposed_artifact = begin[i].artifact_id;
                 event.proposed_lineage = begin[i].stamp.lineage_id;
                 event.proposed_pool = begin[i].stamp.pool;
-                event.proposed_lost_work = lost_work;
+                event.proposed_lost_work = quote.lost_work_units;
                 event.proposed_resource = begin[i].resource;
             }
         }

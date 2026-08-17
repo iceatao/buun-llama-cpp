@@ -51,6 +51,191 @@ static server_cache_yield_candidate candidate(
     return out;
 }
 
+static server_live_retention_candidate live_candidate(
+        int32_t slot,
+        uint64_t artifact,
+        uint64_t lineage,
+        uint64_t coverage,
+        uint64_t recency,
+        uint64_t cells,
+        bool eligible = true) {
+    server_live_retention_candidate out;
+    out.slot_id = slot;
+    out.artifact_id = { artifact };
+    out.stamp.state = common_retention_score_state::known;
+    out.stamp.pool = common_retention_pool::attention;
+    out.stamp.stable_id = artifact;
+    out.stamp.lineage_id = lineage;
+    out.stamp.recency_ordinal = recency;
+    out.stamp.coverage_tokens = coverage;
+    out.lineage.pool = common_retention_pool::attention;
+    out.lineage.lineage_id = lineage;
+    out.lineage.admission_epoch = 1;
+    out.lineage.frequency_epoch = 1;
+    out.marginal_cells = cells;
+    out.eligible = eligible;
+    return out;
+}
+
+static void test_live_retention_projection() {
+    constexpr uint64_t epoch = 10;
+    auto hot = live_candidate(0, 10, 10, 100, 1, 100);
+    hot.lineage.state = common_retention_frequency_state::promoted;
+    hot.lineage.reuse_hits = 4;
+    hot.lineage.frequency_q = 4*COMMON_RETENTION_FREQUENCY_ONE;
+    hot.lineage.frequency_epoch = epoch;
+    hot.lineage.last_credit_epoch = epoch;
+    auto cold = live_candidate(1, 20, 20, 100, 2, 100);
+    std::vector<server_live_retention_candidate> candidates = { hot, cold };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    auto projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.candidate_count == 2);
+    CHECK(projected.slot_id == 1);
+    CHECK(projected.artifact_id.v == 20);
+    CHECK(projected.lost_work_tokens == 100);
+    CHECK(projected.marginal_cells == 100);
+
+    // Victim removal changes the next choice through a linear re-projection of the prepared
+    // inventory; no identity/group re-sort is required between victims in one pressure wave.
+    for (auto & candidate : candidates) {
+        if (candidate.artifact_id == projected.artifact_id) {
+            candidate.present = false;
+        }
+    }
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.candidate_count == 1);
+    CHECK(projected.slot_id == 0);
+    CHECK(projected.artifact_id.v == 10);
+
+    // With identical reuse/work, the entry that releases more physical cells has lower value
+    // density and is the lawful pressure victim.
+    auto small = live_candidate(14, 110, 110, 100, 13, 10);
+    auto large = live_candidate(15, 111, 111, 100, 13, 100);
+    candidates = { small, large };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.slot_id == 15);
+    CHECK(projected.artifact_id.v == 111);
+    CHECK(projected.marginal_cells == 100);
+
+    // An ineligible shorter alias still retains its lineage's shared prefix. Only the unique
+    // 2-token tail disappears with the longer physical owner.
+    auto longer = live_candidate(2, 30, 30, 82, 4, 200);
+    auto shorter = live_candidate(3, 31, 30, 80, 3, 0, false);
+    shorter.lineage = longer.lineage;
+    candidates = { longer, shorter };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.candidate_count == 1);
+    CHECK(projected.slot_id == 2);
+    CHECK(projected.lost_work_tokens == 2);
+    CHECK(projected.marginal_cells == 200);
+
+    auto external = live_candidate(6, 60, 60, 100, 6, 100);
+    external.external_shared_coverage_tokens = 80;
+    candidates = { external };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.lost_work_tokens == 20);
+
+    auto same_lineage = live_candidate(7, 61, 60, 70, 5, 0, false);
+    same_lineage.lineage = external.lineage;
+    candidates = { same_lineage, external };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.artifact_id.v == 60);
+    CHECK(projected.lost_work_tokens == 20);
+
+    auto equal_a = live_candidate(8, 70, 70, 100, 7, 100);
+    auto equal_b = live_candidate(9, 71, 70, 100, 8, 0, false);
+    equal_b.lineage = equal_a.lineage;
+    candidates = { equal_a, equal_b };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.lost_work_tokens == 0);
+
+    // Physical aliases have zero exclusive release and cannot make a pressure wave progress.
+    auto shared = live_candidate(4, 40, 40, 100, 5, 0);
+    candidates = { shared };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(!projected.complete);
+    CHECK(projected.candidate_count == 0);
+
+    auto duplicate_slot = live_candidate(10, 80, 80, 10, 9, 10);
+    auto duplicate_slot_other = live_candidate(10, 81, 81, 10, 10, 10);
+    candidates = { duplicate_slot, duplicate_slot_other };
+    CHECK(!server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+
+    auto duplicate_artifact = live_candidate(16, 120, 120, 10, 10, 10);
+    auto duplicate_artifact_other = live_candidate(17, 120, 121, 10, 11, 10);
+    candidates = { duplicate_artifact, duplicate_artifact_other };
+    CHECK(!server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+
+    auto tie_high = live_candidate(12, 91, 91, 10, 11, 10);
+    auto tie_low  = live_candidate(11, 90, 90, 10, 11, 10);
+    candidates = { tie_high, tie_low };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.artifact_id.v == 90);
+    candidates = { tie_low, tie_high };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(projected.complete);
+    CHECK(projected.artifact_id.v == 90);
+
+    auto overflow = live_candidate(
+        13, 100, 100, UINT64_MAX, 12, 1);
+    overflow.lineage.state = common_retention_frequency_state::promoted;
+    overflow.lineage.reuse_hits = 2;
+    overflow.lineage.frequency_q = 16*COMMON_RETENTION_FREQUENCY_ONE;
+    overflow.lineage.frequency_epoch = epoch;
+    overflow.lineage.last_credit_epoch = epoch;
+    candidates = { overflow };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    projected = server_live_retention_project_prepared(
+        candidates.data(), candidates.size(), epoch);
+    CHECK(!projected.complete);
+
+    // Impossible cross-lineage prefix evidence invalidates the entire projection, including
+    // when that provider is retained rather than eligible for removal.
+    auto invalid = live_candidate(5, 50, 50, 10, 6, 0, false);
+    invalid.external_shared_coverage_tokens = 11;
+    candidates = { cold, invalid };
+    CHECK(!server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+}
+
 // Rebuild yield candidates from a decoded sidecar snapshot (op == stable_id, the
 // way the fixtures mint them) so encode->decode->replay reproduction can be checked.
 static std::vector<server_cache_yield_candidate> resume_candidates(
@@ -883,6 +1068,7 @@ static void test_exception_isolation() {
 }
 
 int main() {
+    test_live_retention_projection();
     test_atomic_assembler_contract();
     test_status_names();
     test_lineage_shadow_projection();
