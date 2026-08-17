@@ -65,8 +65,9 @@ public:
     double kv_bpv() const override { return mem_attn->kv_bpv(); }
 
     // recurrent state has no VBR controller and clears with rm-all; the attn cache answers
-    llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override {
-        return mem_attn->memory_vbr_state(seq_id, n_tokens_extra);
+    llama_memory_vbr_state_data_v2 memory_vbr_state_v2(
+            llama_seq_id seq_id, uint32_t n_tokens_extra) const override {
+        return mem_attn->memory_vbr_state_v2(seq_id, n_tokens_extra);
     }
 
     bool vbr_operation_armed() const override {

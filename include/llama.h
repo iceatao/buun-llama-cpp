@@ -918,6 +918,18 @@ extern "C" {
     LLAMA_API struct llama_memory_vbr_state_data llama_memory_vbr_state(
             llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra);
 
+    // Versioned extension of llama_memory_vbr_state_data. The original by-value result must not
+    // grow: doing so would overwrite the return buffer of already-built callers. [EXPERIMENTAL]
+    struct llama_memory_vbr_state_data_v2 {
+        struct llama_memory_vbr_state_data state;
+        uint32_t used_cells_exclusive; // physical cells owned only by seq_id (0 for seq_id < 0)
+                                       // and therefore freed by removing that sequence. Shared
+                                       // aliases are deliberately excluded.
+    };
+
+    LLAMA_API struct llama_memory_vbr_state_data_v2 llama_memory_vbr_state_v2(
+            llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra);
+
     // Dynamic-VBR scoped retier freeze. This suspends representation mutations only; ordinary
     // memory bookkeeping and decode remain live. The outermost exit arms a fresh controller
     // evaluation at the next safe decode/idle boundary. begin returns an opaque process-local

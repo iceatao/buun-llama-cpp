@@ -223,7 +223,8 @@ public:
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
 
-    llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
+    llama_memory_vbr_state_data_v2 memory_vbr_state_v2(
+            llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
     bool vbr_operation_armed() const override;
     // C4 boundary service: true while this cache's tracker is latched unavailable or its pool
     // has unresolved recovery-ring work. The update context reports an update NEEDED in this

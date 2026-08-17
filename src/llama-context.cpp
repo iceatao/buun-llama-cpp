@@ -7948,7 +7948,16 @@ struct llama_memory_vbr_state_data llama_memory_vbr_state(llama_memory_t mem, ll
         return {};
     }
 
-    return mem->memory_vbr_state(seq_id, n_tokens_extra);
+    return mem->memory_vbr_state_v2(seq_id, n_tokens_extra).state;
+}
+
+struct llama_memory_vbr_state_data_v2 llama_memory_vbr_state_v2(
+        llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra) {
+    if (!mem) {
+        return {};
+    }
+
+    return mem->memory_vbr_state_v2(seq_id, n_tokens_extra);
 }
 
 uint64_t llama_memory_vbr_retier_freeze_begin(

@@ -1742,7 +1742,7 @@ int main(int argc, char ** argv) {
     cparams.n_ctx                  = 128;
     cparams.n_batch                = 32;
     cparams.n_ubatch               = 32;
-    cparams.n_seq_max              = 1;
+    cparams.n_seq_max              = 2;
     cparams.n_threads              = 2;
     cparams.n_threads_batch        = 2;
     cparams.type_k                 = GGML_TYPE_F16;
@@ -1782,7 +1782,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const auto initial = llama_memory_vbr_state(mem, 0, 0);
+    const auto initial_v2 = llama_memory_vbr_state_v2(mem, 0, 0);
+    const auto & initial = initial_v2.state;
+    if (initial_v2.used_cells_exclusive != 0) {
+        fprintf(stderr, "PRECONDITION failed: empty VBR cache reported exclusive cells\n");
+        return 1;
+    }
     if (initial.cursor != 0) {
         fprintf(stderr, "PRECONDITION failed: initial VBR cursor was not zero\n");
         return 1;
@@ -1803,7 +1808,25 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "PRECONDITION failed: seed decode failed\n");
         return 1;
     }
-    const auto seeded = llama_memory_vbr_state(mem, 0, 0);
+    const auto seeded_v2 = llama_memory_vbr_state_v2(mem, 0, 0);
+    const auto & seeded = seeded_v2.state;
+    if (seeded_v2.used_cells_exclusive == 0 || seeded.used_cells_other != 0) {
+        fprintf(stderr, "exclusive VBR cell ownership did not match the seeded sequence\n");
+        return 1;
+    }
+    const auto seeded_base = base->memory_vbr_state_v2(0, 0);
+    const auto seeded_swa  = swa ->memory_vbr_state_v2(0, 0);
+    if (seeded_v2.used_cells_exclusive !=
+            seeded_base.used_cells_exclusive + seeded_swa.used_cells_exclusive) {
+        fprintf(stderr, "iSWA exclusive VBR cell ownership did not equal its physical children\n");
+        return 1;
+    }
+    const auto seeded_all = llama_memory_vbr_state_v2(mem, -1, 0);
+    if (seeded_all.used_cells_exclusive != 0 ||
+        seeded_all.state.used_cells_other != seeded_v2.used_cells_exclusive) {
+        fprintf(stderr, "all-sequence VBR occupancy did not match exclusive seeded ownership\n");
+        return 1;
+    }
     if (seeded.cursor != initial.cursor) {
         fprintf(stderr, "PRECONDITION failed: seed decode consumed the VBR degrade ladder\n");
         return 1;
@@ -2154,6 +2177,40 @@ int main(int argc, char ** argv) {
     if (normal_final.retier_reconciles !=
         before_freeze.retier_reconciles + 1) {
         fprintf(stderr, "ordinary phase changed the reconcile count after reconciliation\n");
+        return 1;
+    }
+
+    const auto exclusive_before_alias = llama_memory_vbr_state_v2(mem, 0, 0);
+    if (exclusive_before_alias.used_cells_exclusive == 0 ||
+        exclusive_before_alias.state.used_cells_other != 0) {
+        fprintf(stderr, "PRECONDITION failed: alias test had no exclusively owned VBR cells\n");
+        return 1;
+    }
+    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+    const auto shared_for_0 = llama_memory_vbr_state_v2(mem, 0, 0);
+    const auto shared_for_1 = llama_memory_vbr_state_v2(mem, 1, 0);
+    if (shared_for_0.used_cells_exclusive != 0 ||
+        shared_for_1.used_cells_exclusive != 0 ||
+        shared_for_0.state.used_cells_other != exclusive_before_alias.used_cells_exclusive ||
+        shared_for_1.state.used_cells_other != exclusive_before_alias.used_cells_exclusive) {
+        fprintf(stderr, "shared VBR cells were incorrectly counted as exclusively reclaimable\n");
+        return 1;
+    }
+    if (!llama_memory_seq_rm(mem, 0, -1, -1)) {
+        fprintf(stderr, "alias test could not remove the first sequence membership\n");
+        return 1;
+    }
+    const auto exclusive_for_1 = llama_memory_vbr_state_v2(mem, 1, 0);
+    if (exclusive_for_1.used_cells_exclusive != exclusive_before_alias.used_cells_exclusive ||
+        exclusive_for_1.state.used_cells_other != 0) {
+        fprintf(stderr, "last alias did not inherit exact exclusive VBR cell ownership\n");
+        return 1;
+    }
+    const bool removed_last_alias = llama_memory_seq_rm(mem, 1, -1, -1);
+    const auto empty_after_alias = llama_memory_vbr_state_v2(mem, -1, 0);
+    if (!removed_last_alias || empty_after_alias.state.used_cells_other != 0 ||
+        empty_after_alias.used_cells_exclusive != 0) {
+        fprintf(stderr, "exclusive VBR cell ownership did not match final physical reclamation\n");
         return 1;
     }
 

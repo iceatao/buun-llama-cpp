@@ -7675,8 +7675,10 @@ double llama_kv_cache::kv_bpv() const {
     return vals > 0.0 ? bits / vals : -1.0;
 }
 
-llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
-    llama_memory_vbr_state_data st = {};
+llama_memory_vbr_state_data_v2 llama_kv_cache::memory_vbr_state_v2(
+        llama_seq_id seq_id, uint32_t n_tokens_extra) const {
+    llama_memory_vbr_state_data_v2 result = {};
+    auto & st = result.state;
     st.representation_epoch = vbr_representation_epoch();
     st.checkpoint_epoch     = vbr_checkpoint_epoch();
     st.retier_freeze_depth       = other ? other->vbr_retier_freeze_depth_       : vbr_retier_freeze_depth_;
@@ -7688,8 +7690,10 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
 
     // full-reset feasibility: used cells the asking seq does not exclusively own. Cells above
     // used_max_p1 are empty by definition, so the scan is bounded by live occupancy.
+    uint32_t used_cells = 0;
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
+        used_cells += cells.get_used();
         const uint32_t top = cells.used_max_p1();
         for (uint32_t i = 0; i < top; ++i) {
             if (cells.is_empty(i)) {
@@ -7700,9 +7704,10 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
             }
         }
     }
+    result.used_cells_exclusive = used_cells - st.used_cells_other;
 
     if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
-        return st; // no controller: zeros besides the occupancy count
+        return result; // no controller: zeros besides the occupancy counts
     }
     st.cursor = (int32_t) vbr_degrade_cursor_;
 
@@ -7723,7 +7728,7 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
         deficit_clamped = std::max(deficit_clamped, pool_proj[pi] - (int64_t) vbr_budget_eff(p));
     }
     if (deficit_raw == INT64_MIN) {
-        return st; // no VMM pools — controller effectively inert
+        return result; // no VMM pools — controller effectively inert
     }
     st.deficit_raw     = deficit_raw;
     st.deficit_clamped = deficit_clamped;
@@ -7775,7 +7780,7 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     }
     st.bpv_if_degraded = sum_vals > 0 ? sum_bits / (double) sum_vals : 0.0;
 
-    return st;
+    return result;
 }
 
 bool llama_kv_cache::vbr_operation_armed() const {

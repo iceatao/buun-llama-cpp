@@ -507,33 +507,39 @@ double llama_kv_cache_iswa::kv_bpv() const {
     return vals > 0.0 ? bits / vals : -1.0;
 }
 
-llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
-    const llama_memory_vbr_state_data b = kv_base->memory_vbr_state(seq_id, n_tokens_extra);
-    const llama_memory_vbr_state_data s = kv_swa ->memory_vbr_state(seq_id, n_tokens_extra);
+llama_memory_vbr_state_data_v2 llama_kv_cache_iswa::memory_vbr_state_v2(
+        llama_seq_id seq_id, uint32_t n_tokens_extra) const {
+    const llama_memory_vbr_state_data_v2 b = kv_base->memory_vbr_state_v2(seq_id, n_tokens_extra);
+    const llama_memory_vbr_state_data_v2 s = kv_swa ->memory_vbr_state_v2(seq_id, n_tokens_extra);
+    const auto & bs = b.state;
+    const auto & ss = s.state;
 
-    llama_memory_vbr_state_data r = {};
+    llama_memory_vbr_state_data_v2 r = {};
+    auto & rs = r.state;
     // each child runs an independent controller with its own budget share: either one over
     // budget means degrades happen, so pressure combines as max, exactly like the trigger
-    r.deficit_raw      = std::max(b.deficit_raw,     s.deficit_raw);
-    r.deficit_clamped  = std::max(b.deficit_clamped, s.deficit_clamped);
-    r.cursor           = b.cursor + s.cursor;
-    r.used_cells_other = b.used_cells_other + s.used_cells_other;
+    rs.deficit_raw      = std::max(bs.deficit_raw,     ss.deficit_raw);
+    rs.deficit_clamped  = std::max(bs.deficit_clamped, ss.deficit_clamped);
+    rs.cursor           = bs.cursor + ss.cursor;
+    rs.used_cells_other = bs.used_cells_other + ss.used_cells_other;
+    r.used_cells_exclusive =
+        b.used_cells_exclusive + s.used_cells_exclusive;
     // Representation epochs are identities, not quantities: preserve the ordered child tuple.
     // Addition would make (base + 1, swa) collide with (base, swa + 1).
-    r.representation_epoch     = b.representation_epoch;
-    r.representation_epoch_swa = s.representation_epoch;
-    r.checkpoint_epoch         = b.checkpoint_epoch;
-    r.checkpoint_epoch_swa     = s.checkpoint_epoch;
+    rs.representation_epoch     = bs.representation_epoch;
+    rs.representation_epoch_swa = ss.representation_epoch;
+    rs.checkpoint_epoch         = bs.checkpoint_epoch;
+    rs.checkpoint_epoch_swa     = ss.checkpoint_epoch;
     // Scoped entry/exit is parent-coordinated, so depth and scope counts agree whenever both
     // children are active. max also handles a model whose base or SWA side has no VBR layers.
-    r.retier_freeze_depth  = std::max(b.retier_freeze_depth, s.retier_freeze_depth);
-    r.retier_env_freeze    = std::max(b.retier_env_freeze,   s.retier_env_freeze);
-    r.retier_freeze_enters = std::max(b.retier_freeze_enters, s.retier_freeze_enters);
-    r.retier_freeze_exits  = std::max(b.retier_freeze_exits,  s.retier_freeze_exits);
-    r.retier_reconciles    = std::max(b.retier_reconciles,    s.retier_reconciles);
+    rs.retier_freeze_depth  = std::max(bs.retier_freeze_depth, ss.retier_freeze_depth);
+    rs.retier_env_freeze    = std::max(bs.retier_env_freeze,   ss.retier_env_freeze);
+    rs.retier_freeze_enters = std::max(bs.retier_freeze_enters, ss.retier_freeze_enters);
+    rs.retier_freeze_exits  = std::max(bs.retier_freeze_exits,  ss.retier_freeze_exits);
+    rs.retier_reconciles    = std::max(bs.retier_reconciles,    ss.retier_reconciles);
     // Decisions are per-controller (base and SWA may see different pressure), so preserve both.
-    r.retier_deferred_decisions =
-        b.retier_deferred_decisions + s.retier_deferred_decisions;
+    rs.retier_deferred_decisions =
+        bs.retier_deferred_decisions + ss.retier_deferred_decisions;
 
     // value-weighted like kv_bpv: weight each child's landing bpv by its total KV values
     double bits_base = 0.0, vals_base = 0.0;
@@ -541,8 +547,8 @@ llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id s
     kv_base->kv_bpv_accum(bits_base, vals_base);
     kv_swa ->kv_bpv_accum(bits_swa,  vals_swa);
     const double vals_sum = vals_base + vals_swa;
-    r.bpv_if_degraded = vals_sum > 0.0
-        ? (b.bpv_if_degraded * vals_base + s.bpv_if_degraded * vals_swa) / vals_sum
+    rs.bpv_if_degraded = vals_sum > 0.0
+        ? (bs.bpv_if_degraded * vals_base + ss.bpv_if_degraded * vals_swa) / vals_sum
         : 0.0;
     return r;
 }
