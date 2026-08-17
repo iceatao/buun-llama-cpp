@@ -1409,6 +1409,35 @@ void test_lifecycle_df2_rollout_and_reuse_thresholds() {
         SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS));
 }
 
+void test_slot_prompt_admission_boundaries() {
+    using result = server_slot_prompt_admission;
+
+    CHECK(server_slot_prompt_admission_check(
+        true, 65535, 2048, 65536) == result::accepted);
+    CHECK(server_slot_prompt_admission_check(
+        true, 65536, 2048, 65536) == result::context_too_large);
+    CHECK(server_slot_prompt_admission_check(
+        true, 66201, 2048, 65536) == result::context_too_large);
+
+    CHECK(server_slot_prompt_admission_check(
+        false, 2048, 2048, 65536) == result::accepted);
+    CHECK(server_slot_prompt_admission_check(
+        false, 2049, 2048, 65536) == result::batch_too_large);
+    CHECK(server_slot_prompt_admission_check(
+        false, 65536, 65536, 65536) == result::accepted);
+    CHECK(server_slot_prompt_admission_check(
+        false, 65537, 65537, 65536) == result::context_too_large);
+
+    const auto preserved = server_rejected_prompt_preservation_for_test();
+    CHECK(preserved.rejected);
+    CHECK(preserved.error_geometry_valid);
+    CHECK(preserved.prompt_preserved);
+    CHECK(preserved.checkpoints_preserved);
+    CHECK(preserved.retention_preserved);
+    CHECK(preserved.oversized_child_rejected);
+    CHECK(preserved.selection_skipped);
+}
+
 void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
     server_cache_authority authority;
     const std::string execution = "lifecycle-prefix-failure";
@@ -4378,6 +4407,7 @@ int main(int argc, char ** argv) {
     test_lifecycle_shadow_retains_live_alias_coverage();
     test_lifecycle_df2_token_pressure_uses_tokens();
     test_lifecycle_df2_rollout_and_reuse_thresholds();
+    test_slot_prompt_admission_boundaries();
     test_lifecycle_shadow_prefix_failure_does_not_change_authority();
     test_lifecycle_df2_capacity_executes_decayed_fallback();
     test_lifecycle_df2_accounting_fault_falls_back_to_fifo();

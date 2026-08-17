@@ -33,6 +33,19 @@ server_cache_family_slot_round_trip_for_test(
         server_cache_control_token binding_token,
         server_cache_control_token second_binding_token = {});
 
+struct server_rejected_prompt_preservation_result {
+    bool rejected = false;
+    bool prompt_preserved = false;
+    bool checkpoints_preserved = false;
+    bool retention_preserved = false;
+    bool error_geometry_valid = false;
+    bool oversized_child_rejected = false;
+    bool selection_skipped = false;
+};
+
+server_rejected_prompt_preservation_result
+server_rejected_prompt_preservation_for_test();
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;

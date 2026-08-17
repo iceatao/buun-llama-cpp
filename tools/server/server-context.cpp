@@ -2357,6 +2357,8 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend server_rejected_prompt_preservation_result
+        server_rejected_prompt_preservation_for_test();
 
 public:
     // only use these pointers outside of this class:
@@ -3947,6 +3949,17 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+
+    struct slot_prompt_admission_geometry {
+        bool can_split = true;
+        int32_t n_ubatch = 0;
+    };
+
+    // Deterministic model-free door for the rejected-launch regression. No
+    // production caller installs an override.
+    const slot_prompt_admission_geometry * prompt_admission_geometry_for_test =
+        nullptr;
+    uint64_t prompt_selection_calls_for_test = 0;
 
     // MTP↔mmproj GPU swap state
     bool mmproj_gpu_swap = false;
@@ -7512,6 +7525,9 @@ private:
     }
 
     server_slot * get_available_slot(const server_task & task) {
+        if (prompt_admission_geometry_for_test) {
+            prompt_selection_calls_for_test++;
+        }
         auto stage1 = cache_plan_select_before_mutation(
             task, cache_plan_authority.get(), false);
         server_slot * ret = stage1.target;
@@ -7936,7 +7952,190 @@ private:
         return output;
     }
 
+    void prepare_prompt_tokens_for_launch(
+            const server_slot & slot,
+            server_task & task) {
+        if (task.prompt_tokens_prepared) {
+            return;
+        }
+
+        if (slot.diff_self_spec && task.tokens.size() > 0) {
+            // Work at the token level to avoid detokenize→retokenize roundtrip issues.
+            llama_tokens toks(task.tokens.get_tokens());
+            const llama_token think_open  = slot.diff_think_open_id;
+            const llama_token think_close = slot.diff_think_close_id;
+            auto nl_vec = common_tokenize(vocab, "\n", false, false);
+            const llama_token nl_tok = nl_vec.empty() ? LLAMA_TOKEN_NULL : nl_vec[0];
+
+            // Strip ALL closed <think>...</think> blocks (compact or newlined).
+            // The Jinja template injects them into every assistant message but they
+            // cause verbatim repetition in multi-turn. We re-add the correct form at the end.
+            if (think_open != LLAMA_TOKEN_NULL && think_close != LLAMA_TOKEN_NULL) {
+                llama_tokens fixed;
+                fixed.reserve(toks.size());
+                for (size_t ti = 0; ti < toks.size(); ti++) {
+                    if (toks[ti] == think_open) {
+                        size_t end = ti + 1;
+                        if (end < toks.size() && nl_tok != LLAMA_TOKEN_NULL && toks[end] == nl_tok) end++;
+                        if (end < toks.size() && toks[end] == think_close) {
+                            end++;
+                            if (end < toks.size() && nl_tok != LLAMA_TOKEN_NULL && toks[end] == nl_tok) end++;
+                            ti = end - 1;
+                            continue;
+                        }
+                    }
+                    fixed.push_back(toks[ti]);
+                }
+                toks = std::move(fixed);
+            }
+
+            // Truncate looped content from previous assistant responses in history.
+            // Once a response loops, the contaminated text poisons all future turns.
+            {
+                const llama_token im_start = 10, im_end = 11;
+                const llama_token tok_ass = 1503, tok_ist = 19464;
+
+                std::vector<std::pair<int, int>> asst_ranges;
+                for (int i = 0; i + 3 < (int) toks.size(); i++) {
+                    if (toks[i] == im_start && toks[i + 1] == tok_ass && toks[i + 2] == tok_ist) {
+                        int content_start = i + 4;
+                        if (content_start >= (int) toks.size()) break;
+                        int end_pos = content_start;
+                        while (end_pos < (int) toks.size() && toks[end_pos] != im_end) end_pos++;
+                        if (end_pos < (int) toks.size()) {
+                            asst_ranges.push_back({content_start, end_pos});
+                        }
+                    }
+                }
+
+                int total_removed = 0;
+                for (auto it = asst_ranges.rbegin(); it != asst_ranges.rend(); ++it) {
+                    auto [cs, ep] = *it;
+                    int len = ep - cs;
+                    if (len < 16) continue;
+
+                    int truncate_at = -1;
+                    for (int pos = cs + 16; pos <= ep; pos++) {
+                        int n = pos - cs;
+                        for (int period = 4; period <= std::min(32, n/2); period++) {
+                            bool match = true;
+                            for (int j = 0; j < period; j++) {
+                                if (toks[pos - 1 - j] != toks[pos - 1 - j - period]) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) {
+                                truncate_at = pos - 2 * period;
+                                goto found_loop;
+                            }
+                        }
+                    }
+                    found_loop:
+                    if (truncate_at > cs && truncate_at < ep) {
+                        int remove_count = ep - truncate_at;
+                        toks.erase(toks.begin() + truncate_at, toks.begin() + ep);
+                        total_removed += remove_count;
+                    }
+                }
+                if (total_removed > 0) {
+                    SLT_INF(slot, "diff: stripped %d looped tokens from %d assistant blocks in prompt\n",
+                            total_removed, (int) asst_ranges.size());
+                }
+            }
+
+            // Strip trailing open <think> not followed by </think>.
+            {
+                int think_pos = -1;
+                for (int ti = (int) toks.size() - 1; ti >= 0; ti--) {
+                    if (toks[ti] == think_open) { think_pos = ti; break; }
+                }
+                if (think_pos >= 0) {
+                    bool has_close = false;
+                    for (int ti = think_pos + 1; ti < (int) toks.size(); ti++) {
+                        if (toks[ti] == think_close) { has_close = true; break; }
+                    }
+                    if (!has_close) {
+                        toks.resize(think_pos);
+                    }
+                }
+            }
+
+            // Ensure prompt ends with <think>\n</think>\n.
+            {
+                int n = (int) toks.size();
+                bool has_think_block = (n >= 4 && nl_tok != LLAMA_TOKEN_NULL &&
+                    toks[n - 4] == think_open && toks[n - 3] == nl_tok &&
+                    toks[n - 2] == think_close && toks[n - 1] == nl_tok);
+                if (!has_think_block && nl_tok != LLAMA_TOKEN_NULL) {
+                    toks.push_back(think_open);
+                    toks.push_back(nl_tok);
+                    toks.push_back(think_close);
+                    toks.push_back(nl_tok);
+                }
+            }
+
+            task.tokens = server_tokens(toks, task.tokens.has_mtmd);
+        }
+
+        task.prompt_tokens_prepared = true;
+    }
+
+    bool admit_task_for_slot(
+            const server_slot & slot,
+            server_task & task) {
+        const int32_t n_ubatch = prompt_admission_geometry_for_test
+            ? prompt_admission_geometry_for_test->n_ubatch
+            : llama_n_ubatch(ctx_tgt);
+        const bool can_split = prompt_admission_geometry_for_test
+            ? prompt_admission_geometry_for_test->can_split
+            : (!task.need_embd() ||
+               (llama_get_memory(ctx_tgt) &&
+                llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST));
+        switch (server_slot_prompt_admission_check(
+                can_split, task.tokens.size(), n_ubatch, slot.n_ctx)) {
+            case server_slot_prompt_admission::batch_too_large:
+                send_error(
+                    task,
+                    string_format(
+                        "input (%d tokens) is too large to process. increase the physical batch "
+                        "size (current batch size: %d)",
+                        task.n_tokens(), n_ubatch),
+                    ERROR_TYPE_SERVER);
+                return false;
+            case server_slot_prompt_admission::context_too_large:
+                if (!can_split) {
+                    send_error(
+                        task.id,
+                        string_format(
+                            "input (%d tokens) is larger than the max context size (%d tokens). skipping",
+                            task.n_tokens(), slot.n_ctx),
+                        ERROR_TYPE_EXCEED_CONTEXT_SIZE,
+                        task.n_tokens(), slot.n_ctx);
+                } else {
+                    send_error(
+                        task.id,
+                        string_format(
+                            "request (%d tokens) exceeds the available context size (%d tokens), try increasing it",
+                            task.n_tokens(), slot.n_ctx),
+                        ERROR_TYPE_EXCEED_CONTEXT_SIZE,
+                        task.n_tokens(), slot.n_ctx);
+                }
+                return false;
+            case server_slot_prompt_admission::accepted:
+                return true;
+        }
+        GGML_ABORT("invalid slot prompt admission");
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // Defensive backstop for any future caller which does not pass through
+        // process_single_task's group-wide preselection admission.
+        prepare_prompt_tokens_for_launch(slot, task);
+        if (!admit_task_for_slot(slot, task)) {
+            return false;
+        }
+
         common_cache_family_binding incoming_family;
         if (server_cache_family_resolve_for_launch(
                 cache_control_authority.get(),
@@ -8064,126 +8263,6 @@ private:
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
         } else {
             slot.smpl.reset();
-        }
-
-        if (slot.diff_self_spec && task.tokens.size() > 0) {
-            // Work at the token level to avoid detokenize→retokenize roundtrip issues.
-            llama_tokens toks(task.tokens.get_tokens());
-            const llama_token think_open  = slot.diff_think_open_id;
-            const llama_token think_close = slot.diff_think_close_id;
-            auto nl_vec = common_tokenize(vocab, "\n", false, false);
-            const llama_token nl_tok = nl_vec.empty() ? LLAMA_TOKEN_NULL : nl_vec[0];
-
-            // Strip ALL closed <think>...</think> blocks (compact or newlined).
-            // The Jinja template injects them into every assistant message but they
-            // cause verbatim repetition in multi-turn. We re-add the correct form at the end.
-            if (think_open != LLAMA_TOKEN_NULL && think_close != LLAMA_TOKEN_NULL) {
-                llama_tokens fixed;
-                fixed.reserve(toks.size());
-                for (size_t ti = 0; ti < toks.size(); ti++) {
-                    if (toks[ti] == think_open) {
-                        size_t end = ti + 1;
-                        if (end < toks.size() && nl_tok != LLAMA_TOKEN_NULL && toks[end] == nl_tok) end++;
-                        if (end < toks.size() && toks[end] == think_close) {
-                            end++;
-                            if (end < toks.size() && nl_tok != LLAMA_TOKEN_NULL && toks[end] == nl_tok) end++;
-                            ti = end - 1; // skip the entire closed think block
-                            continue;
-                        }
-                    }
-                    fixed.push_back(toks[ti]);
-                }
-                toks = std::move(fixed);
-            }
-
-            // Truncate looped content from previous assistant responses in history.
-            // Once a response loops, the contaminated text poisons all future turns.
-            {
-                const llama_token im_start = 10, im_end = 11;
-                const llama_token tok_ass = 1503, tok_ist = 19464;
-
-                // Find all completed assistant blocks (not the final generation block)
-                std::vector<std::pair<int,int>> asst_ranges; // (content_start, im_end_pos)
-                for (int i = 0; i + 3 < (int)toks.size(); i++) {
-                    if (toks[i] == im_start && toks[i+1] == tok_ass && toks[i+2] == tok_ist) {
-                        int content_start = i + 4; // skip: im_start, ass, istant, \n
-                        if (content_start >= (int)toks.size()) break;
-                        int end_pos = content_start;
-                        while (end_pos < (int)toks.size() && toks[end_pos] != im_end) end_pos++;
-                        if (end_pos < (int)toks.size()) { // only completed blocks (have im_end)
-                            asst_ranges.push_back({content_start, end_pos});
-                        }
-                    }
-                }
-
-                int total_removed = 0;
-                for (auto it = asst_ranges.rbegin(); it != asst_ranges.rend(); ++it) {
-                    auto [cs, ep] = *it;
-                    int len = ep - cs;
-                    if (len < 16) continue;
-
-                    int truncate_at = -1;
-                    for (int pos = cs + 16; pos <= ep; pos++) {
-                        int n = pos - cs;
-                        for (int period = 4; period <= std::min(32, n/2); period++) {
-                            bool match = true;
-                            for (int j = 0; j < period; j++) {
-                                if (toks[pos - 1 - j] != toks[pos - 1 - j - period]) {
-                                    match = false;
-                                    break;
-                                }
-                            }
-                            if (match) {
-                                truncate_at = pos - 2 * period;
-                                goto found_loop;
-                            }
-                        }
-                    }
-                    found_loop:
-                    if (truncate_at > cs && truncate_at < ep) {
-                        int remove_count = ep - truncate_at;
-                        toks.erase(toks.begin() + truncate_at, toks.begin() + ep);
-                        total_removed += remove_count;
-                    }
-                }
-                if (total_removed > 0) {
-                    SLT_INF(slot, "diff: stripped %d looped tokens from %d assistant blocks in prompt\n",
-                            total_removed, (int)asst_ranges.size());
-                }
-            }
-
-            // Strip trailing open <think> not followed by </think>
-            {
-                int think_pos = -1;
-                for (int ti = (int)toks.size() - 1; ti >= 0; ti--) {
-                    if (toks[ti] == think_open) { think_pos = ti; break; }
-                }
-                if (think_pos >= 0) {
-                    bool has_close = false;
-                    for (int ti = think_pos + 1; ti < (int)toks.size(); ti++) {
-                        if (toks[ti] == think_close) { has_close = true; break; }
-                    }
-                    if (!has_close) {
-                        toks.resize(think_pos);
-                    }
-                }
-            }
-
-            // Ensure prompt ends with <think>\n</think>\n
-            {
-                int n = (int)toks.size();
-                bool has_think_block = (n >= 4 && nl_tok != LLAMA_TOKEN_NULL &&
-                    toks[n-4] == think_open && toks[n-3] == nl_tok &&
-                    toks[n-2] == think_close && toks[n-1] == nl_tok);
-                if (!has_think_block && nl_tok != LLAMA_TOKEN_NULL) {
-                    toks.push_back(think_open);
-                    toks.push_back(nl_tok);
-                    toks.push_back(think_close);
-                    toks.push_back(nl_tok);
-                }
-            }
-
-            task.tokens = server_tokens(toks, task.tokens.has_mtmd);
         }
 
         // The binding follows retained immutable content. Only a full-prefix
@@ -9153,6 +9232,29 @@ private:
                         if (!tokenize_cli_input(task)) {
                             break;
                         }
+                    }
+
+                    // Establish final prompt geometry before slot selection can
+                    // save, restore, retarget, or reclaim any cached state.
+                    // Validate the entire parallel-sampling group before the
+                    // first child is launched, so a rejected sibling cannot
+                    // leave another slot partially committed.
+                    GGML_ASSERT(!slots.empty());
+                    const auto prepare_and_admit = [&](server_task & candidate) {
+                        prepare_prompt_tokens_for_launch(
+                            slots.front(), candidate);
+                        return admit_task_for_slot(
+                            slots.front(), candidate);
+                    };
+                    bool group_admitted = prepare_and_admit(task);
+                    for (auto & child : task.child_tasks) {
+                        if (!group_admitted || !prepare_and_admit(child)) {
+                            group_admitted = false;
+                            break;
+                        }
+                    }
+                    if (!group_admitted) {
+                        break;
                     }
 
                     const int id_task = task.id;
@@ -10804,39 +10906,7 @@ private:
                             return;
                         }
 
-                        if (!slot.can_split()) {
-                            if (slot.task->n_tokens() > n_ubatch) {
-                                send_error(slot,
-                                           string_format(
-                                               "input (%d tokens) is too large to process. increase the physical batch "
-                                               "size (current batch size: %d)",
-                                               slot.task->n_tokens(), n_ubatch),
-                                           ERROR_TYPE_SERVER);
-                                slot.release();
-                                return;
-                            }
-
-                            if (slot.task->n_tokens() > slot.n_ctx) {
-                                send_error(
-                                    slot,
-                                    string_format(
-                                        "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
-                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                                slot.release();
-                                return;
-                            }
-                        } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
-                                send_error(slot,
-                                           string_format("request (%d tokens) exceeds the available context size (%d "
-                                                         "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
-                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                                slot.release();
-                                return;
-                            }
-
+                        if (slot.can_split()) {
                             // Gate-5 edit-regime observation. Capture the logical
                             // branch point before checkpoint restore or VBR policy
                             // can rewind the physical frontier. The raw token LCP
@@ -13605,6 +13675,91 @@ private:
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
 };
+
+server_rejected_prompt_preservation_result
+server_rejected_prompt_preservation_for_test() {
+    server_rejected_prompt_preservation_result result;
+    server_context_impl context;
+    context.sleeping = true;
+
+    server_retention_sidecar_store retention;
+    context.slots.emplace_back();
+    auto & slot = context.slots.front();
+    slot.id = 0;
+    slot.n_ctx = 8;
+    slot.prompt.tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4, 5, 6 }, false);
+    slot.prompt.sequence_epoch = 1;
+    slot.prompt.checkpoints.emplace_back();
+    slot.prompt.checkpoints.back().n_tokens = 4;
+    slot.retention_obs = &retention;
+
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, 6);
+    const auto live_key = server_retention_instance_key::for_slot(slot.id);
+    const auto checkpoint_key = server_retention_instance_key::for_checkpoint(
+        slot.id, &slot.prompt.checkpoints.front());
+    if (!retention.publish(
+            live_key, common_retention_pool::attention, spans,
+            true, 6, 6, true) ||
+        !retention.publish(
+            checkpoint_key, common_retention_pool::attention, spans,
+            true, 6, 4, true, nullptr, nullptr, &live_key)) {
+        return result;
+    }
+    const auto live_artifact = retention.artifact_id(live_key);
+    const auto checkpoint_artifact = retention.artifact_id(checkpoint_key);
+
+    const llama_tokens prompt_before = slot.prompt.tokens.get_tokens();
+    const size_t checkpoints_before = slot.prompt.checkpoints.size();
+    const server_context_impl::slot_prompt_admission_geometry geometry {
+        true, 4,
+    };
+    context.prompt_admission_geometry_for_test = &geometry;
+
+    server_task task(SERVER_TASK_TYPE_COMPLETION);
+    task.id = 77;
+    task.tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4, 5, 6, 7, 8, 9 }, false);
+    context.queue_results.add_waiting_task_id(task.id);
+    context.process_single_task(std::move(task));
+
+    auto response = context.queue_results.recv(77);
+    const auto * error = dynamic_cast<const server_task_result_error *>(
+        response.get());
+    result.rejected = error &&
+        error->err_type == ERROR_TYPE_EXCEED_CONTEXT_SIZE;
+    result.error_geometry_valid = error &&
+        error->n_prompt_tokens == 9 && error->n_ctx == 8;
+
+    server_task parent(SERVER_TASK_TYPE_COMPLETION);
+    parent.id = 78;
+    parent.tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4, 5, 6, 7 }, false);
+    parent.add_child(parent.id, 79);
+    parent.child_tasks.front().tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4, 5, 6, 7, 8 }, false);
+    context.queue_results.add_waiting_task_id(79);
+    context.process_single_task(std::move(parent));
+    auto child_response = context.queue_results.recv(79);
+    const auto * child_error =
+        dynamic_cast<const server_task_result_error *>(child_response.get());
+    result.oversized_child_rejected = child_error &&
+        child_error->err_type == ERROR_TYPE_EXCEED_CONTEXT_SIZE &&
+        child_error->n_prompt_tokens == 8 && child_error->n_ctx == 8;
+    result.selection_skipped =
+        context.prompt_selection_calls_for_test == 0;
+
+    result.prompt_preserved =
+        slot.prompt.tokens.get_tokens() == prompt_before;
+    result.checkpoints_preserved =
+        slot.prompt.checkpoints.size() == checkpoints_before &&
+        slot.prompt.checkpoints.front().n_tokens == 4;
+    result.retention_preserved =
+        retention.artifact_id(live_key) == live_artifact &&
+        retention.artifact_id(checkpoint_key) == checkpoint_artifact;
+    return result;
+}
 
 //
 // server_context (public API)
