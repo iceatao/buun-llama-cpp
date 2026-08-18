@@ -4870,6 +4870,12 @@ private:
 
         const std::string & mmproj_path = params_base.mmproj.path;
 
+        if (params_base.vbr_dynamic() && params_base.fit_params_vbr_growth_headroom_bytes == 0 &&
+            !params_base.fit_params_target.empty()) {
+            params_base.fit_params_vbr_growth_headroom_bytes = *std::max_element(
+                    params_base.fit_params_target.begin(), params_base.fit_params_target.end());
+        }
+
         // measure mmproj memory for auto-fit (upstream #21489)
         // Only reserve mmproj space when auto-fit is actively selecting context size.
         // When -c is explicit, the fitter doesn't run so there's no need to reserve.
@@ -5058,15 +5064,83 @@ private:
             }
         }
 
-        // When mmproj GPU swap is active, run the fitter before n_parallel doubling.  The MTP
-        // context and GPU mmproj are never resident together: the image path destroys MTP before
-        // loading mmproj, then unloads mmproj before recreating MTP.  Reserve the ordinary margin
-        // plus the larger of those two phase-local consumers, not their sum.  Native MTP is sized
-        // from the fitted context, so solve the resulting dependency to a fixed point.
-        //
-        // The doubled n_parallel used for speculative rollback would also make the dry target
-        // context carry decode-only recurrent backup cells during this prefill-oriented solve.
+        // Always enable kv_unified for single-slot servers — simplifies CUDA graph topology,
+        // giving ~28% faster prompt eval even without speculative decoding.
+        if (n_parallel_user == 1 && !params_base.kv_unified) {
+            params_base.kv_unified = true;
+            SRV_INF("%s", "auto-enabled kv-unified: single-slot server doesn't need separate KV stream\n");
+        }
+
+        // A target needs one backup sequence per user slot only when speculative decoding is
+        // active and rollback cannot use recurrent-state planes. RS-plane contexts carry their
+        // rollback snapshots inside each user sequence; doubling n_seq_max there allocates a
+        // second, unused copy of every recurrent plane (several GiB on hybrid Qwen models).
+        const bool speculative_target_active =
+            params_base.speculative.has_dft() ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+            params_base.speculative.has_model_free_type();
+        bool target_uses_rs_plane = false;
+        if (speculative_target_active && params_base.speculative.need_n_rs_seq() > 0) {
+            try {
+                auto mparams_probe = common_model_params_to_llama(params_base);
+                target_uses_rs_plane = common_model_uses_recurrent_memory(
+                        params_base.model.path.c_str(), &mparams_probe,
+                        params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            } catch (const std::exception & e) {
+                // Preserve the established backup-sequence path if the lightweight probe fails.
+                SRV_WRN("could not inspect target rollback memory; reserving backup sequences: %s\n", e.what());
+            }
+        }
+
+        n_seq_max_full = n_parallel_user;
+        if (speculative_target_active && !target_uses_rs_plane) {
+            params_base.n_parallel = n_parallel_user * 2;
+            n_seq_max_full = params_base.n_parallel;
+            recurrent_expansion.state = server_recurrent_expansion_state::contracted;
+
+            // The backup sequences double n_seq_max. Without unified KV each sequence gets its
+            // own n_ctx / n_seq_max stream, so the doubling silently HALVES every slot's usable
+            // context on top of the user's n_parallel division (-np 2 + MTP -> n_ctx/4 per
+            // slot). Unified KV shares one full-length cell pool across sequences instead —
+            // same auto-enable precedent as the single-slot case above.
+            if (!params_base.kv_unified) {
+                params_base.kv_unified = true;
+                SRV_INF("%s", "auto-enabled kv-unified: speculative decoding doubles n_seq_max, "
+                        "which would halve the per-slot context with per-sequence KV streams\n");
+            }
+
+        } else if (target_uses_rs_plane) {
+            SRV_DBG("speculative target uses recurrent rollback planes; n_seq_max remains %d\n",
+                    n_parallel_user);
+        }
+
+        if (speculative_target_active) {
+            // Keep the output cap synchronized with the target's resolved sequence geometry.
+            params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+            // The fork DFlash drafter verifies a full block (up to block_size tokens, typ. 16,
+            // plus ddtree branches) against the TARGET per step, so the target's output_reserve
+            // peaks well above n_seq_max. But common_speculative_n_max is 0 for the fork DFlash
+            // type and block_size isn't known until the draft model loads (which happens after
+            // this target context is created), so server_n_outputs_max undercounts here.
+            // Reserve a generous per-sequence output budget as a floor. The cap only bounds
+            // output_reserve's lazily-grown buffers and is clamped to n_batch — the same
+            // ceiling a non-speculative context gets by default — so it costs nothing until
+            // a batch actually requests that many outputs.
+            constexpr int32_t DFLASH_VERIFY_OUTPUTS_PER_SEQ = 32; // ~2x block_size headroom
+            const int32_t dflash_verify_floor = std::min<int32_t>(
+                (int32_t) params_base.n_batch, (int32_t) n_seq_max_full * DFLASH_VERIFY_OUTPUTS_PER_SEQ);
+            params_base.n_outputs_max = std::max<int32_t>(params_base.n_outputs_max, dflash_verify_floor);
+        }
+
+        // When mmproj GPU swap is active, solve the target using its real speculative sequence
+        // geometry. The MTP context and GPU mmproj are never resident together: the image path
+        // destroys MTP before loading mmproj, then unloads mmproj before recreating MTP. Reserve
+        // the ordinary margin plus the larger of those two phase-local consumers, not their sum.
+        // Native MTP is sized from the fitted context, so solve the resulting dependency to a
+        // fixed point.
         const bool has_mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+        bool swap_fit_solved = false;
         if (params_base.mmproj_gpu_swap && has_mtp && has_mmproj
                 && params_base.fit_params && params_base.n_ctx == 0) {
             std::vector<size_t> margins_base = params_base.fit_params_target;
@@ -5125,22 +5199,26 @@ private:
                                      uint32_t                  & n_ctx_fit,
                                      size_t                    & total_mtp) {
                 std::vector<size_t> margins_work = margins;
-                auto mparams_fit = common_model_params_to_llama(params_base);
-                auto cparams_fit = common_context_params_to_llama(params_base);
+                common_params params_fit = params_base;
+                auto mparams_fit = common_model_params_to_llama(params_fit);
+                auto cparams_fit = common_context_params_to_llama(params_fit);
 
                 const auto fit_status = common_fit_params(
-                        params_base.model.path.c_str(), &mparams_fit, &cparams_fit,
-                        params_base.tensor_split,
-                        params_base.tensor_buft_overrides.data(),
-                        &params_base.moe_cache,
+                        params_fit.model.path.c_str(), &mparams_fit, &cparams_fit,
+                        params_fit.tensor_split,
+                        params_fit.tensor_buft_overrides.data(),
+                        &params_fit.moe_cache,
                         margins_work.data(),
-                        params_base.fit_params_min_ctx,
-                        params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-                if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams_fit.n_ctx == 0) {
+                        params_fit.fit_params_min_ctx,
+                        params_fit.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
                     return false;
                 }
+                // n_ctx stays 0 when the fit needed no changes: the model default fits as-is.
+                // 0 also means "default" to the memory measurement below; resolve it to the
+                // trained context (hp_nct) afterwards so the caller gets a concrete value.
 
-                common_params params_mtp = params_base;
+                common_params params_mtp = params_fit;
                 params_mtp.n_parallel = n_parallel_user;
                 params_mtp.n_ctx = cparams_fit.n_ctx;
                 params_mtp.cache_type_k = params_base.speculative.draft.cache_type_k;
@@ -5176,7 +5254,7 @@ private:
                 for (size_t i = 0; i < margins_needed.size(); ++i) {
                     margins_needed[i] += std::max(mtp_by_device[i], mmproj_by_device[i]);
                 }
-                n_ctx_fit = cparams_fit.n_ctx;
+                n_ctx_fit = cparams_fit.n_ctx != 0 ? cparams_fit.n_ctx : hp_nct_mtp;
                 return true;
             };
 
@@ -5249,7 +5327,7 @@ private:
 
             params_base.fit_params_target = std::move(margins_trial);
             params_base.n_ctx = n_ctx_selected;
-            params_base.fit_params = false;
+            swap_fit_solved = true;
             SRV_INF("mmproj GPU swap fit %s and validated: n_ctx=%u, device 0 margin=%.2f MiB\n",
                     converged ? "converged" : "bounded", params_base.n_ctx,
                     params_base.fit_params_target[0] / (1024.0 * 1024.0));
@@ -5257,68 +5335,11 @@ private:
                     startup_unavailable[0] / (1024.0 * 1024.0));
         }
 
-        // Always enable kv_unified for single-slot servers — simplifies CUDA graph topology,
-        // giving ~28% faster prompt eval even without speculative decoding.
-        if (n_parallel_user == 1 && !params_base.kv_unified) {
-            params_base.kv_unified = true;
-            SRV_INF("%s", "auto-enabled kv-unified: single-slot server doesn't need separate KV stream\n");
-        }
-
-        // Double n_parallel only when actual speculative decoding is active
-        // (draft model, MTP, or model-free self-speculation), not for phantom
-        // --spec-type draft without -md. Model-free types verify their drafts through
-        // the TARGET context too, so hybrid/recurrent targets need the same backup
-        // sequence for partial-accept rollback: without the doubling n_seq_max stays at
-        // n_parallel_user and llama_memory_recurrent::seq_cp silently no-ops on the
-        // out-of-range backup seq — rollback then WIPES the recurrent state instead of
-        // restoring it (#74: output stays plausible but wrong, degrading over time).
-        if (params_base.speculative.has_dft() ||
-            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
-            params_base.speculative.has_model_free_type()) {
-            params_base.n_parallel = n_parallel_user * 2;
-            n_seq_max_full = params_base.n_parallel;
-            recurrent_expansion.state = server_recurrent_expansion_state::contracted;
-
-            // The backup sequences double n_seq_max. Without unified KV each sequence gets its
-            // own n_ctx / n_seq_max stream, so the doubling silently HALVES every slot's usable
-            // context on top of the user's n_parallel division (-np 2 + MTP -> n_ctx/4 per
-            // slot). Unified KV shares one full-length cell pool across sequences instead —
-            // same auto-enable precedent as the single-slot case above.
-            if (!params_base.kv_unified) {
-                params_base.kv_unified = true;
-                SRV_INF("%s", "auto-enabled kv-unified: speculative decoding doubles n_seq_max, "
-                        "which would halve the per-slot context with per-sequence KV streams\n");
-            }
-
-            // n_outputs_max was computed above (server_n_outputs_max) with the pre-doubling
-            // n_parallel. The target context is created just below with the DOUBLED n_parallel,
-            // so its n_seq_max grows accordingly and output_reserve(n_seq_max) needs the cap to
-            // cover it. For spec types whose n_outputs_per_seq is 1 (notably the fork DFlash
-            // type, which returns n_max==0), the original cap stayed at n_parallel_user and
-            // tripped GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max) in output_reserve.
-            // Recompute with the doubled n_parallel so the cap tracks the real n_seq_max.
-            params_base.n_outputs_max = server_n_outputs_max(params_base);
-
-            // The fork DFlash drafter verifies a full block (up to block_size tokens, typ. 16,
-            // plus ddtree branches) against the TARGET per step, so the target's output_reserve
-            // peaks well above n_seq_max. But common_speculative_n_max is 0 for the fork DFlash
-            // type and block_size isn't known until the draft model loads (which happens after
-            // this target context is created), so server_n_outputs_max undercounts here.
-            // Reserve a generous per-sequence output budget as a floor. The cap only bounds
-            // output_reserve's lazily-grown buffers and is clamped to n_batch — the same
-            // ceiling a non-speculative context gets by default — so it costs nothing until
-            // a batch actually requests that many outputs.
-            constexpr int32_t DFLASH_VERIFY_OUTPUTS_PER_SEQ = 32; // ~2x block_size headroom
-            const int32_t dflash_verify_floor = std::min<int32_t>(
-                (int32_t) params_base.n_batch, (int32_t) n_seq_max_full * DFLASH_VERIFY_OUTPUTS_PER_SEQ);
-            params_base.n_outputs_max = std::max<int32_t>(params_base.n_outputs_max, dflash_verify_floor);
-        }
-
         // Native MTP contributes a context-dependent KV cache plus compute buffers after the
         // target fit.  Solve that dependency instead of measuring MTP at n_ctx_train and treating
         // the result as a fixed margin: the latter grossly over-reserves small fitted contexts,
         // while max(margin, MTP) spends the caller's safety margin on MTP itself.
-        if (spec_mtp && !has_draft && params_base.fit_params) {
+        if (spec_mtp && !has_draft && params_base.fit_params && !swap_fit_solved) {
             const std::vector<size_t> margins_base = params_base.fit_params_target;
             std::vector<size_t> margins_trial = margins_base;
             std::vector<ggml_backend_dev_t> tgt_devices = params_base.devices;
@@ -5345,9 +5366,12 @@ private:
                         margins_work.data(),
                         params_trial.fit_params_min_ctx,
                         params_trial.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-                if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams_trial.n_ctx == 0) {
+                if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
                     return false;
                 }
+                // n_ctx stays 0 when the fit needed no changes: the model default fits as-is.
+                // 0 also means "default" to the memory measurement below; resolve it to the
+                // trained context (hp_nct) afterwards so the caller gets a concrete value.
 
                 common_params params_mtp = params_base;
                 params_mtp.n_parallel = n_parallel_user;
@@ -5380,7 +5404,7 @@ private:
                         }
                     }
                 }
-                n_ctx_fit = cparams_trial.n_ctx;
+                n_ctx_fit = cparams_trial.n_ctx != 0 ? cparams_trial.n_ctx : hp_nct_mtp;
                 return true;
             };
 

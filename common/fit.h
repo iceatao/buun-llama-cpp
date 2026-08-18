@@ -116,3 +116,9 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
+
+// Inspect model memory semantics without allocating weights or context buffers.
+bool common_model_uses_recurrent_memory(
+                         const char * path_model,
+           const llama_model_params * mparams,
+                     ggml_log_level   log_level);

@@ -1323,6 +1323,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 COM_WRN("%s", "implicit VBR auto-fit resolved to CPU KV placement; using static f16 KV cache\n");
                 cparams = common_context_params_to_llama(params);
             }
+            if (cparams.vbr_dynamic && params.fit_params_vbr_growth_headroom_bytes != 0) {
+                cparams.vbr_growth_headroom_bytes = params.fit_params_vbr_growth_headroom_bytes;
+            }
         }
     }
 

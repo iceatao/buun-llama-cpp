@@ -575,6 +575,10 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+    // Server-side auxiliary reservations may raise fit_params_target. Dynamic VBR should retain
+    // the caller's ordinary per-device safety headroom and account auxiliaries through live free
+    // memory instead of treating their bytes as permanently unavailable a second time.
+    uint64_t fit_params_vbr_growth_headroom_bytes = 0; // 0 = derive from fit_params_target
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model

@@ -539,6 +539,23 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
     return ret;
 }
 
+bool common_model_uses_recurrent_memory(
+        const char * path_model,
+        const llama_model_params * mparams,
+        ggml_log_level log_level) {
+    common_fit_logger_guard logger_guard(log_level);
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));
+    if (model == nullptr) {
+        throw std::runtime_error("failed to load model");
+    }
+    return llama_model_is_recurrent(model.get()) || llama_model_is_hybrid(model.get());
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
