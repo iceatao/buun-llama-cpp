@@ -1077,19 +1077,29 @@ llama_kv_cache::llama_kv_cache(
                 layer_type_k = vbr_layer_policy.k[il];
                 layer_type_v = vbr_layer_policy.v[il];
             }
-            // Turbo types have no CPU vec_dot kernel; partial offload keeps GPU
-            // VBR layers native and falls CPU-bound VBR layers back to q8_0.
-            if (cpu_bound_kv && (ggml_type_is_turbo(layer_type_k) || ggml_type_is_turbo(layer_type_v))) {
-                if (layer_type_k != GGML_TYPE_Q8_0) {
-                    layer_type_k = GGML_TYPE_Q8_0;
-                }
-                if (layer_type_v != GGML_TYPE_Q8_0) {
-                    layer_type_v = GGML_TYPE_Q8_0;
-                }
-                static bool warned = false;
-                if (!warned) {
-                    LLAMA_LOG_WARN("llama_kv_cache: turbo KV cache falling back to q8_0 for CPU-bound layers (partial offload)\n");
-                    warned = true;
+            // Turbo types have no CPU vec_dot kernel. A movable dynamic-VBR side also cannot
+            // degrade on the host because host buffers have no VMM pool. Pin only those sides
+            // at q8_0; preserve an explicitly pinned f16/bf16/q8_0 side in a mixed -ct config.
+            // The no-alloc fit construction takes this same path, so its host-memory price and
+            // the real allocation stay identical.
+            if (cpu_bound_kv) {
+                const auto cpu_type = [&](ggml_type type, bool pinned) {
+                    const bool needs_q8 = ggml_type_is_turbo(type) ||
+                        (vbr_params_.dynamic && !pinned && type == GGML_TYPE_F16);
+                    return needs_q8 ? GGML_TYPE_Q8_0 : type;
+                };
+                const ggml_type cpu_type_k = cpu_type(layer_type_k, vbr_params_.pin_k);
+                const ggml_type cpu_type_v = cpu_type(layer_type_v, vbr_params_.pin_v);
+                const bool pinned_to_q8 = cpu_type_k != layer_type_k || cpu_type_v != layer_type_v;
+                layer_type_k = cpu_type_k;
+                layer_type_v = cpu_type_v;
+                if (pinned_to_q8) {
+                    static bool warned = false;
+                    if (!warned) {
+                        LLAMA_LOG_WARN("llama_kv_cache: CPU-bound movable KV sides pinned at q8_0 "
+                                "(partial offload; excluded from the VBR degrade ladder)\n");
+                        warned = true;
+                    }
                 }
             }
         }
@@ -1231,9 +1241,21 @@ llama_kv_cache::llama_kv_cache(
     auto try_vmm_alloc = [&](ggml_context * c, ggml_backend_buffer_type_t bft) -> ggml_backend_buffer_t {
         const std::vector<llama_vbr_dev> devs = llama_vbr_backend_devs_for_buft(bft);
         if (devs.empty()) {
-            // Falling back silently would be a trap: the fit pass priced this KV at the floor
-            // tier (1.25 bits/value) but a static fallback stays at the f16 entry tier — 12.8x
-            // the budgeted VRAM with no degrade possible, an OOM at depth on any fitted config.
+            // Host KV from partial offload is legal under dynamic VBR: movable sides were
+            // pinned at q8_0 by the CPU fallback above, while explicitly pinned sides kept
+            // their requested type. They live in system memory outside the fit's VRAM budget,
+            // and the degrade walk skips units with no pool — static allocation is correct.
+            if (ggml_backend_buft_is_host(bft)) {
+                LLAMA_LOG_WARN("%s: dynamic VBR with partial offload: CPU-bound KV layers stay "
+                        "static (movable sides use q8_0; explicit side pins keep their type); "
+                        "only GPU-resident layers degrade\n", __func__);
+                return nullptr;
+            }
+            // For device KV without VBR backend support (the meta tensor-parallel buft),
+            // falling back silently would be a trap: the fit pass priced this KV at the floor
+            // tier (1.25 bits/value) but a static fallback stays at the entry tier — up to
+            // 12.8x the budgeted VRAM with no degrade possible, an OOM at depth on any
+            // fitted config.
             throw std::runtime_error(format(
                     "dynamic VBR (-ctk vbr) requires per-device KV buffers with turbo/VBR backend "
                     "support, but the KV buffer type is %s (or a device underneath it) without "
