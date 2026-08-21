@@ -1787,17 +1787,17 @@ bool server_prompt_cache::enable_retention_shadow() noexcept {
     return true;
 }
 
-size_t server_prompt_cache::size() const {
-    size_t naive = 0;
-    bool has_vbr = false;
-    for (const auto & state : states) {
-        naive += state.size();
-        has_vbr |= state.payload.kind() ==
-            server_prompt_cache_payload_kind::vbr_artifact;
-    }
-    if (!has_vbr || !acct) {
-        return naive;
-    }
+namespace {
+
+struct server_prompt_cache_budget_bytes {
+    size_t compact = 0;
+    size_t anchor = 0;
+    bool exact = false;
+};
+
+server_prompt_cache_budget_bytes server_prompt_cache_measure_budgets(
+        const std::list<server_prompt_cache_state> & states) noexcept {
+    server_prompt_cache_budget_bytes out;
     try {
         std::vector<const server_prompt_cache_payload *> payloads;
         payloads.reserve(states.size());
@@ -1807,26 +1807,101 @@ size_t server_prompt_cache::size() const {
                     server_prompt_cache_payload_kind::vbr_artifact) {
                 payloads.push_back(&state.payload);
             } else {
+                if (state.size() > SIZE_MAX - fixed_bytes) {
+                    return out;
+                }
                 fixed_bytes += state.size();
             }
         }
-        llama_cache_acct_release_set_preview preview;
-        if (!server_prompt_cache_payload::preview_vbr_retire_union(
-                payloads, acct->serial(), preview)) {
-            return naive;
+        server_prompt_cache_vbr_budget_summary summary;
+        if (!server_prompt_cache_payload::summarize_vbr_budgets(
+                payloads, summary) ||
+            summary.compact_resident_bytes > SIZE_MAX - fixed_bytes ||
+            summary.anchor_resident_bytes > SIZE_MAX -
+                fixed_bytes - size_t(summary.compact_resident_bytes)) {
+            return out;
         }
-        uint64_t vbr_bytes = 0;
-        for (const auto & row : preview.rows) {
-            if (row.resident_allocated > UINT64_MAX - vbr_bytes) {
-                return naive;
-            }
-            vbr_bytes += row.resident_allocated;
-        }
-        return vbr_bytes <= SIZE_MAX - fixed_bytes
-            ? fixed_bytes + size_t(vbr_bytes) : naive;
+        out.compact = fixed_bytes +
+            size_t(summary.compact_resident_bytes);
+        out.anchor = size_t(summary.anchor_resident_bytes);
+        out.exact = true;
+        return out;
     } catch (...) {
+        return {};
+    }
+}
+
+} // namespace
+
+size_t server_prompt_cache::size() const {
+    size_t naive = 0;
+    bool has_vbr = false;
+    bool has_anchor = false;
+    for (const auto & state : states) {
+        naive += state.size();
+        if (state.payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact) {
+            has_vbr = true;
+            has_anchor |= state.payload.vbr_has_quality_anchor();
+        }
+    }
+    if (!has_vbr) {
         return naive;
     }
+    if (!has_anchor) {
+        if (!acct) {
+            return naive;
+        }
+        try {
+            std::vector<const server_prompt_cache_payload *> payloads;
+            payloads.reserve(states.size());
+            size_t fixed_bytes = 0;
+            for (const auto & state : states) {
+                if (state.payload.kind() ==
+                        server_prompt_cache_payload_kind::vbr_artifact) {
+                    payloads.push_back(&state.payload);
+                } else {
+                    fixed_bytes += state.size();
+                }
+            }
+            llama_cache_acct_release_set_preview preview;
+            if (!server_prompt_cache_payload::preview_vbr_retire_union(
+                    payloads, acct->serial(), preview)) {
+                return naive;
+            }
+            uint64_t vbr_bytes = 0;
+            for (const auto & row : preview.rows) {
+                if (row.resident_allocated > UINT64_MAX - vbr_bytes) {
+                    return naive;
+                }
+                vbr_bytes += row.resident_allocated;
+            }
+            return vbr_bytes <= SIZE_MAX - fixed_bytes
+                ? fixed_bytes + size_t(vbr_bytes) : naive;
+        } catch (...) {
+            return naive;
+        }
+    }
+    const auto measured = server_prompt_cache_measure_budgets(states);
+    return measured.exact ? measured.compact + measured.anchor : naive;
+}
+
+size_t server_prompt_cache::anchor_size() const {
+    size_t naive = 0;
+    bool has_anchor = false;
+    for (const auto & state : states) {
+        const auto bytes = state.payload.vbr_anchor_resident_bytes();
+        has_anchor |= bytes != 0 || state.payload.vbr_has_quality_anchor();
+        if (bytes > SIZE_MAX - naive) {
+            return SIZE_MAX;
+        }
+        naive += size_t(bytes);
+    }
+    if (!has_anchor) {
+        return 0;
+    }
+    const auto measured = server_prompt_cache_measure_budgets(states);
+    return measured.exact ? measured.anchor : naive;
 }
 
 size_t server_prompt_cache::n_tokens() const {
@@ -3481,6 +3556,7 @@ struct host_trade_candidate {
     bool main_family = false;
     bool soft_leased = false;
     bool hard_leased = false;
+    bool mandatory_anchor = false;
     bool vbr = false;
     bool vbr_logical_alias = false;
     bool retirement_ready = false;
@@ -3555,6 +3631,7 @@ bool host_trade_price(
             return false;
         }
         out.ranking.artifact_id = artifact.candidate.artifact_id;
+        out.mandatory_anchor = artifact.mandatory_anchor;
         if (artifact.candidate.lease.state !=
                 server_cache_lease_eval_state::known) {
             return false;
@@ -3571,9 +3648,9 @@ bool host_trade_price(
                 out.retirement_ready = true;
                 return true;
             }
-            // H1 ordinary pressure owns only compact-current entries. A
-            // quality anchor has a separate budget/competition terminal in
-            // a later slice and must not be hidden in compact victim bytes.
+            // Ordinary pressure owns only compact-current entries. A quality
+            // anchor has a separate byte pool and parent-value competition;
+            // it must never be hidden in compact victim bytes.
             if (out.hard_leased || !cache.acct ||
                 victim->payload.vbr_has_quality_anchor()) {
                 return false;
@@ -4864,6 +4941,30 @@ bool server_prompt_cache::destroy_priced_host_entry(
     return false;
 }
 
+void server_prompt_cache::refuse_incoming_under_pressure(
+        iterator incoming,
+        server_cache_destruction_reason reason) {
+    if (incoming == states.end()) {
+        return;
+    }
+    if (incoming->payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact) {
+        vbr_artifact_prepared_retire prepared;
+        const bool alias_only =
+            incoming->payload.vbr_logical_erase_only();
+        if (!acct ||
+            (!alias_only && !incoming->payload.prepare_vbr_retire(
+                acct->serial(), prepared)) ||
+            !destroy_df2_entry(
+                incoming, reason,
+                alias_only ? nullptr : &prepared)) {
+            destroy_entry(incoming, reason);
+        }
+    } else {
+        destroy_entry(incoming, reason);
+    }
+}
+
 bool server_prompt_cache::evict_front_under_pressure(
         server_cache_destruction_reason reason,
         iterator incoming,
@@ -4981,22 +5082,7 @@ bool server_prompt_cache::evict_front_under_pressure(
             observe_retention_pressure_choice(
                 reason, incoming, incoming, competition_wave_valid);
         }
-        if (incoming->payload.kind() ==
-                server_prompt_cache_payload_kind::vbr_artifact) {
-            vbr_artifact_prepared_retire prepared;
-            const bool alias_only =
-                incoming->payload.vbr_logical_erase_only();
-            if (!acct ||
-                (!alias_only && !incoming->payload.prepare_vbr_retire(
-                    acct->serial(), prepared)) ||
-                !destroy_df2_entry(
-                    incoming, reason,
-                    alias_only ? nullptr : &prepared)) {
-                destroy_entry(incoming, reason);
-            }
-        } else {
-            destroy_entry(incoming, reason);
-        }
+        refuse_incoming_under_pressure(incoming, reason);
     }
     if (recovery_pin_excluded) {
         emit_host_pressure_floor_outcome(
@@ -5316,13 +5402,32 @@ bool server_prompt_cache::publish(
                 server_retention_instance_key::for_slot(source_slot))) {
             return false;
         }
-        if ((limit_size > 0 && staged.size() > limit_size) ||
+        const uint64_t staged_anchor =
+            staged.payload.vbr_anchor_resident_bytes();
+        if (staged_anchor > staged.size()) {
+            return false;
+        }
+        const size_t staged_compact =
+            staged.size() - size_t(staged_anchor);
+        const size_t staged_budget_bytes = quality_anchor_budget_enabled
+            ? staged_compact : staged.size();
+        if ((limit_size > 0 && staged_budget_bytes > limit_size) ||
             (limit_size == 0 && limit_tokens > 0 &&
              size_t(staged.prompt.n_tokens()) > limit_tokens)) {
             return false;
         }
-        size_t total_bytes = staged.size();
+        size_t total_bytes = staged_budget_bytes;
+        size_t fixed_bytes = 0;
         size_t total_tokens = size_t(staged.prompt.n_tokens());
+        std::vector<const server_prompt_cache_payload *> payloads;
+        if (quality_anchor_budget_enabled) {
+            try {
+                payloads.reserve(states.size() + 1);
+                payloads.push_back(&staged.payload);
+            } catch (...) {
+                return false;
+            }
+        }
         for (const auto & state : states) {
             // An unpinned exact alias is replaced later in this same
             // scheduler transaction. Excluding it makes republication
@@ -5332,20 +5437,47 @@ bool server_prompt_cache::publish(
                 exactly_redundant(state, staged)) {
                 continue;
             }
-            if (state.size() > SIZE_MAX - total_bytes ||
-                size_t(state.prompt.n_tokens()) > SIZE_MAX - total_tokens) {
+            if (size_t(state.prompt.n_tokens()) > SIZE_MAX - total_tokens) {
                 return false;
             }
-            total_bytes += state.size();
             total_tokens += size_t(state.prompt.n_tokens());
+            if (!quality_anchor_budget_enabled) {
+                if (state.size() > SIZE_MAX - total_bytes) {
+                    return false;
+                }
+                total_bytes += state.size();
+            } else if (state.payload.kind() ==
+                    server_prompt_cache_payload_kind::vbr_artifact) {
+                try {
+                    payloads.push_back(&state.payload);
+                } catch (...) {
+                    return false;
+                }
+            } else if (state.size() <= SIZE_MAX - fixed_bytes) {
+                fixed_bytes += state.size();
+            } else {
+                return false;
+            }
         }
-        if (limit_size > 0 && total_bytes > limit_size && acct) {
+        if (quality_anchor_budget_enabled) {
+            server_prompt_cache_vbr_budget_summary budgets;
+            if (!server_prompt_cache_payload::summarize_vbr_budgets(
+                    payloads, budgets) ||
+                budgets.compact_resident_bytes > SIZE_MAX - fixed_bytes) {
+                return false;
+            }
+            total_bytes = fixed_bytes +
+                size_t(budgets.compact_resident_bytes);
+        } else if (limit_size > 0 && total_bytes > limit_size && acct) {
             try {
-                std::vector<const server_prompt_cache_payload *> payloads;
                 payloads.reserve(states.size() + 1);
                 payloads.push_back(&staged.payload);
-                size_t fixed_bytes = 0;
+                fixed_bytes = 0;
                 for (const auto & state : states) {
+                    if (state.recovery_pins == 0 &&
+                        exactly_redundant(state, staged)) {
+                        continue;
+                    }
                     if (state.payload.kind() ==
                             server_prompt_cache_payload_kind::vbr_artifact) {
                         payloads.push_back(&state.payload);
@@ -5364,7 +5496,7 @@ bool server_prompt_cache::publish(
                     total_bytes = fixed_bytes + size_t(vbr_bytes);
                 }
             } catch (...) {
-                // Retain the conservative per-entry upper bound.
+                // Keep the conservative allocation-free upper bound.
             }
         }
         const size_t effective_token_limit =
@@ -5374,10 +5506,8 @@ bool server_prompt_cache::publish(
             (limit_size > 0 && total_bytes > limit_size) ||
             (limit_tokens > 0 && total_tokens > effective_token_limit);
         if (requires_pressure &&
-            ((staged.payload.vbr_has_quality_anchor() &&
-              !staged.payload.vbr_logical_erase_only()) ||
-             (!staged.payload.vbr_retirement_exclusive() &&
-              !staged.payload.vbr_logical_erase_only()))) {
+            !staged.payload.vbr_retirement_exclusive() &&
+            !staged.payload.vbr_logical_erase_only()) {
             return false;
         }
     }
@@ -6006,8 +6136,283 @@ void server_prompt_cache::update() {
     (void) update_impl(states.end());
 }
 
+bool server_prompt_cache::enforce_quality_anchor_budget(
+        iterator incoming,
+        uint64_t competition_epoch,
+        size_t & anchor_bytes) {
+    static_assert(SERVER_PROMPT_CACHE_VBR_ANCHOR_MAX_CANDIDATES ==
+        SERVER_RETENTION_MAX_CANDIDATES);
+    if (anchor_bytes <= limit_anchor_size) {
+        return true;
+    }
+    // An anchor is optional acceleration state. If complete parent-value
+    // evidence is unavailable during publication, discard only the incoming
+    // anchor and preserve its already-published compact checkpoint. This is
+    // also the no-ranking fast terminal for a zero anchor budget.
+    const auto discard_incoming_anchor = [&]() noexcept {
+        if (incoming == states.end() ||
+            !incoming->payload.vbr_has_quality_anchor()) {
+            return false;
+        }
+        server_prompt_cache_payload compact;
+        if (!incoming->payload.prepare_vbr_compact_only(compact)) {
+            return false;
+        }
+        const bool physical =
+            incoming->payload.vbr_anchor_retirement_exclusive();
+        vbr_artifact_prepared_retire prepared;
+        if (physical && (!acct ||
+            !incoming->payload.prepare_vbr_anchor_retire(
+                acct->serial(), prepared))) {
+            return false;
+        }
+        incoming->payload = std::move(compact);
+        if (physical) {
+            const auto status = prepared.commit();
+            GGML_ASSERT(status !=
+                vbr_artifact_prepared_retire_status::unavailable);
+        }
+        quality_anchor_retires++;
+        const auto measured = server_prompt_cache_measure_budgets(states);
+        if (!measured.exact) {
+            return false;
+        }
+        anchor_bytes = measured.anchor;
+        return true;
+    };
+    const auto refuse_or_discard_incoming = [&]() noexcept {
+        if (discard_incoming_anchor() &&
+            anchor_bytes <= limit_anchor_size) {
+            return true;
+        }
+        quality_anchor_refusals++;
+        return false;
+    };
+    if (!publish_authority || !acct || !retention_obs || !lease_obs ||
+        !lease_execution_identity || competition_epoch == 0) {
+        return refuse_or_discard_incoming();
+    }
+
+    struct anchor_binding {
+        llama_cache_acct_artifact_id artifact;
+        iterator state;
+    };
+    try {
+        std::vector<server_live_retention_candidate> rows(
+            SERVER_RETENTION_MAX_CANDIDATES);
+        struct fill_context {
+            server_live_retention_candidate * rows = nullptr;
+            size_t capacity = 0;
+            size_t size = 0;
+        } fill { rows.data(), rows.size(), 0 };
+        const auto visitor = [](void * opaque,
+                const server_retention_value_snapshot & value) noexcept {
+            auto & context = *static_cast<fill_context *>(opaque);
+            if (context.size == context.capacity ||
+                context.size > size_t(INT32_MAX)) {
+                return false;
+            }
+            auto & row = context.rows[context.size];
+            row.slot_id = int32_t(context.size);
+            row.artifact_id = value.artifact_id;
+            row.stamp = value.stamp;
+            row.lineage = value.lineage;
+            row.external_shared_coverage_tokens =
+                value.external_shared_coverage_tokens;
+            row.present = true;
+            row.eligible = false;
+            context.size++;
+            return true;
+        };
+        const auto inventory = retention_obs->value_snapshots(
+            &fill, visitor);
+        if (inventory.status !=
+                server_retention_value_snapshot_status::complete ||
+            inventory.size != fill.size || fill.size == 0) {
+            return refuse_or_discard_incoming();
+        }
+        rows.resize(fill.size);
+
+        std::vector<std::pair<uint64_t, size_t>> row_index;
+        row_index.reserve(rows.size());
+        for (size_t i = 0; i < rows.size(); ++i) {
+            row_index.push_back({ rows[i].artifact_id.v, i });
+        }
+        std::sort(row_index.begin(), row_index.end());
+        if (std::adjacent_find(
+                row_index.begin(), row_index.end(),
+                [](const auto & a, const auto & b) {
+                    return a.first == b.first;
+                }) != row_index.end()) {
+            return refuse_or_discard_incoming();
+        }
+
+        lease_obs->lifecycle_point();
+        std::vector<anchor_binding> bindings;
+        bindings.reserve(states.size());
+        bool have_anchor_binding = false;
+        uint32_t ordinal = 0;
+        for (auto it = states.begin(); it != states.end(); ++it, ++ordinal) {
+            if (it->payload.kind() !=
+                    server_prompt_cache_payload_kind::vbr_artifact) {
+                continue;
+            }
+            host_trade_candidate priced;
+            (void) host_trade_price(
+                *this, it, ordinal,
+                server_cache_destruction_reason::host_capacity,
+                nullptr, priced);
+            const auto found = std::lower_bound(
+                row_index.begin(), row_index.end(),
+                std::pair<uint64_t, size_t> {
+                    priced.ranking.artifact_id.v, 0 });
+            if (!priced.ranking.artifact_id.v ||
+                found == row_index.end() ||
+                found->first != priced.ranking.artifact_id.v ||
+                !priced.lease_known) {
+                return refuse_or_discard_incoming();
+            }
+            auto & row = rows[found->second];
+            if (row.eligible) {
+                return refuse_or_discard_incoming();
+            }
+            if (it->payload.vbr_has_quality_anchor()) {
+                row.eligible =
+                    it->payload.vbr_anchor_resident_bytes() != 0 &&
+                    !priced.hard_leased && !priced.mandatory_anchor &&
+                    it->recovery_pins == 0;
+                have_anchor_binding = true;
+            }
+            bindings.push_back({ priced.ranking.artifact_id, it });
+        }
+        if (!have_anchor_binding || !server_live_retention_prepare(
+                rows.data(), rows.size(), competition_epoch)) {
+            return refuse_or_discard_incoming();
+        }
+        std::vector<server_anchor_parent_rank> parent_values;
+        if (!server_anchor_parent_values_prepared(
+                rows.data(), rows.size(), competition_epoch, parent_values)) {
+            return refuse_or_discard_incoming();
+        }
+        std::sort(bindings.begin(), bindings.end(), [](const auto & a,
+                                                       const auto & b) {
+            return a.artifact.v < b.artifact.v;
+        });
+        std::sort(parent_values.begin(), parent_values.end(), [](const auto & a,
+                                                                 const auto & b) {
+            return a.artifact_id.v < b.artifact_id.v;
+        });
+
+        std::vector<server_prompt_cache_vbr_anchor_plan_candidate>
+            plan_candidates;
+        plan_candidates.reserve(bindings.size());
+        for (const auto & binding : bindings) {
+            const auto ranked = std::lower_bound(
+                parent_values.begin(), parent_values.end(), binding.artifact.v,
+                [](const auto & value, uint64_t artifact) {
+                    return value.artifact_id.v < artifact;
+                });
+            server_prompt_cache_vbr_anchor_plan_candidate candidate;
+            candidate.payload = &binding.state->payload;
+            candidate.artifact_id = binding.artifact;
+            candidate.eligible = ranked != parent_values.end() &&
+                ranked->artifact_id == binding.artifact;
+            if (candidate.eligible) {
+                candidate.parent_value_q = ranked->parent_value.lost_value_q;
+                candidate.recency_ordinal =
+                    ranked->parent_value.recency_ordinal;
+                candidate.pool = uint8_t(ranked->pool);
+                candidate.lineage_id = ranked->lineage_id;
+            }
+            plan_candidates.push_back(candidate);
+        }
+        std::vector<llama_cache_acct_artifact_id> selected;
+        if (!server_prompt_cache_plan_vbr_anchor_releases(
+                plan_candidates, anchor_bytes, limit_anchor_size,
+                selected)) {
+            return refuse_or_discard_incoming();
+        }
+
+        struct anchor_terminal {
+            iterator state;
+            server_prompt_cache_payload compact;
+        };
+        std::vector<anchor_terminal> terminals;
+        terminals.reserve(selected.size());
+        for (const auto artifact : selected) {
+            const auto binding = std::lower_bound(
+                bindings.begin(), bindings.end(), artifact.v,
+                [](const auto & value, uint64_t id) {
+                    return value.artifact.v < id;
+                });
+            if (binding == bindings.end() ||
+                binding->artifact != artifact ||
+                binding->state == states.end() ||
+                !binding->state->payload.vbr_has_quality_anchor() ||
+                binding->state->recovery_pins != 0) {
+                terminals.clear();
+                return refuse_or_discard_incoming();
+            }
+            host_trade_candidate current;
+            (void) host_trade_price(
+                *this, binding->state, 0,
+                server_cache_destruction_reason::host_capacity,
+                nullptr, current);
+            if (!current.lease_known || current.hard_leased ||
+                current.mandatory_anchor ||
+                current.ranking.artifact_id != artifact) {
+                terminals.clear();
+                return refuse_or_discard_incoming();
+            }
+            anchor_terminal terminal;
+            terminal.state = binding->state;
+            if (!binding->state->payload.prepare_vbr_compact_only(
+                    terminal.compact)) {
+                terminals.clear();
+                return refuse_or_discard_incoming();
+            }
+            terminals.push_back(std::move(terminal));
+        }
+        std::vector<const server_prompt_cache_payload *> selected_payloads;
+        selected_payloads.reserve(terminals.size());
+        for (const auto & terminal : terminals) {
+            selected_payloads.push_back(&terminal.state->payload);
+        }
+        std::vector<vbr_artifact_prepared_retire> prepared_retires;
+        if (server_fault("vbr_anchor_prepare_fail") ||
+            !server_prompt_cache_payload::prepare_vbr_anchor_retire_batch(
+                selected_payloads, acct->serial(), prepared_retires)) {
+            terminals.clear();
+            return refuse_or_discard_incoming();
+        }
+        // Every allocation, lease, replacement, and last-owner retirement
+        // capability is ready before the first node changes variant.
+        for (auto & terminal : terminals) {
+            terminal.state->payload = std::move(terminal.compact);
+            quality_anchor_retires++;
+        }
+        for (auto & prepared : prepared_retires) {
+            const auto status = prepared.commit();
+            GGML_ASSERT(status !=
+                vbr_artifact_prepared_retire_status::unavailable);
+        }
+        const auto measured = server_prompt_cache_measure_budgets(states);
+        if (!measured.exact) {
+            return refuse_or_discard_incoming();
+        }
+        anchor_bytes = measured.anchor;
+        if (anchor_bytes > limit_anchor_size) {
+            return refuse_or_discard_incoming();
+        }
+        return true;
+    } catch (...) {
+        return refuse_or_discard_incoming();
+    }
+}
+
 bool server_prompt_cache::update_impl(iterator incoming) {
-    if (limit_size == 0 && limit_tokens == 0) {
+    if (limit_size == 0 && limit_tokens == 0 &&
+        !quality_anchor_budget_enabled) {
         return true;
     }
     bool pressure_wave_started = false;
@@ -6015,48 +6420,51 @@ bool server_prompt_cache::update_impl(iterator incoming) {
     bool retention_shadow_observed = false;
     size_t cache_bytes = 0;
     size_t cache_tokens = 0;
+    size_t anchor_bytes = 0;
     const auto measure_cache = [&]() noexcept {
         cache_bytes = 0;
         cache_tokens = 0;
+        anchor_bytes = 0;
         bool has_vbr = false;
         for (const auto & state : states) {
-            has_vbr |= state.payload.kind() ==
+            const bool vbr = state.payload.kind() ==
                 server_prompt_cache_payload_kind::vbr_artifact;
-            cache_bytes += state.size();
+            has_vbr |= vbr;
+            if (vbr && quality_anchor_budget_enabled) {
+                const uint64_t anchor =
+                    state.payload.vbr_anchor_resident_bytes();
+                const size_t total = state.size();
+                if (anchor > total || anchor > SIZE_MAX - anchor_bytes) {
+                    cache_bytes = SIZE_MAX;
+                    anchor_bytes = SIZE_MAX;
+                } else {
+                    cache_bytes += total - size_t(anchor);
+                    anchor_bytes += size_t(anchor);
+                }
+            } else {
+                cache_bytes += state.size();
+            }
             cache_tokens += state.prompt.n_tokens();
         }
 
         // The per-entry sum is an allocation-free upper bound. Exact VBR
-        // union work is needed only close enough to a configured boundary
-        // that shared sealed allocations can change the pressure decision.
+        // union work is needed only close enough to either independent byte
+        // boundary that shared sealed allocations can change the decision.
         const bool pressure_plausible =
-            limit_size > 0 && cache_bytes > limit_size;
-        if (!has_vbr || !acct || !pressure_plausible) {
+            (limit_size > 0 && cache_bytes > limit_size) ||
+            (quality_anchor_budget_enabled &&
+             anchor_bytes > limit_anchor_size);
+        if (!has_vbr || !pressure_plausible) {
             return;
         }
-
-        try {
-            std::vector<const server_prompt_cache_payload *> vbr_payloads;
-            vbr_payloads.reserve(states.size());
-            size_t fixed_bytes = 0;
-            for (const auto & state : states) {
-                if (state.payload.kind() ==
-                        server_prompt_cache_payload_kind::vbr_artifact) {
-                    vbr_payloads.push_back(&state.payload);
-                } else {
-                    fixed_bytes += state.size();
-                }
+        const auto measured = server_prompt_cache_measure_budgets(states);
+        if (measured.exact) {
+            cache_bytes = measured.compact;
+            anchor_bytes = quality_anchor_budget_enabled
+                ? measured.anchor : 0;
+            if (!quality_anchor_budget_enabled) {
+                cache_bytes += measured.anchor;
             }
-            llama_cache_acct_release_set_preview preview;
-            uint64_t bytes = 0;
-            if (server_prompt_cache_payload::preview_vbr_retire_union(
-                    vbr_payloads, acct->serial(), preview) &&
-                vbr_release_resident_bytes(preview, bytes) &&
-                bytes <= SIZE_MAX - fixed_bytes) {
-                cache_bytes = fixed_bytes + size_t(bytes);
-            }
-        } catch (...) {
-            // Preserve the conservative upper bound on unavailable evidence.
         }
     };
     measure_cache();
@@ -6074,6 +6482,37 @@ bool server_prompt_cache::update_impl(iterator incoming) {
         competition_wave_valid =
             retention_obs->begin_competition_wave();
     };
+    if (quality_anchor_budget_enabled &&
+        anchor_bytes > limit_anchor_size) {
+        begin_pressure_wave();
+        SRV_WRN(
+            " - quality-anchor limit reached (size = %.3f MiB, cap = %.3f MiB)\n",
+            anchor_bytes / (1024.0 * 1024.0),
+            limit_anchor_size / (1024.0 * 1024.0));
+        if (!enforce_quality_anchor_budget(
+                incoming,
+                retention_obs ? retention_obs->competition_epoch_value() : 0,
+                anchor_bytes)) {
+            if (incoming != states.end()) {
+                if (destruction_obs) {
+                    destruction_obs->note_host_trade_publication_skip();
+                }
+                if (publish_authority) {
+                    const uint64_t sequence =
+                        ++publish_authority->destruction_quote_sequence;
+                    observe_host_trade_refusal(
+                        *this, sequence,
+                        common_cache_plan_destruction_reason::
+                            capacity_refused);
+                }
+                refuse_incoming_under_pressure(
+                    incoming,
+                    server_cache_destruction_reason::host_capacity);
+            }
+            return false;
+        }
+        measure_cache();
+    }
     if (limit_size > 0) {
         while (!states.empty() && cache_bytes > limit_size) {
             begin_pressure_wave();

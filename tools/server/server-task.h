@@ -1067,9 +1067,19 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // Independent quality-only pool, in bytes. Zero is the valid
+    // compact-only configuration: anchors are optional and are stripped
+    // without invalidating their compact current artifact.
+    size_t limit_anchor_size = 0;
+    // H1 backend gate. H2 will bind the product budget deliberately; keeping
+    // this false preserves literal zero work before automatic anchors exist.
+    bool quality_anchor_budget_enabled = false;
+
     int32_t cache_plan_next_source_id = 0;
 
     size_t size() const;
+
+    size_t anchor_size() const;
 
     size_t n_tokens() const;
 
@@ -1187,6 +1197,8 @@ struct server_prompt_cache {
     uint64_t debug_destruction_emissions = 0;
     uint64_t debug_recovery_pin_exclusions = 0;
     uint64_t debug_host_pressure_floor_outcomes = 0;
+    uint64_t quality_anchor_retires = 0;
+    uint64_t quality_anchor_refusals = 0;
     llama_cache_acct_artifact_id debug_last_recovery_pin_excluded;
     bool host_trade_substrate_warned = false;
 
@@ -1237,6 +1249,9 @@ private:
         bool observe_retention_shadow,
         uint64_t & released_bytes,
         size_t & released_tokens);
+    void refuse_incoming_under_pressure(
+        iterator incoming,
+        server_cache_destruction_reason reason);
     bool destroy_df2_entry(
         iterator it,
         server_cache_destruction_reason reason,
@@ -1244,6 +1259,10 @@ private:
         uint64_t * released_bytes = nullptr,
         size_t * released_tokens = nullptr);
     bool update_impl(iterator incoming);
+    bool enforce_quality_anchor_budget(
+        iterator incoming,
+        uint64_t competition_epoch,
+        size_t & anchor_bytes);
     void observe_retention_pressure_choice(
             server_cache_destruction_reason reason,
             iterator incoming,

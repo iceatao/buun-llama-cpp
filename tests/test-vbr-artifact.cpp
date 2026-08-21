@@ -2702,6 +2702,45 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
     CHECK(typed.same_storage(independently_bundled));
     CHECK(!typed.same_storage(independently_wrapped));
 
+    // The anchor planner reasons over the global allocation-ID union, not
+    // each variant's standalone size. Two logical parents sharing the same
+    // anchor release zero bytes individually; after the stable first drop,
+    // the survivor becomes the exact physical release candidate.
+    const uint64_t shared_anchor_bytes =
+        typed.vbr_anchor_resident_bytes();
+    CHECK(shared_anchor_bytes > 0);
+    std::vector<server_prompt_cache_vbr_anchor_plan_candidate>
+        shared_anchor_candidates {
+            { &typed, { 101 }, 10, 7, 0, 11, true },
+            { &independently_bundled, { 102 }, 10, 7, 0, 12, true },
+        };
+    std::vector<llama_cache_acct_artifact_id> shared_anchor_plan;
+    CHECK(server_prompt_cache_plan_vbr_anchor_releases(
+        shared_anchor_candidates, shared_anchor_bytes,
+        shared_anchor_bytes - 1, shared_anchor_plan));
+    CHECK(shared_anchor_plan.size() == 2);
+    CHECK(shared_anchor_plan[0].v == 101);
+    CHECK(shared_anchor_plan[1].v == 102);
+
+    // Max logical alias cardinality stays one allocation-union build plus a
+    // bounded refcount/ordered-set walk; it must not regress to one global
+    // allocation sort per retired parent.
+    std::vector<server_prompt_cache_vbr_anchor_plan_candidate>
+        max_anchor_candidates;
+    max_anchor_candidates.reserve(
+        SERVER_PROMPT_CACHE_VBR_ANCHOR_MAX_CANDIDATES);
+    for (uint64_t i = 0;
+         i < SERVER_PROMPT_CACHE_VBR_ANCHOR_MAX_CANDIDATES; ++i) {
+        max_anchor_candidates.push_back({
+            &typed, { 1000 + i }, 10, 7, 0, 1000 + i, true,
+        });
+    }
+    CHECK(server_prompt_cache_plan_vbr_anchor_releases(
+        max_anchor_candidates, shared_anchor_bytes, 0,
+        shared_anchor_plan));
+    CHECK(shared_anchor_plan.size() ==
+          SERVER_PROMPT_CACHE_VBR_ANCHOR_MAX_CANDIDATES);
+
     // Equal, lower-quality, or reversed roles are not anchors.
     const auto equal_reference = f.catalog->publish(
         f.package, f.completions(), f.budget);
@@ -4161,6 +4200,36 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(bounded.states.front().payload.restorable());
 }
 
+static vbr_artifact_package prompt_cache_quality_anchor_package(
+        const vbr_artifact_package & source) {
+    auto result = source;
+    auto & descriptor = result.unit_blobs[0].descriptor;
+    descriptor.repr_gen++;
+    descriptor.current_type = GGML_TYPE_TURBO8_0;
+    descriptor.last_source_type = GGML_TYPE_F16;
+    descriptor.promote_hops = 0;
+    descriptor.last_transition =
+        vbr_repr_transition::degrade_f16_to_t8_admitted;
+    descriptor.representation.source_loss_history = 0;
+    auto & generation =
+        result.manifest.generation.controllers[0].units[0];
+    generation.repr_gen = descriptor.repr_gen;
+    generation.current_type = descriptor.current_type;
+    generation.last_source_type = descriptor.last_source_type;
+    generation.domain = vbr_downward_tier_domain(
+        ggml_type(descriptor.current_type));
+    generation.promote_hops = descriptor.promote_hops;
+    generation.last_transition = descriptor.last_transition;
+    result.manifest.unit_references[0].repr_gen = descriptor.repr_gen;
+    const ggml_type anchor_types[] = { GGML_TYPE_TURBO8_0 };
+    result.manifest.controller_policy[0].current_type_vector_digest =
+        vbr_type_vector_digest(anchor_types, 1);
+    result.manifest.manifest_digest = {};
+    result.manifest.capture_generation_id = {};
+    result.manifest.consistency = {};
+    return result;
+}
+
 static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     catalog_fixture fixture;
 
@@ -4510,40 +4579,13 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
 
-    // Quality anchors have their own future sub-budget and competition. H1
-    // ordinary compact pressure must not smuggle the anchor bytes into a
-    // compact victim quote or retire the pair as one ordinary entry.
+    // Quality anchors have their own sub-budget and competition. Ordinary
+    // compact pressure must not smuggle anchor bytes into a compact victim
+    // quote or retire the pair as one ordinary entry.
     const auto compact_reference = fixture.catalog->publish(
         fixture.package, fixture.completions(), fixture.budget);
-    auto anchor_package = fixture.package;
-    auto & anchor_descriptor = anchor_package.unit_blobs[0].descriptor;
-    anchor_descriptor.repr_gen++;
-    anchor_descriptor.current_type = GGML_TYPE_TURBO8_0;
-    anchor_descriptor.last_source_type = GGML_TYPE_F16;
-    anchor_descriptor.promote_hops = 0;
-    anchor_descriptor.last_transition =
-        vbr_repr_transition::degrade_f16_to_t8_admitted;
-    anchor_descriptor.representation.source_loss_history = 0;
-    auto & anchor_generation =
-        anchor_package.manifest.generation.controllers[0].units[0];
-    anchor_generation.repr_gen = anchor_descriptor.repr_gen;
-    anchor_generation.current_type = anchor_descriptor.current_type;
-    anchor_generation.last_source_type =
-        anchor_descriptor.last_source_type;
-    anchor_generation.domain =
-        vbr_downward_tier_domain(
-            ggml_type(anchor_descriptor.current_type));
-    anchor_generation.promote_hops = anchor_descriptor.promote_hops;
-    anchor_generation.last_transition = anchor_descriptor.last_transition;
-    anchor_package.manifest.unit_references[0].repr_gen =
-        anchor_descriptor.repr_gen;
-    const ggml_type anchor_types[] = { GGML_TYPE_TURBO8_0 };
-    anchor_package.manifest.controller_policy[0]
-        .current_type_vector_digest =
-            vbr_type_vector_digest(anchor_types, 1);
-    anchor_package.manifest.manifest_digest = {};
-    anchor_package.manifest.capture_generation_id = {};
-    anchor_package.manifest.consistency = {};
+    auto anchor_package =
+        prompt_cache_quality_anchor_package(fixture.package);
     CHECK(fixture.catalog->configure_accounting(anchor_package));
     const auto anchor_reference = fixture.catalog->publish(
         anchor_package, fixture.completions(), fixture.budget);
@@ -4568,27 +4610,256 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     auto anchor_payload = server_prompt_cache_payload::from_vbr_variants(
         std::move(anchor_variants));
     CHECK(anchor_payload.vbr_has_quality_anchor());
+    const size_t anchor_payload_bytes = anchor_payload.size();
+    const size_t anchor_marginal_bytes = size_t(
+        anchor_payload.vbr_anchor_resident_bytes());
+    CHECK(anchor_marginal_bytes > 0);
+    CHECK(anchor_marginal_bytes < anchor_payload_bytes);
+    const size_t compact_payload_bytes =
+        anchor_payload_bytes - anchor_marginal_bytes;
+
+    // With the independent backend gate off, preserve the previous total
+    // host-cap behavior: anchors are not free bytes and a borrowed staged
+    // pair that exceeds the total cap is refused without cache mutation.
+    auto rollback_payload = anchor_payload;
     cache.limit_size = 0;
+    auto rollback_stage = cache.stage_vbr(
+        prompt, std::move(rollback_payload),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(rollback_stage.size() == 1);
+    cache.limit_size = compact_payload_bytes;
+    server_prompt_cache::iterator rollback_result = cache.states.begin();
+    CHECK(!cache.publish(
+        std::move(rollback_stage), &prompt, source_slot, &rollback_result));
+    CHECK(rollback_result == cache.states.end());
+    CHECK(cache.states.empty());
+    CHECK(fixture.catalog->snapshot().references == 2);
+
+    cache.limit_size = 0;
+    cache.quality_anchor_budget_enabled = true;
+    cache.limit_anchor_size = anchor_marginal_bytes;
     auto anchor_stage = cache.stage_vbr(
         prompt, std::move(anchor_payload),
         fixture.package.manifest.identity.execution_identity,
         fixture.package.manifest.identity.adapter_config_identity);
     CHECK(anchor_stage.size() == 1);
-    cache.limit_size = anchor_stage.front().size();
-    cache.limit_tokens = 1;
+    // The full physical set is larger than this ordinary byte cap, but its
+    // compact pool fits exactly. Publication must therefore preserve both
+    // variants without invoking ordinary DF2.
+    cache.limit_size = compact_payload_bytes;
     server_prompt_cache::iterator anchor_state;
     CHECK(cache.publish(
         std::move(anchor_stage), &prompt, source_slot, &anchor_state));
-    cache.limit_tokens = 0;
+    CHECK(cache.anchor_size() == anchor_marginal_bytes);
+    CHECK(cache.size() == anchor_payload_bytes);
     const auto df2_before_anchor =
         authority.destruction.host_trade_df2_executed;
-    cache.limit_size = anchor_state->size() - 1;
     cache.update();
     CHECK(cache.states.size() == 1);
     CHECK(&cache.states.front() == &*anchor_state);
+    CHECK(anchor_state->payload.vbr_has_quality_anchor());
     CHECK(fixture.catalog->snapshot().references == 2);
     CHECK(authority.destruction.host_trade_df2_executed ==
           df2_before_anchor);
+
+    // A protected over-budget incumbent cannot turn publish(false) into a
+    // hidden successful insertion. The compact-only incoming node is retired
+    // transactionally while the pinned compact+anchor node remains intact.
+    const auto refused_compact_reference = fixture.catalog->publish(
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(refused_compact_reference.reference_artifact.v != 0);
+    auto refused_compact_payload = owned_payload(
+        refused_compact_reference.reference_artifact);
+    auto refused_compact_stage = cache.stage_vbr(
+        prompt, std::move(refused_compact_payload),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(refused_compact_stage.size() == 1);
+    anchor_state->recovery_pins = 1;
+    cache.limit_anchor_size = anchor_marginal_bytes - 1;
+    const auto anchor_refusals_before = cache.quality_anchor_refusals;
+    server_prompt_cache::iterator refused_compact = cache.states.begin();
+    CHECK(!cache.publish(
+        std::move(refused_compact_stage), &prompt, source_slot,
+        &refused_compact));
+    CHECK(refused_compact == cache.states.end());
+    CHECK(cache.states.size() == 1);
+    CHECK(&cache.states.front() == &*anchor_state);
+    CHECK(anchor_state->payload.vbr_has_quality_anchor());
+    CHECK(fixture.catalog->snapshot().references == 2);
+    CHECK(cache.quality_anchor_refusals ==
+          anchor_refusals_before + 1);
+    anchor_state->recovery_pins = 0;
+
+    // Tightening only the anchor budget retires the quality variant while
+    // preserving the compact node, its stable host association, and the
+    // ordinary DF2 counter.
+    const auto anchor_host_key =
+        server_retention_instance_key::for_host_entry(&*anchor_state);
+    const auto anchor_host_artifact = retention.artifact_id(anchor_host_key);
+    cache.update();
+    CHECK(cache.states.size() == 1);
+    CHECK(&cache.states.front() == &*anchor_state);
+    CHECK(!anchor_state->payload.vbr_has_quality_anchor());
+    CHECK(anchor_state->size() == compact_payload_bytes);
+    CHECK(cache.anchor_size() == 0);
+    CHECK(cache.quality_anchor_retires == 1);
+    CHECK(cache.quality_anchor_refusals ==
+          anchor_refusals_before + 1);
+    CHECK(retention.artifact_id(anchor_host_key) == anchor_host_artifact);
+    CHECK(fixture.catalog->snapshot().references == 1);
+    CHECK(authority.destruction.host_trade_df2_executed ==
+          df2_before_anchor);
+    cache.limit_size = 0;
+    cache.quality_anchor_budget_enabled = false;
+    cache.clear_accounting();
+    cache.states.clear();
+    CHECK(fixture.catalog->snapshot().references == 0);
+
+    // Two logical nodes can share one immutable variant owner when a pinned
+    // incumbent causes publication dedup to retain an exact alias. Anchor
+    // pressure must prepare one physical catalog retirement before changing
+    // either node, then replace both logical variants and commit it once.
+    const auto shared_compact_reference = fixture.catalog->publish(
+        fixture.package, fixture.completions(), fixture.budget);
+    const auto shared_anchor_reference = fixture.catalog->publish(
+        anchor_package, fixture.completions(), fixture.budget);
+    CHECK(shared_compact_reference.reference_artifact.v != 0);
+    CHECK(shared_anchor_reference.reference_artifact.v != 0);
+    vbr_artifact_package_view shared_compact_view;
+    vbr_artifact_package_view shared_anchor_view;
+    CHECK(fixture.catalog->resolve_reference(
+              shared_compact_reference.reference_artifact,
+              shared_compact_view) == vbr_artifact_resolve_status::ok);
+    CHECK(fixture.catalog->resolve_reference(
+              shared_anchor_reference.reference_artifact,
+              shared_anchor_view) == vbr_artifact_resolve_status::ok);
+    auto shared_compact_owner =
+        server_prompt_cache_vbr_payload::adopt_owned(
+            std::move(shared_compact_view));
+    auto shared_anchor_owner =
+        server_prompt_cache_vbr_payload::adopt_owned(
+            std::move(shared_anchor_view));
+    auto shared_variants = server_prompt_cache_vbr_variant_set::create(
+        std::move(shared_compact_owner), std::move(shared_anchor_owner));
+    CHECK(shared_variants);
+    auto shared_first_payload =
+        server_prompt_cache_payload::from_vbr_variants(shared_variants);
+    auto shared_second_payload =
+        server_prompt_cache_payload::from_vbr_variants(shared_variants);
+    const size_t shared_anchor_bytes = size_t(
+        shared_first_payload.vbr_anchor_resident_bytes());
+    CHECK(shared_anchor_bytes > 0);
+    shared_variants.reset();
+
+    server_prompt_cache_payload shared_compact_probe_a;
+    server_prompt_cache_payload shared_compact_probe_b;
+    CHECK(shared_first_payload.prepare_vbr_compact_only(
+        shared_compact_probe_a));
+    CHECK(shared_second_payload.prepare_vbr_compact_only(
+        shared_compact_probe_b));
+    std::vector<const server_prompt_cache_payload *> shared_selected {
+        &shared_first_payload, &shared_second_payload,
+    };
+    std::vector<vbr_artifact_prepared_retire> shared_prepared;
+    CHECK(!server_prompt_cache_payload::prepare_vbr_anchor_retire_batch(
+        shared_selected, fixture.ledger.serial() + 1, shared_prepared));
+    CHECK(shared_prepared.empty());
+    CHECK(shared_first_payload.vbr_has_quality_anchor());
+    CHECK(shared_second_payload.vbr_has_quality_anchor());
+    CHECK(fixture.catalog->snapshot().references == 2);
+    shared_compact_probe_a = {};
+    shared_compact_probe_b = {};
+
+    cache.quality_anchor_budget_enabled = true;
+    cache.limit_anchor_size = shared_anchor_bytes;
+    cache.limit_size = 0;
+    auto shared_first_stage = cache.stage_vbr(
+        prompt, std::move(shared_first_payload),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    server_prompt_cache::iterator shared_first_state;
+    CHECK(cache.publish(
+        std::move(shared_first_stage), &prompt, source_slot,
+        &shared_first_state));
+    shared_first_state->recovery_pins = 1;
+    auto shared_second_stage = cache.stage_vbr(
+        prompt, std::move(shared_second_payload),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    server_prompt_cache::iterator shared_second_state;
+    CHECK(cache.publish(
+        std::move(shared_second_stage), &prompt, source_slot,
+        &shared_second_state));
+    CHECK(cache.states.size() == 2);
+    CHECK(shared_first_state->payload.vbr_has_quality_anchor());
+    CHECK(shared_second_state->payload.vbr_has_quality_anchor());
+    CHECK(fixture.catalog->snapshot().references == 2);
+
+    shared_first_state->recovery_pins = 0;
+    cache.limit_anchor_size = 0;
+    const auto shared_retires_before = cache.quality_anchor_retires;
+    cache.update();
+    CHECK(cache.states.size() == 2);
+    CHECK(!shared_first_state->payload.vbr_has_quality_anchor());
+    CHECK(!shared_second_state->payload.vbr_has_quality_anchor());
+    CHECK(cache.anchor_size() == 0);
+    CHECK(cache.quality_anchor_retires == shared_retires_before + 2);
+    CHECK(fixture.catalog->snapshot().references == 1);
+    cache.quality_anchor_budget_enabled = false;
+    cache.limit_size = 0;
+    cache.clear_accounting();
+    cache.states.clear();
+    CHECK(fixture.catalog->snapshot().references == 0);
+
+    // Missing anchor-ranking authority is fail-soft for a newly published
+    // optional variant: a zero anchor budget strips only that variant and
+    // still publishes the compact checkpoint.
+    const auto fallback_compact_reference = fixture.catalog->publish(
+        fixture.package, fixture.completions(), fixture.budget);
+    const auto fallback_anchor_reference = fixture.catalog->publish(
+        anchor_package, fixture.completions(), fixture.budget);
+    CHECK(fallback_compact_reference.reference_artifact.v != 0);
+    CHECK(fallback_anchor_reference.reference_artifact.v != 0);
+    vbr_artifact_package_view fallback_compact_view;
+    vbr_artifact_package_view fallback_anchor_view;
+    CHECK(fixture.catalog->resolve_reference(
+              fallback_compact_reference.reference_artifact,
+              fallback_compact_view) == vbr_artifact_resolve_status::ok);
+    CHECK(fixture.catalog->resolve_reference(
+              fallback_anchor_reference.reference_artifact,
+              fallback_anchor_view) == vbr_artifact_resolve_status::ok);
+    auto fallback_compact = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(fallback_compact_view));
+    auto fallback_anchor = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(fallback_anchor_view));
+    auto fallback_variants = server_prompt_cache_vbr_variant_set::create(
+        std::move(fallback_compact), std::move(fallback_anchor));
+    CHECK(fallback_variants);
+    auto fallback_payload =
+        server_prompt_cache_payload::from_vbr_variants(
+            std::move(fallback_variants));
+    CHECK(fallback_payload.vbr_has_quality_anchor());
+    auto fallback_stage = cache.stage_vbr(
+        prompt, std::move(fallback_payload),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(fallback_stage.size() == 1);
+    cache.quality_anchor_budget_enabled = true;
+    cache.limit_anchor_size = 0;
+    cache.limit_size = compact_payload_bytes;
+    cache.lease_obs = nullptr;
+    server_prompt_cache::iterator fallback_state;
+    CHECK(cache.publish(
+        std::move(fallback_stage), &prompt, source_slot, &fallback_state));
+    CHECK(fallback_state != cache.states.end());
+    CHECK(!fallback_state->payload.vbr_has_quality_anchor());
+    CHECK(fallback_state->size() == compact_payload_bytes);
+    CHECK(cache.anchor_size() == 0);
+    CHECK(fixture.catalog->snapshot().references == 1);
+    cache.lease_obs = &authority.leases;
+    cache.quality_anchor_budget_enabled = false;
     cache.limit_size = 0;
     cache.clear_accounting();
     cache.states.clear();
@@ -4619,6 +4890,117 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
             std::move(shutdown_stage), &prompt, source_slot));
         CHECK(fixture.catalog->snapshot().references == 1);
     }
+    CHECK(fixture.catalog->snapshot().references == 0);
+}
+
+static void test_prompt_cache_vbr_anchor_prepare_rollback() {
+    catalog_fixture fixture;
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens { 101, 102 }, false);
+    prompt.sequence_epoch = 3;
+    std::string media_identity;
+    CHECK(prompt.tokens.media_content_identity(
+        prompt.n_tokens(), media_identity));
+    fixture.package.manifest.identity.media_content_identity =
+        media_identity;
+    fixture.package.manifest.identity.next_position =
+        prompt.tokens.pos_next();
+    auto anchor_package =
+        prompt_cache_quality_anchor_package(fixture.package);
+    CHECK(fixture.catalog->configure_accounting(anchor_package));
+    const auto compact_reference = fixture.catalog->publish(
+        fixture.package, fixture.completions(), fixture.budget);
+    const auto anchor_reference = fixture.catalog->publish(
+        anchor_package, fixture.completions(), fixture.budget);
+    CHECK(compact_reference.reference_artifact.v != 0);
+    CHECK(anchor_reference.reference_artifact.v != 0);
+
+    vbr_artifact_package_view compact_view;
+    vbr_artifact_package_view anchor_view;
+    CHECK(fixture.catalog->resolve_reference(
+              compact_reference.reference_artifact, compact_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(fixture.catalog->resolve_reference(
+              anchor_reference.reference_artifact, anchor_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto compact_owner = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(compact_view));
+    auto anchor_owner = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(anchor_view));
+    auto variants = server_prompt_cache_vbr_variant_set::create(
+        std::move(compact_owner), std::move(anchor_owner));
+    CHECK(variants);
+    auto first_payload =
+        server_prompt_cache_payload::from_vbr_variants(variants);
+    auto second_payload =
+        server_prompt_cache_payload::from_vbr_variants(variants);
+    const size_t anchor_bytes = size_t(
+        first_payload.vbr_anchor_resident_bytes());
+    CHECK(anchor_bytes > 0);
+    variants.reset();
+
+    server_cache_authority authority;
+    server_retention_sidecar_store retention;
+    retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+    CHECK(retention.enable_prefix_tracking());
+    constexpr int32_t source_slot = 9;
+    const auto source_key =
+        server_retention_instance_key::for_slot(source_slot);
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+    CHECK(retention.publish(
+        source_key, common_retention_pool::attention,
+        spans, true, prompt.n_tokens(), prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        retention, source_key, prompt,
+        fixture.package.manifest.identity.adapter_config_identity,
+        prompt.n_tokens()));
+
+    server_prompt_cache cache(0, 0);
+    cache.acct = &fixture.ledger;
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+    cache.retention_obs = &retention;
+    cache.lease_obs = &authority.leases;
+    cache.lease_execution_identity =
+        &fixture.package.manifest.identity.execution_identity;
+    cache.retention_df2_authority = true;
+    CHECK(cache.enable_retention_shadow());
+    cache.quality_anchor_budget_enabled = true;
+    cache.limit_anchor_size = anchor_bytes;
+
+    auto first_stage = cache.stage_vbr(
+        prompt, std::move(first_payload),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    server_prompt_cache::iterator first_state;
+    CHECK(cache.publish(
+        std::move(first_stage), &prompt, source_slot, &first_state));
+    first_state->recovery_pins = 1;
+    auto second_stage = cache.stage_vbr(
+        prompt, std::move(second_payload),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    server_prompt_cache::iterator second_state;
+    CHECK(cache.publish(
+        std::move(second_stage), &prompt, source_slot, &second_state));
+    first_state->recovery_pins = 0;
+    CHECK(cache.states.size() == 2);
+    CHECK(fixture.catalog->snapshot().references == 2);
+
+    cache.limit_anchor_size = 0;
+    const auto retires_before = cache.quality_anchor_retires;
+    cache.update();
+    CHECK(cache.states.size() == 2);
+    CHECK(first_state->payload.vbr_has_quality_anchor());
+    CHECK(second_state->payload.vbr_has_quality_anchor());
+    CHECK(cache.anchor_size() == anchor_bytes);
+    CHECK(cache.quality_anchor_retires == retires_before);
+    CHECK(fixture.catalog->snapshot().references == 2);
+
+    cache.quality_anchor_budget_enabled = false;
+    cache.clear_accounting();
+    cache.states.clear();
     CHECK(fixture.catalog->snapshot().references == 0);
 }
 
@@ -4908,6 +5290,16 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+    if (server_fault("vbr_anchor_prepare_fail")) {
+        test_prompt_cache_vbr_anchor_prepare_rollback();
+        if (failures != 0) {
+            fprintf(stderr, "%d VBR anchor rollback test(s) failed\n",
+                    failures);
+            return 1;
+        }
+        printf("VBR prompt-cache anchor rollback: PASS\n");
+        return 0;
+    }
     if (server_fault("vbr_prompt_cache_prefix_fail")) {
         test_prompt_cache_vbr_atomic_logical_publication();
         if (failures != 0) {

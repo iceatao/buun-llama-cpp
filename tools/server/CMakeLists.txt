@@ -130,5 +130,11 @@ if (LLAMA_BUILD_TESTS)
         set_tests_properties(test-vbr-artifact-vbr-prefix-fault PROPERTIES
             LABELS main
             ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_prompt_cache_prefix_fail")
+        add_test(NAME test-vbr-artifact-vbr-anchor-prepare-fault
+            COMMAND test-vbr-artifact)
+        set_tests_properties(
+            test-vbr-artifact-vbr-anchor-prepare-fault PROPERTIES
+            LABELS main
+            ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_anchor_prepare_fail")
     endif()
 endif()

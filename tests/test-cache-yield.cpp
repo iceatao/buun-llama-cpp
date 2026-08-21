@@ -236,6 +236,63 @@ static void test_live_retention_projection() {
         candidates.data(), candidates.size(), epoch));
 }
 
+static void test_anchor_parent_values() {
+    constexpr uint64_t epoch = 10;
+
+    // This seam owns parent retention value only. Physical anchor release and
+    // final ordering belong to the allocation-union planner.
+    auto low_parent = live_candidate(0, 10, 10, 10, 1, 0);
+    auto high_parent = live_candidate(1, 20, 20, 100, 1, 0);
+    std::vector<server_live_retention_candidate> candidates {
+        high_parent, low_parent,
+    };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    std::vector<server_anchor_parent_rank> values;
+    CHECK(server_anchor_parent_values_prepared(
+        candidates.data(), candidates.size(), epoch, values));
+    CHECK(values.size() == 2);
+    auto find_value = [&](uint64_t artifact) -> const server_anchor_parent_rank & {
+        const auto found = std::find_if(values.begin(), values.end(),
+            [&](const auto & value) { return value.artifact_id.v == artifact; });
+        CHECK(found != values.end());
+        return *found;
+    };
+    CHECK(find_value(10).parent_value.lost_value_q <
+          find_value(20).parent_value.lost_value_q);
+
+    // Equal parent value and recency remain equal across different lineages;
+    // stable lineage identity must not become part of the parent currency.
+    auto tie_low = live_candidate(2, 30, 30, 100, 4, 0);
+    auto tie_high = live_candidate(3, 31, 31, 100, 4, 0);
+    candidates = { tie_low, tie_high };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    CHECK(server_anchor_parent_values_prepared(
+        candidates.data(), candidates.size(), epoch, values));
+    CHECK(values.size() == 2);
+    CHECK(find_value(30).parent_value.lost_value_q ==
+          find_value(31).parent_value.lost_value_q);
+    CHECK(find_value(30).parent_value.recency_ordinal ==
+          find_value(31).parent_value.recency_ordinal);
+
+    // Protected rows remain retained-coverage evidence but never enter the
+    // parent-value inventory. A compact-only row is marked ineligible by the
+    // caller and is likewise omitted.
+    auto protected_alias = live_candidate(4, 40, 40, 80, 2, 0, false);
+    auto eligible_tail = live_candidate(5, 41, 40, 100, 3, 0);
+    protected_alias.lineage = eligible_tail.lineage;
+    auto no_anchor = live_candidate(6, 50, 50, 1, 4, 0);
+    no_anchor.eligible = false;
+    candidates = { eligible_tail, protected_alias, no_anchor };
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    CHECK(server_anchor_parent_values_prepared(
+        candidates.data(), candidates.size(), epoch, values));
+    CHECK(values.size() == 1);
+    CHECK(values[0].artifact_id.v == 41);
+}
+
 // Rebuild yield candidates from a decoded sidecar snapshot (op == stable_id, the
 // way the fixtures mint them) so encode->decode->replay reproduction can be checked.
 static std::vector<server_cache_yield_candidate> resume_candidates(
@@ -1069,6 +1126,7 @@ static void test_exception_isolation() {
 
 int main() {
     test_live_retention_projection();
+    test_anchor_parent_values();
     test_atomic_assembler_contract();
     test_status_names();
     test_lineage_shadow_projection();

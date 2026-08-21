@@ -142,6 +142,8 @@ std::string lora_config_identity(const std::vector<common_adapter_lora_info> & l
 //   load_clone_fail - force lifecycle restore clone staging to fail before target mutation
 //   vbr_prompt_cache_prefix_fail - refuse VBR prefix publication after its
 //                                  provisional lineage clone (rollback gate)
+//   vbr_anchor_prepare_fail - refuse the prepared quality-anchor retirement
+//                             batch before any logical payload mutation
 //   frontier_disagree_after_flip - make the frontier selector disagree only after
 //                                  it owns reads (exercises fail-closed legacy fallback)
 bool server_fault(const char * tag);

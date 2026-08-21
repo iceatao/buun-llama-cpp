@@ -81,6 +81,13 @@ struct server_live_retention_candidate {
     bool eligible = false;
 };
 
+struct server_anchor_parent_rank {
+    llama_cache_acct_artifact_id artifact_id;
+    common_retention_pool pool = common_retention_pool::attention;
+    uint64_t lineage_id = 0;
+    common_retention_shadow_value parent_value;
+};
+
 struct server_live_retention_projection {
     bool complete = false;
     uint64_t candidate_count = 0;
@@ -123,6 +130,18 @@ server_live_retention_projection server_live_retention_project_prepared(
     const server_live_retention_candidate * candidates,
     size_t size,
     uint64_t competition_epoch,
+    const common_retention_frequency_config & config = {}) noexcept;
+
+// H1 quality-only pool: quote the parent retention value of every eligible
+// artifact. The candidate array must already have passed
+// server_live_retention_prepare(); ineligible rows still contribute retained
+// prefix coverage. Exact physical anchor bytes and final ordering belong to
+// server_prompt_cache_plan_vbr_anchor_releases().
+bool server_anchor_parent_values_prepared(
+    const server_live_retention_candidate * candidates,
+    size_t size,
+    uint64_t competition_epoch,
+    std::vector<server_anchor_parent_rank> & out,
     const common_retention_frequency_config & config = {}) noexcept;
 
 struct server_cache_yield_result {

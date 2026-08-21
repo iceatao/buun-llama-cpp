@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <new>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -425,6 +427,13 @@ uint64_t server_prompt_cache_vbr_variant_set::resident_bytes() const noexcept {
     return impl_ ? impl_->resident : 0;
 }
 
+uint64_t server_prompt_cache_vbr_variant_set::anchor_resident_bytes()
+        const noexcept {
+    return impl_ && impl_->compact &&
+            impl_->compact->resident_bytes() <= impl_->resident
+        ? impl_->resident - impl_->compact->resident_bytes() : 0;
+}
+
 size_t server_prompt_cache_vbr_variant_set::allocation_count() const noexcept {
     return impl_ ? impl_->allocations : 0;
 }
@@ -453,6 +462,48 @@ bool server_prompt_cache_vbr_variant_set::logical_erase_preserves_storage()
 
 bool server_prompt_cache_vbr_variant_set::has_quality_anchor() const noexcept {
     return impl_ && bool(impl_->anchor);
+}
+
+bool server_prompt_cache_vbr_variant_set::anchor_retirement_exclusive()
+        const noexcept {
+    return impl_ && impl_->anchor && impl_->anchor->retirement_owned() &&
+           impl_->anchor.use_count() == 1;
+}
+
+bool server_prompt_cache_vbr_variant_set::prepare_anchor_retire(
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept {
+    out.reset();
+    if (!anchor_retirement_exclusive()) {
+        return false;
+    }
+    return prepare_anchor_retire_owned(expected_serial, out);
+}
+
+bool server_prompt_cache_vbr_variant_set::prepare_anchor_retire_owned(
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept {
+    out.reset();
+    if (!impl_ || !impl_->anchor ||
+        !impl_->anchor->retirement_owned()) {
+        return false;
+    }
+    try {
+        std::vector<const vbr_artifact_package_view *> packages {
+            &impl_->anchor->package(),
+        };
+        return packages.front()->prepare_owned_retire(
+            packages, expected_serial, out);
+    } catch (...) {
+        out.reset();
+        return false;
+    }
+}
+
+std::shared_ptr<const server_prompt_cache_vbr_variant_set>
+server_prompt_cache_vbr_variant_set::compact_only() const noexcept {
+    return impl_ && impl_->compact
+        ? create(impl_->compact) : nullptr;
 }
 
 bool server_prompt_cache_vbr_variant_set::preview_retire(
@@ -615,6 +666,140 @@ bool server_prompt_cache_payload::vbr_has_quality_anchor() const noexcept {
     return variants && variants->has_quality_anchor();
 }
 
+uint64_t server_prompt_cache_payload::vbr_anchor_resident_bytes()
+        const noexcept {
+    const auto * variants = vbr_variants();
+    return variants ? variants->anchor_resident_bytes() : 0;
+}
+
+bool server_prompt_cache_payload::vbr_anchor_retirement_exclusive()
+        const noexcept {
+    const auto * owner = std::get_if<vbr_variant_owner>(&storage_);
+    return owner && *owner && owner->use_count() == 1 &&
+           (*owner)->anchor_retirement_exclusive();
+}
+
+bool server_prompt_cache_payload::prepare_vbr_anchor_retire(
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept {
+    out.reset();
+    const auto * variants = vbr_variants();
+    return vbr_anchor_retirement_exclusive() &&
+           variants->prepare_anchor_retire(expected_serial, out);
+}
+
+bool server_prompt_cache_payload::prepare_vbr_compact_only(
+        server_prompt_cache_payload & out) const noexcept {
+    out = {};
+    const auto * variants = vbr_variants();
+    if (!variants || !variants->has_quality_anchor()) {
+        return false;
+    }
+    auto compact = variants->compact_only();
+    if (!compact) {
+        return false;
+    }
+    out = from_vbr_variants(std::move(compact));
+    return out.valid() && !out.vbr_has_quality_anchor();
+}
+
+bool server_prompt_cache_payload::prepare_vbr_anchor_retire_batch(
+        const std::vector<const server_prompt_cache_payload *> & selected,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_prepared_retire> & out) noexcept {
+    out.clear();
+    if (selected.empty() || expected_serial == 0) {
+        return false;
+    }
+    try {
+        struct variant_state {
+            const vbr_variant_owner * owner = nullptr;
+            size_t selected_refs = 0;
+        };
+        std::map<const server_prompt_cache_vbr_variant_set *, variant_state>
+            variants;
+        std::set<const server_prompt_cache_payload *> unique_payloads;
+        for (const auto * payload : selected) {
+            if (!payload || !unique_payloads.insert(payload).second) {
+                return false;
+            }
+            const auto * owner = std::get_if<vbr_variant_owner>(
+                &payload->storage_);
+            if (!owner || !*owner ||
+                !(*owner)->has_quality_anchor()) {
+                return false;
+            }
+            auto & state = variants[owner->get()];
+            if (!state.owner) {
+                // Two shared_ptr objects may name the same immutable variant;
+                // either one is a valid use-count witness.
+                state.owner = owner;
+            }
+            state.selected_refs++;
+        }
+
+        struct anchor_state {
+            const server_prompt_cache_vbr_owner * owner = nullptr;
+            const server_prompt_cache_vbr_variant_set * representative =
+                nullptr;
+            size_t destroyed_variants = 0;
+        };
+        std::map<const server_prompt_cache_vbr_payload *, anchor_state>
+            anchors;
+        for (const auto & entry : variants) {
+            const auto & state = entry.second;
+            if (!state.owner || state.selected_refs == 0 ||
+                state.selected_refs > size_t(state.owner->use_count())) {
+                return false;
+            }
+            if (state.selected_refs != size_t(state.owner->use_count())) {
+                continue;
+            }
+            const auto & anchor = entry.first->quality_anchor();
+            if (!anchor || !anchor->retirement_owned()) {
+                return false;
+            }
+            auto & group = anchors[anchor.get()];
+            if (!group.owner) {
+                group.owner = &anchor;
+                group.representative = entry.first;
+            }
+            group.destroyed_variants++;
+        }
+
+        size_t physical_groups = 0;
+        for (const auto & entry : anchors) {
+            const auto & group = entry.second;
+            if (!group.owner || !*group.owner ||
+                group.destroyed_variants >
+                    size_t(group.owner->use_count())) {
+                return false;
+            }
+            physical_groups += group.destroyed_variants ==
+                size_t(group.owner->use_count());
+        }
+        out.reserve(physical_groups);
+        for (const auto & entry : anchors) {
+            const auto & group = entry.second;
+            if (group.destroyed_variants !=
+                    size_t(group.owner->use_count())) {
+                continue;
+            }
+            vbr_artifact_prepared_retire prepared;
+            if (!group.representative->prepare_anchor_retire_owned(
+                    expected_serial, prepared)) {
+                out.clear();
+                return false;
+            }
+            out.push_back(std::move(prepared));
+        }
+        return true;
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
 bool server_prompt_cache_payload::preview_vbr_retire(
         uint64_t expected_serial,
         llama_cache_acct_release_set_preview & out) const noexcept {
@@ -662,6 +847,338 @@ bool server_prompt_cache_payload::preview_vbr_retire_union(
             variants, expected_serial, out);
     } catch (...) {
         out = {};
+        return false;
+    }
+}
+
+bool server_prompt_cache_payload::summarize_vbr_budgets(
+        const std::vector<const server_prompt_cache_payload *> & payloads,
+        server_prompt_cache_vbr_budget_summary & out) noexcept {
+    out = {};
+    if (payloads.empty()) {
+        return true;
+    }
+    try {
+        size_t compact_rows = 0;
+        size_t all_rows = 0;
+        for (const auto * payload : payloads) {
+            const auto * variants = payload ? payload->vbr_variants() : nullptr;
+            if (!variants || !variants->compact_current()) {
+                return false;
+            }
+            size_t rows = 0;
+            if (!allocation_row_count(
+                    variants->compact_current()->package(), rows) ||
+                rows > std::numeric_limits<size_t>::max() - compact_rows) {
+                return false;
+            }
+            compact_rows += rows;
+            if (variants->quality_anchor()) {
+                if (!allocation_row_count(
+                        variants->quality_anchor()->package(), rows) ||
+                    rows > std::numeric_limits<size_t>::max() - all_rows) {
+                    return false;
+                }
+                all_rows += rows;
+            }
+        }
+        const size_t anchor_rows = all_rows;
+        if (compact_rows > std::numeric_limits<size_t>::max() - all_rows) {
+            return false;
+        }
+        all_rows += compact_rows;
+
+        std::vector<vbr_artifact_allocation_view> compact;
+        std::vector<vbr_artifact_allocation_view> all;
+        compact.reserve(compact_rows);
+        if (anchor_rows != 0) {
+            all.reserve(all_rows);
+        }
+        for (const auto * payload : payloads) {
+            const auto * variants = payload->vbr_variants();
+            append_allocations(variants->compact_current()->package(), compact);
+            if (anchor_rows != 0) {
+                append_allocations(
+                    variants->compact_current()->package(), all);
+                if (variants->quality_anchor()) {
+                    append_allocations(
+                        variants->quality_anchor()->package(), all);
+                }
+            }
+        }
+        server_prompt_cache_vbr_accounting_summary compact_summary;
+        if (!server_prompt_cache_summarize_vbr_allocations(
+                std::move(compact), compact_summary)) {
+            return false;
+        }
+        if (anchor_rows == 0) {
+            out.compact_resident_bytes = compact_summary.resident_bytes;
+            out.compact_allocations = compact_summary.allocation_count;
+            return true;
+        }
+        server_prompt_cache_vbr_accounting_summary all_summary;
+        if (!server_prompt_cache_summarize_vbr_allocations(
+                std::move(all), all_summary) ||
+            compact_summary.resident_bytes > all_summary.resident_bytes ||
+            compact_summary.allocation_count > all_summary.allocation_count) {
+            return false;
+        }
+        out.compact_resident_bytes = compact_summary.resident_bytes;
+        out.anchor_resident_bytes =
+            all_summary.resident_bytes - compact_summary.resident_bytes;
+        out.compact_allocations = compact_summary.allocation_count;
+        out.anchor_allocations =
+            all_summary.allocation_count - compact_summary.allocation_count;
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
+bool server_prompt_cache_plan_vbr_anchor_releases(
+        const std::vector<server_prompt_cache_vbr_anchor_plan_candidate> & candidates,
+        uint64_t current_anchor_bytes,
+        uint64_t limit_anchor_bytes,
+        std::vector<llama_cache_acct_artifact_id> & selected) noexcept {
+    selected.clear();
+    if (current_anchor_bytes <= limit_anchor_bytes) {
+        return true;
+    }
+    if (candidates.empty() || candidates.size() >
+            SERVER_PROMPT_CACHE_VBR_ANCHOR_MAX_CANDIDATES) {
+        return false;
+    }
+    try {
+        struct tagged_allocation {
+            const vbr_artifact_allocation_view * value = nullptr;
+            size_t candidate = 0;
+            bool compact = false;
+        };
+        std::vector<tagged_allocation> tagged;
+        std::vector<llama_cache_acct_artifact_id> artifacts;
+        artifacts.reserve(candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const auto & candidate = candidates[i];
+            const auto * variants = candidate.payload
+                ? candidate.payload->vbr_variants() : nullptr;
+            if (!candidate.artifact_id.v || !variants ||
+                !variants->compact_current() ||
+                (candidate.eligible && !variants->quality_anchor())) {
+                return false;
+            }
+            artifacts.push_back(candidate.artifact_id);
+            const auto append = [&](const vbr_artifact_package_view & package,
+                                    bool compact) {
+                const auto add = [&](const auto & rows) {
+                    for (const auto & row : rows) {
+                        tagged.push_back({ &row, i, compact });
+                    }
+                };
+                add(package.reference_allocations());
+                for (const auto & unit : package.units()) {
+                    add(unit.payload_allocations);
+                    add(unit.stash_allocations);
+                }
+            };
+            append(variants->compact_current()->package(), true);
+            if (variants->quality_anchor()) {
+                append(variants->quality_anchor()->package(), false);
+            }
+        }
+        std::sort(artifacts.begin(), artifacts.end(),
+            [](auto a, auto b) { return a.v < b.v; });
+        if (std::adjacent_find(artifacts.begin(), artifacts.end()) !=
+                artifacts.end()) {
+            return false;
+        }
+        std::sort(tagged.begin(), tagged.end(), [](const auto & a,
+                                                   const auto & b) {
+            return std::tie(a.value->allocation.v, a.compact, a.candidate) <
+                   std::tie(b.value->allocation.v, b.compact, b.candidate);
+        });
+
+        struct allocation_state {
+            uint64_t resident = 0;
+            uint32_t references = 0;
+            std::vector<size_t> candidates;
+        };
+        std::vector<allocation_state> allocations;
+        std::vector<std::vector<size_t>> candidate_allocations(
+            candidates.size());
+        uint64_t measured_anchor_bytes = 0;
+        for (size_t first = 0; first < tagged.size();) {
+            size_t last = first + 1;
+            const auto * canonical = tagged[first].value;
+            while (last < tagged.size() &&
+                   tagged[last].value->allocation ==
+                       canonical->allocation) {
+                if (!allocation_equal(*canonical, *tagged[last].value)) {
+                    return false;
+                }
+                last++;
+            }
+            if (!canonical->allocation) {
+                if (canonical->logical != 0 || canonical->resident != 0) {
+                    return false;
+                }
+                first = last;
+                continue;
+            }
+            const bool compact = std::any_of(
+                tagged.begin() + first, tagged.begin() + last,
+                [](const auto & row) { return row.compact; });
+            if (!compact) {
+                allocation_state state;
+                state.resident = canonical->resident;
+                for (size_t i = first; i < last; ++i) {
+                    if (tagged[i].compact ||
+                        (!state.candidates.empty() &&
+                         state.candidates.back() == tagged[i].candidate)) {
+                        continue;
+                    }
+                    state.candidates.push_back(tagged[i].candidate);
+                }
+                if (state.candidates.size() > UINT32_MAX ||
+                    state.resident > UINT64_MAX - measured_anchor_bytes) {
+                    return false;
+                }
+                state.references = uint32_t(state.candidates.size());
+                if (state.references != 0) {
+                    const size_t index = allocations.size();
+                    for (const size_t candidate : state.candidates) {
+                        candidate_allocations[candidate].push_back(index);
+                    }
+                    measured_anchor_bytes += state.resident;
+                    allocations.push_back(std::move(state));
+                }
+            }
+            first = last;
+        }
+        if (measured_anchor_bytes != current_anchor_bytes) {
+            return false;
+        }
+
+        std::vector<size_t> priority;
+        priority.reserve(candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (candidates[i].eligible) {
+                priority.push_back(i);
+            }
+        }
+        std::sort(priority.begin(), priority.end(), [&](size_t a, size_t b) {
+            const auto & lhs = candidates[a];
+            const auto & rhs = candidates[b];
+            return std::tie(lhs.parent_value_q, lhs.recency_ordinal,
+                            lhs.pool, lhs.lineage_id, lhs.artifact_id.v) <
+                   std::tie(rhs.parent_value_q, rhs.recency_ordinal,
+                            rhs.pool, rhs.lineage_id, rhs.artifact_id.v);
+        });
+
+        struct choice {
+            uint64_t bytes = 0;
+            size_t candidate = 0;
+        };
+        struct choice_less {
+            const std::vector<server_prompt_cache_vbr_anchor_plan_candidate> *
+                candidates = nullptr;
+            bool operator()(const choice & a, const choice & b) const {
+                if (a.bytes != b.bytes) {
+                    return a.bytes > b.bytes;
+                }
+                const auto & lhs = (*candidates)[a.candidate];
+                const auto & rhs = (*candidates)[b.candidate];
+                return std::tie(lhs.pool, lhs.lineage_id,
+                                lhs.artifact_id.v) <
+                       std::tie(rhs.pool, rhs.lineage_id,
+                                rhs.artifact_id.v);
+            }
+        };
+        std::vector<uint64_t> marginal(candidates.size(), 0);
+        std::vector<bool> remaining(candidates.size(), true);
+        for (size_t first = 0; first < priority.size() &&
+                measured_anchor_bytes > limit_anchor_bytes;) {
+            size_t last = first + 1;
+            const auto & group = candidates[priority[first]];
+            while (last < priority.size()) {
+                const auto & next = candidates[priority[last]];
+                if (next.parent_value_q != group.parent_value_q ||
+                    next.recency_ordinal != group.recency_ordinal) {
+                    break;
+                }
+                last++;
+            }
+            std::set<choice, choice_less> choices(
+                choice_less { &candidates });
+            for (size_t i = first; i < last; ++i) {
+                const size_t candidate = priority[i];
+                uint64_t bytes = 0;
+                for (const size_t allocation :
+                        candidate_allocations[candidate]) {
+                    if (allocations[allocation].references == 1) {
+                        if (allocations[allocation].resident >
+                                UINT64_MAX - bytes) {
+                            return false;
+                        }
+                        bytes += allocations[allocation].resident;
+                    }
+                }
+                marginal[candidate] = bytes;
+                choices.insert({ bytes, candidate });
+            }
+            while (!choices.empty() &&
+                   measured_anchor_bytes > limit_anchor_bytes) {
+                const choice current = *choices.begin();
+                choices.erase(choices.begin());
+                const size_t candidate = current.candidate;
+                remaining[candidate] = false;
+                selected.push_back(candidates[candidate].artifact_id);
+                for (const size_t allocation :
+                        candidate_allocations[candidate]) {
+                    auto & state = allocations[allocation];
+                    if (state.references == 0) {
+                        return false;
+                    }
+                    state.references--;
+                    if (state.references == 0) {
+                        if (state.resident > measured_anchor_bytes) {
+                            return false;
+                        }
+                        measured_anchor_bytes -= state.resident;
+                    } else if (state.references == 1) {
+                        size_t survivor = candidates.size();
+                        for (const size_t value : state.candidates) {
+                            if (remaining[value]) {
+                                survivor = value;
+                                break;
+                            }
+                        }
+                        if (survivor != candidates.size() &&
+                            candidates[survivor].eligible &&
+                            candidates[survivor].parent_value_q ==
+                                group.parent_value_q &&
+                            candidates[survivor].recency_ordinal ==
+                                group.recency_ordinal) {
+                            choices.erase({ marginal[survivor], survivor });
+                            if (state.resident >
+                                    UINT64_MAX - marginal[survivor]) {
+                                return false;
+                            }
+                            marginal[survivor] += state.resident;
+                            choices.insert({ marginal[survivor], survivor });
+                        }
+                    }
+                }
+            }
+            first = last;
+        }
+        if (measured_anchor_bytes > limit_anchor_bytes) {
+            selected.clear();
+            return false;
+        }
+        return true;
+    } catch (...) {
+        selected.clear();
         return false;
     }
 }

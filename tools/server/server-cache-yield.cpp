@@ -299,6 +299,94 @@ server_live_retention_projection server_live_retention_project_prepared(
     return result;
 }
 
+bool server_anchor_parent_values_prepared(
+        const server_live_retention_candidate * candidates,
+        size_t size,
+        uint64_t competition_epoch,
+        std::vector<server_anchor_parent_rank> & out,
+        const common_retention_frequency_config & config) noexcept {
+    out.clear();
+    if (!candidates || size == 0 ||
+        size > SERVER_CACHE_YIELD_MAX_CANDIDATES ||
+        competition_epoch == 0 || !config.valid()) {
+        return false;
+    }
+    try {
+        out.reserve(size);
+        for (size_t first = 0; first < size;) {
+            size_t last = first;
+            uint64_t maximum = 0;
+            uint64_t second = 0;
+            uint32_t maximum_count = 0;
+            const auto pool = candidates[first].stamp.pool;
+            const uint64_t lineage_id = candidates[first].stamp.lineage_id;
+            const auto lineage = candidates[first].lineage;
+            while (last < size && candidates[last].stamp.pool == pool &&
+                   candidates[last].stamp.lineage_id == lineage_id) {
+                const auto & candidate = candidates[last];
+                if (candidate.lineage != lineage ||
+                    !candidate.stamp.valid() ||
+                    candidate.stamp.state !=
+                        common_retention_score_state::known ||
+                    candidate.external_shared_coverage_tokens >
+                        candidate.stamp.coverage_tokens ||
+                    (last > first &&
+                        std::tie(candidates[last - 1].stamp.coverage_tokens,
+                                 candidates[last - 1].artifact_id.v) >=
+                        std::tie(candidate.stamp.coverage_tokens,
+                                 candidate.artifact_id.v))) {
+                    out.clear();
+                    return false;
+                }
+                if (candidate.present) {
+                    const uint64_t coverage =
+                        candidate.stamp.coverage_tokens;
+                    if (coverage > maximum) {
+                        second = maximum;
+                        maximum = coverage;
+                        maximum_count = 1;
+                    } else if (coverage == maximum) {
+                        maximum_count++;
+                    } else {
+                        second = std::max(second, coverage);
+                    }
+                }
+                last++;
+            }
+            for (size_t i = first; i < last; ++i) {
+                const auto & candidate = candidates[i];
+                if (!candidate.present || !candidate.eligible) {
+                    continue;
+                }
+                server_retention_singleton_quote quote;
+                if (!server_retention_quote_singleton(
+                        candidate.stamp, candidate.lineage,
+                        maximum, second, maximum_count,
+                        candidate.external_shared_coverage_tokens,
+                        1, competition_epoch, config, quote)) {
+                    out.clear();
+                    return false;
+                }
+                out.push_back({
+                    candidate.artifact_id,
+                    candidate.stamp.pool,
+                    candidate.stamp.lineage_id,
+                    quote.value,
+                });
+            }
+            first = last;
+        }
+        std::sort(out.begin(), out.end(), [](const auto & a, const auto & b) {
+            return std::tie(a.pool, a.lineage_id, a.artifact_id.v) <
+                   std::tie(b.pool, b.lineage_id, b.artifact_id.v);
+        });
+        return !out.empty();
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
 server_retention_shadow_projection server_retention_shadow_project(
         const std::vector<server_cache_yield_candidate> & candidates,
         uint64_t competition_epoch,
