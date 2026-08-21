@@ -7,7 +7,251 @@
 #include <deque>
 #include <limits>
 #include <new>
+#include <tuple>
 #include <utility>
+
+namespace {
+
+struct capture_projection_placement {
+    uint64_t manifest_id = 0;
+    const vbr_artifact_stream_placement * placement = nullptr;
+};
+
+struct capture_projection_cursor {
+    const capture_projection_placement * source = nullptr;
+    size_t cell = 0;
+};
+
+bool capture_checked_add(uint64_t a, uint64_t b, uint64_t & output) {
+    if (b > UINT64_MAX - a) {
+        return false;
+    }
+    output = a + b;
+    return true;
+}
+
+bool capture_cursor_after(
+        const capture_projection_cursor & lhs,
+        const capture_projection_cursor & rhs) {
+    const auto & lhs_cell = lhs.source->placement->cells[lhs.cell];
+    const auto & rhs_cell = rhs.source->placement->cells[rhs.cell];
+    return std::tie(lhs_cell.physical_cell, lhs.source->manifest_id) >
+           std::tie(rhs_cell.physical_cell, rhs.source->manifest_id);
+}
+
+} // namespace
+
+bool vbr_artifact_project_capture_union(
+        const vbr_capture_projection_batch & batch,
+        const vbr_capture_projection_limits & limits,
+        vbr_capture_projection_plan & output) noexcept {
+    output = {};
+    try {
+        const auto & manifests = batch.manifests;
+        if (batch.source_namespace == 0 || manifests.empty() ||
+            manifests.size() > limits.max_manifests ||
+            limits.max_manifests == 0 || limits.max_placements == 0 ||
+            limits.max_input_cells == 0 || limits.max_union_cells == 0 ||
+            limits.max_segments == 0 ||
+            limits.max_dependency_references == 0) {
+            return false;
+        }
+
+        uint64_t placement_count = 0;
+        uint64_t input_cells = 0;
+        std::vector<uint64_t> manifest_ids;
+        manifest_ids.reserve(manifests.size());
+        std::vector<capture_projection_placement> placements;
+        for (const auto & manifest : manifests) {
+            if (manifest.manifest_id == 0 || manifest.placements.empty() ||
+                !capture_checked_add(
+                    placement_count, manifest.placements.size(),
+                    placement_count) ||
+                placement_count > limits.max_placements) {
+                return false;
+            }
+            manifest_ids.push_back(manifest.manifest_id);
+            std::vector<std::pair<llama_seq_id, llama_pos>> logical_positions;
+            for (const auto & placement : manifest.placements) {
+                if (placement.child_id == UINT32_MAX ||
+                    placement.stream_index == UINT32_MAX ||
+                    placement.source_sequence < 0 ||
+                    placement.computation_frontier <= 0 ||
+                    placement.cells.empty() ||
+                    !capture_checked_add(
+                        input_cells, placement.cells.size(), input_cells) ||
+                    input_cells > limits.max_input_cells) {
+                    return false;
+                }
+                placements.push_back({ manifest.manifest_id, &placement });
+                for (size_t i = 0; i < placement.cells.size(); ++i) {
+                    const auto & cell = placement.cells[i];
+                    if (cell.physical_cell == UINT32_MAX ||
+                        cell.logical_position < 0 ||
+                        cell.logical_position >=
+                            placement.computation_frontier ||
+                        (i != 0 &&
+                         placement.cells[i - 1].physical_cell >=
+                             cell.physical_cell)) {
+                        return false;
+                    }
+                    logical_positions.push_back({
+                        placement.source_sequence,
+                        cell.logical_position,
+                    });
+                }
+            }
+            std::sort(logical_positions.begin(), logical_positions.end());
+            if (std::adjacent_find(
+                    logical_positions.begin(), logical_positions.end()) !=
+                    logical_positions.end()) {
+                return false;
+            }
+        }
+        std::sort(manifest_ids.begin(), manifest_ids.end());
+        if (std::adjacent_find(manifest_ids.begin(), manifest_ids.end()) !=
+                manifest_ids.end()) {
+            return false;
+        }
+        std::sort(placements.begin(), placements.end(),
+            [](const auto & lhs, const auto & rhs) {
+                return std::tie(lhs.placement->child_id,
+                                lhs.placement->stream_index,
+                                lhs.manifest_id) <
+                       std::tie(rhs.placement->child_id,
+                                rhs.placement->stream_index,
+                                rhs.manifest_id);
+            });
+        if (std::adjacent_find(
+                placements.begin(), placements.end(),
+                [](const auto & lhs, const auto & rhs) {
+                    return lhs.manifest_id == rhs.manifest_id &&
+                           lhs.placement->child_id ==
+                               rhs.placement->child_id &&
+                           lhs.placement->stream_index ==
+                               rhs.placement->stream_index;
+                }) != placements.end()) {
+            return false;
+        }
+
+        vbr_capture_projection_plan plan;
+        plan.source_namespace = batch.source_namespace;
+        plan.manifest_count = uint32_t(manifests.size());
+        plan.placement_count = uint32_t(placement_count);
+        plan.input_cell_references = input_cells;
+        uint64_t segment_count = 0;
+        std::vector<capture_projection_cursor> heap;
+        std::vector<uint64_t> dependencies;
+        for (size_t group_begin = 0; group_begin < placements.size();) {
+            size_t group_end = group_begin + 1;
+            while (group_end < placements.size() &&
+                   placements[group_end].placement->child_id ==
+                       placements[group_begin].placement->child_id &&
+                   placements[group_end].placement->stream_index ==
+                       placements[group_begin].placement->stream_index) {
+                ++group_end;
+            }
+            plan.streams.push_back({
+                placements[group_begin].placement->child_id,
+                placements[group_begin].placement->stream_index,
+                {},
+            });
+            auto & stream = plan.streams.back();
+            heap.clear();
+            dependencies.clear();
+            heap.reserve(group_end - group_begin);
+            dependencies.reserve(group_end - group_begin);
+            for (size_t i = group_begin; i < group_end; ++i) {
+                heap.push_back({ &placements[i], 0 });
+            }
+            std::make_heap(heap.begin(), heap.end(), capture_cursor_after);
+
+            while (!heap.empty()) {
+                const uint32_t cell =
+                    heap.front().source->placement->cells[
+                        heap.front().cell].physical_cell;
+                dependencies.clear();
+                while (!heap.empty() &&
+                       heap.front().source->placement->cells[
+                           heap.front().cell].physical_cell == cell) {
+                    std::pop_heap(
+                        heap.begin(), heap.end(), capture_cursor_after);
+                    auto cursor = heap.back();
+                    heap.pop_back();
+                    if (!dependencies.empty() &&
+                        dependencies.back() == cursor.source->manifest_id) {
+                        return false;
+                    }
+                    dependencies.push_back(cursor.source->manifest_id);
+                    ++cursor.cell;
+                    if (cursor.cell <
+                            cursor.source->placement->cells.size()) {
+                        heap.push_back(cursor);
+                        std::push_heap(
+                            heap.begin(), heap.end(), capture_cursor_after);
+                    }
+                }
+
+                if (plan.union_cell_count == limits.max_union_cells) {
+                    return false;
+                }
+                const auto dependencies_equal = [&]() {
+                    if (stream.segments.empty()) {
+                        return false;
+                    }
+                    const auto & prior = stream.segments.back();
+                    return prior.dependency_count == dependencies.size() &&
+                        std::equal(
+                            dependencies.begin(), dependencies.end(),
+                            plan.dependent_manifest_ids.begin() +
+                                prior.first_dependency);
+                };
+                const bool extend = !stream.segments.empty() &&
+                    uint64_t(stream.segments.back().first_physical_cell) +
+                        stream.segments.back().cell_count == cell &&
+                    dependencies_equal();
+                if (extend) {
+                    if (stream.segments.back().cell_count == UINT32_MAX) {
+                        return false;
+                    }
+                    ++stream.segments.back().cell_count;
+                } else {
+                    if (segment_count == limits.max_segments ||
+                        plan.dependency_references >
+                            limits.max_dependency_references ||
+                        dependencies.size() >
+                            limits.max_dependency_references -
+                                plan.dependency_references ||
+                        plan.dependent_manifest_ids.size() > UINT32_MAX ||
+                        dependencies.size() > UINT32_MAX) {
+                        return false;
+                    }
+                    const uint32_t first_dependency = uint32_t(
+                        plan.dependent_manifest_ids.size());
+                    plan.dependent_manifest_ids.insert(
+                        plan.dependent_manifest_ids.end(),
+                        dependencies.begin(), dependencies.end());
+                    ++segment_count;
+                    plan.dependency_references += dependencies.size();
+                    stream.segments.push_back({
+                        cell, 1, first_dependency,
+                        uint32_t(dependencies.size()),
+                    });
+                }
+                ++plan.union_cell_count;
+            }
+            group_begin = group_end;
+        }
+        if (plan.streams.empty()) {
+            return false;
+        }
+        output = std::move(plan);
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
 
 const char * vbr_capture_stream_status_name(
         vbr_capture_stream_status status) noexcept {

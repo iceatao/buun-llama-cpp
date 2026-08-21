@@ -1,4 +1,5 @@
 #include "llama-vbr-artifact.h"
+#include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-artifact-catalog.h"
 #include "server-cache-lease.h"
 #include "server-cache-vbr-proof.h"
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -43,6 +45,8 @@ static_assert(!std::is_copy_constructible<vbr_staged_payloads>::value);
 static_assert(!std::is_copy_assignable<vbr_staged_payloads>::value);
 static_assert(std::is_nothrow_move_constructible<vbr_staged_payloads>::value);
 static_assert(std::is_nothrow_move_assignable<vbr_staged_payloads>::value);
+static_assert(std::is_trivially_copyable<
+    vbr_capture_projection_segment>::value);
 
 #define CHECK(cond) \
     do { \
@@ -4512,7 +4516,297 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
 }
 
 #endif
-int main() {
+
+static vbr_artifact_stream_placement capture_placement(
+        uint32_t child,
+        uint32_t stream,
+        llama_seq_id sequence,
+        llama_pos frontier,
+        std::initializer_list<std::pair<uint32_t, llama_pos>> cells) {
+    vbr_artifact_stream_placement result;
+    result.child_id = child;
+    result.stream_index = stream;
+    result.source_sequence = sequence;
+    result.computation_frontier = frontier;
+    for (const auto & cell : cells) {
+        result.cells.push_back({ cell.first, cell.second, 0, 0 });
+    }
+    return result;
+}
+
+static void test_sequence_projected_capture_union() {
+    vbr_capture_projection_manifest twenty;
+    twenty.manifest_id = 20;
+    twenty.placements.push_back(capture_placement(
+        0, 0, 2, 10, {{0, 0}, {1, 1}, {2, 2}, {4, 4}}));
+    twenty.placements.push_back(capture_placement(
+        1, 0, 4, 10, {{1, 1}}));
+    vbr_capture_projection_manifest ten;
+    ten.manifest_id = 10;
+    ten.placements.push_back(capture_placement(
+        0, 0, 3, 10, {{1, 1}, {2, 2}, {3, 3}}));
+
+    vbr_capture_projection_limits limits;
+    vbr_capture_projection_plan plan;
+    vbr_capture_projection_batch batch { 77, { twenty, ten } };
+    CHECK(vbr_artifact_project_capture_union(
+        batch, limits, plan));
+    CHECK(plan.source_namespace == 77);
+    CHECK(plan.manifest_count == 2);
+    CHECK(plan.placement_count == 3);
+    CHECK(plan.input_cell_references == 8);
+    CHECK(plan.union_cell_count == 6);
+    CHECK(plan.dependency_references == 6);
+    CHECK(plan.streams.size() == 2);
+    if (plan.streams.size() == 2) {
+        const auto & first = plan.streams[0];
+        CHECK(first.child_id == 0);
+        CHECK(first.stream_index == 0);
+        CHECK(first.segments.size() == 4);
+        if (first.segments.size() == 4) {
+            CHECK(first.segments[0].first_physical_cell == 0);
+            CHECK(first.segments[0].cell_count == 1);
+            CHECK(std::vector<uint64_t>(
+                      plan.dependent_manifest_ids.begin() +
+                          first.segments[0].first_dependency,
+                      plan.dependent_manifest_ids.begin() +
+                          first.segments[0].first_dependency +
+                          first.segments[0].dependency_count) ==
+                  std::vector<uint64_t>({20}));
+            CHECK(first.segments[1].first_physical_cell == 1);
+            CHECK(first.segments[1].cell_count == 2);
+            CHECK(std::vector<uint64_t>(
+                      plan.dependent_manifest_ids.begin() +
+                          first.segments[1].first_dependency,
+                      plan.dependent_manifest_ids.begin() +
+                          first.segments[1].first_dependency +
+                          first.segments[1].dependency_count) ==
+                  std::vector<uint64_t>({10, 20}));
+            CHECK(first.segments[2].first_physical_cell == 3);
+            CHECK(first.segments[2].cell_count == 1);
+            CHECK(std::vector<uint64_t>(
+                      plan.dependent_manifest_ids.begin() +
+                          first.segments[2].first_dependency,
+                      plan.dependent_manifest_ids.begin() +
+                          first.segments[2].first_dependency +
+                          first.segments[2].dependency_count) ==
+                  std::vector<uint64_t>({10}));
+            CHECK(first.segments[3].first_physical_cell == 4);
+            CHECK(first.segments[3].cell_count == 1);
+            CHECK(std::vector<uint64_t>(
+                      plan.dependent_manifest_ids.begin() +
+                          first.segments[3].first_dependency,
+                      plan.dependent_manifest_ids.begin() +
+                          first.segments[3].first_dependency +
+                          first.segments[3].dependency_count) ==
+                  std::vector<uint64_t>({20}));
+        }
+        const auto & second = plan.streams[1];
+        CHECK(second.child_id == 1);
+        CHECK(second.stream_index == 0);
+        CHECK(second.segments.size() == 1);
+        if (second.segments.size() == 1) {
+            CHECK(second.segments[0].first_physical_cell == 1);
+            CHECK(second.segments[0].cell_count == 1);
+            CHECK(std::vector<uint64_t>(
+                      plan.dependent_manifest_ids.begin() +
+                          second.segments[0].first_dependency,
+                      plan.dependent_manifest_ids.begin() +
+                          second.segments[0].first_dependency +
+                          second.segments[0].dependency_count) ==
+                  std::vector<uint64_t>({20}));
+        }
+    }
+
+    // Caller order cannot affect the transport or dependency plan.
+    vbr_capture_projection_plan reversed;
+    vbr_capture_projection_batch reversed_batch { 77, { ten, twenty } };
+    CHECK(vbr_artifact_project_capture_union(
+        reversed_batch, limits, reversed));
+    CHECK(reversed.source_namespace == plan.source_namespace);
+    CHECK(reversed.manifest_count == plan.manifest_count);
+    CHECK(reversed.placement_count == plan.placement_count);
+    CHECK(reversed.input_cell_references == plan.input_cell_references);
+    CHECK(reversed.union_cell_count == plan.union_cell_count);
+    CHECK(reversed.dependency_references == plan.dependency_references);
+    CHECK(reversed.streams.size() == plan.streams.size());
+    if (reversed.streams.size() == plan.streams.size()) {
+        for (size_t i = 0; i < plan.streams.size(); ++i) {
+            CHECK(reversed.streams[i].child_id == plan.streams[i].child_id);
+            CHECK(reversed.streams[i].stream_index ==
+                  plan.streams[i].stream_index);
+            CHECK(reversed.streams[i].segments.size() ==
+                  plan.streams[i].segments.size());
+            const size_t count = std::min(
+                reversed.streams[i].segments.size(),
+                plan.streams[i].segments.size());
+            for (size_t j = 0; j < count; ++j) {
+                CHECK(reversed.streams[i].segments[j].first_physical_cell ==
+                      plan.streams[i].segments[j].first_physical_cell);
+                CHECK(reversed.streams[i].segments[j].cell_count ==
+                      plan.streams[i].segments[j].cell_count);
+                CHECK(reversed.streams[i].segments[j].first_dependency ==
+                      plan.streams[i].segments[j].first_dependency);
+                CHECK(reversed.streams[i].segments[j].dependency_count ==
+                      plan.streams[i].segments[j].dependency_count);
+            }
+        }
+    }
+    CHECK(reversed.dependent_manifest_ids == plan.dependent_manifest_ids);
+
+    // Every refusal is transactional: even a pre-populated output is cleared.
+    auto expect_refused = [&](const vbr_capture_projection_batch & refused_batch,
+                              const vbr_capture_projection_limits & bound) {
+        vbr_capture_projection_plan refused = plan;
+        CHECK(!vbr_artifact_project_capture_union(
+            refused_batch, bound, refused));
+        CHECK(refused.source_namespace == 0);
+        CHECK(refused.manifest_count == 0);
+        CHECK(refused.placement_count == 0);
+        CHECK(refused.input_cell_references == 0);
+        CHECK(refused.union_cell_count == 0);
+        CHECK(refused.dependency_references == 0);
+        CHECK(refused.streams.empty());
+        CHECK(refused.dependent_manifest_ids.empty());
+    };
+
+    auto exact_limits = limits;
+    exact_limits.max_manifests = 2;
+    exact_limits.max_placements = 3;
+    exact_limits.max_input_cells = 8;
+    exact_limits.max_union_cells = 6;
+    exact_limits.max_segments = 5;
+    exact_limits.max_dependency_references = 6;
+    vbr_capture_projection_plan exact;
+    CHECK(vbr_artifact_project_capture_union(batch, exact_limits, exact));
+
+    auto too_few_manifests = exact_limits;
+    too_few_manifests.max_manifests = 1;
+    expect_refused(batch, too_few_manifests);
+    auto too_few_placements = exact_limits;
+    too_few_placements.max_placements = 2;
+    expect_refused(batch, too_few_placements);
+    auto too_few_input = exact_limits;
+    too_few_input.max_input_cells = 7;
+    expect_refused(batch, too_few_input);
+    auto too_few_union = limits;
+    too_few_union.max_union_cells = 5;
+    expect_refused(batch, too_few_union);
+    auto too_few_segments = limits;
+    too_few_segments.max_segments = 4;
+    expect_refused(batch, too_few_segments);
+    auto too_few_dependencies = limits;
+    too_few_dependencies.max_dependency_references = 5;
+    expect_refused(batch, too_few_dependencies);
+
+    auto no_namespace = batch;
+    no_namespace.source_namespace = 0;
+    expect_refused(no_namespace, limits);
+
+    auto duplicate_id = ten;
+    duplicate_id.manifest_id = twenty.manifest_id;
+    expect_refused({ 77, { twenty, duplicate_id } }, limits);
+
+    auto duplicate_stream = ten;
+    duplicate_stream.placements.push_back(capture_placement(
+        0, 0, 4, 10, {{5, 5}}));
+    expect_refused({ 77, { duplicate_stream } }, limits);
+
+    auto unordered = ten;
+    std::reverse(unordered.placements[0].cells.begin(),
+                 unordered.placements[0].cells.end());
+    expect_refused({ 77, { unordered } }, limits);
+
+    auto beyond_frontier = ten;
+    beyond_frontier.placements[0].cells.back().logical_position = 10;
+    expect_refused({ 77, { beyond_frontier } }, limits);
+
+    auto zero_id = ten;
+    zero_id.manifest_id = 0;
+    expect_refused({ 77, { zero_id } }, limits);
+    auto invalid_physical = ten;
+    invalid_physical.placements[0].cells[0].physical_cell = UINT32_MAX;
+    expect_refused({ 77, { invalid_physical } }, limits);
+    auto invalid_logical = ten;
+    invalid_logical.placements[0].cells[0].logical_position = -1;
+    expect_refused({ 77, { invalid_logical } }, limits);
+
+    auto duplicate_logical = ten;
+    duplicate_logical.placements[0].cells[1].logical_position =
+        duplicate_logical.placements[0].cells[0].logical_position;
+    expect_refused({ 77, { duplicate_logical } }, limits);
+
+    vbr_capture_projection_manifest cross_placement;
+    cross_placement.manifest_id = 30;
+    cross_placement.placements.push_back(capture_placement(
+        0, 0, 5, 10, {{1, 2}}));
+    cross_placement.placements.push_back(capture_placement(
+        1, 0, 5, 10, {{2, 2}}));
+    expect_refused({ 77, { cross_placement } }, limits);
+
+    // Logical positions are sequence-scoped, so two independent sequences
+    // may cite the same position without making the manifest ambiguous.
+    cross_placement.placements[1].source_sequence = 6;
+    vbr_capture_projection_plan sequence_scoped;
+    CHECK(vbr_artifact_project_capture_union(
+        { 77, { cross_placement } }, limits, sequence_scoped));
+}
+
+static void benchmark_sequence_projected_capture_union() {
+    static constexpr uint32_t CELLS = 1048576;
+    vbr_capture_projection_manifest even;
+    even.manifest_id = 1;
+    even.placements.push_back(capture_placement(0, 0, 1, CELLS, {}));
+    vbr_capture_projection_manifest odd;
+    odd.manifest_id = 2;
+    odd.placements.push_back(capture_placement(0, 0, 2, CELLS, {}));
+    auto & even_cells = even.placements[0].cells;
+    auto & odd_cells = odd.placements[0].cells;
+    even_cells.reserve(CELLS/2);
+    odd_cells.reserve(CELLS/2);
+    for (uint32_t cell = 0; cell < CELLS; ++cell) {
+        auto & target = (cell & 1u) ? odd_cells : even_cells;
+        target.push_back({ cell, llama_pos(cell/2), 0, 0 });
+    }
+
+    vbr_capture_projection_limits limits;
+    limits.max_manifests = 2;
+    limits.max_placements = 2;
+    limits.max_input_cells = CELLS;
+    limits.max_union_cells = CELLS;
+    limits.max_segments = CELLS;
+    limits.max_dependency_references = CELLS;
+    vbr_capture_projection_plan plan;
+    const auto begin = std::chrono::steady_clock::now();
+    CHECK(vbr_artifact_project_capture_union(
+        { 1, { std::move(even), std::move(odd) } }, limits, plan));
+    const auto elapsed = std::chrono::duration_cast<
+        std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+    CHECK(plan.manifest_count == 2);
+    CHECK(plan.placement_count == 2);
+    CHECK(plan.input_cell_references == CELLS);
+    CHECK(plan.union_cell_count == CELLS);
+    CHECK(plan.dependency_references == CELLS);
+    CHECK(plan.streams.size() == 1);
+    if (plan.streams.size() == 1) {
+        CHECK(plan.streams[0].segments.size() == CELLS);
+    }
+    CHECK(plan.dependent_manifest_ids.size() == CELLS);
+    printf("VBR_CAPTURE_PROJECTION_BENCH cells=%u segments=%zu "
+           "dependencies=%zu elapsed_us=%lld\n",
+           CELLS,
+           plan.streams.empty() ? 0 : plan.streams[0].segments.size(),
+           plan.dependent_manifest_ids.size(),
+           (long long) elapsed);
+}
+
+int main(int argc, char ** argv) {
+    if (argc == 2 &&
+        strcmp(argv[1], "--capture-projection-bench") == 0) {
+        benchmark_sequence_projected_capture_union();
+        return failures == 0 ? 0 : 1;
+    }
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
     if (server_fault("vbr_prompt_cache_prefix_fail")) {
         test_prompt_cache_vbr_atomic_logical_publication();
@@ -4546,6 +4840,7 @@ int main() {
     test_catalog_package_lease_and_reference_placement();
     test_prompt_cache_vbr_payload_fanout_lifetime();
     test_prompt_cache_vbr_same_frontier_variants();
+    test_sequence_projected_capture_union();
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST

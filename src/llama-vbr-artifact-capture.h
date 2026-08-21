@@ -120,6 +120,64 @@ struct vbr_capture_stream_stats {
     std::array<uint8_t, 32> streaming_digest = {};
 };
 
+// H1 sequence-projected capture planning. Each logical manifest contributes
+// exact live placement evidence; the planner lowers their physical-row union
+// into deterministic runs whose dependency sets identify precisely which
+// manifests must be cancelled if that run cannot be sealed. This is a
+// process-local capture plan, not wire metadata.
+struct vbr_capture_projection_manifest {
+    uint64_t manifest_id = 0;
+    std::vector<vbr_artifact_stream_placement> placements;
+};
+
+struct vbr_capture_projection_segment {
+    uint32_t first_physical_cell = 0;
+    uint32_t cell_count = 0;
+    uint32_t first_dependency = 0;
+    uint32_t dependency_count = 0;
+};
+
+struct vbr_capture_projection_stream {
+    uint32_t child_id = UINT32_MAX;
+    uint32_t stream_index = UINT32_MAX;
+    std::vector<vbr_capture_projection_segment> segments;
+};
+
+struct vbr_capture_projection_limits {
+    uint32_t max_manifests = 4096;
+    uint32_t max_placements = 4096;
+    uint32_t max_input_cells = 1048576;
+    uint32_t max_union_cells = 1048576;
+    uint32_t max_segments = 1048576;
+    uint32_t max_dependency_references = 1048576;
+};
+
+// One batch is structurally bound to one live memory-tree namespace. Child
+// and stream IDs are meaningful only within that immutable source namespace;
+// callers must start a separate batch for another live tree.
+struct vbr_capture_projection_batch {
+    uint64_t source_namespace = 0;
+    std::vector<vbr_capture_projection_manifest> manifests;
+};
+
+struct vbr_capture_projection_plan {
+    uint64_t source_namespace = 0;
+    uint32_t manifest_count = 0;
+    uint32_t placement_count = 0;
+    uint64_t input_cell_references = 0;
+    uint64_t union_cell_count = 0;
+    uint64_t dependency_references = 0;
+    std::vector<vbr_capture_projection_stream> streams;
+    std::vector<uint64_t> dependent_manifest_ids;
+};
+
+// Allocation failure, malformed placement evidence, duplicate identities, or
+// any limit violation clears output and returns false.
+bool vbr_artifact_project_capture_union(
+    const vbr_capture_projection_batch & batch,
+    const vbr_capture_projection_limits & limits,
+    vbr_capture_projection_plan & output) noexcept;
+
 // One globally-bounded ring split across per-device lanes. A null device lane
 // is the deterministic CPU test path. Real lanes allocate that device's host
 // buffer type and use optional backend events; no event means a synchronized
