@@ -6498,6 +6498,7 @@ bool llama_kv_cache::vbr_capture_snapshot_acquire(
         output.source_namespace = source_namespace;
         output.child_id = child_id;
         output.logical_unit_id = logical_unit_id;
+        output.lineage_uuid = tracker->lineage_identity();
         output.controller_generation = tracker->controller_generation();
         output.mutation_serial = unit_mutation_serial;
         output.generation = tracker->unit_generation(logical_unit_id);
@@ -6534,6 +6535,7 @@ bool llama_kv_cache::vbr_capture_snapshot_recheck(
         uint64_t unit_mutation_serial = 0;
         std::array<uint8_t, 32> topology = {};
         return tracker != nullptr && tracker->active() &&
+            tracker->lineage_identity() == expected.lineage_uuid &&
             tracker->controller_generation() == expected.controller_generation &&
             session->cache->vbr_capture_unit_read_serial(
                 expected.logical_unit_id, unit_mutation_serial) &&

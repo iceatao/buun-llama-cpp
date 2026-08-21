@@ -1,5 +1,6 @@
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-artifact-stage.h"
+#include "llama-vbr-identity-digest.h"
 #include "llama-vbr-operation.h"
 #include "server-vbr-artifact-store.h"
 
@@ -252,6 +253,7 @@ struct projected_snapshot_fixture {
                    self.snapshot.generation.promote_hops &&
                expected.generation.last_transition ==
                    self.snapshot.generation.last_transition &&
+               expected.lineage_uuid == self.snapshot.lineage_uuid &&
                expected.controller_generation ==
                    self.snapshot.controller_generation &&
                expected.mutation_serial == self.snapshot.mutation_serial;
@@ -344,6 +346,7 @@ static void test_projected_unit_transfer() {
     snapshot.snapshot.source_namespace = 91;
     snapshot.snapshot.child_id = 0;
     snapshot.snapshot.logical_unit_id = 7;
+    snapshot.snapshot.lineage_uuid = { 17, 19 };
     snapshot.snapshot.controller_generation = 11;
     snapshot.snapshot.mutation_serial = 0;
     snapshot.snapshot.generation.repr_gen = 13;
@@ -368,13 +371,13 @@ static void test_projected_unit_transfer() {
     CHECK(snapshot.acquired == 1);
     CHECK(snapshot.rechecked == 1);
     CHECK(snapshot.released == 1);
-    CHECK(captured.projection == projection);
-    CHECK(captured.shards.size() == 2);
-    CHECK(captured.packed_bytes == 20);
-    CHECK(captured.transfer.bytes == 20);
+    CHECK(captured.projection() == projection);
+    CHECK(captured.shards().size() == 2);
+    CHECK(captured.packed_bytes() == 20);
+    CHECK(captured.transfer().bytes == 20);
     CHECK(std::any_of(
-        captured.transfer.streaming_digest.begin(),
-        captured.transfer.streaming_digest.end(),
+        captured.transfer().streaming_digest.begin(),
+        captured.transfer().streaming_digest.end(),
         [](uint8_t value) { return value != 0; }));
     auto rebound_sources = sources;
     rebound_sources[0].source.context = &first;
@@ -382,25 +385,25 @@ static void test_projected_unit_transfer() {
     std::array<uint8_t, 32> rebound_digest = {};
     CHECK(vbr_capture_projected_shard_topology(
         rebound_sources, rebound_count, rebound_digest));
-    CHECK(rebound_digest != captured.snapshot.shard_topology_digest);
+    CHECK(rebound_digest != captured.snapshot().shard_topology_digest);
     rebound_sources = sources;
     rebound_sources[0].source.tensor_offset = 1;
     CHECK(vbr_capture_projected_shard_topology(
         rebound_sources, rebound_count, rebound_digest));
-    CHECK(rebound_digest != captured.snapshot.shard_topology_digest);
-    if (captured.shards.size() == 2) {
-        CHECK(captured.shards[0].shard_index == 0);
-        CHECK(captured.shards[1].shard_index == 1);
-        CHECK(read_chain(*captured.shards[0].bytes) ==
+    CHECK(rebound_digest != captured.snapshot().shard_topology_digest);
+    if (captured.shards().size() == 2) {
+        CHECK(captured.shards()[0].shard_index == 0);
+        CHECK(captured.shards()[1].shard_index == 1);
+        CHECK(read_chain(*captured.shards()[0].bytes) ==
               projected_rows(first.bytes, 2, { 1, 2, 3, 5 }));
-        CHECK(read_chain(*captured.shards[1].bytes) ==
+        CHECK(read_chain(*captured.shards()[1].bytes) ==
               projected_rows(second.bytes, 3, { 1, 2, 3, 5 }));
-        CHECK(captured.slices.size() == 4);
-        if (captured.slices.size() == 4) {
-            CHECK(captured.slices[0].packed_first_row == 0);
-            CHECK(captured.slices[1].packed_first_row == 1);
-            CHECK(captured.slices[2].packed_first_row == 2);
-            CHECK(captured.slices[3].packed_first_row == 3);
+        CHECK(projection->streams[0].segments.size() == 4);
+        if (projection->streams[0].segments.size() == 4) {
+            CHECK(projection->streams[0].segments[0].packed_first_row == 0);
+            CHECK(projection->streams[0].segments[1].packed_first_row == 1);
+            CHECK(projection->streams[0].segments[2].packed_first_row == 2);
+            CHECK(projection->streams[0].segments[3].packed_first_row == 3);
         }
     }
 
@@ -414,18 +417,30 @@ static void test_projected_unit_transfer() {
     CHECK(vbr_artifact_project_capture_union(
         { 91, { combined } }, {}, combined_projection));
     projected_snapshot_fixture combined_snapshot;
-    combined_snapshot.snapshot = captured.snapshot;
+    combined_snapshot.snapshot = captured.snapshot();
     vbr_capture_projected_unit combined_capture;
     CHECK(vbr_capture_projected_unit_transfer(
               combined_projection, 0, 0, 7, sources, {},
               combined_snapshot.provider(), *ring, combined_capture) ==
           vbr_capture_stream_status::ok);
-    CHECK(combined_capture.packed_bytes == captured.packed_bytes);
-    CHECK(combined_capture.transfer.streaming_digest !=
-          captured.transfer.streaming_digest);
+    CHECK(combined_capture.packed_bytes() == captured.packed_bytes());
+    CHECK(combined_capture.transfer().streaming_digest !=
+          captured.transfer().streaming_digest);
+
+    projected_snapshot_fixture other_lineage;
+    other_lineage.snapshot = captured.snapshot();
+    other_lineage.snapshot.lineage_uuid.lo++;
+    vbr_capture_projected_unit lineage_capture;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, {},
+              other_lineage.provider(), *ring, lineage_capture) ==
+          vbr_capture_stream_status::ok);
+    CHECK(lineage_capture.packed_bytes() == captured.packed_bytes());
+    CHECK(lineage_capture.transfer().streaming_digest !=
+          captured.transfer().streaming_digest);
 
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     snapshot.recheck_ok = false;
     vbr_capture_projected_unit changed = captured;
     CHECK(vbr_capture_projected_unit_transfer(
@@ -436,11 +451,11 @@ static void test_projected_unit_transfer() {
     CHECK(snapshot.acquired == 1);
     CHECK(snapshot.rechecked == 1);
     CHECK(snapshot.released == 1);
-    CHECK(!changed.projection);
-    CHECK(changed.shards.empty());
+    CHECK(!changed);
+    CHECK(changed.shards().empty());
 
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     sources[0].source.fail_completion_at = 0;
     vbr_capture_projected_unit failed = captured;
     CHECK(vbr_capture_projected_unit_transfer(
@@ -451,11 +466,11 @@ static void test_projected_unit_transfer() {
     CHECK(snapshot.acquired == 1);
     CHECK(snapshot.rechecked == 0);
     CHECK(snapshot.released == 1);
-    CHECK(!failed.projection);
-    CHECK(failed.shards.empty());
+    CHECK(!failed);
+    CHECK(failed.shards().empty());
 
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     snapshot.acquire_ok = false;
     sources[0].source.fail_completion_at = UINT64_MAX;
     CHECK(vbr_capture_projected_unit_transfer(
@@ -468,7 +483,7 @@ static void test_projected_unit_transfer() {
     CHECK(snapshot.released == 0);
 
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     snapshot.snapshot.controller_generation = 0;
     CHECK(vbr_capture_projected_unit_transfer(
               projection, 0, 0, 7, sources,
@@ -481,7 +496,7 @@ static void test_projected_unit_transfer() {
 
     // Stable zero serials are valid; odd mutation/publish serials are not.
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     snapshot.snapshot.mutation_serial = 1;
     CHECK(vbr_capture_projected_unit_transfer(
               projection, 0, 0, 7, sources, {},
@@ -499,23 +514,23 @@ static void test_projected_unit_transfer() {
         CHECK(invalid.rechecked == 0);
         CHECK(invalid.released == 1);
     };
-    auto invalid_snapshot = captured.snapshot;
+    auto invalid_snapshot = captured.snapshot();
     invalid_snapshot.generation.last_source_type = -1;
     expect_invalid_snapshot(invalid_snapshot);
-    invalid_snapshot = captured.snapshot;
+    invalid_snapshot = captured.snapshot();
     invalid_snapshot.generation.current_type = GGML_TYPE_COUNT;
     expect_invalid_snapshot(invalid_snapshot);
-    invalid_snapshot = captured.snapshot;
+    invalid_snapshot = captured.snapshot();
     invalid_snapshot.generation.domain = vbr_repr_domain(255);
     expect_invalid_snapshot(invalid_snapshot);
-    invalid_snapshot = captured.snapshot;
+    invalid_snapshot = captured.snapshot();
     invalid_snapshot.generation.last_transition = vbr_repr_transition(255);
     expect_invalid_snapshot(invalid_snapshot);
-    invalid_snapshot = captured.snapshot;
+    invalid_snapshot = captured.snapshot();
     invalid_snapshot.generation.flags = 1;
     expect_invalid_snapshot(invalid_snapshot);
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     snapshot.snapshot.generation.publish_seq = 15;
     CHECK(vbr_capture_projected_unit_transfer(
               projection, 0, 0, 7, sources, {},
@@ -526,7 +541,7 @@ static void test_projected_unit_transfer() {
     // The snapshot authenticates the complete shard set. Reordering is
     // normalized, while omission, sparse/sentinel IDs, and substitution fail.
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     auto omitted = sources;
     omitted.erase(omitted.begin());
     CHECK(vbr_capture_projected_unit_transfer(
@@ -536,7 +551,7 @@ static void test_projected_unit_transfer() {
     auto substituted = sources;
     substituted[0].source_identity++;
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     CHECK(vbr_capture_projected_unit_transfer(
               projection, 0, 0, 7, substituted, {},
               snapshot.provider(), *ring, failed) ==
@@ -556,7 +571,7 @@ static void test_projected_unit_transfer() {
     vbr_capture_projected_transfer_limits tight;
     tight.max_shards = 1;
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     CHECK(vbr_capture_projected_unit_transfer(
               projection, 0, 0, 7, sources, tight,
               snapshot.provider(), *ring, failed) ==
@@ -591,7 +606,7 @@ static void test_projected_unit_transfer() {
           vbr_capture_stream_status::projection_invalid);
 
     snapshot = {};
-    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot = captured.snapshot();
     sources[0].row_count = 3;
     CHECK(vbr_capture_projected_unit_transfer(
               projection, 0, 0, 7, sources,
@@ -600,6 +615,443 @@ static void test_projected_unit_transfer() {
           vbr_capture_stream_status::projection_invalid);
     CHECK(snapshot.acquired == 0);
     CHECK(snapshot.released == 0);
+}
+
+struct projected_controller_fixture {
+    uint64_t rejected_manifest = 0;
+    std::vector<uint64_t> rechecked;
+
+    static bool recheck(
+            void * context,
+            uint64_t manifest_id,
+            const vbr_capture_controller_target * targets,
+            size_t target_count) noexcept {
+        auto & self = *static_cast<projected_controller_fixture *>(context);
+        self.rechecked.push_back(manifest_id);
+        if (manifest_id == self.rejected_manifest || !targets ||
+            target_count == 0) {
+            return false;
+        }
+        for (size_t i = 0; i < target_count; ++i) {
+            if (targets[i].manifest_id != manifest_id ||
+                (i != 0 &&
+                 targets[i - 1].child_id >= targets[i].child_id)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    vbr_capture_controller_target_provider provider() {
+        return { this, recheck };
+    }
+};
+
+static vbr_unit_generation projected_generation(
+        uint64_t repr_gen, ggml_type type = GGML_TYPE_F16) {
+    vbr_unit_generation generation;
+    generation.repr_gen = repr_gen;
+    generation.publish_seq = repr_gen*2;
+    generation.current_type = type;
+    generation.last_source_type = type;
+    return generation;
+}
+
+static vbr_capture_controller_target projected_target(
+        uint64_t manifest_id,
+        uint32_t child_id,
+        uint64_t controller_generation,
+        const vbr_unit_generation & generation) {
+    vbr_capture_controller_target target;
+    target.manifest_id = manifest_id;
+    target.source_namespace = 707;
+    target.child_id = child_id;
+    target.lineage_uuid = {
+        uint64_t(child_id + 1), controller_generation + 1000,
+    };
+    target.controller_generation = controller_generation;
+    target.units = { generation };
+    target.policy.child_id = child_id;
+    target.policy.dependency_mode =
+        checkpoint_child_dependency_mode::live_guarded;
+    target.policy.degrade_order_digest.fill(
+        uint8_t(1 + controller_generation + child_id));
+    target.policy.policy_digest.fill(
+        uint8_t(17 + controller_generation + child_id));
+    target.policy.cursor = controller_generation;
+    target.policy.floor_type = GGML_TYPE_Q4_0;
+    target.policy.pressure_independent_settings = 9;
+    target.policy.n_stream = 1;
+    target.policy.unified = true;
+    target.policy.wm_cells = 64;
+    target.policy.current_type_vector_digest =
+        vbr_type_vector_digest(std::vector<ggml_type> {
+            ggml_type(generation.current_type),
+        });
+    target.policy.completed_wave = true;
+    return target;
+}
+
+static vbr_capture_projected_unit capture_projected_unit_for_target(
+        const vbr_capture_projection & projection,
+        const vbr_capture_controller_target & target,
+        uint32_t stream_index = 0) {
+    synthetic_source source;
+    source.bytes.resize(8);
+    for (uint32_t i = 0; i < source.bytes.size(); ++i) {
+        source.bytes[i] = uint8_t(
+            i + target.child_id + target.controller_generation);
+    }
+    vbr_capture_projected_shard_source shard;
+    shard.shard_index = 0;
+    shard.row_count = source.bytes.size();
+    shard.row_bytes = 1;
+    shard.source_identity =
+        target.controller_generation*10 + target.child_id + 1;
+    shard.source.size = source.bytes.size();
+    shard.source.context = &source;
+    shard.source.read = read_synthetic;
+    std::vector<vbr_capture_projected_shard_source> sources { shard };
+
+    projected_snapshot_fixture snapshot;
+    snapshot.snapshot.source_namespace = target.source_namespace;
+    snapshot.snapshot.child_id = target.child_id;
+    snapshot.snapshot.logical_unit_id = 0;
+    snapshot.snapshot.lineage_uuid = target.lineage_uuid;
+    snapshot.snapshot.controller_generation = target.controller_generation;
+    snapshot.snapshot.mutation_serial = 0;
+    snapshot.snapshot.generation = target.units[0];
+    CHECK(vbr_capture_projected_shard_topology(
+        sources, snapshot.snapshot.shard_count,
+        snapshot.snapshot.shard_topology_digest));
+    vbr_capture_stream_status status;
+    auto ring = vbr_pinned_chunk_ring::create({ {} }, 16, 4, status);
+    CHECK(ring);
+    vbr_capture_projected_unit unit;
+    if (ring) {
+        CHECK(vbr_capture_projected_unit_transfer(
+                  projection, target.child_id, stream_index, 0,
+                  sources, {}, snapshot.provider(), *ring, unit) ==
+              vbr_capture_stream_status::ok);
+    }
+    return unit;
+}
+
+static const vbr_capture_manifest_result * projected_manifest(
+        const vbr_capture_manifest_assembly & assembly,
+        uint64_t manifest_id) {
+    const auto & manifests = assembly.manifests();
+    const auto found = std::find_if(
+        manifests.begin(), manifests.end(),
+        [&](const auto & value) { return value.manifest_id == manifest_id; });
+    return found == manifests.end() ? nullptr : &*found;
+}
+
+static bool assemble_projected_test_batch(
+        const vbr_capture_projection & projection,
+        const std::vector<vbr_capture_controller_target> & targets,
+        const std::vector<vbr_capture_projected_unit> & units,
+        const vbr_capture_controller_target_provider & provider,
+        const vbr_capture_manifest_assembly_limits & limits,
+        vbr_capture_manifest_assembly & output) {
+    auto owned_targets = targets;
+    auto owned_units = units;
+    return vbr_capture_assemble_manifests(
+        projection, std::move(owned_targets), std::move(owned_units),
+        provider, limits, output);
+}
+
+static void test_manifest_coherent_assembly() {
+    vbr_capture_projection_manifest first;
+    first.manifest_id = 10;
+    first.placements.push_back(projected_placement(10, 10, { 1, 2 }));
+    vbr_capture_projection_manifest second;
+    second.manifest_id = 20;
+    auto second_placement = projected_placement(20, 20, { 3, 4 });
+    second_placement.child_id = 1;
+    second.placements.push_back(std::move(second_placement));
+    vbr_capture_projection_manifest shared;
+    shared.manifest_id = 30;
+    shared.placements.push_back(projected_placement(30, 30, { 2, 5 }));
+    auto shared_second = projected_placement(30, 31, { 4, 6 });
+    shared_second.child_id = 1;
+    shared.placements.push_back(std::move(shared_second));
+    vbr_capture_projection projection;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, { shared, second, first } }, {}, projection));
+
+    const auto generation_a = projected_generation(5);
+    const auto generation_b = projected_generation(7, GGML_TYPE_Q8_0);
+    const auto generation_c = projected_generation(9, GGML_TYPE_Q6_K);
+    auto target_first = projected_target(10, 0, 101, generation_a);
+    auto target_second = projected_target(20, 1, 202, generation_b);
+    auto target_shared_a = projected_target(30, 0, 101, generation_a);
+    auto target_shared_b = projected_target(30, 1, 303, generation_c);
+    std::vector<vbr_capture_controller_target> targets {
+        target_shared_b, target_first, target_shared_a, target_second,
+    };
+    std::vector<vbr_capture_projected_unit> units {
+        capture_projected_unit_for_target(projection, target_shared_b),
+        capture_projected_unit_for_target(projection, target_second),
+        capture_projected_unit_for_target(projection, target_first),
+    };
+
+    projected_controller_fixture controller;
+    vbr_capture_manifest_assembly assembled;
+    CHECK(assemble_projected_test_batch(
+        projection, targets, units, controller.provider(), {}, assembled));
+    CHECK(bool(assembled));
+    CHECK(controller.rechecked == std::vector<uint64_t>({ 10, 20, 30 }));
+    CHECK(assembled.controller_targets().size() == 4);
+    CHECK(assembled.projected_units().size() == 3);
+    CHECK(assembled.manifests().size() == 3);
+    CHECK(assembled.manifests()[0].manifest_id == 10);
+    CHECK(assembled.manifests()[1].manifest_id == 20);
+    CHECK(assembled.manifests()[2].manifest_id == 30);
+    for (const auto & manifest : assembled.manifests()) {
+        CHECK(manifest.state == vbr_capture_manifest_state::ready);
+    }
+    const auto * manifest_first = projected_manifest(assembled, 10);
+    const auto * manifest_shared = projected_manifest(assembled, 30);
+    CHECK(manifest_first != nullptr);
+    CHECK(manifest_shared != nullptr);
+    if (manifest_first && manifest_shared) {
+        CHECK(manifest_first->controller_count == 1);
+        CHECK(manifest_first->unit_count == 1);
+        CHECK(manifest_shared->controller_count == 2);
+        CHECK(manifest_shared->unit_count == 2);
+        const uint32_t first_unit = assembled.unit_references()[
+            manifest_first->first_unit];
+        const uint32_t shared_unit = assembled.unit_references()[
+            manifest_shared->first_unit];
+        CHECK(first_unit == shared_unit);
+    }
+
+    // Losing one target generation invalidates only manifests that name it;
+    // independently sealed units and manifests remain available.
+    auto partial_units = units;
+    partial_units.erase(partial_units.begin());
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        projection, targets, partial_units,
+        controller.provider(), {}, assembled));
+    CHECK(projected_manifest(assembled, 10)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 20)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 30)->state ==
+          vbr_capture_manifest_state::dependency_unavailable);
+    CHECK(assembled.projected_units().size() == 2);
+
+    auto stale_targets = targets;
+    stale_targets.front().controller_generation = 404;
+    stale_targets.front().policy.cursor = 404;
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        projection, stale_targets, units,
+        controller.provider(), {}, assembled));
+    CHECK(projected_manifest(assembled, 10)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 20)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 30)->state ==
+          vbr_capture_manifest_state::dependency_unavailable);
+    CHECK(assembled.projected_units().size() == 2);
+    CHECK(projected_manifest(assembled, 30)->controller_count == 0);
+    CHECK(projected_manifest(assembled, 30)->unit_count == 0);
+
+    stale_targets = targets;
+    stale_targets.front().units[0].repr_gen++;
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        projection, stale_targets, units,
+        controller.provider(), {}, assembled));
+    CHECK(projected_manifest(assembled, 10)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 30)->state ==
+          vbr_capture_manifest_state::dependency_unavailable);
+
+    stale_targets = targets;
+    stale_targets.front().lineage_uuid.lo++;
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        projection, stale_targets, units,
+        controller.provider(), {}, assembled));
+    CHECK(projected_manifest(assembled, 10)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 20)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 30)->state ==
+          vbr_capture_manifest_state::dependency_unavailable);
+
+    auto missing_targets = targets;
+    missing_targets.erase(missing_targets.begin());
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        projection, missing_targets, units,
+        controller.provider(), {}, assembled));
+    CHECK(controller.rechecked == std::vector<uint64_t>({ 10, 20 }));
+    CHECK(projected_manifest(assembled, 10)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 20)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 30)->state ==
+          vbr_capture_manifest_state::dependency_unavailable);
+
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        projection, {}, units, controller.provider(), {}, assembled));
+    CHECK(controller.rechecked.empty());
+    CHECK(assembled.manifests().size() == 3);
+    CHECK(std::all_of(
+        assembled.manifests().begin(), assembled.manifests().end(),
+        [](const auto & manifest) {
+            return manifest.state ==
+                vbr_capture_manifest_state::dependency_unavailable;
+        }));
+    CHECK(assembled.projected_units().empty());
+
+    controller = {};
+    controller.rejected_manifest = 30;
+    CHECK(assemble_projected_test_batch(
+        projection, targets, units, controller.provider(), {}, assembled));
+    CHECK(projected_manifest(assembled, 10)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 20)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 30)->state ==
+          vbr_capture_manifest_state::dependency_unavailable);
+    CHECK(assembled.projected_units().size() == 2);
+
+    // Exact flat-arena bounds are accepted; one-less limits fail
+    // transactionally and clear an earlier successful capability.
+    vbr_capture_manifest_assembly_limits exact;
+    exact.max_controller_targets = 4;
+    exact.max_projected_units = 3;
+    exact.max_manifests = 3;
+    exact.max_controller_references = 4;
+    exact.max_unit_references = 4;
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        projection, targets, units, controller.provider(), exact, assembled));
+    const auto expect_limit_refusal = [&](auto tighten) {
+        auto limited = exact;
+        tighten(limited);
+        CHECK(!assemble_projected_test_batch(
+            projection, targets, units,
+            controller.provider(), limited, assembled));
+        CHECK(!assembled);
+    };
+    expect_limit_refusal([](auto & value) {
+        value.max_controller_targets = 3;
+    });
+    expect_limit_refusal([](auto & value) {
+        value.max_projected_units = 2;
+    });
+    expect_limit_refusal([](auto & value) {
+        value.max_manifests = 2;
+    });
+    expect_limit_refusal([](auto & value) {
+        value.max_controller_references = 3;
+    });
+    expect_limit_refusal([](auto & value) {
+        value.max_unit_references = 3;
+    });
+
+    auto conflicting_targets = targets;
+    conflicting_targets[2].units[0].repr_gen++;
+    conflicting_targets[2].policy.current_type_vector_digest =
+        target_shared_a.policy.current_type_vector_digest;
+    CHECK(!assemble_projected_test_batch(
+        projection, conflicting_targets, units,
+        controller.provider(), {}, assembled));
+    CHECK(!assembled);
+
+    conflicting_targets = targets;
+    conflicting_targets[2].lineage_uuid.lo++;
+    CHECK(!assemble_projected_test_batch(
+        projection, conflicting_targets, units,
+        controller.provider(), {}, assembled));
+    CHECK(!assembled);
+
+    auto duplicate_targets = targets;
+    duplicate_targets.push_back(target_first);
+    CHECK(!assemble_projected_test_batch(
+        projection, duplicate_targets, units,
+        controller.provider(), {}, assembled));
+    CHECK(!assembled);
+
+    auto malformed_units = units;
+    malformed_units.front() = {};
+    CHECK(!assemble_projected_test_batch(
+        projection, targets, malformed_units,
+        controller.provider(), {}, assembled));
+    CHECK(!assembled);
+
+    // One controller tuple spans all streams of a child; every projected
+    // stream must supply the complete unit vector before the manifest is ready.
+    vbr_capture_projection_manifest multi_stream;
+    multi_stream.manifest_id = 40;
+    multi_stream.placements.push_back(
+        projected_placement(40, 40, { 1, 3 }));
+    auto stream_one_placement =
+        projected_placement(40, 41, { 2, 4 });
+    stream_one_placement.stream_index = 1;
+    multi_stream.placements.push_back(std::move(stream_one_placement));
+    vbr_capture_projection stream_projection;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, { multi_stream } }, {}, stream_projection));
+    auto stream_target = projected_target(40, 0, 505, generation_a);
+    stream_target.policy.n_stream = 2;
+    stream_target.policy.unified = false;
+    std::vector<vbr_capture_controller_target> stream_targets {
+        stream_target,
+    };
+    std::vector<vbr_capture_projected_unit> stream_units {
+        capture_projected_unit_for_target(stream_projection, stream_target, 1),
+        capture_projected_unit_for_target(stream_projection, stream_target, 0),
+    };
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        stream_projection, stream_targets, stream_units,
+        controller.provider(), {}, assembled));
+    CHECK(projected_manifest(assembled, 40)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 40)->controller_count == 1);
+    CHECK(projected_manifest(assembled, 40)->unit_count == 2);
+    stream_units.pop_back();
+    CHECK(assemble_projected_test_batch(
+        stream_projection, stream_targets, stream_units,
+        controller.provider(), {}, assembled));
+    CHECK(projected_manifest(assembled, 40)->state ==
+          vbr_capture_manifest_state::dependency_unavailable);
+
+    vbr_capture_projection_manifest selected_stream;
+    selected_stream.manifest_id = 50;
+    auto selected_placement = projected_placement(50, 50, { 2, 4 });
+    selected_placement.stream_index = 1;
+    selected_stream.placements.push_back(std::move(selected_placement));
+    vbr_capture_projection selected_projection;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, { selected_stream } }, {}, selected_projection));
+    auto selected_target = projected_target(50, 0, 606, generation_b);
+    selected_target.policy.n_stream = 2;
+    selected_target.policy.unified = false;
+    std::vector<vbr_capture_controller_target> selected_targets {
+        selected_target,
+    };
+    std::vector<vbr_capture_projected_unit> selected_units {
+        capture_projected_unit_for_target(
+            selected_projection, selected_target, 1),
+    };
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        selected_projection, selected_targets, selected_units,
+        controller.provider(), {}, assembled));
+    CHECK(projected_manifest(assembled, 50)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 50)->controller_count == 1);
+    CHECK(projected_manifest(assembled, 50)->unit_count == 1);
 }
 
 struct generated_h2d_source {
@@ -1387,6 +1839,7 @@ int main(int argc, char ** argv) {
     test_registry_quiescence_query();
     test_cpu_ring_boundaries();
     test_projected_unit_transfer();
+    test_manifest_coherent_assembly();
     test_h2d_bounded_streaming();
     test_ring_accounting_once();
     test_capture_reservation_domain_preparation();

@@ -144,6 +144,7 @@ struct vbr_capture_projection_segment {
     uint32_t cell_count = 0;
     uint32_t first_dependency = 0;
     uint32_t dependency_count = 0;
+    uint64_t packed_first_row = 0;
 };
 
 struct vbr_capture_projection_stream {
@@ -264,6 +265,7 @@ struct vbr_capture_unit_snapshot {
     uint64_t source_namespace = 0;
     uint32_t child_id = UINT32_MAX;
     uint32_t logical_unit_id = UINT32_MAX;
+    vbr_lineage_uuid lineage_uuid = {};
     uint64_t controller_generation = 0;
     uint64_t mutation_serial = 0;
     vbr_unit_generation generation;
@@ -304,12 +306,6 @@ struct vbr_capture_projected_shard_source {
     vbr_capture_stream_source source;
 };
 
-struct vbr_capture_projected_slice {
-    uint32_t projection_segment = UINT32_MAX;
-    uint64_t packed_first_row = 0;
-    uint32_t row_count = 0;
-};
-
 struct vbr_capture_projected_shard {
     uint32_t shard_index = UINT32_MAX;
     std::shared_ptr<const artifact_segment_chain> bytes;
@@ -325,17 +321,139 @@ struct vbr_capture_projected_transfer_limits {
     uint64_t max_total_packed_bytes = uint64_t(16)*1024*1024*1024;
 };
 
-struct vbr_capture_projected_unit {
-    vbr_capture_projection projection;
-    vbr_capture_unit_snapshot snapshot;
-    uint32_t child_id = UINT32_MAX;
-    uint32_t stream_index = UINT32_MAX;
-    uint32_t logical_unit_id = UINT32_MAX;
-    uint64_t packed_bytes = 0;
-    vbr_capture_stream_stats transfer;
-    std::vector<vbr_capture_projected_slice> slices;
-    std::vector<vbr_capture_projected_shard> shards;
+// Immutable unit capability minted only after the complete projected transfer
+// and its terminal representation recheck succeed. Copying is shallow; no
+// mutable segment-chain alias escapes the minting boundary.
+class vbr_capture_projected_unit {
+  public:
+    vbr_capture_projected_unit() noexcept = default;
+
+    explicit operator bool() const noexcept;
+    const vbr_capture_projection & projection() const noexcept;
+    const vbr_capture_unit_snapshot & snapshot() const noexcept;
+    uint32_t child_id() const noexcept;
+    uint32_t stream_index() const noexcept;
+    uint32_t logical_unit_id() const noexcept;
+    uint64_t packed_bytes() const noexcept;
+    const vbr_capture_stream_stats & transfer() const noexcept;
+    const std::vector<vbr_capture_projected_shard> & shards() const noexcept;
+
+  private:
+    struct data;
+    explicit vbr_capture_projected_unit(
+        std::shared_ptr<const data> data) noexcept;
+
+    std::shared_ptr<const data> data_;
+
+    friend vbr_capture_stream_status vbr_capture_projected_unit_transfer(
+        vbr_capture_projection,
+        uint32_t,
+        uint32_t,
+        uint32_t,
+        const std::vector<vbr_capture_projected_shard_source> &,
+        const vbr_capture_projected_transfer_limits &,
+        const vbr_capture_unit_snapshot_provider &,
+        vbr_pinned_chunk_ring &,
+        vbr_capture_projected_unit &) noexcept;
 };
+
+// A controller-authenticated representation target for one projected child.
+// The target is a value capability: assembly owns its copy, and the
+// provider below rechecks that the canonical controller simulator still
+// considers the complete tuple reachable before any manifest becomes ready.
+struct vbr_capture_controller_target {
+    uint64_t manifest_id = 0;
+    uint64_t source_namespace = 0;
+    uint32_t child_id = UINT32_MAX;
+    vbr_lineage_uuid lineage_uuid = {};
+    uint64_t controller_generation = 0;
+    vbr_artifact_controller_policy policy;
+    std::vector<vbr_unit_generation> units;
+};
+
+struct vbr_capture_controller_target_provider {
+    using recheck_fn = bool (*)(
+        void * context,
+        uint64_t manifest_id,
+        const vbr_capture_controller_target * targets,
+        size_t target_count) noexcept;
+
+    void * context = nullptr;
+    recheck_fn recheck = nullptr;
+};
+
+enum class vbr_capture_manifest_state : uint8_t {
+    ready = 0,
+    dependency_unavailable,
+};
+
+struct vbr_capture_manifest_result {
+    uint64_t manifest_id = 0;
+    vbr_capture_manifest_state state =
+        vbr_capture_manifest_state::dependency_unavailable;
+    uint32_t first_controller = 0;
+    uint32_t controller_count = 0;
+    uint32_t first_unit = 0;
+    uint32_t unit_count = 0;
+};
+
+struct vbr_capture_manifest_assembly_limits {
+    // A target is scoped to one manifest/child, so the projection's
+    // 4,096-placement ceiling is also the reachable target/reference ceiling.
+    uint32_t max_controller_targets = 4096;
+    uint32_t max_projected_units = 16384;
+    uint32_t max_manifests = 4096;
+    uint64_t max_controller_references = 4096;
+    uint64_t max_unit_references = 1048576;
+};
+
+// One immutable transport batch can finish partially: a missing, stale, or
+// no-longer-reachable unit invalidates only manifests whose projection names
+// it. Ready rows reference assembly-owned controller targets and sealed unit
+// capabilities through flat bounded arenas. Construction is private so no
+// mutable alias can invalidate the certified controller tuple afterward.
+class vbr_capture_manifest_assembly {
+  public:
+    vbr_capture_manifest_assembly() noexcept = default;
+
+    explicit operator bool() const noexcept;
+    const vbr_capture_projection & projection() const noexcept;
+    const std::vector<vbr_capture_controller_target> &
+        controller_targets() const noexcept;
+    const std::vector<vbr_capture_projected_unit> &
+        projected_units() const noexcept;
+    const std::vector<uint32_t> & controller_references() const noexcept;
+    const std::vector<uint32_t> & unit_references() const noexcept;
+    const std::vector<vbr_capture_manifest_result> & manifests() const noexcept;
+
+  private:
+    struct data;
+    explicit vbr_capture_manifest_assembly(
+        std::shared_ptr<const data> data) noexcept;
+
+    std::shared_ptr<const data> data_;
+
+    friend bool vbr_capture_assemble_manifests(
+        vbr_capture_projection,
+        std::vector<vbr_capture_controller_target> &&,
+        std::vector<vbr_capture_projected_unit> &&,
+        const vbr_capture_controller_target_provider &,
+        const vbr_capture_manifest_assembly_limits &,
+        vbr_capture_manifest_assembly &) noexcept;
+};
+
+// Structural corruption, duplicate identities, or a limit violation clears
+// output and returns false. Dependency failure is a successful assembly with
+// the affected manifest rows marked dependency_unavailable. The two rvalue
+// inventories transfer ownership into the immutable result on success and
+// prevent an implicit deep copy from occurring before limit validation.
+bool vbr_capture_assemble_manifests(
+    vbr_capture_projection projection,
+    std::vector<vbr_capture_controller_target> && controller_targets,
+    std::vector<vbr_capture_projected_unit> && projected_units,
+    const vbr_capture_controller_target_provider & targets,
+    const vbr_capture_manifest_assembly_limits & limits,
+    vbr_capture_manifest_assembly & output) noexcept;
 
 // Computes the canonical topology identity consumed by the snapshot owner.
 // Sources may be supplied in any order, but must form exactly [0, count).

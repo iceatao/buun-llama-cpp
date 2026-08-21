@@ -399,9 +399,9 @@ struct llama_kv_cache_vbr_epoch_test {
                         unit.logical_unit, sources, {},
                         transfer_session.provider(), *ring, captured) !=
                             vbr_capture_stream_status::ok ||
-                    captured.packed_bytes == 0 ||
-                    captured.shards.size() != sources.size() ||
-                    captured.snapshot.generation.repr_gen !=
+                    captured.packed_bytes() == 0 ||
+                    captured.shards().size() != sources.size() ||
+                    captured.snapshot().generation.repr_gen !=
                         unit.generation.repr_gen ||
                     transfer_session.active) {
                     return false;

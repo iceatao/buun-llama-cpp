@@ -1,12 +1,15 @@
 #include "llama-vbr-artifact-capture.h"
 
+#include "llama-vbr-identity-digest.h"
 #include "llama-sha256.h"
 
 #include <algorithm>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
 #include <new>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -28,6 +31,57 @@ bool capture_checked_add(uint64_t a, uint64_t b, uint64_t & output) {
     }
     output = a + b;
     return true;
+}
+
+bool capture_generation_equal(
+        const vbr_unit_generation & lhs,
+        const vbr_unit_generation & rhs) noexcept {
+    return lhs.repr_gen == rhs.repr_gen &&
+           lhs.publish_seq == rhs.publish_seq &&
+           lhs.current_type == rhs.current_type &&
+           lhs.last_source_type == rhs.last_source_type &&
+           lhs.domain == rhs.domain &&
+           lhs.promote_hops == rhs.promote_hops &&
+           lhs.last_transition == rhs.last_transition &&
+           lhs.flags == rhs.flags;
+}
+
+bool capture_generation_valid(
+        const vbr_unit_generation & generation) noexcept {
+    return generation.repr_gen != 0 &&
+           (generation.publish_seq & 1u) == 0 &&
+           generation.current_type >= 0 &&
+           generation.current_type < GGML_TYPE_COUNT &&
+           generation.last_source_type >= 0 &&
+           generation.last_source_type < GGML_TYPE_COUNT &&
+           generation.domain <= vbr_repr_domain::tapped &&
+           generation.last_transition <=
+               vbr_repr_transition::recovery_invalidate &&
+           generation.flags == 0;
+}
+
+bool capture_digest_nonzero(
+        const std::array<uint8_t, 32> & digest) noexcept {
+    return std::any_of(digest.begin(), digest.end(),
+        [](uint8_t value) { return value != 0; });
+}
+
+bool capture_policy_equal(
+        const vbr_artifact_controller_policy & lhs,
+        const vbr_artifact_controller_policy & rhs) noexcept {
+    return lhs.child_id == rhs.child_id &&
+           lhs.dependency_mode == rhs.dependency_mode &&
+           lhs.degrade_order_digest == rhs.degrade_order_digest &&
+           lhs.policy_digest == rhs.policy_digest &&
+           lhs.cursor == rhs.cursor &&
+           lhs.floor_type == rhs.floor_type &&
+           lhs.pressure_independent_settings ==
+               rhs.pressure_independent_settings &&
+           lhs.n_stream == rhs.n_stream && lhs.unified == rhs.unified &&
+           lhs.wm_cells == rhs.wm_cells &&
+           lhs.current_type_vector_digest ==
+               rhs.current_type_vector_digest &&
+           lhs.completed_wave == rhs.completed_wave;
 }
 
 bool capture_cursor_after(
@@ -262,6 +316,11 @@ bool vbr_artifact_project_capture_union(
                     });
                 }
                 ++plan.union_cell_count;
+            }
+            uint64_t packed_first_row = 0;
+            for (auto & segment : stream.segments) {
+                segment.packed_first_row = packed_first_row;
+                packed_first_row += segment.cell_count;
             }
             group_begin = group_end;
         }
@@ -875,30 +934,78 @@ bool vbr_capture_projected_shard_topology(
     }
 }
 
+struct vbr_capture_projected_unit::data {
+    vbr_capture_projection projection;
+    vbr_capture_unit_snapshot snapshot;
+    uint32_t child_id = UINT32_MAX;
+    uint32_t stream_index = UINT32_MAX;
+    uint32_t logical_unit_id = UINT32_MAX;
+    uint64_t packed_bytes = 0;
+    vbr_capture_stream_stats transfer;
+    std::vector<vbr_capture_projected_shard> shards;
+};
+
+vbr_capture_projected_unit::vbr_capture_projected_unit(
+        std::shared_ptr<const data> data) noexcept
+    : data_(std::move(data)) {}
+
+vbr_capture_projected_unit::operator bool() const noexcept {
+    return bool(data_);
+}
+
+const vbr_capture_projection &
+vbr_capture_projected_unit::projection() const noexcept {
+    static const vbr_capture_projection empty;
+    return data_ ? data_->projection : empty;
+}
+
+const vbr_capture_unit_snapshot &
+vbr_capture_projected_unit::snapshot() const noexcept {
+    static const vbr_capture_unit_snapshot empty;
+    return data_ ? data_->snapshot : empty;
+}
+
+uint32_t vbr_capture_projected_unit::child_id() const noexcept {
+    return data_ ? data_->child_id : UINT32_MAX;
+}
+
+uint32_t vbr_capture_projected_unit::stream_index() const noexcept {
+    return data_ ? data_->stream_index : UINT32_MAX;
+}
+
+uint32_t vbr_capture_projected_unit::logical_unit_id() const noexcept {
+    return data_ ? data_->logical_unit_id : UINT32_MAX;
+}
+
+uint64_t vbr_capture_projected_unit::packed_bytes() const noexcept {
+    return data_ ? data_->packed_bytes : 0;
+}
+
+const vbr_capture_stream_stats &
+vbr_capture_projected_unit::transfer() const noexcept {
+    static const vbr_capture_stream_stats empty;
+    return data_ ? data_->transfer : empty;
+}
+
+const std::vector<vbr_capture_projected_shard> &
+vbr_capture_projected_unit::shards() const noexcept {
+    static const std::vector<vbr_capture_projected_shard> empty;
+    return data_ ? data_->shards : empty;
+}
+
 namespace {
 
 bool projected_snapshot_valid(
         const vbr_capture_unit_snapshot & snapshot) noexcept {
-    const auto & generation = snapshot.generation;
     return snapshot.source_namespace != 0 &&
            snapshot.child_id != UINT32_MAX &&
            snapshot.logical_unit_id != UINT32_MAX &&
+           vbr_lineage_uuid_is_set(snapshot.lineage_uuid) &&
            snapshot.controller_generation != 0 &&
            (snapshot.mutation_serial & 1u) == 0 &&
-           generation.repr_gen != 0 &&
-           (generation.publish_seq & 1u) == 0 &&
-           generation.current_type >= 0 &&
-           generation.current_type < GGML_TYPE_COUNT &&
-           generation.last_source_type >= 0 &&
-           generation.last_source_type < GGML_TYPE_COUNT &&
-           generation.domain <= vbr_repr_domain::tapped &&
-           generation.last_transition <=
-               vbr_repr_transition::recovery_invalidate &&
-           generation.flags == 0 && snapshot.shard_count != 0 &&
-           std::any_of(
-               snapshot.shard_topology_digest.begin(),
-               snapshot.shard_topology_digest.end(),
-               [](uint8_t value) { return value != 0; });
+           capture_generation_valid(snapshot.generation) &&
+           snapshot.shard_count != 0 &&
+           capture_digest_nonzero(snapshot.shard_topology_digest);
 }
 
 } // namespace
@@ -995,15 +1102,15 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
             return vbr_capture_stream_status::projection_invalid;
         }
 
-        std::vector<vbr_capture_projected_slice> slices;
-        slices.reserve(selected->segments.size());
         struct cell_range { uint32_t first = 0; uint32_t count = 0; };
         std::vector<cell_range> cell_ranges;
         cell_ranges.reserve(selected->segments.size());
         uint64_t packed_rows = 0;
         for (uint32_t i = 0; i < selected->segments.size(); ++i) {
             const auto & segment = selected->segments[i];
-            slices.push_back({ i, packed_rows, segment.cell_count });
+            if (segment.packed_first_row != packed_rows) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
             packed_rows += segment.cell_count;
             if (!cell_ranges.empty() &&
                 uint64_t(cell_ranges.back().first) +
@@ -1110,17 +1217,12 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
         for (const auto & segment : selected->segments) {
             layout_hash.u32(segment.first_physical_cell);
             layout_hash.u32(segment.cell_count);
+            layout_hash.u64(segment.packed_first_row);
             layout_hash.u32(segment.dependency_count);
             for (uint32_t i = 0; i < segment.dependency_count; ++i) {
                 layout_hash.u64(projection->dependent_manifest_ids[
                     segment.first_dependency + i]);
             }
-        }
-        layout_hash.u64(slices.size());
-        for (const auto & slice : slices) {
-            layout_hash.u32(slice.projection_segment);
-            layout_hash.u64(slice.packed_first_row);
-            layout_hash.u32(slice.row_count);
         }
         const auto layout_digest = layout_hash.finish();
 
@@ -1149,20 +1251,21 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
             return vbr_capture_stream_status::snapshot_unavailable;
         }
 
-        vbr_capture_projected_unit result;
+        vbr_capture_projected_unit::data result;
         result.projection = std::move(projection);
         result.snapshot = snapshot;
         result.child_id = child_id;
         result.stream_index = stream_index;
         result.logical_unit_id = logical_unit_id;
         result.packed_bytes = total_packed_bytes;
-        result.slices = std::move(slices);
         result.shards.reserve(ordered.size());
         llama_sha256_writer unit_hash;
         static constexpr char UNIT_DOMAIN[] =
             "buun.vbr.capture/projected-unit";
         unit_hash.string(UNIT_DOMAIN, sizeof(UNIT_DOMAIN) - 1);
         unit_hash.bytes(layout_digest.data(), layout_digest.size());
+        unit_hash.u64(snapshot.lineage_uuid.hi);
+        unit_hash.u64(snapshot.lineage_uuid.lo);
         unit_hash.u64(snapshot.controller_generation);
         unit_hash.u64(snapshot.mutation_serial);
         unit_hash.u64(snapshot.generation.repr_gen);
@@ -1227,10 +1330,452 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
         }
         snapshots.release(snapshots.context, snapshot);
         release.active = false;
-        output = std::move(result);
+        output = vbr_capture_projected_unit(
+            std::make_shared<const vbr_capture_projected_unit::data>(
+                std::move(result)));
         return vbr_capture_stream_status::ok;
     } catch (...) {
         output = {};
         return vbr_capture_stream_status::internal_error;
+    }
+}
+
+struct vbr_capture_manifest_assembly::data {
+    vbr_capture_projection projection;
+    std::vector<vbr_capture_controller_target> controller_targets;
+    std::vector<vbr_capture_projected_unit> projected_units;
+    std::vector<uint32_t> controller_references;
+    std::vector<uint32_t> unit_references;
+    std::vector<vbr_capture_manifest_result> manifests;
+};
+
+vbr_capture_manifest_assembly::vbr_capture_manifest_assembly(
+        std::shared_ptr<const data> data) noexcept
+    : data_(std::move(data)) {}
+
+vbr_capture_manifest_assembly::operator bool() const noexcept {
+    return bool(data_);
+}
+
+const vbr_capture_projection &
+vbr_capture_manifest_assembly::projection() const noexcept {
+    static const vbr_capture_projection empty;
+    return data_ ? data_->projection : empty;
+}
+
+const std::vector<vbr_capture_controller_target> &
+vbr_capture_manifest_assembly::controller_targets() const noexcept {
+    static const std::vector<vbr_capture_controller_target> empty;
+    return data_ ? data_->controller_targets : empty;
+}
+
+const std::vector<vbr_capture_projected_unit> &
+vbr_capture_manifest_assembly::projected_units() const noexcept {
+    static const std::vector<vbr_capture_projected_unit> empty;
+    return data_ ? data_->projected_units : empty;
+}
+
+const std::vector<uint32_t> &
+vbr_capture_manifest_assembly::controller_references() const noexcept {
+    static const std::vector<uint32_t> empty;
+    return data_ ? data_->controller_references : empty;
+}
+
+const std::vector<uint32_t> &
+vbr_capture_manifest_assembly::unit_references() const noexcept {
+    static const std::vector<uint32_t> empty;
+    return data_ ? data_->unit_references : empty;
+}
+
+const std::vector<vbr_capture_manifest_result> &
+vbr_capture_manifest_assembly::manifests() const noexcept {
+    static const std::vector<vbr_capture_manifest_result> empty;
+    return data_ ? data_->manifests : empty;
+}
+
+bool vbr_capture_assemble_manifests(
+        vbr_capture_projection projection,
+        std::vector<vbr_capture_controller_target> && controller_targets,
+        std::vector<vbr_capture_projected_unit> && projected_units,
+        const vbr_capture_controller_target_provider & targets,
+        const vbr_capture_manifest_assembly_limits & limits,
+        vbr_capture_manifest_assembly & output) noexcept {
+    output = {};
+    try {
+        if (!projection || !targets.recheck ||
+            limits.max_controller_targets == 0 ||
+            limits.max_projected_units == 0 || limits.max_manifests == 0 ||
+            limits.max_controller_references == 0 ||
+            limits.max_unit_references == 0 ||
+            limits.max_controller_references > UINT32_MAX ||
+            limits.max_unit_references > UINT32_MAX ||
+            controller_targets.size() > limits.max_controller_targets ||
+            controller_targets.size() >
+                limits.max_controller_references ||
+            projected_units.size() > limits.max_projected_units ||
+            projection->manifest_count == 0 ||
+            projection->manifest_count > limits.max_manifests ||
+            projection->source_namespace == 0 ||
+            projection->dependency_references !=
+                projection->dependent_manifest_ids.size()) {
+            return false;
+        }
+
+        using target_key = std::pair<uint64_t, uint32_t>;
+        using stream_key = std::pair<uint32_t, uint32_t>;
+        using unit_key =
+            std::tuple<uint32_t, uint32_t, uint64_t, uint32_t>;
+        std::sort(controller_targets.begin(), controller_targets.end(),
+            [](const auto & lhs, const auto & rhs) {
+                return std::tie(lhs.manifest_id, lhs.child_id) <
+                       std::tie(rhs.manifest_id, rhs.child_id);
+            });
+        std::sort(projected_units.begin(), projected_units.end(),
+            [](const auto & lhs, const auto & rhs) {
+                return std::make_tuple(
+                           lhs.child_id(), lhs.stream_index(),
+                           lhs.snapshot().controller_generation,
+                           lhs.logical_unit_id()) <
+                       std::make_tuple(
+                           rhs.child_id(), rhs.stream_index(),
+                           rhs.snapshot().controller_generation,
+                           rhs.logical_unit_id());
+            });
+
+        std::map<stream_key, const vbr_capture_projection_stream *>
+            projection_streams;
+        for (const auto & stream : projection->streams) {
+            if (stream.segments.empty() ||
+                !projection_streams.emplace(
+                    stream_key { stream.child_id, stream.stream_index },
+                    &stream).second) {
+                return false;
+            }
+        }
+
+        std::map<target_key, uint32_t> target_by_manifest_child;
+        std::map<std::pair<uint32_t, uint64_t>, uint32_t>
+            target_by_representation;
+        uint64_t target_unit_references = 0;
+        for (uint32_t i = 0; i < controller_targets.size(); ++i) {
+            const auto & target = controller_targets[i];
+            if (target.units.empty() ||
+                target.units.size() > limits.max_projected_units ||
+                target.units.size() >
+                    limits.max_unit_references - target_unit_references) {
+                return false;
+            }
+            target_unit_references += target.units.size();
+            std::vector<ggml_type> types;
+            types.reserve(target.units.size());
+            bool generations_valid = !target.units.empty();
+            for (const auto & generation : target.units) {
+                generations_valid = generations_valid &&
+                    capture_generation_valid(generation);
+                types.push_back(static_cast<ggml_type>(
+                    generation.current_type));
+            }
+            if (target.manifest_id == 0 ||
+                target.source_namespace != projection->source_namespace ||
+                target.child_id == UINT32_MAX ||
+                !vbr_lineage_uuid_is_set(target.lineage_uuid) ||
+                target.controller_generation == 0 ||
+                target.policy.child_id != target.child_id ||
+                target.policy.dependency_mode !=
+                    checkpoint_child_dependency_mode::live_guarded ||
+                !capture_digest_nonzero(
+                    target.policy.degrade_order_digest) ||
+                !capture_digest_nonzero(target.policy.policy_digest) ||
+                target.policy.floor_type < 0 ||
+                target.policy.floor_type >= GGML_TYPE_COUNT ||
+                target.policy.n_stream == 0 ||
+                target.policy.unified != (target.policy.n_stream == 1) ||
+                target.policy.wm_cells == 0 ||
+                !target.policy.completed_wave || !generations_valid ||
+                target.policy.current_type_vector_digest !=
+                    vbr_type_vector_digest(types) ||
+                !target_by_manifest_child.emplace(target_key {
+                    target.manifest_id, target.child_id }, i).second) {
+                return false;
+            }
+            const auto representation = target_by_representation.emplace(
+                std::pair<uint32_t, uint64_t> {
+                    target.child_id, target.controller_generation }, i);
+            if (!representation.second) {
+                const auto & prior =
+                    controller_targets[representation.first->second];
+                if (prior.lineage_uuid != target.lineage_uuid ||
+                    prior.units.size() != target.units.size()) {
+                    return false;
+                }
+                for (uint32_t unit = 0; unit < target.units.size(); ++unit) {
+                    if (!capture_generation_equal(
+                            prior.units[unit], target.units[unit])) {
+                        return false;
+                    }
+                }
+                if (!capture_policy_equal(prior.policy, target.policy)) {
+                    return false;
+                }
+            }
+        }
+
+        std::map<uint64_t, std::set<stream_key>> manifest_streams;
+        for (const auto & stream : projection->streams) {
+            for (const auto & segment : stream.segments) {
+                if (segment.dependency_count == 0 ||
+                    segment.first_dependency >
+                        projection->dependent_manifest_ids.size() ||
+                    segment.dependency_count >
+                        projection->dependent_manifest_ids.size() -
+                            segment.first_dependency) {
+                    return false;
+                }
+                for (uint32_t i = 0; i < segment.dependency_count; ++i) {
+                    const uint64_t manifest_id =
+                        projection->dependent_manifest_ids[
+                            segment.first_dependency + i];
+                    if (manifest_id == 0) {
+                        return false;
+                    }
+                    manifest_streams[manifest_id].insert({
+                        stream.child_id, stream.stream_index,
+                    });
+                }
+            }
+        }
+        if (manifest_streams.size() != projection->manifest_count) {
+            return false;
+        }
+
+        std::map<uint64_t, std::vector<uint32_t>> manifest_targets;
+        std::vector<bool> manifest_reachable;
+        manifest_reachable.reserve(manifest_streams.size());
+        uint64_t referenced_targets = 0;
+        for (const auto & entry : manifest_streams) {
+            auto & refs = manifest_targets[entry.first];
+            bool complete = true;
+            std::map<uint32_t, std::set<uint32_t>> streams_by_child;
+            for (const auto & stream : entry.second) {
+                streams_by_child[stream.first].insert(stream.second);
+            }
+            for (const auto & child : streams_by_child) {
+                const auto target = target_by_manifest_child.find({
+                    entry.first, child.first,
+                });
+                if (target == target_by_manifest_child.end()) {
+                    complete = false;
+                    continue;
+                }
+                const auto & policy =
+                    controller_targets[target->second].policy;
+                for (const uint32_t stream : child.second) {
+                    if (stream >= policy.n_stream) {
+                        return false;
+                    }
+                }
+                refs.push_back(target->second);
+            }
+            referenced_targets += refs.size();
+            if (complete) {
+                if (refs.empty() ||
+                    refs.front() >= controller_targets.size() ||
+                    refs.size() > controller_targets.size() - refs.front()) {
+                    return false;
+                }
+                for (uint32_t i = 0; i < refs.size(); ++i) {
+                    if (refs[i] != refs.front() + i) {
+                        return false;
+                    }
+                }
+            }
+            manifest_reachable.push_back(complete && targets.recheck(
+                targets.context, entry.first,
+                complete ? controller_targets.data() + refs.front() : nullptr,
+                complete ? refs.size() : 0));
+        }
+        if (referenced_targets != controller_targets.size()) {
+            return false;
+        }
+
+        std::map<unit_key, uint32_t> input_unit_by_key;
+        std::vector<bool> unit_valid(projected_units.size(), false);
+        for (uint32_t i = 0; i < projected_units.size(); ++i) {
+            const auto & unit = projected_units[i];
+            const auto & snapshot = unit.snapshot();
+            const unit_key key {
+                unit.child_id(), unit.stream_index(),
+                snapshot.controller_generation,
+                unit.logical_unit_id(),
+            };
+            if (!unit || !(unit.projection() == projection) ||
+                !input_unit_by_key.emplace(key, i).second) {
+                return false;
+            }
+            const auto stream = projection_streams.find({
+                unit.child_id(), unit.stream_index(),
+            });
+            const auto representation = target_by_representation.find({
+                unit.child_id(), snapshot.controller_generation,
+            });
+            const bool named_by_target =
+                representation != target_by_representation.end() &&
+                unit.logical_unit_id() < controller_targets[
+                    representation->second].units.size();
+            const vbr_unit_generation * expected = nullptr;
+            if (named_by_target) {
+                expected = &controller_targets[representation->second].units[
+                    unit.logical_unit_id()];
+            }
+            if (stream == projection_streams.end() ||
+                snapshot.source_namespace != projection->source_namespace ||
+                snapshot.child_id != unit.child_id() ||
+                snapshot.logical_unit_id != unit.logical_unit_id() ||
+                !vbr_lineage_uuid_is_set(snapshot.lineage_uuid) ||
+                snapshot.controller_generation == 0 ||
+                (snapshot.mutation_serial & 1u) != 0 ||
+                !capture_generation_valid(snapshot.generation) ||
+                snapshot.shard_count != unit.shards().size() ||
+                snapshot.shard_count == 0 ||
+                !capture_digest_nonzero(
+                    snapshot.shard_topology_digest) ||
+                unit.packed_bytes() == 0 ||
+                unit.transfer().bytes != unit.packed_bytes() ||
+                !capture_digest_nonzero(
+                    unit.transfer().streaming_digest)) {
+                return false;
+            }
+            for (uint32_t j = 0; j < unit.shards().size(); ++j) {
+                const auto & shard = unit.shards()[j];
+                if (shard.shard_index != j || shard.bytes == nullptr ||
+                    shard.bytes->size() == 0 ||
+                    !capture_digest_nonzero(shard.streaming_digest)) {
+                    return false;
+                }
+            }
+            unit_valid[i] = named_by_target && expected != nullptr &&
+                snapshot.lineage_uuid == controller_targets[
+                    representation->second].lineage_uuid &&
+                capture_generation_equal(snapshot.generation, *expected);
+        }
+
+        auto result = std::make_shared<vbr_capture_manifest_assembly::data>();
+        result->projection = projection;
+        result->controller_targets = std::move(controller_targets);
+        result->projected_units.reserve(projected_units.size());
+        std::map<unit_key, uint32_t> valid_unit_by_key;
+        for (uint32_t i = 0; i < projected_units.size(); ++i) {
+            if (!unit_valid[i]) {
+                continue;
+            }
+            const auto & unit = projected_units[i];
+            const uint32_t next = uint32_t(result->projected_units.size());
+            valid_unit_by_key.emplace(unit_key {
+                unit.child_id(), unit.stream_index(),
+                unit.snapshot().controller_generation,
+                unit.logical_unit_id(),
+            }, next);
+            result->projected_units.push_back(std::move(projected_units[i]));
+        }
+
+        result->manifests.reserve(manifest_targets.size());
+        uint32_t manifest_index = 0;
+        for (const auto & entry : manifest_targets) {
+            const uint64_t manifest_id = entry.first;
+            const auto & controller_refs = entry.second;
+            const size_t controller_mark =
+                result->controller_references.size();
+            const size_t unit_mark = result->unit_references.size();
+            bool ready = manifest_reachable[manifest_index++];
+            for (const uint32_t target_index : controller_refs) {
+                if (!ready) {
+                    break;
+                }
+                if (result->controller_references.size() >=
+                        limits.max_controller_references) {
+                    return false;
+                }
+                result->controller_references.push_back(target_index);
+            }
+            for (const auto & stream : manifest_streams.at(manifest_id)) {
+                if (!ready) {
+                    break;
+                }
+                const auto target_index = target_by_manifest_child.find({
+                    manifest_id, stream.first,
+                });
+                if (target_index == target_by_manifest_child.end()) {
+                    ready = false;
+                    break;
+                }
+                const auto & target =
+                    result->controller_targets[target_index->second];
+                for (uint32_t unit = 0; unit < target.units.size(); ++unit) {
+                    const auto found = valid_unit_by_key.find(unit_key {
+                        target.child_id, stream.second,
+                        target.controller_generation, unit,
+                    });
+                    if (found == valid_unit_by_key.end() ||
+                        !capture_generation_equal(
+                            result->projected_units[found->second].
+                                snapshot().generation,
+                            target.units[unit])) {
+                        ready = false;
+                        break;
+                    }
+                    if (result->unit_references.size() >=
+                            limits.max_unit_references) {
+                        return false;
+                    }
+                    result->unit_references.push_back(found->second);
+                }
+            }
+            if (!ready) {
+                result->controller_references.resize(controller_mark);
+                result->unit_references.resize(unit_mark);
+            }
+            vbr_capture_manifest_result manifest;
+            manifest.manifest_id = manifest_id;
+            manifest.state = ready
+                ? vbr_capture_manifest_state::ready
+                : vbr_capture_manifest_state::dependency_unavailable;
+            manifest.first_controller = uint32_t(controller_mark);
+            manifest.controller_count = ready
+                ? uint32_t(result->controller_references.size() -
+                    controller_mark) : 0;
+            manifest.first_unit = uint32_t(unit_mark);
+            manifest.unit_count = ready
+                ? uint32_t(result->unit_references.size() - unit_mark) : 0;
+            result->manifests.push_back(manifest);
+        }
+
+        // Do not keep unique payload segments alive for manifests that could
+        // not be certified. Units shared with any ready manifest survive and
+        // every flat reference is remapped to the compact owned vector.
+        std::vector<bool> referenced_units(
+            result->projected_units.size(), false);
+        for (const uint32_t unit : result->unit_references) {
+            referenced_units[unit] = true;
+        }
+        std::vector<uint32_t> unit_remap(
+            result->projected_units.size(), UINT32_MAX);
+        std::vector<vbr_capture_projected_unit> retained_units;
+        retained_units.reserve(result->projected_units.size());
+        for (uint32_t i = 0; i < result->projected_units.size(); ++i) {
+            if (!referenced_units[i]) {
+                continue;
+            }
+            unit_remap[i] = uint32_t(retained_units.size());
+            retained_units.push_back(std::move(result->projected_units[i]));
+        }
+        for (uint32_t & unit : result->unit_references) {
+            unit = unit_remap[unit];
+        }
+        result->projected_units = std::move(retained_units);
+        output = vbr_capture_manifest_assembly(std::move(result));
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
     }
 }
