@@ -454,15 +454,40 @@ vbr_capture_stream_status capture_status_for_ring_failure(
 
 } // namespace
 
+namespace {
+
+std::array<uint8_t, 32> capture_range_leaf_digest(
+    uint64_t index,
+    uint32_t size,
+    const std::array<uint8_t, 32> & payload) noexcept;
+
+} // namespace
+
 struct artifact_segment_chain::impl {
     std::vector<artifact_segment> segments;
     std::vector<uint64_t> segment_ends;
     uint64_t total = 0;
     size_t max_segment = 0;
+    uint32_t authenticated_chunk_bytes = 0;
+    uint32_t max_authenticated_chunks = 0;
+    uint32_t authenticated_current_bytes = 0;
+    bool authenticated_closed = false;
+    llama_sha256_writer authenticated_current_hash;
+    std::vector<std::array<uint8_t, 32>> authenticated_leaves;
 };
 
 artifact_segment_chain::artifact_segment_chain()
     : impl_(new impl) {}
+artifact_segment_chain::artifact_segment_chain(
+        uint32_t authenticated_chunk_bytes,
+        uint32_t max_authenticated_chunks)
+    : impl_(new impl) {
+    if (authenticated_chunk_bytes == VBR_CAPTURE_RANGE_CHUNK_BYTES &&
+        max_authenticated_chunks != 0) {
+        impl_->authenticated_chunk_bytes = authenticated_chunk_bytes;
+        impl_->max_authenticated_chunks = max_authenticated_chunks;
+    }
+}
 artifact_segment_chain::~artifact_segment_chain() = default;
 artifact_segment_chain::artifact_segment_chain(
         artifact_segment_chain &&) noexcept = default;
@@ -473,9 +498,29 @@ bool artifact_segment_chain::append(
         const uint8_t * data, size_t size) noexcept {
     try {
         if ((!data && size != 0) ||
+            impl_->authenticated_closed ||
             size > std::numeric_limits<uint64_t>::max() -
                 impl_->total) {
             return false;
+        }
+        if (impl_->authenticated_chunk_bytes != 0) {
+            const uint64_t new_total = impl_->total + size;
+            const uint64_t chunks = new_total == 0 ? 0 :
+                (new_total - 1)/impl_->authenticated_chunk_bytes + 1;
+            if (chunks > impl_->max_authenticated_chunks) {
+                return false;
+            }
+            const uint64_t completed =
+                new_total/impl_->authenticated_chunk_bytes;
+            if (completed > impl_->authenticated_leaves.capacity()) {
+                const uint64_t doubled =
+                    impl_->authenticated_leaves.capacity() == 0 ? 1 :
+                    std::min<uint64_t>(
+                        impl_->max_authenticated_chunks,
+                        uint64_t(impl_->authenticated_leaves.capacity())*2);
+                impl_->authenticated_leaves.reserve(size_t(std::max(
+                    completed, doubled)));
+            }
         }
         if (impl_->segments.size() == impl_->segments.capacity()) {
             const size_t next = impl_->segments.empty() ? 1 :
@@ -507,6 +552,31 @@ bool artifact_segment_chain::append(
         impl_->segment_ends.push_back(impl_->total);
         impl_->max_segment =
             std::max(impl_->max_segment, size);
+        if (impl_->authenticated_chunk_bytes != 0) {
+            size_t consumed = 0;
+            while (consumed < size) {
+                const size_t take = std::min<size_t>(
+                    size - consumed,
+                    impl_->authenticated_chunk_bytes -
+                        impl_->authenticated_current_bytes);
+                impl_->authenticated_current_hash.bytes(
+                    data + consumed, take);
+                impl_->authenticated_current_bytes += uint32_t(take);
+                consumed += take;
+                if (impl_->authenticated_current_bytes ==
+                        impl_->authenticated_chunk_bytes) {
+                    const auto payload =
+                        impl_->authenticated_current_hash.finish();
+                    impl_->authenticated_leaves.push_back(
+                        capture_range_leaf_digest(
+                            impl_->authenticated_leaves.size(),
+                            impl_->authenticated_current_bytes,
+                            payload));
+                    impl_->authenticated_current_hash = {};
+                    impl_->authenticated_current_bytes = 0;
+                }
+            }
+        }
         return true;
     } catch (...) {
         return false;
@@ -523,6 +593,10 @@ size_t artifact_segment_chain::segment_count() const noexcept {
 
 size_t artifact_segment_chain::max_segment_size() const noexcept {
     return impl_->max_segment;
+}
+
+bool artifact_segment_chain::authenticated() const noexcept {
+    return impl_->authenticated_chunk_bytes != 0;
 }
 
 bool artifact_segment_chain::read(
@@ -609,6 +683,485 @@ std::array<uint8_t, 32> vbr_capture_stream_digest(
         offset += count;
     }
     return hash.finish();
+}
+
+namespace {
+
+using capture_range_digest = std::array<uint8_t, 32>;
+
+// Conservative charge for the shared-owner control block, the tree data
+// object, and its small vector headers. Digest arenas are charged separately.
+static constexpr uint64_t CAPTURE_RANGE_TREE_OWNER_BYTES = 256;
+static constexpr uint64_t CAPTURE_SHARED_OWNER_BYTES = 64;
+
+capture_range_digest capture_range_leaf_digest(
+        uint64_t index, uint32_t size,
+        const capture_range_digest & payload) noexcept {
+    llama_sha256_writer hash;
+    static constexpr char DOMAIN[] =
+        "buun.vbr.capture/range-leaf/v1";
+    hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+    hash.u64(index);
+    hash.u32(size);
+    hash.bytes(payload.data(), payload.size());
+    return hash.finish();
+}
+
+capture_range_digest capture_range_node_digest(
+        uint32_t level, const capture_range_digest & left,
+        const capture_range_digest & right) noexcept {
+    llama_sha256_writer hash;
+    static constexpr char DOMAIN[] =
+        "buun.vbr.capture/range-node/v1";
+    hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+    hash.u32(level);
+    hash.bytes(left.data(), left.size());
+    hash.bytes(right.data(), right.size());
+    return hash.finish();
+}
+
+capture_range_digest capture_range_root_digest(
+        uint64_t total_bytes, uint32_t chunk_bytes,
+        uint32_t chunk_count, uint32_t padded_count,
+        const capture_range_digest & tree_root) noexcept {
+    llama_sha256_writer hash;
+    static constexpr char DOMAIN[] =
+        "buun.vbr.capture/range-root/v1";
+    hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+    hash.u64(total_bytes);
+    hash.u32(chunk_bytes);
+    hash.u32(chunk_count);
+    hash.u32(padded_count);
+    hash.bytes(tree_root.data(), tree_root.size());
+    return hash.finish();
+}
+
+bool capture_range_metadata_add(
+        uint64_t count, uint64_t item_bytes,
+        uint64_t & total) noexcept {
+    return item_bytes == 0 ||
+        (count <= (UINT64_MAX - total)/item_bytes &&
+         (total += count*item_bytes, true));
+}
+
+bool capture_range_tree_metadata_bytes(
+        uint64_t chunk_count, uint64_t & metadata_bytes,
+        uint32_t * padded_count = nullptr) noexcept {
+    metadata_bytes = CAPTURE_RANGE_TREE_OWNER_BYTES;
+    if (chunk_count == 0 || chunk_count > UINT32_MAX) {
+        return false;
+    }
+    uint32_t padded = 1;
+    while (padded < chunk_count) {
+        if (padded > UINT32_MAX/2) {
+            return false;
+        }
+        padded *= 2;
+    }
+    uint64_t node_count = 0;
+    for (uint64_t count = padded;; count /= 2) {
+        if (!capture_checked_add(node_count, count, node_count)) {
+            return false;
+        }
+        if (count == 1) {
+            break;
+        }
+    }
+    if (!capture_range_metadata_add(
+            node_count, sizeof(capture_range_digest),
+            metadata_bytes)) {
+        return false;
+    }
+    if (padded_count) {
+        *padded_count = padded;
+    }
+    return true;
+}
+
+} // namespace
+
+struct vbr_capture_range_tree::data {
+    uint64_t total_bytes = 0;
+    uint64_t metadata_bytes = 0;
+    uint32_t chunk_bytes = 0;
+    uint32_t chunk_count = 0;
+    uint32_t padded_count = 0;
+    capture_range_digest root = {};
+    std::vector<std::vector<capture_range_digest>> levels;
+};
+
+struct capture_range_proof_node {
+    uint32_t level = 0;
+    uint32_t index = 0;
+    capture_range_digest digest = {};
+};
+
+struct vbr_capture_range_proof::data {
+    uint64_t total_bytes = 0;
+    uint64_t metadata_bytes = 0;
+    uint32_t chunk_bytes = 0;
+    uint32_t chunk_count = 0;
+    uint32_t padded_count = 0;
+    capture_range_digest root = {};
+    std::vector<vbr_capture_authenticated_range> ranges;
+    std::vector<uint32_t> selected_chunks;
+    std::vector<capture_range_proof_node> proof_nodes;
+};
+
+vbr_capture_range_tree::vbr_capture_range_tree(
+        std::shared_ptr<const data> data) noexcept
+    : data_(std::move(data)) {}
+
+vbr_capture_range_tree::operator bool() const noexcept {
+    return bool(data_);
+}
+
+uint64_t vbr_capture_range_tree::total_bytes() const noexcept {
+    return data_ ? data_->total_bytes : 0;
+}
+
+uint32_t vbr_capture_range_tree::chunk_bytes() const noexcept {
+    return data_ ? data_->chunk_bytes : 0;
+}
+
+uint32_t vbr_capture_range_tree::chunk_count() const noexcept {
+    return data_ ? data_->chunk_count : 0;
+}
+
+uint64_t vbr_capture_range_tree::metadata_bytes() const noexcept {
+    return data_ ? data_->metadata_bytes : 0;
+}
+
+const capture_range_digest & vbr_capture_range_tree::root() const noexcept {
+    static const capture_range_digest empty = {};
+    return data_ ? data_->root : empty;
+}
+
+vbr_capture_range_proof::vbr_capture_range_proof(
+        std::shared_ptr<const data> data) noexcept
+    : data_(std::move(data)) {}
+
+vbr_capture_range_proof::operator bool() const noexcept {
+    return bool(data_);
+}
+
+const capture_range_digest & vbr_capture_range_proof::root() const noexcept {
+    static const capture_range_digest empty = {};
+    return data_ ? data_->root : empty;
+}
+
+uint64_t vbr_capture_range_proof::total_bytes() const noexcept {
+    return data_ ? data_->total_bytes : 0;
+}
+
+uint32_t vbr_capture_range_proof::chunk_bytes() const noexcept {
+    return data_ ? data_->chunk_bytes : 0;
+}
+
+const std::vector<vbr_capture_authenticated_range> &
+vbr_capture_range_proof::ranges() const noexcept {
+    static const std::vector<vbr_capture_authenticated_range> empty;
+    return data_ ? data_->ranges : empty;
+}
+
+uint32_t vbr_capture_range_proof::selected_chunk_count() const noexcept {
+    return data_ ? uint32_t(data_->selected_chunks.size()) : 0;
+}
+
+uint32_t vbr_capture_range_proof::proof_node_count() const noexcept {
+    return data_ ? uint32_t(data_->proof_nodes.size()) : 0;
+}
+
+uint64_t vbr_capture_range_proof::metadata_bytes() const noexcept {
+    return data_ ? data_->metadata_bytes : 0;
+}
+
+bool vbr_capture_range_seal(
+        artifact_segment_chain & chain,
+        uint64_t max_metadata_bytes,
+        vbr_capture_range_tree & output) noexcept {
+    output = {};
+    auto & state = *chain.impl_;
+    if (state.authenticated_chunk_bytes !=
+            VBR_CAPTURE_RANGE_CHUNK_BYTES ||
+        state.max_authenticated_chunks == 0 ||
+        state.authenticated_closed || state.total == 0 ||
+        max_metadata_bytes == 0) {
+        return false;
+    }
+    state.authenticated_closed = true;
+    try {
+        if (state.authenticated_current_bytes != 0) {
+            if (state.authenticated_leaves.size() >=
+                    state.max_authenticated_chunks) {
+                return false;
+            }
+            state.authenticated_leaves.reserve(
+                state.authenticated_leaves.size() + 1);
+            const auto payload =
+                state.authenticated_current_hash.finish();
+            state.authenticated_leaves.push_back(
+                capture_range_leaf_digest(
+                    state.authenticated_leaves.size(),
+                    state.authenticated_current_bytes, payload));
+            state.authenticated_current_bytes = 0;
+        }
+        if (state.authenticated_leaves.empty() ||
+            state.authenticated_leaves.size() > UINT32_MAX) {
+            return false;
+        }
+        uint64_t metadata_bytes = 0;
+        uint32_t padded = 0;
+        if (!capture_range_tree_metadata_bytes(
+                state.authenticated_leaves.size(), metadata_bytes,
+                &padded) ||
+            metadata_bytes > max_metadata_bytes) {
+            return false;
+        }
+        auto result = std::make_shared<vbr_capture_range_tree::data>();
+        result->total_bytes = state.total;
+        result->metadata_bytes = metadata_bytes;
+        result->chunk_bytes = state.authenticated_chunk_bytes;
+        result->chunk_count = uint32_t(state.authenticated_leaves.size());
+        result->padded_count = padded;
+        result->levels.push_back(
+            std::move(state.authenticated_leaves));
+        auto & leaves = result->levels.back();
+        leaves.reserve(padded);
+        llama_sha256_writer empty_payload_hash;
+        const auto empty_payload = empty_payload_hash.finish();
+        while (leaves.size() < padded) {
+            leaves.push_back(capture_range_leaf_digest(
+                leaves.size(), 0, empty_payload));
+        }
+        uint32_t level = 0;
+        while (result->levels.back().size() > 1) {
+            const auto & prior = result->levels.back();
+            std::vector<capture_range_digest> next;
+            next.reserve(prior.size()/2);
+            for (size_t i = 0; i < prior.size(); i += 2) {
+                next.push_back(capture_range_node_digest(
+                    level, prior[i], prior[i + 1]));
+            }
+            result->levels.push_back(std::move(next));
+            ++level;
+        }
+        result->root = capture_range_root_digest(
+            result->total_bytes, result->chunk_bytes,
+            result->chunk_count, result->padded_count,
+            result->levels.back().front());
+        if (!capture_digest_nonzero(result->root)) {
+            return false;
+        }
+        output = vbr_capture_range_tree(std::move(result));
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+bool vbr_capture_range_prove(
+        const vbr_capture_range_tree & tree,
+        const std::vector<vbr_capture_authenticated_range> & ranges,
+        const vbr_capture_range_proof_limits & limits,
+        vbr_capture_range_proof & output) noexcept {
+    output = {};
+    try {
+        if (!tree.data_ || ranges.empty() || limits.max_ranges == 0 ||
+            ranges.size() > limits.max_ranges ||
+            limits.max_selected_chunks == 0 ||
+            limits.max_proof_nodes == 0 ||
+            limits.max_metadata_bytes == 0) {
+            return false;
+        }
+        auto result = std::make_shared<vbr_capture_range_proof::data>();
+        result->total_bytes = tree.data_->total_bytes;
+        result->chunk_bytes = tree.data_->chunk_bytes;
+        result->chunk_count = tree.data_->chunk_count;
+        result->padded_count = tree.data_->padded_count;
+        result->root = tree.data_->root;
+        result->ranges = ranges;
+        uint64_t prior_end = 0;
+        for (const auto & range : ranges) {
+            if (range.size == 0 || range.offset < prior_end ||
+                range.offset >= result->total_bytes ||
+                range.size > result->total_bytes - range.offset) {
+                return false;
+            }
+            const uint64_t end = range.offset + range.size;
+            const uint32_t first = uint32_t(
+                range.offset/result->chunk_bytes);
+            const uint32_t last = uint32_t(
+                (end - 1)/result->chunk_bytes);
+            for (uint32_t chunk = first;; ++chunk) {
+                if (result->selected_chunks.empty() ||
+                    result->selected_chunks.back() != chunk) {
+                    if (result->selected_chunks.size() >=
+                            limits.max_selected_chunks) {
+                        return false;
+                    }
+                    result->selected_chunks.push_back(chunk);
+                }
+                if (chunk == last) {
+                    break;
+                }
+            }
+            prior_end = end;
+        }
+        std::vector<uint32_t> known = result->selected_chunks;
+        for (uint32_t level = 0;
+             level + 1 < tree.data_->levels.size(); ++level) {
+            std::vector<uint32_t> parents;
+            parents.reserve((known.size() + 1)/2);
+            for (const uint32_t index : known) {
+                const uint32_t sibling = index ^ 1u;
+                if (!std::binary_search(
+                        known.begin(), known.end(), sibling)) {
+                    if (result->proof_nodes.size() >=
+                            limits.max_proof_nodes ||
+                        sibling >= tree.data_->levels[level].size()) {
+                        return false;
+                    }
+                    result->proof_nodes.push_back({
+                        level, sibling,
+                        tree.data_->levels[level][sibling],
+                    });
+                }
+                const uint32_t parent = index/2;
+                if (parents.empty() || parents.back() != parent) {
+                    parents.push_back(parent);
+                }
+            }
+            known = std::move(parents);
+        }
+        if (known.size() != 1 || known.front() != 0) {
+            return false;
+        }
+        uint64_t metadata_bytes =
+            sizeof(vbr_capture_range_proof::data) +
+            CAPTURE_SHARED_OWNER_BYTES;
+        if (!capture_range_metadata_add(
+                result->ranges.capacity(),
+                sizeof(vbr_capture_authenticated_range),
+                metadata_bytes) ||
+            !capture_range_metadata_add(
+                result->selected_chunks.capacity(), sizeof(uint32_t),
+                metadata_bytes) ||
+            !capture_range_metadata_add(
+                result->proof_nodes.capacity(),
+                sizeof(capture_range_proof_node), metadata_bytes) ||
+            metadata_bytes > limits.max_metadata_bytes) {
+            return false;
+        }
+        result->metadata_bytes = metadata_bytes;
+        output = vbr_capture_range_proof(std::move(result));
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+bool vbr_capture_range_verify(
+        const vbr_capture_range_proof & proof,
+        const vbr_artifact_byte_source & source,
+        uint64_t * bytes_read) noexcept {
+    if (bytes_read) {
+        *bytes_read = 0;
+    }
+    try {
+        if (!proof.data_ || !source.read ||
+            source.size != proof.data_->total_bytes ||
+            proof.data_->chunk_bytes != VBR_CAPTURE_RANGE_CHUNK_BYTES ||
+            proof.data_->selected_chunks.empty() ||
+            proof.data_->padded_count == 0) {
+            return false;
+        }
+        using indexed_digest =
+            std::pair<uint32_t, capture_range_digest>;
+        std::vector<indexed_digest> known;
+        known.reserve(proof.data_->selected_chunks.size());
+        std::array<uint8_t, VBR_CAPTURE_RANGE_CHUNK_BYTES> scratch;
+        uint64_t read_total = 0;
+        for (const uint32_t chunk : proof.data_->selected_chunks) {
+            if (chunk >= proof.data_->chunk_count) {
+                return false;
+            }
+            const uint64_t offset = uint64_t(chunk)*proof.data_->chunk_bytes;
+            const uint32_t size = uint32_t(std::min<uint64_t>(
+                proof.data_->chunk_bytes,
+                proof.data_->total_bytes - offset));
+            if (!source.read(
+                    source.context, offset, scratch.data(), size)) {
+                return false;
+            }
+            llama_sha256_writer payload_hash;
+            payload_hash.bytes(scratch.data(), size);
+            known.push_back({ chunk, capture_range_leaf_digest(
+                chunk, size, payload_hash.finish()) });
+            read_total += size;
+        }
+        size_t proof_cursor = 0;
+        uint32_t level = 0;
+        for (uint32_t width = proof.data_->padded_count;
+             width > 1; width /= 2, ++level) {
+            std::vector<indexed_digest> parents;
+            parents.reserve((known.size() + 1)/2);
+            for (size_t i = 0; i < known.size();) {
+                const auto current = known[i];
+                const uint32_t sibling_index = current.first ^ 1u;
+                capture_range_digest sibling;
+                bool sibling_known = false;
+                if (i + 1 < known.size() &&
+                    known[i + 1].first == sibling_index) {
+                    sibling = known[i + 1].second;
+                    sibling_known = true;
+                } else {
+                    if (proof_cursor >= proof.data_->proof_nodes.size()) {
+                        return false;
+                    }
+                    const auto & node =
+                        proof.data_->proof_nodes[proof_cursor++];
+                    if (node.level != level ||
+                        node.index != sibling_index) {
+                        return false;
+                    }
+                    sibling = node.digest;
+                }
+                const auto & left = (current.first & 1u) == 0
+                    ? current.second : sibling;
+                const auto & right = (current.first & 1u) == 0
+                    ? sibling : current.second;
+                parents.push_back({
+                    current.first/2,
+                    capture_range_node_digest(level, left, right),
+                });
+                i += sibling_known ? 2 : 1;
+            }
+            known = std::move(parents);
+        }
+        if (proof_cursor != proof.data_->proof_nodes.size() ||
+            known.size() != 1 || known.front().first != 0) {
+            return false;
+        }
+        const auto root = capture_range_root_digest(
+            proof.data_->total_bytes, proof.data_->chunk_bytes,
+            proof.data_->chunk_count, proof.data_->padded_count,
+            known.front().second);
+        if (root != proof.data_->root) {
+            return false;
+        }
+        if (bytes_read) {
+            *bytes_read = read_total;
+        }
+        return true;
+    } catch (...) {
+        if (bytes_read) {
+            *bytes_read = 0;
+        }
+        return false;
+    }
 }
 
 struct vbr_pinned_chunk_ring::impl {
@@ -734,13 +1287,16 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         return vbr_capture_stream_status::invalid_argument;
     }
     const size_t chunk_size = impl_->core->chunk_bytes();
+    const bool legacy_digest = !destination.authenticated();
 
     std::deque<vbr_pinned_chunk_lease> pending;
     llama_sha256_writer hash;
     static constexpr char domain_label[] =
         "buun.vbr.capture.segment-stream";
-    hash.string(domain_label, sizeof(domain_label) - 1);
-    hash.u64(transfer_bytes);
+    if (legacy_digest) {
+        hash.string(domain_label, sizeof(domain_label) - 1);
+        hash.u64(transfer_bytes);
+    }
 
     const auto synchronize_only = [&]() noexcept {
         for (auto & entry : pending) {
@@ -776,7 +1332,9 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
             impl_->core->release(entry);
             return vbr_capture_stream_status::internal_error;
         }
-        hash.bytes(entry.data(), entry.valid());
+        if (legacy_digest) {
+            hash.bytes(entry.data(), entry.valid());
+        }
         stats.bytes += entry.valid();
         stats.chunks++;
         impl_->core->release(entry);
@@ -859,7 +1417,9 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         }
         stats.max_segment_size =
             destination.max_segment_size();
-        stats.streaming_digest = hash.finish();
+        if (legacy_digest) {
+            stats.streaming_digest = hash.finish();
+        }
         return vbr_capture_stream_status::ok;
     } catch (...) {
         synchronize_only();
@@ -1030,6 +1590,8 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
             limits.max_shard_segment_references == 0 ||
             limits.max_source_operations == 0 ||
             limits.max_total_packed_bytes == 0 ||
+            limits.max_authenticated_chunks == 0 ||
+            limits.max_authenticated_metadata_bytes == 0 ||
             !snapshots.acquire || !snapshots.recheck ||
             !snapshots.release ||
             projection->dependency_references !=
@@ -1127,8 +1689,14 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
         }
         std::vector<uint64_t> shard_packed_bytes;
         shard_packed_bytes.reserve(ordered.size());
+        std::vector<uint32_t> shard_authenticated_chunks;
+        shard_authenticated_chunks.reserve(ordered.size());
+        std::vector<uint64_t> shard_authenticated_metadata;
+        shard_authenticated_metadata.reserve(ordered.size());
         uint64_t total_packed_bytes = 0;
         uint64_t source_operations = 0;
+        uint64_t authenticated_chunks = 0;
+        uint64_t authenticated_metadata_bytes = 0;
         const uint64_t chunk_bytes = ring.chunk_bytes();
         if (chunk_bytes == 0) {
             return vbr_capture_stream_status::projection_invalid;
@@ -1171,6 +1739,23 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
             }
             total_packed_bytes += packed_bytes;
             shard_packed_bytes.push_back(packed_bytes);
+            const uint64_t chunk_count =
+                (packed_bytes - 1)/VBR_CAPTURE_RANGE_CHUNK_BYTES + 1;
+            uint64_t tree_metadata_bytes = 0;
+            if (chunk_count >
+                    limits.max_authenticated_chunks -
+                        authenticated_chunks ||
+                !capture_range_tree_metadata_bytes(
+                    chunk_count, tree_metadata_bytes) ||
+                tree_metadata_bytes >
+                    limits.max_authenticated_metadata_bytes -
+                        authenticated_metadata_bytes) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
+            authenticated_chunks += chunk_count;
+            authenticated_metadata_bytes += tree_metadata_bytes;
+            shard_authenticated_chunks.push_back(uint32_t(chunk_count));
+            shard_authenticated_metadata.push_back(tree_metadata_bytes);
 
             uint64_t packed_cursor = 0;
             for (const auto & range : cell_ranges) {
@@ -1284,7 +1869,9 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
                     uint64_t(cell_ranges[i].count)*shard->row_bytes,
                 };
             }
-            auto chain = std::make_shared<artifact_segment_chain>();
+            auto chain = std::make_shared<artifact_segment_chain>(
+                VBR_CAPTURE_RANGE_CHUNK_BYTES,
+                shard_authenticated_chunks[shard_index]);
             vbr_capture_stream_stats stats;
             const auto streamed = ring.stream_ranges(
                 shard->source, ranges, *chain, stats);
@@ -1315,6 +1902,14 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
             unit_hash.u32(shard->row_count);
             unit_hash.u64(shard->row_bytes);
             unit_hash.u64(shard->source_identity);
+            vbr_capture_range_tree authenticated_ranges;
+            if (!vbr_capture_range_seal(
+                    *chain, shard_authenticated_metadata[shard_index],
+                    authenticated_ranges) ||
+                authenticated_ranges.total_bytes() != chain->size()) {
+                return vbr_capture_stream_status::internal_error;
+            }
+            stats.streaming_digest = authenticated_ranges.root();
             unit_hash.bytes(
                 stats.streaming_digest.data(),
                 stats.streaming_digest.size());
@@ -1322,6 +1917,7 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
                 shard->shard_index,
                 std::move(chain),
                 stats.streaming_digest,
+                std::move(authenticated_ranges),
             });
         }
         result.transfer.streaming_digest = unit_hash.finish();
@@ -1346,6 +1942,7 @@ struct vbr_capture_manifest_assembly::data {
     std::vector<vbr_capture_projected_unit> projected_units;
     std::vector<uint32_t> controller_references;
     std::vector<uint32_t> unit_references;
+    std::vector<vbr_capture_manifest_range_proof> range_proofs;
     std::vector<vbr_capture_manifest_result> manifests;
 };
 
@@ -1387,6 +1984,12 @@ vbr_capture_manifest_assembly::unit_references() const noexcept {
     return data_ ? data_->unit_references : empty;
 }
 
+const std::vector<vbr_capture_manifest_range_proof> &
+vbr_capture_manifest_assembly::range_proofs() const noexcept {
+    static const std::vector<vbr_capture_manifest_range_proof> empty;
+    return data_ ? data_->range_proofs : empty;
+}
+
 const std::vector<vbr_capture_manifest_result> &
 vbr_capture_manifest_assembly::manifests() const noexcept {
     static const std::vector<vbr_capture_manifest_result> empty;
@@ -1407,8 +2010,15 @@ bool vbr_capture_assemble_manifests(
             limits.max_projected_units == 0 || limits.max_manifests == 0 ||
             limits.max_controller_references == 0 ||
             limits.max_unit_references == 0 ||
+            limits.max_range_proofs == 0 ||
+            limits.max_range_proof_metadata_bytes == 0 ||
+            limits.range_proof.max_ranges == 0 ||
+            limits.range_proof.max_selected_chunks == 0 ||
+            limits.range_proof.max_proof_nodes == 0 ||
+            limits.range_proof.max_metadata_bytes == 0 ||
             limits.max_controller_references > UINT32_MAX ||
             limits.max_unit_references > UINT32_MAX ||
+            limits.max_range_proofs > UINT32_MAX ||
             controller_targets.size() > limits.max_controller_targets ||
             controller_targets.size() >
                 limits.max_controller_references ||
@@ -1423,6 +2033,8 @@ bool vbr_capture_assemble_manifests(
 
         using target_key = std::pair<uint64_t, uint32_t>;
         using stream_key = std::pair<uint32_t, uint32_t>;
+        using manifest_stream_key =
+            std::tuple<uint64_t, uint32_t, uint32_t>;
         using unit_key =
             std::tuple<uint32_t, uint32_t, uint64_t, uint32_t>;
         std::sort(controller_targets.begin(), controller_targets.end(),
@@ -1521,6 +2133,9 @@ bool vbr_capture_assemble_manifests(
         }
 
         std::map<uint64_t, std::set<stream_key>> manifest_streams;
+        std::map<manifest_stream_key,
+                 std::vector<vbr_capture_authenticated_range>>
+            manifest_packed_ranges;
         for (const auto & stream : projection->streams) {
             for (const auto & segment : stream.segments) {
                 if (segment.dependency_count == 0 ||
@@ -1541,6 +2156,21 @@ bool vbr_capture_assemble_manifests(
                     manifest_streams[manifest_id].insert({
                         stream.child_id, stream.stream_index,
                     });
+                    auto & ranges = manifest_packed_ranges[
+                        manifest_stream_key {
+                            manifest_id, stream.child_id,
+                            stream.stream_index,
+                        }];
+                    if (!ranges.empty() &&
+                        ranges.back().offset + ranges.back().size ==
+                            segment.packed_first_row) {
+                        ranges.back().size += segment.cell_count;
+                    } else {
+                        ranges.push_back({
+                            segment.packed_first_row,
+                            segment.cell_count,
+                        });
+                    }
                 }
             }
         }
@@ -1649,7 +2279,12 @@ bool vbr_capture_assemble_manifests(
                 const auto & shard = unit.shards()[j];
                 if (shard.shard_index != j || shard.bytes == nullptr ||
                     shard.bytes->size() == 0 ||
-                    !capture_digest_nonzero(shard.streaming_digest)) {
+                    !capture_digest_nonzero(shard.streaming_digest) ||
+                    !shard.authenticated_ranges ||
+                    shard.authenticated_ranges.total_bytes() !=
+                        shard.bytes->size() ||
+                    !capture_digest_nonzero(
+                        shard.authenticated_ranges.root())) {
                     return false;
                 }
             }
@@ -1680,12 +2315,14 @@ bool vbr_capture_assemble_manifests(
 
         result->manifests.reserve(manifest_targets.size());
         uint32_t manifest_index = 0;
+        uint64_t range_proof_metadata_bytes = 0;
         for (const auto & entry : manifest_targets) {
             const uint64_t manifest_id = entry.first;
             const auto & controller_refs = entry.second;
             const size_t controller_mark =
                 result->controller_references.size();
             const size_t unit_mark = result->unit_references.size();
+            const size_t range_proof_mark = result->range_proofs.size();
             bool ready = manifest_reachable[manifest_index++];
             for (const uint32_t target_index : controller_refs) {
                 if (!ready) {
@@ -1728,11 +2365,94 @@ bool vbr_capture_assemble_manifests(
                         return false;
                     }
                     result->unit_references.push_back(found->second);
+                    const auto projection_stream =
+                        projection_streams.find(stream);
+                    if (projection_stream == projection_streams.end()) {
+                        return false;
+                    }
+                    const auto & segments =
+                        projection_stream->second->segments;
+                    if (segments.empty()) {
+                        return false;
+                    }
+                    const uint64_t packed_rows =
+                        segments.back().packed_first_row +
+                        segments.back().cell_count;
+                    if (packed_rows == 0) {
+                        return false;
+                    }
+                    const auto & captured =
+                        result->projected_units[found->second];
+                    for (const auto & shard : captured.shards()) {
+                        if (!shard.bytes ||
+                            shard.bytes->size()%packed_rows != 0) {
+                            return false;
+                        }
+                        const uint64_t row_bytes =
+                            shard.bytes->size()/packed_rows;
+                        if (row_bytes == 0) {
+                            return false;
+                        }
+                        const auto planned_ranges =
+                            manifest_packed_ranges.find({
+                                manifest_id, stream.first, stream.second,
+                            });
+                        if (planned_ranges == manifest_packed_ranges.end() ||
+                            planned_ranges->second.empty() ||
+                            planned_ranges->second.size() >
+                                limits.range_proof.max_ranges) {
+                            return false;
+                        }
+                        std::vector<vbr_capture_authenticated_range> ranges;
+                        ranges.reserve(planned_ranges->second.size());
+                        for (const auto & rows : planned_ranges->second) {
+                            if (rows.offset > UINT64_MAX/row_bytes ||
+                                rows.size > UINT64_MAX/row_bytes) {
+                                return false;
+                            }
+                            ranges.push_back({
+                                rows.offset*row_bytes,
+                                rows.size*row_bytes,
+                            });
+                        }
+                        if (ranges.empty() ||
+                            result->range_proofs.size() >=
+                                limits.max_range_proofs) {
+                            return false;
+                        }
+                        vbr_capture_range_proof proof;
+                        if (!vbr_capture_range_prove(
+                                shard.authenticated_ranges, ranges,
+                                limits.range_proof, proof)) {
+                            return false;
+                        }
+                        const uint64_t proof_charge =
+                            proof.metadata_bytes() +
+                            2*sizeof(vbr_capture_manifest_range_proof);
+                        if (proof_charge < proof.metadata_bytes() ||
+                            proof_charge >
+                                limits.max_range_proof_metadata_bytes -
+                                    range_proof_metadata_bytes) {
+                            return false;
+                        }
+                        range_proof_metadata_bytes +=
+                            proof_charge;
+                        result->range_proofs.push_back({
+                            found->second, shard.shard_index,
+                            std::move(proof),
+                        });
+                    }
                 }
             }
             if (!ready) {
                 result->controller_references.resize(controller_mark);
                 result->unit_references.resize(unit_mark);
+                while (result->range_proofs.size() > range_proof_mark) {
+                    range_proof_metadata_bytes -=
+                        result->range_proofs.back().proof.metadata_bytes() +
+                        2*sizeof(vbr_capture_manifest_range_proof);
+                    result->range_proofs.pop_back();
+                }
             }
             vbr_capture_manifest_result manifest;
             manifest.manifest_id = manifest_id;
@@ -1746,6 +2466,10 @@ bool vbr_capture_assemble_manifests(
             manifest.first_unit = uint32_t(unit_mark);
             manifest.unit_count = ready
                 ? uint32_t(result->unit_references.size() - unit_mark) : 0;
+            manifest.first_range_proof = uint32_t(range_proof_mark);
+            manifest.range_proof_count = ready
+                ? uint32_t(result->range_proofs.size() -
+                    range_proof_mark) : 0;
             result->manifests.push_back(manifest);
         }
 
@@ -1770,6 +2494,13 @@ bool vbr_capture_assemble_manifests(
         }
         for (uint32_t & unit : result->unit_references) {
             unit = unit_remap[unit];
+        }
+        for (auto & proof : result->range_proofs) {
+            if (proof.unit_index >= unit_remap.size() ||
+                unit_remap[proof.unit_index] == UINT32_MAX) {
+                return false;
+            }
+            proof.unit_index = unit_remap[proof.unit_index];
         }
         result->projected_units = std::move(retained_units);
         output = vbr_capture_manifest_assembly(std::move(result));

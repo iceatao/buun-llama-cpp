@@ -72,6 +72,125 @@ static void test_segment_chain_offsets() {
     CHECK(!chain.read(8, &one, 1));
 }
 
+struct range_verify_source {
+    std::vector<uint8_t> bytes;
+    uint64_t calls = 0;
+
+    static bool read(
+            const void * opaque, uint64_t offset,
+            uint8_t * destination, size_t size) noexcept {
+        auto & self = *const_cast<range_verify_source *>(
+            static_cast<const range_verify_source *>(opaque));
+        if (offset > self.bytes.size() ||
+            size > self.bytes.size() - offset) {
+            return false;
+        }
+        self.calls++;
+        std::memcpy(destination, self.bytes.data() + offset, size);
+        return true;
+    }
+
+    vbr_artifact_byte_source source() const {
+        return { bytes.size(), this, read };
+    }
+};
+
+static void test_authenticated_range_tree() {
+    static constexpr size_t CHUNK = VBR_CAPTURE_RANGE_CHUNK_BYTES;
+    std::vector<uint8_t> bytes(4*CHUNK + 123);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = uint8_t((i*29 + i/251 + 7) & 0xff);
+    }
+
+    artifact_segment_chain chain(VBR_CAPTURE_RANGE_CHUNK_BYTES, 5);
+    CHECK(chain.append(bytes.data(), 17));
+    CHECK(chain.append(bytes.data() + 17, CHUNK + 91));
+    CHECK(chain.append(
+        bytes.data() + CHUNK + 108,
+        bytes.size() - CHUNK - 108));
+    vbr_capture_range_tree tree;
+    CHECK(vbr_capture_range_seal(chain, 1024, tree));
+    CHECK(tree);
+    CHECK(tree.total_bytes() == bytes.size());
+    CHECK(tree.chunk_bytes() == CHUNK);
+    CHECK(tree.chunk_count() == 5);
+    CHECK(tree.metadata_bytes() >= 15*32);
+    CHECK(std::any_of(
+        tree.root().begin(), tree.root().end(),
+        [](uint8_t value) { return value != 0; }));
+    CHECK(!chain.append(bytes.data(), 1));
+
+    // Append boundaries do not affect the authenticated root.
+    artifact_segment_chain rechunked(VBR_CAPTURE_RANGE_CHUNK_BYTES, 5);
+    CHECK(rechunked.append(bytes.data(), bytes.size()));
+    vbr_capture_range_tree same;
+    CHECK(vbr_capture_range_seal(rechunked, 1024, same));
+    CHECK(same.root() == tree.root());
+
+    vbr_capture_range_proof proof;
+    const std::vector<vbr_capture_authenticated_range> ranges {
+        { CHUNK + 100, 200 },
+        { 4*CHUNK + 3, 100 },
+    };
+    CHECK(vbr_capture_range_prove(tree, ranges, {}, proof));
+    CHECK(proof);
+    CHECK(proof.root() == tree.root());
+    CHECK(proof.ranges().size() == 2);
+    CHECK(proof.selected_chunk_count() == 2);
+    CHECK(proof.proof_node_count() == 4);
+    CHECK(proof.metadata_bytes() <= 1024);
+
+    range_verify_source source { bytes };
+    uint64_t bytes_read = 99;
+    CHECK(vbr_capture_range_verify(proof, source.source(), &bytes_read));
+    CHECK(bytes_read == CHUNK + 123);
+    CHECK(source.calls == 2);
+
+    // Selected corruption is detected; omitted chunks are never read.
+    source.bytes[CHUNK + 101] ^= 1;
+    CHECK(!vbr_capture_range_verify(proof, source.source(), &bytes_read));
+    CHECK(bytes_read == 0);
+    source.bytes = bytes;
+    source.bytes[2*CHUNK + 1] ^= 1;
+    source.calls = 0;
+    CHECK(vbr_capture_range_verify(proof, source.source(), &bytes_read));
+    CHECK(source.calls == 2);
+
+    vbr_capture_range_proof refused = proof;
+    auto tight = vbr_capture_range_proof_limits{};
+    tight.max_ranges = 1;
+    CHECK(!vbr_capture_range_prove(tree, ranges, tight, refused));
+    CHECK(!refused);
+    tight = {};
+    tight.max_selected_chunks = 1;
+    CHECK(!vbr_capture_range_prove(tree, ranges, tight, refused));
+    tight = {};
+    tight.max_proof_nodes = 2;
+    CHECK(!vbr_capture_range_prove(tree, ranges, tight, refused));
+    tight = {};
+    tight.max_metadata_bytes = proof.metadata_bytes() - 1;
+    CHECK(!vbr_capture_range_prove(tree, ranges, tight, refused));
+    CHECK(!vbr_capture_range_prove(
+        tree, { { CHUNK, 0 } }, {}, refused));
+    CHECK(!vbr_capture_range_prove(
+        tree, { { 2*CHUNK, 4 }, { CHUNK, 4 } }, {}, refused));
+
+    artifact_segment_chain unavailable;
+    vbr_capture_range_tree unavailable_tree = tree;
+    CHECK(unavailable.append(bytes.data(), 4));
+    CHECK(!vbr_capture_range_seal(unavailable, 1024, unavailable_tree));
+    CHECK(!unavailable_tree);
+    artifact_segment_chain over_cap(VBR_CAPTURE_RANGE_CHUNK_BYTES, 1);
+    CHECK(!over_cap.append(bytes.data(), CHUNK + 1));
+    CHECK(over_cap.size() == 0);
+    artifact_segment_chain metadata_cap(
+        VBR_CAPTURE_RANGE_CHUNK_BYTES, 5);
+    CHECK(metadata_cap.append(bytes.data(), bytes.size()));
+    CHECK(!vbr_capture_range_seal(
+        metadata_cap, tree.metadata_bytes() - 1, unavailable_tree));
+    CHECK(!unavailable_tree);
+}
+
 static void test_registry_quiescence_query() {
     const vbr_controller_instance_id instance { 0x1111, 0x2222 };
     const vbr_controller_instance_id other { 0x3333, 0x4444 };
@@ -394,6 +513,16 @@ static void test_projected_unit_transfer() {
     if (captured.shards().size() == 2) {
         CHECK(captured.shards()[0].shard_index == 0);
         CHECK(captured.shards()[1].shard_index == 1);
+        CHECK(captured.shards()[0].authenticated_ranges);
+        CHECK(captured.shards()[1].authenticated_ranges);
+        CHECK(captured.shards()[0].streaming_digest ==
+              captured.shards()[0].authenticated_ranges.root());
+        CHECK(captured.shards()[1].streaming_digest ==
+              captured.shards()[1].authenticated_ranges.root());
+        CHECK(captured.shards()[0].authenticated_ranges.total_bytes() == 8);
+        CHECK(captured.shards()[1].authenticated_ranges.total_bytes() == 12);
+        CHECK(captured.shards()[0].authenticated_ranges.root() !=
+              captured.shards()[1].authenticated_ranges.root());
         CHECK(read_chain(*captured.shards()[0].bytes) ==
               projected_rows(first.bytes, 2, { 1, 2, 3, 5 }));
         CHECK(read_chain(*captured.shards()[1].bytes) ==
@@ -604,6 +733,22 @@ static void test_projected_unit_transfer() {
               projection, 0, 0, 7, sources, tight,
               snapshot.provider(), *ring, failed) ==
           vbr_capture_stream_status::projection_invalid);
+    tight = {};
+    tight.max_authenticated_chunks = 1;
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot();
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, tight,
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::projection_invalid);
+    CHECK(snapshot.acquired == 0);
+    tight = {};
+    tight.max_authenticated_metadata_bytes = 63;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, tight,
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::projection_invalid);
+    CHECK(snapshot.acquired == 0);
 
     snapshot = {};
     snapshot.snapshot = captured.snapshot();
@@ -695,17 +840,18 @@ static vbr_capture_controller_target projected_target(
 static vbr_capture_projected_unit capture_projected_unit_for_target(
         const vbr_capture_projection & projection,
         const vbr_capture_controller_target & target,
-        uint32_t stream_index = 0) {
+        uint32_t stream_index = 0,
+        uint64_t row_bytes = 1) {
     synthetic_source source;
-    source.bytes.resize(8);
+    source.bytes.resize(size_t(8*row_bytes));
     for (uint32_t i = 0; i < source.bytes.size(); ++i) {
         source.bytes[i] = uint8_t(
             i + target.child_id + target.controller_generation);
     }
     vbr_capture_projected_shard_source shard;
     shard.shard_index = 0;
-    shard.row_count = source.bytes.size();
-    shard.row_bytes = 1;
+    shard.row_count = 8;
+    shard.row_bytes = row_bytes;
     shard.source_identity =
         target.controller_generation*10 + target.child_id + 1;
     shard.source.size = source.bytes.size();
@@ -725,7 +871,10 @@ static vbr_capture_projected_unit capture_projected_unit_for_target(
         sources, snapshot.snapshot.shard_count,
         snapshot.snapshot.shard_topology_digest));
     vbr_capture_stream_status status;
-    auto ring = vbr_pinned_chunk_ring::create({ {} }, 16, 4, status);
+    const size_t chunk_bytes = row_bytes == 1 ? 4 :
+        VBR_CAPTURE_RANGE_CHUNK_BYTES;
+    auto ring = vbr_pinned_chunk_ring::create(
+        { {} }, 2*chunk_bytes, chunk_bytes, status);
     CHECK(ring);
     vbr_capture_projected_unit unit;
     if (ring) {
@@ -804,6 +953,7 @@ static void test_manifest_coherent_assembly() {
     CHECK(controller.rechecked == std::vector<uint64_t>({ 10, 20, 30 }));
     CHECK(assembled.controller_targets().size() == 4);
     CHECK(assembled.projected_units().size() == 3);
+    CHECK(assembled.range_proofs().size() == 4);
     CHECK(assembled.manifests().size() == 3);
     CHECK(assembled.manifests()[0].manifest_id == 10);
     CHECK(assembled.manifests()[1].manifest_id == 20);
@@ -818,14 +968,52 @@ static void test_manifest_coherent_assembly() {
     if (manifest_first && manifest_shared) {
         CHECK(manifest_first->controller_count == 1);
         CHECK(manifest_first->unit_count == 1);
+        CHECK(manifest_first->range_proof_count == 1);
         CHECK(manifest_shared->controller_count == 2);
         CHECK(manifest_shared->unit_count == 2);
+        CHECK(manifest_shared->range_proof_count == 2);
         const uint32_t first_unit = assembled.unit_references()[
             manifest_first->first_unit];
         const uint32_t shared_unit = assembled.unit_references()[
             manifest_shared->first_unit];
         CHECK(first_unit == shared_unit);
+        const auto & first_proof = assembled.range_proofs()[
+            manifest_first->first_range_proof].proof;
+        const auto & shared_proof = assembled.range_proofs()[
+            manifest_shared->first_range_proof].proof;
+        CHECK(first_proof.ranges().size() == 1);
+        CHECK(shared_proof.ranges().size() == 1);
+        if (first_proof.ranges().size() == 1 &&
+            shared_proof.ranges().size() == 1) {
+            CHECK(first_proof.ranges()[0].offset == 0);
+            CHECK(first_proof.ranges()[0].size == 2);
+            CHECK(shared_proof.ranges()[0].offset == 1);
+            CHECK(shared_proof.ranges()[0].size == 2);
+        }
     }
+    for (const auto & range : assembled.range_proofs()) {
+        CHECK(range.unit_index < assembled.projected_units().size());
+        if (range.unit_index >= assembled.projected_units().size()) {
+            continue;
+        }
+        const auto & unit = assembled.projected_units()[range.unit_index];
+        CHECK(range.shard_index < unit.shards().size());
+        if (range.shard_index < unit.shards().size()) {
+            uint64_t bytes_read = 0;
+            CHECK(vbr_capture_range_verify(
+                range.proof,
+                unit.shards()[range.shard_index].bytes->source(),
+                &bytes_read));
+            CHECK(bytes_read ==
+                  unit.shards()[range.shard_index].bytes->size());
+        }
+    }
+    uint64_t all_ready_proof_metadata = 0;
+    for (const auto & range : assembled.range_proofs()) {
+        all_ready_proof_metadata += range.proof.metadata_bytes() +
+            2*sizeof(vbr_capture_manifest_range_proof);
+    }
+    CHECK(all_ready_proof_metadata > 80);
 
     // Losing one target generation invalidates only manifests that name it;
     // independently sealed units and manifests remain available.
@@ -841,7 +1029,9 @@ static void test_manifest_coherent_assembly() {
           vbr_capture_manifest_state::ready);
     CHECK(projected_manifest(assembled, 30)->state ==
           vbr_capture_manifest_state::dependency_unavailable);
+    CHECK(projected_manifest(assembled, 30)->range_proof_count == 0);
     CHECK(assembled.projected_units().size() == 2);
+    CHECK(assembled.range_proofs().size() == 2);
 
     auto stale_targets = targets;
     stale_targets.front().controller_generation = 404;
@@ -931,6 +1121,8 @@ static void test_manifest_coherent_assembly() {
     exact.max_manifests = 3;
     exact.max_controller_references = 4;
     exact.max_unit_references = 4;
+    exact.max_range_proofs = 4;
+    exact.max_range_proof_metadata_bytes = all_ready_proof_metadata;
     controller = {};
     CHECK(assemble_projected_test_batch(
         projection, targets, units, controller.provider(), exact, assembled));
@@ -956,6 +1148,13 @@ static void test_manifest_coherent_assembly() {
     });
     expect_limit_refusal([](auto & value) {
         value.max_unit_references = 3;
+    });
+    expect_limit_refusal([](auto & value) {
+        value.max_range_proofs = 3;
+    });
+    expect_limit_refusal([&](auto & value) {
+        value.max_range_proof_metadata_bytes =
+            all_ready_proof_metadata - 1;
     });
 
     auto conflicting_targets = targets;
@@ -1052,6 +1251,69 @@ static void test_manifest_coherent_assembly() {
           vbr_capture_manifest_state::ready);
     CHECK(projected_manifest(assembled, 50)->controller_count == 1);
     CHECK(projected_manifest(assembled, 50)->unit_count == 1);
+
+    // Manifest proofs select only their own canonical chunks even when one
+    // projected unit physically packs several independent prefixes.
+    vbr_capture_projection_manifest chunk_zero;
+    chunk_zero.manifest_id = 60;
+    chunk_zero.placements.push_back(
+        projected_placement(60, 60, { 0 }));
+    vbr_capture_projection_manifest chunk_one;
+    chunk_one.manifest_id = 70;
+    chunk_one.placements.push_back(
+        projected_placement(70, 70, { 3 }));
+    vbr_capture_projection chunk_projection;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, { chunk_zero, chunk_one } }, {}, chunk_projection));
+    auto chunk_target_zero = projected_target(60, 0, 707, generation_a);
+    auto chunk_target_one = projected_target(70, 0, 707, generation_a);
+    std::vector<vbr_capture_controller_target> chunk_targets {
+        chunk_target_zero, chunk_target_one,
+    };
+    std::vector<vbr_capture_projected_unit> chunk_units {
+        capture_projected_unit_for_target(
+            chunk_projection, chunk_target_zero, 0,
+            VBR_CAPTURE_RANGE_CHUNK_BYTES),
+    };
+    controller = {};
+    CHECK(assemble_projected_test_batch(
+        chunk_projection, chunk_targets, chunk_units,
+        controller.provider(), {}, assembled));
+    const auto * manifest_zero = projected_manifest(assembled, 60);
+    const auto * manifest_one = projected_manifest(assembled, 70);
+    CHECK(manifest_zero && manifest_one);
+    if (manifest_zero && manifest_one) {
+        CHECK(manifest_zero->range_proof_count == 1);
+        CHECK(manifest_one->range_proof_count == 1);
+        const auto & proof_zero = assembled.range_proofs()[
+            manifest_zero->first_range_proof].proof;
+        const auto & proof_one = assembled.range_proofs()[
+            manifest_one->first_range_proof].proof;
+        CHECK(proof_zero.ranges().size() == 1);
+        CHECK(proof_one.ranges().size() == 1);
+        if (proof_zero.ranges().size() == 1 &&
+            proof_one.ranges().size() == 1) {
+            CHECK(proof_zero.ranges()[0].offset == 0);
+            CHECK(proof_zero.ranges()[0].size ==
+                  VBR_CAPTURE_RANGE_CHUNK_BYTES);
+            CHECK(proof_one.ranges()[0].offset ==
+                  VBR_CAPTURE_RANGE_CHUNK_BYTES);
+            CHECK(proof_one.ranges()[0].size ==
+                  VBR_CAPTURE_RANGE_CHUNK_BYTES);
+        }
+        const auto unit_index = assembled.range_proofs()[
+            manifest_zero->first_range_proof].unit_index;
+        const auto & bytes = assembled.projected_units()[unit_index].
+            shards()[0].bytes;
+        uint64_t zero_bytes = 0;
+        uint64_t one_bytes = 0;
+        CHECK(vbr_capture_range_verify(
+            proof_zero, bytes->source(), &zero_bytes));
+        CHECK(vbr_capture_range_verify(
+            proof_one, bytes->source(), &one_bytes));
+        CHECK(zero_bytes == VBR_CAPTURE_RANGE_CHUNK_BYTES);
+        CHECK(one_bytes == VBR_CAPTURE_RANGE_CHUNK_BYTES);
+    }
 }
 
 struct generated_h2d_source {
@@ -1836,6 +2098,7 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
     test_segment_chain_offsets();
+    test_authenticated_range_tree();
     test_registry_quiescence_query();
     test_cpu_ring_boundaries();
     test_projected_unit_transfer();

@@ -18,6 +18,11 @@
 static constexpr uint64_t VBR_CAPTURE_PINNED_RING_MAX_BYTES =
     VBR_PINNED_RING_MAX_BYTES;
 
+// Canonical authenticated range granularity. Projected transfers hash these
+// chunks while copying from the backend, so later prefix projections verify
+// only the chunks they cite plus a bounded proof.
+static constexpr uint32_t VBR_CAPTURE_RANGE_CHUNK_BYTES = 64*1024;
+
 enum class vbr_capture_stream_status : uint8_t {
     ok = 0,
     invalid_argument,
@@ -62,6 +67,9 @@ struct artifact_segment {
 class artifact_segment_chain {
 public:
     artifact_segment_chain();
+    artifact_segment_chain(
+        uint32_t authenticated_chunk_bytes,
+        uint32_t max_authenticated_chunks);
     ~artifact_segment_chain();
 
     artifact_segment_chain(const artifact_segment_chain &) = delete;
@@ -73,13 +81,115 @@ public:
     uint64_t size() const noexcept;
     size_t segment_count() const noexcept;
     size_t max_segment_size() const noexcept;
+    bool authenticated() const noexcept;
     bool read(uint64_t offset, uint8_t * destination, size_t size) const noexcept;
     vbr_artifact_byte_source source() const noexcept;
 
 private:
     struct impl;
     std::unique_ptr<impl> impl_;
+    friend bool vbr_capture_range_seal(
+        artifact_segment_chain &,
+        uint64_t,
+        class vbr_capture_range_tree &) noexcept;
 };
+
+struct vbr_capture_authenticated_range {
+    uint64_t offset = 0;
+    uint64_t size = 0;
+};
+
+struct vbr_capture_range_proof_limits {
+    uint32_t max_ranges = 4096;
+    uint32_t max_selected_chunks = 1048576;
+    uint32_t max_proof_nodes = 1048576;
+    uint64_t max_metadata_bytes = uint64_t(64)*1024*1024;
+};
+
+// Immutable Merkle owner produced from the same append pass that creates the
+// pageable segment chain. The root binds total bytes, canonical chunking, and
+// the complete padded tree; no payload rescan is needed to seal it.
+class vbr_capture_range_tree {
+public:
+    vbr_capture_range_tree() noexcept = default;
+    explicit operator bool() const noexcept;
+    uint64_t total_bytes() const noexcept;
+    uint32_t chunk_bytes() const noexcept;
+    uint32_t chunk_count() const noexcept;
+    uint64_t metadata_bytes() const noexcept;
+    const std::array<uint8_t, 32> & root() const noexcept;
+
+private:
+    struct data;
+    explicit vbr_capture_range_tree(
+        std::shared_ptr<const data> data) noexcept;
+    std::shared_ptr<const data> data_;
+
+    friend class artifact_segment_chain;
+    friend bool vbr_capture_range_seal(
+        artifact_segment_chain &,
+        uint64_t,
+        vbr_capture_range_tree &) noexcept;
+    friend bool vbr_capture_range_prove(
+        const vbr_capture_range_tree &,
+        const std::vector<vbr_capture_authenticated_range> &,
+        const vbr_capture_range_proof_limits &,
+        class vbr_capture_range_proof &) noexcept;
+};
+
+// Immutable proof capability. Selected chunks are stored as indices rather
+// than payload copies; verification reads them from the supplied byte source.
+class vbr_capture_range_proof {
+public:
+    vbr_capture_range_proof() noexcept = default;
+    explicit operator bool() const noexcept;
+    const std::array<uint8_t, 32> & root() const noexcept;
+    uint64_t total_bytes() const noexcept;
+    uint32_t chunk_bytes() const noexcept;
+    const std::vector<vbr_capture_authenticated_range> & ranges() const noexcept;
+    uint32_t selected_chunk_count() const noexcept;
+    uint32_t proof_node_count() const noexcept;
+    uint64_t metadata_bytes() const noexcept;
+
+private:
+    struct data;
+    explicit vbr_capture_range_proof(
+        std::shared_ptr<const data> data) noexcept;
+    std::shared_ptr<const data> data_;
+
+    friend bool vbr_capture_range_prove(
+        const vbr_capture_range_tree &,
+        const std::vector<vbr_capture_authenticated_range> &,
+        const vbr_capture_range_proof_limits &,
+        vbr_capture_range_proof &) noexcept;
+    friend bool vbr_capture_range_verify(
+        const vbr_capture_range_proof &,
+        const vbr_artifact_byte_source &,
+        uint64_t *) noexcept;
+};
+
+// Sealing is valid only for a chain constructed with authenticated chunking,
+// after all appends complete. All failures clear output and leave the chain
+// readable but permanently unsealed for publication.
+bool vbr_capture_range_seal(
+    artifact_segment_chain & chain,
+    uint64_t max_metadata_bytes,
+    vbr_capture_range_tree & output) noexcept;
+
+// Ranges must be sorted, nonempty, nonoverlapping, and within the sealed byte
+// extent. Proof construction and verification are transactional/fail-closed.
+bool vbr_capture_range_prove(
+    const vbr_capture_range_tree & tree,
+    const std::vector<vbr_capture_authenticated_range> & ranges,
+    const vbr_capture_range_proof_limits & limits,
+    vbr_capture_range_proof & output) noexcept;
+
+// Verifies only selected canonical chunks. bytes_read is optional diagnostic
+// evidence and is reset on every path.
+bool vbr_capture_range_verify(
+    const vbr_capture_range_proof & proof,
+    const vbr_artifact_byte_source & source,
+    uint64_t * bytes_read = nullptr) noexcept;
 
 std::array<uint8_t, 32> vbr_capture_stream_digest(
     const artifact_segment_chain & chain) noexcept;
@@ -310,6 +420,7 @@ struct vbr_capture_projected_shard {
     uint32_t shard_index = UINT32_MAX;
     std::shared_ptr<const artifact_segment_chain> bytes;
     std::array<uint8_t, 32> streaming_digest = {};
+    vbr_capture_range_tree authenticated_ranges;
 };
 
 struct vbr_capture_projected_transfer_limits {
@@ -319,6 +430,8 @@ struct vbr_capture_projected_transfer_limits {
     // lease is held. More fragmented unions must use a bounded packed view.
     uint32_t max_source_operations = 4096;
     uint64_t max_total_packed_bytes = uint64_t(16)*1024*1024*1024;
+    uint32_t max_authenticated_chunks = 262144;
+    uint64_t max_authenticated_metadata_bytes = uint64_t(32)*1024*1024;
 };
 
 // Immutable unit capability minted only after the complete projected transfer
@@ -395,6 +508,14 @@ struct vbr_capture_manifest_result {
     uint32_t controller_count = 0;
     uint32_t first_unit = 0;
     uint32_t unit_count = 0;
+    uint32_t first_range_proof = 0;
+    uint32_t range_proof_count = 0;
+};
+
+struct vbr_capture_manifest_range_proof {
+    uint32_t unit_index = UINT32_MAX;
+    uint32_t shard_index = UINT32_MAX;
+    vbr_capture_range_proof proof;
 };
 
 struct vbr_capture_manifest_assembly_limits {
@@ -405,6 +526,12 @@ struct vbr_capture_manifest_assembly_limits {
     uint32_t max_manifests = 4096;
     uint64_t max_controller_references = 4096;
     uint64_t max_unit_references = 1048576;
+    // A packed fallback is required before one batch can retain more proof
+    // owners than projected units. This prevents millions of tiny heap-owned
+    // proofs even when their element arenas fit the byte cap.
+    uint64_t max_range_proofs = 16384;
+    uint64_t max_range_proof_metadata_bytes = uint64_t(64)*1024*1024;
+    vbr_capture_range_proof_limits range_proof;
 };
 
 // One immutable transport batch can finish partially: a missing, stale, or
@@ -424,6 +551,8 @@ class vbr_capture_manifest_assembly {
         projected_units() const noexcept;
     const std::vector<uint32_t> & controller_references() const noexcept;
     const std::vector<uint32_t> & unit_references() const noexcept;
+    const std::vector<vbr_capture_manifest_range_proof> &
+        range_proofs() const noexcept;
     const std::vector<vbr_capture_manifest_result> & manifests() const noexcept;
 
   private:
