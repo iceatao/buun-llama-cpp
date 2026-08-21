@@ -922,7 +922,8 @@ bool llama_cache_acct_ledger::preview_release(
 bool llama_cache_acct_ledger::preview_release_set(
         const std::vector<llama_cache_acct_op_id> & selected,
         uint64_t expected_serial,
-        llama_cache_acct_release_set_preview & out) const noexcept {
+        llama_cache_acct_release_set_preview & out,
+        bool include_category_yields) const noexcept {
     out = {};
     std::lock_guard<std::mutex> lock(mtx);
     if (state.serial != expected_serial) {
@@ -980,9 +981,49 @@ bool llama_cache_acct_ledger::preview_release_set(
             }
             row->logical_payload += it->second.charged_logical;
             row->resident_allocated += it->second.resident_bytes;
+            if (include_category_yields) {
+                auto yield = std::find_if(
+                    next.yield_rows.begin(), next.yield_rows.end(),
+                    [&](const auto & candidate) {
+                        return candidate.category == it->second.category &&
+                               candidate.domain == it->second.domain;
+                    });
+                if (yield == next.yield_rows.end()) {
+                    next.yield_rows.push_back({
+                        it->second.category, it->second.domain, 0, 0 });
+                    yield = std::prev(next.yield_rows.end());
+                }
+                if (it->second.charged_logical >
+                        std::numeric_limits<uint64_t>::max() -
+                            yield->logical_payload ||
+                    it->second.resident_bytes >
+                        std::numeric_limits<uint64_t>::max() -
+                            yield->resident_allocated) {
+                    return false;
+                }
+                yield->logical_payload += it->second.charged_logical;
+                yield->resident_allocated += it->second.resident_bytes;
+            }
         }
         std::sort(next.rows.begin(), next.rows.end(),
             [](const auto & a, const auto & b) {
+                if (a.domain.residency != b.domain.residency) {
+                    return a.domain.residency < b.domain.residency;
+                }
+                if (a.domain.kind != b.domain.kind) {
+                    return a.domain.kind < b.domain.kind;
+                }
+                if (a.domain.topology != b.domain.topology) {
+                    return a.domain.topology.v < b.domain.topology.v;
+                }
+                return a.domain.device_ordinal.v <
+                       b.domain.device_ordinal.v;
+            });
+        std::sort(next.yield_rows.begin(), next.yield_rows.end(),
+            [](const auto & a, const auto & b) {
+                if (a.category != b.category) {
+                    return a.category < b.category;
+                }
                 if (a.domain.residency != b.domain.residency) {
                     return a.domain.residency < b.domain.residency;
                 }
@@ -999,6 +1040,76 @@ bool llama_cache_acct_ledger::preview_release_set(
         return true;
     } catch (...) {
         out = {};
+        return false;
+    }
+}
+
+bool llama_cache_acct_ledger::preview_release_set_resident_batch(
+        const std::vector<llama_cache_acct_release_set_view> & sets,
+        uint64_t expected_serial,
+        std::vector<uint64_t> & out) const noexcept {
+    out.clear();
+    std::lock_guard<std::mutex> lock(mtx);
+    if (state.serial != expected_serial) {
+        return false;
+    }
+    try {
+        size_t max_ops = 0;
+        for (const auto & set : sets) {
+            if ((set.size != 0 && set.data == nullptr) ||
+                set.size > std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            max_ops = std::max(max_ops, set.size);
+        }
+        out.assign(sets.size(), 0);
+        std::unordered_map<llama_cache_acct_alloc_id, uint32_t> selected_refs;
+        std::unordered_set<llama_cache_acct_op_id> unique_ops;
+        selected_refs.reserve(max_ops);
+        unique_ops.reserve(max_ops);
+        for (size_t i = 0; i < sets.size(); ++i) {
+            selected_refs.clear();
+            unique_ops.clear();
+            const auto & set = sets[i];
+            for (size_t j = 0; j < set.size; ++j) {
+                const auto op = set.data[j];
+                if (!op || !unique_ops.insert(op).second) {
+                    out.clear();
+                    return false;
+                }
+                release_resolution resolved;
+                if (resolve_release_locked(op, resolved) !=
+                        release_resolution_status::ok) {
+                    out.clear();
+                    return false;
+                }
+                auto & count = selected_refs[resolved.operation->alloc];
+                if (count == std::numeric_limits<uint32_t>::max()) {
+                    out.clear();
+                    return false;
+                }
+                count++;
+            }
+            uint64_t resident = 0;
+            for (const auto & [alloc, count] : selected_refs) {
+                const auto it = allocs.find(alloc);
+                if (it == allocs.end() || count > it->second.committed_refs) {
+                    out.clear();
+                    return false;
+                }
+                if (count == it->second.committed_refs) {
+                    if (it->second.resident_bytes > UINT64_MAX - resident) {
+                        out.clear();
+                        return false;
+                    }
+                    resident += it->second.resident_bytes;
+                }
+            }
+            out[i] = resident;
+        }
+        return true;
+    } catch (...) {
+        out.clear();
         return false;
     }
 }

@@ -21,8 +21,7 @@ struct server_cache_authority;
 
 struct server_cache_live_checkpoint_admission {
     llama_cache_acct_artifact_id artifact;
-    uint64_t checkpoint_bytes = 0;
-    uint64_t accelerator_bytes = 0;
+    const common_prompt_checkpoint * checkpoint = nullptr;
     std::vector<llama_cache_acct_op_id> committed;
 };
 
@@ -377,8 +376,7 @@ struct server_cache_authority {
     // one ring incurs one budget sample and one reservation transaction.
     bool admit_live_checkpoint(
         llama_cache_acct_artifact_id artifact,
-        uint64_t checkpoint_bytes,
-        uint64_t accelerator_bytes,
+        const common_prompt_checkpoint & checkpoint,
         std::vector<llama_cache_acct_op_id> & committed) noexcept;
 
     // Bounded process-local D-A receipt publication for destruction work that

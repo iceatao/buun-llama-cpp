@@ -1722,7 +1722,8 @@ void test_lifecycle_df2_accounting_fault_falls_back_to_fifo() {
     // Corrupt only DF2's proposed cold victim. Its immutable payload bytes
     // remain rankable, but authority must refuse the stale release set and
     // return to the lawful FIFO floor before touching that entry.
-    CHECK(authority.ledger.release(newest->acct_op_snapshot));
+    CHECK(!newest->release_ops().empty());
+    CHECK(authority.ledger.release(newest->release_ops().front()));
     cache.limit_size = 150;
     cache.update();
     CHECK(cache.states.size() == 1);
@@ -3145,10 +3146,14 @@ void test_lifecycle_restore_batch_timing() {
             common_retention_pool::attention, spans, true, 4096,
             checkpoint.n_tokens, true));
     }
+    constexpr size_t checkpoint_plane_bytes =
+        64 * 1024 + 8 * 1024 + 4 * 1024 + 1024;
+    CHECK(cache.size() == 32 + 8 * checkpoint_plane_bytes);
 
     // Prepare eight non-consuming deliveries concurrently. Every checkpoint
-    // plane shares the immutable host allocation; mutating one delivery
-    // detaches only that plane and cannot alter the host or its seven peers.
+    // plane shares the immutable host allocation; mutating one unadmitted
+    // delivery detaches only that handle and cannot alter the accounted host
+    // or its seven peers.
     std::vector<server_prompt_cache_restore_delivery> fanout;
     fanout.reserve(8);
     for (int i = 0; i < 8; ++i) {
@@ -3212,14 +3217,19 @@ void test_lifecycle_restore_batch_timing() {
         commit_samples.push_back(uint64_t(std::chrono::duration_cast<
             std::chrono::nanoseconds>(commit_end - commit_begin).count()));
         CHECK(live.checkpoints.size() == 8);
+        // The host now owns only the marginal full-snapshot allocation. Every
+        // checkpoint plane remains resident through the live aliases and is
+        // therefore credited with zero host-cache release bytes.
+        CHECK(cache.size() == 32);
         for (const auto & checkpoint : live.checkpoints) {
             server_retention_candidate candidate;
             CHECK(authority.retention.candidate_for_instance(
                 server_retention_instance_key::for_checkpoint(
                     100 + trial, &checkpoint), candidate));
-            CHECK(candidate.release_ops.size() == 2);
+            CHECK(candidate.release_ops.size() == 4);
         }
         authority.retention.retire_slot(100 + trial);
+        CHECK(cache.size() == 32 + 8 * checkpoint_plane_bytes);
     }
     std::sort(prepare_samples.begin(), prepare_samples.end());
     std::sort(commit_samples.begin(), commit_samples.end());
@@ -3282,7 +3292,7 @@ void test_checkpoint_creation_churn_timing() {
         std::vector<llama_cache_acct_op_id> ops;
         const auto admit_begin = std::chrono::steady_clock::now();
         CHECK(authority.admit_live_checkpoint(
-            artifact, checkpoint.data_tgt.size(), checkpoint.accel.size(), ops));
+            artifact, checkpoint, ops));
         const auto admit_end = std::chrono::steady_clock::now();
         CHECK(authority.retention.attach_release_ops(key, std::move(ops)));
         const auto attach_end = std::chrono::steady_clock::now();
@@ -3569,6 +3579,46 @@ void test_consuming_rebind_mints_checkpoint_ownership() {
     CHECK(authority.ledger.snapshot().live_ops == 0);
 }
 
+void test_restore_partial_checkpoint_ownership_fails_closed() {
+    server_cache_authority authority;
+    configure_host_accounting(authority, true);
+    server_prompt_cache cache(0, 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.retention_obs = &authority.retention;
+    cache.destruction_obs = &authority.destruction;
+
+    auto entry = make_prompt_entry("partial-restore", { 1, 2, 3 });
+    for (int i = 0; i < 2; ++i) {
+        entry.front().prompt.checkpoints.emplace_back();
+        auto & checkpoint = entry.front().prompt.checkpoints.back();
+        checkpoint.n_tokens = i + 1;
+        checkpoint.data_tgt.assign(8, uint8_t(i + 1));
+    }
+    CHECK(cache.publish(std::move(entry)));
+    common_chat_msg_spans spans;
+    const auto host_key =
+        server_retention_instance_key::for_host_entry(&cache.states.front());
+    CHECK(authority.retention.publish(
+        host_key, common_retention_pool::attention,
+        spans, false, 3, 3, true));
+    for (const auto & checkpoint : cache.states.front().prompt.checkpoints) {
+        CHECK(authority.retention.publish(
+            server_retention_instance_key::for_checkpoint(-1, &checkpoint),
+            common_retention_pool::attention, spans, false, 3,
+            checkpoint.n_tokens, true));
+    }
+
+    server_prompt_cache_restore_delivery delivery;
+    server_prompt live;
+    cache.commit_restore_delivery(
+        cache.states.begin(), std::move(delivery), live, 7);
+    CHECK(cache.states.empty());
+    CHECK(live.checkpoints.empty());
+    authority.retention.retire_slot(7);
+    CHECK(authority.ledger.snapshot().live_ops == 0);
+}
+
 void test_lifecycle_release_prepare_failure_keeps_legacy_bound() {
     server_cache_authority authority;
     server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
@@ -3605,6 +3655,71 @@ void test_lifecycle_restore_clone_fault() {
     CHECK(cache.states.size() == 1);
     CHECK(cache.states.front().size() == source_size);
     CHECK(cache.states.front().prompt.n_tokens() == 3);
+}
+
+void test_host_publication_accounting_fault_is_atomic() {
+    server_cache_authority authority;
+    configure_host_accounting(authority, true);
+    CHECK(authority.retention.enable_prefix_tracking());
+    server_prompt_cache cache(0, 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.retention_obs = &authority.retention;
+    cache.destruction_obs = &authority.destruction;
+
+    constexpr int32_t source_slot = 19;
+    server_prompt source;
+    source.tokens = server_tokens(llama_tokens { 1, 2, 3, 4 }, false);
+    source.checkpoints.emplace_back();
+    auto & checkpoint = source.checkpoints.back();
+    checkpoint.n_tokens = 3;
+    checkpoint.data_tgt.assign(64, 1);
+    checkpoint.accel.ring.assign(16, 2);
+    const auto source_key = server_retention_instance_key::for_slot(
+        source_slot);
+    (void) publish_live_retention(
+        authority.retention, source, source_slot);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, source_key, source, "atomic-host", 4));
+    const auto checkpoint_key =
+        server_retention_instance_key::for_checkpoint(
+            source_slot, &checkpoint);
+    common_chat_msg_spans spans;
+    CHECK(authority.retention.publish(
+        checkpoint_key, common_retention_pool::attention,
+        spans, false, 4, 3, true, nullptr, nullptr, &source_key));
+    const auto checkpoint_artifact =
+        authority.retention.artifact_id(checkpoint_key);
+    std::vector<llama_cache_acct_op_id> checkpoint_ops;
+    CHECK(authority.admit_live_checkpoint(
+        checkpoint_artifact, checkpoint, checkpoint_ops));
+    CHECK(authority.retention.attach_release_ops(
+        checkpoint_key, std::move(checkpoint_ops)));
+
+    auto staged = cache.stage(source, 32, 0, "atomic-host");
+    CHECK(staged.size() == 1);
+    const auto host_key = server_retention_instance_key::for_host_entry(
+        &staged.front());
+    const auto host_checkpoint_key =
+        server_retention_instance_key::for_checkpoint(
+            -1, &staged.front().prompt.checkpoints.front());
+    const auto before = authority.ledger.snapshot();
+    const uint64_t refusals_before = authority.admission_refusals;
+    server_prompt_cache::iterator published = cache.states.begin();
+    CHECK(!cache.publish(
+        std::move(staged), &source, source_slot, &published));
+    CHECK(published == cache.states.end());
+    CHECK(cache.states.empty());
+    CHECK(authority.admission_refusals == refusals_before + 1);
+    CHECK(authority.retention.artifact_id(host_key).v == 0);
+    CHECK(authority.retention.artifact_id(host_checkpoint_key).v == 0);
+    CHECK(authority.retention.clone_source_available(source_key));
+    CHECK(authority.retention.clone_source_available(checkpoint_key));
+    const auto after = authority.ledger.snapshot();
+    CHECK(after.live_ops == before.live_ops);
+    CHECK(after.allocations.size() == before.allocations.size());
+    authority.retention.retire_slot(source_slot);
+    CHECK(authority.ledger.snapshot().live_ops == 0);
 }
 
 void test_lifecycle_authority_without_debug_is_silent() {
@@ -4369,7 +4484,7 @@ void test_checkpoint_thin_lane_skips_pinned_member() {
         std::vector<llama_cache_acct_op_id> ops;
         CHECK(authority.admit_live_checkpoint(
             authority.retention.artifact_id(key),
-            checkpoint.data_tgt.size(), 0, ops));
+            checkpoint, ops));
         CHECK(authority.retention.attach_release_ops(key, std::move(ops)));
     }
     const auto pinned_key = server_retention_instance_key::for_checkpoint(
@@ -4520,17 +4635,18 @@ void test_live_checkpoint_payload_ownership() {
     // Prefix tracking is prompt-payload evidence only. Enabling it must not
     // make the canonical lifecycle checkpoint candidate unavailable.
     CHECK(authority.retention.enable_prefix_tracking());
-    const auto * checkpoint =
-        reinterpret_cast<const common_prompt_checkpoint *>(uintptr_t(0x1234));
+    common_prompt_checkpoint checkpoint;
+    checkpoint.data_tgt.assign(64, 1);
+    checkpoint.accel.ring.assign(16, 2);
     const auto live =
-        server_retention_instance_key::for_checkpoint(3, checkpoint);
+        server_retention_instance_key::for_checkpoint(3, &checkpoint);
     common_chat_msg_spans spans;
     CHECK(authority.retention.publish(
         live, common_retention_pool::recurrent, spans,
         false, 16, 8, true));
     const auto artifact = authority.retention.artifact_id(live);
     std::vector<llama_cache_acct_op_id> ops;
-    CHECK(authority.admit_live_checkpoint(artifact, 64, 16, ops));
+    CHECK(authority.admit_live_checkpoint(artifact, checkpoint, ops));
     CHECK(ops.size() == 2);
     CHECK(authority.retention.attach_release_ops(live, ops));
     server_retention_candidate candidate;
@@ -4542,7 +4658,7 @@ void test_live_checkpoint_payload_ownership() {
     // Host copies remain aggregate-owned: clone the retention record but not
     // the live member's independently releasable operation set.
     const auto host =
-        server_retention_instance_key::for_checkpoint(-1, checkpoint);
+        server_retention_instance_key::for_checkpoint(-1, &checkpoint);
     CHECK(authority.retention.clone(live, host));
     CHECK(authority.retention.candidate_for_instance(host, candidate));
     CHECK(candidate.release_ops.empty());
@@ -4572,12 +4688,18 @@ void test_live_checkpoint_batch_admission() {
     sequential_samples.reserve(21);
     batch_samples.reserve(21);
     for (uint64_t trial = 0; trial < 21; ++trial) {
+        std::vector<common_prompt_checkpoint> sequential_checkpoints(8);
+        for (auto & checkpoint : sequential_checkpoints) {
+            checkpoint.data_tgt.assign(64 * 1024, 1);
+            checkpoint.accel.ring.assign(4 * 1024, 2);
+        }
         std::vector<llama_cache_acct_op_id> all_ops;
         const auto begin = std::chrono::steady_clock::now();
         for (uint64_t member = 0; member < 8; ++member) {
             std::vector<llama_cache_acct_op_id> ops;
             CHECK(authority.admit_live_checkpoint(
-                { 1000 + trial * 8 + member }, 64 * 1024, 4 * 1024, ops));
+                { 1000 + trial * 8 + member },
+                sequential_checkpoints[member], ops));
             all_ops.insert(all_ops.end(), ops.begin(), ops.end());
         }
         const auto end = std::chrono::steady_clock::now();
@@ -4588,10 +4710,12 @@ void test_live_checkpoint_batch_admission() {
         }
 
         std::vector<server_cache_live_checkpoint_admission> batch(8);
+        std::vector<common_prompt_checkpoint> checkpoints(8);
         for (uint64_t member = 0; member < batch.size(); ++member) {
+            checkpoints[member].data_tgt.assign(64 * 1024, 1);
+            checkpoints[member].accel.ring.assign(4 * 1024, 2);
             batch[member].artifact = { 2000 + trial * 8 + member };
-            batch[member].checkpoint_bytes = 64 * 1024;
-            batch[member].accelerator_bytes = 4 * 1024;
+            batch[member].checkpoint = &checkpoints[member];
         }
         const uint64_t commits_before = authority.admission_commits;
         const auto batch_begin = std::chrono::steady_clock::now();
@@ -4620,10 +4744,13 @@ void test_live_checkpoint_batch_admission() {
     // an operation, and the ledger remains at its pre-batch baseline.
     const auto before = authority.ledger.snapshot();
     std::vector<server_cache_live_checkpoint_admission> invalid(2);
+    common_prompt_checkpoint invalid_checkpoint[2];
+    invalid_checkpoint[0].data_tgt.assign(64, 1);
+    invalid_checkpoint[1].data_tgt.assign(64, 1);
     invalid[0].artifact = { 9001 };
-    invalid[0].checkpoint_bytes = 64;
+    invalid[0].checkpoint = &invalid_checkpoint[0];
     invalid[1].artifact = {};
-    invalid[1].checkpoint_bytes = 64;
+    invalid[1].checkpoint = &invalid_checkpoint[1];
     CHECK(!authority.admit_live_checkpoints(invalid));
     CHECK(invalid[0].committed.empty());
     CHECK(invalid[1].committed.empty());
@@ -4631,14 +4758,238 @@ void test_live_checkpoint_batch_admission() {
 
     server_cache_authority unavailable;
     std::vector<server_cache_live_checkpoint_admission> refused(2);
+    common_prompt_checkpoint refused_checkpoint[2];
+    refused_checkpoint[0].data_tgt.assign(64, 1);
+    refused_checkpoint[1].data_tgt.assign(64, 1);
     refused[0].artifact = { 9101 };
-    refused[0].checkpoint_bytes = 64;
+    refused[0].checkpoint = &refused_checkpoint[0];
     refused[1].artifact = { 9102 };
-    refused[1].checkpoint_bytes = 64;
+    refused[1].checkpoint = &refused_checkpoint[1];
     CHECK(!unavailable.admit_live_checkpoints(refused));
     CHECK(refused[0].committed.empty());
     CHECK(refused[1].committed.empty());
     CHECK(unavailable.ledger.snapshot().live_ops == 0);
+}
+
+void test_shared_checkpoint_physical_accounting() {
+    server_cache_authority authority;
+    configure_host_accounting(authority);
+
+    const auto resident_bytes = [](const llama_cache_acct_snapshot & snapshot) {
+        uint64_t total = 0;
+        for (const auto & allocation : snapshot.allocations) {
+            total += allocation.resident_bytes;
+        }
+        return total;
+    };
+
+    {
+        common_prompt_checkpoint source;
+        source.data_tgt.assign(64, 1);
+        source.data_dft.assign(32, 2);
+        source.accel.ring.assign(16, 3);
+        source.accel.spec.assign(8, 4);
+        std::vector<llama_cache_acct_op_id> source_ops;
+        CHECK(authority.admit_live_checkpoint({ 10001 }, source, source_ops));
+        CHECK(source_ops.size() == 4);
+
+        auto snapshot = authority.ledger.snapshot();
+        CHECK(snapshot.allocations.size() == 4);
+        CHECK(resident_bytes(snapshot) == 120);
+        CHECK(snapshot.live_ops == 4);
+
+        server_prompt prompt;
+        prompt.checkpoints.push_back(source);
+        server_prompt_cache bounded(0, 0);
+        bounded.acct = &authority.ledger;
+        bounded.publish_authority = &authority;
+        bounded.limit_size = 32;
+        auto staged = bounded.stage(prompt, 16, 0, "shared-physical");
+        CHECK(staged.size() == 1);
+        CHECK(staged.front().size() == 136);
+
+        server_prompt unbound_prompt;
+        unbound_prompt.checkpoints.emplace_back();
+        unbound_prompt.checkpoints.back().data_tgt.assign(64, 1);
+        CHECK(bounded.stage(
+            unbound_prompt, 16, 0, "unbound-physical").empty());
+
+        std::vector<common_prompt_checkpoint> aliases(8, source);
+        std::vector<server_cache_live_checkpoint_admission> batch(8);
+        for (size_t i = 0; i < batch.size(); ++i) {
+            batch[i].artifact = { 10100 + i };
+            batch[i].checkpoint = &aliases[i];
+        }
+        CHECK(authority.admit_live_checkpoints(batch));
+        snapshot = authority.ledger.snapshot();
+        CHECK(snapshot.allocations.size() == 4);
+        CHECK(resident_bytes(snapshot) == 120);
+        CHECK(snapshot.live_ops == 36);
+        for (const auto & allocation : snapshot.allocations) {
+            CHECK(allocation.committed_refs == 9);
+        }
+
+        for (const auto & member : batch) {
+            CHECK(member.committed.size() == 4);
+            for (const auto op : member.committed) {
+                CHECK(authority.ledger.release(op));
+            }
+        }
+        for (const auto op : source_ops) {
+            CHECK(authority.ledger.release(op));
+        }
+        CHECK(authority.ledger.snapshot().live_ops == 0);
+    }
+
+    // Mutating one unaccounted alias detaches only that plane. Once admitted,
+    // each logical handle is sealed while the other planes keep sharing the
+    // existing physical allocations.
+    {
+        common_prompt_checkpoint source;
+        source.data_tgt.assign(64, 1);
+        source.data_dft.assign(32, 2);
+        source.accel.ring.assign(16, 3);
+        source.accel.spec.assign(8, 4);
+        common_prompt_checkpoint detached = source;
+        detached.data_tgt.mutable_at(0) = 9;
+        CHECK(!detached.data_tgt.shares_storage_with(source.data_tgt));
+        CHECK(detached.data_dft.shares_storage_with(source.data_dft));
+        // Close the intentionally escaped reference before accounting seals
+        // this independently owned plane.
+        detached.data_tgt.assign(64, 9);
+
+        std::vector<llama_cache_acct_op_id> source_ops;
+        CHECK(authority.admit_live_checkpoint({ 11001 }, source, source_ops));
+
+        bool bound_mutation_refused = false;
+        try {
+            source.data_tgt.mutable_at(0) = 7;
+        } catch (const std::logic_error &) {
+            bound_mutation_refused = true;
+        }
+        CHECK(bound_mutation_refused);
+        CHECK(source.data_tgt.view()[0] == 1);
+        bool bound_resize_refused = false;
+        try {
+            source.data_tgt.resize(65);
+        } catch (const std::logic_error &) {
+            bound_resize_refused = true;
+        }
+        CHECK(bound_resize_refused);
+        CHECK(source.data_tgt.size() == 64);
+
+        std::vector<llama_cache_acct_op_id> detached_ops;
+        CHECK(authority.admit_live_checkpoint(
+            { 11002 }, detached, detached_ops));
+        const auto snapshot = authority.ledger.snapshot();
+        CHECK(snapshot.allocations.size() == 5);
+        CHECK(resident_bytes(snapshot) == 184);
+        CHECK(snapshot.live_ops == 8);
+        for (const auto op : detached_ops) {
+            CHECK(authority.ledger.release(op));
+        }
+        for (const auto op : source_ops) {
+            CHECK(authority.ledger.release(op));
+        }
+        CHECK(authority.ledger.snapshot().live_ops == 0);
+    }
+
+    // An escaped mutable pointer cannot be sealed into the immutable
+    // accounting namespace. Replacing the buffer closes that escape and
+    // restores ordinary admission.
+    {
+        common_prompt_checkpoint exposed;
+        exposed.data_tgt.assign(32, 1);
+        auto * escaped = exposed.data_tgt.mutable_data();
+        CHECK(escaped != nullptr);
+        std::vector<llama_cache_acct_op_id> ops;
+        CHECK(!authority.admit_live_checkpoint({ 12001 }, exposed, ops));
+        CHECK(ops.empty());
+        CHECK(authority.ledger.snapshot().live_ops == 0);
+        exposed.data_tgt.assign(32, 2);
+        CHECK(authority.admit_live_checkpoint({ 12002 }, exposed, ops));
+        for (const auto op : ops) {
+            CHECK(authority.ledger.release(op));
+        }
+        CHECK(authority.ledger.snapshot().live_ops == 0);
+    }
+
+    // Exact pressure progress is physical, not the logical checkpoint sum.
+    // Five host snapshots each release 32 bytes; their 100-byte checkpoint
+    // planes remain owned by the corresponding live checkpoint handles.
+    {
+        server_cache_authority pressure_authority;
+        configure_host_accounting(pressure_authority);
+        server_prompt_cache cache(0, 0);
+        cache.acct = &pressure_authority.ledger;
+        cache.publish_authority = &pressure_authority;
+        std::vector<common_prompt_checkpoint> live(5);
+        std::vector<std::vector<llama_cache_acct_op_id>> live_ops(5);
+        for (size_t i = 0; i < live.size(); ++i) {
+            live[i].data_tgt.assign(100, uint8_t(i + 1));
+            CHECK(pressure_authority.admit_live_checkpoint(
+                { 13001 + i }, live[i], live_ops[i]));
+            server_prompt_cache_state host;
+            host.payload.fixed_state()->main.assign(32, uint8_t(i + 1));
+            host.prompt.checkpoints.push_back(live[i]);
+            CHECK(pressure_authority.admit_host_entry(host));
+            cache.states.push_back(std::move(host));
+        }
+        CHECK(cache.size() == 160);
+        cache.limit_size = 100;
+        cache.update();
+        CHECK(cache.states.size() == 3);
+        CHECK(cache.size() == 96);
+        cache.limit_size = 1;
+        cache.update();
+        CHECK(cache.states.empty());
+        for (const auto & member : live_ops) {
+            for (const auto op : member) {
+                CHECK(pressure_authority.ledger.release(op));
+            }
+        }
+        CHECK(pressure_authority.ledger.snapshot().live_ops == 0);
+    }
+
+    // A normal eight-checkpoint/four-plane host produces six aggregated
+    // category/measure yields, not 66 per-operation rows.
+    {
+        server_cache_authority drop_authority;
+        configure_host_accounting(drop_authority, true);
+        drop_authority.destruction.lease_context = &drop_authority.leases;
+        drop_authority.destruction.lease_evaluator =
+            server_cache_lease_evaluate_request;
+        server_prompt_cache cache(0, 0);
+        cache.acct = &drop_authority.ledger;
+        cache.publish_authority = &drop_authority;
+        cache.destruction_obs = &drop_authority.destruction;
+        cache.retention_obs = &drop_authority.retention;
+        server_prompt_cache_state host;
+        host.payload.fixed_state()->main.assign(32, 1);
+        for (size_t i = 0; i < 8; ++i) {
+            host.prompt.checkpoints.emplace_back();
+            auto & checkpoint = host.prompt.checkpoints.back();
+            checkpoint.data_tgt.assign(64, 1);
+            checkpoint.data_dft.assign(32, 2);
+            checkpoint.accel.ring.assign(16, 3);
+            checkpoint.accel.spec.assign(8, 4);
+        }
+        CHECK(drop_authority.admit_host_entry(host));
+        cache.states.push_back(std::move(host));
+        CHECK(publish_host_retention(
+            drop_authority, cache.states.begin()).v != 0);
+        cache.destroy_entry(
+            cache.states.begin(),
+            server_cache_destruction_reason::host_capacity);
+        CHECK(cache.states.empty());
+        CHECK(drop_authority.destruction.n_events == 1);
+        const auto & request = drop_authority.destruction.events[0].request;
+        CHECK(!request.overflowed);
+        CHECK(request.n_yields == 6);
+        CHECK(drop_authority.destruction.events[0].verdict !=
+              server_cache_destruction_verdict::unavailable);
+        CHECK(drop_authority.ledger.snapshot().live_ops == 0);
+    }
 }
 
 } // namespace
@@ -4662,6 +5013,24 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         if (failures == 0) {
             std::puts("test-server-prompt-cache: CLONE_FAULT_PASS");
+        }
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--accounting-fault") {
+        test_host_publication_accounting_fault_is_atomic();
+        llama_backend_free();
+        if (failures == 0) {
+            std::puts("test-server-prompt-cache: ACCOUNTING_FAULT_PASS");
+        }
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 &&
+        std::string(argv[1]) == "--restore-checkpoint-fault") {
+        test_restore_partial_checkpoint_ownership_fails_closed();
+        llama_backend_free();
+        if (failures == 0) {
+            std::puts(
+                "test-server-prompt-cache: RESTORE_CHECKPOINT_FAULT_PASS");
         }
         return failures == 0 ? 0 : 1;
     }
@@ -4728,6 +5097,7 @@ int main(int argc, char ** argv) {
     test_checkpoint_effect_matrix_consistency();
     test_live_checkpoint_payload_ownership();
     test_live_checkpoint_batch_admission();
+    test_shared_checkpoint_physical_accounting();
     llama_backend_free();
 
     if (failures != 0) {

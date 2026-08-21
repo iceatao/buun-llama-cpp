@@ -286,10 +286,10 @@ public:
     bool checkpoint_inventory(
         const server_retention_instance_key & key,
         server_retention_checkpoint_inventory & out) const noexcept;
-    // D-A4 live-checkpoint payload ownership. Host-entry checkpoint clones
-    // intentionally never inherit these operations: their bytes remain part
-    // of the host entry's aggregate three-leaf allocation. A restore mints a
-    // fresh independent set only after the clone/rebind reaches its live key.
+    // D-A4 checkpoint payload ownership. Host saves and non-consuming restores
+    // join the immutable plane allocations instead of charging copied bytes;
+    // each independently retireable logical checkpoint still owns one exact
+    // operation reference per unique plane allocation.
     // Takes ownership on entry; failure releases every supplied operation.
     bool attach_release_ops(
         const server_retention_instance_key & key,

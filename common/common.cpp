@@ -2279,10 +2279,13 @@ bool common_prompt_batch_decode(
 common_shared_byte_buffer::common_shared_byte_buffer(
         const common_shared_byte_buffer & other) {
     if (other.mutable_exposed_ && other.bytes_) {
-        bytes_ = std::make_shared<std::vector<uint8_t>>(*other.bytes_);
+        bytes_ = std::make_shared<storage>(other.bytes_->bytes);
     } else {
         bytes_ = other.bytes_;
     }
+    // A copied handle has not acquired its own ledger reference. The shared
+    // storage retains the immutable allocation identity for later admission.
+    accounting_owned_ = false;
 }
 
 common_shared_byte_buffer & common_shared_byte_buffer::operator=(
@@ -2290,31 +2293,63 @@ common_shared_byte_buffer & common_shared_byte_buffer::operator=(
     if (this == &other) {
         return *this;
     }
+    if (accounting_owned_) {
+        throw std::logic_error(
+            "cannot replace an accounted checkpoint allocation");
+    }
     common_shared_byte_buffer replacement(other);
     bytes_ = std::move(replacement.bytes_);
     mutable_exposed_ = false;
+    accounting_owned_ = false;
+    return *this;
+}
+
+common_shared_byte_buffer::common_shared_byte_buffer(
+        common_shared_byte_buffer && other) noexcept
+    : bytes_(std::move(other.bytes_)),
+      mutable_exposed_(other.mutable_exposed_),
+      accounting_owned_(other.accounting_owned_) {
+    other.mutable_exposed_ = false;
+    other.accounting_owned_ = false;
+}
+
+common_shared_byte_buffer & common_shared_byte_buffer::operator=(
+        common_shared_byte_buffer && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    GGML_ASSERT(!accounting_owned_);
+    bytes_ = std::move(other.bytes_);
+    mutable_exposed_ = other.mutable_exposed_;
+    accounting_owned_ = other.accounting_owned_;
+    other.mutable_exposed_ = false;
+    other.accounting_owned_ = false;
     return *this;
 }
 
 size_t common_shared_byte_buffer::size() const noexcept {
-    return bytes_ ? bytes_->size() : 0;
+    return bytes_ ? bytes_->bytes.size() : 0;
 }
 
 bool common_shared_byte_buffer::empty() const noexcept {
-    return !bytes_ || bytes_->empty();
+    return !bytes_ || bytes_->bytes.empty();
 }
 
 const uint8_t * common_shared_byte_buffer::data() const noexcept {
-    return bytes_ ? bytes_->data() : nullptr;
+    return bytes_ ? bytes_->bytes.data() : nullptr;
 }
 
 std::vector<uint8_t> & common_shared_byte_buffer::mutable_view() {
-    if (!bytes_) {
-        bytes_ = std::make_shared<std::vector<uint8_t>>();
-    } else if (!bytes_.unique()) {
-        bytes_ = std::make_shared<std::vector<uint8_t>>(*bytes_);
+    if (accounting_owned_) {
+        throw std::logic_error(
+            "cannot mutate an accounted checkpoint allocation");
     }
-    return *bytes_;
+    if (!bytes_) {
+        bytes_ = std::make_shared<storage>();
+    } else if (!bytes_.unique() || bytes_->accounting_allocation != 0) {
+        bytes_ = std::make_shared<storage>(bytes_->bytes);
+    }
+    return bytes_->bytes;
 }
 
 uint8_t * common_shared_byte_buffer::mutable_data() {
@@ -2329,42 +2364,54 @@ uint8_t * common_shared_byte_buffer::mutable_data() {
 void common_shared_byte_buffer::clear() noexcept {
     bytes_.reset();
     mutable_exposed_ = false;
+    accounting_owned_ = false;
 }
 
 void common_shared_byte_buffer::resize(size_t size) {
+    if (accounting_owned_ &&
+        bytes_->bytes.size() != size) {
+        throw std::logic_error(
+            "cannot resize an accounted checkpoint allocation");
+    }
     if (size == 0) {
         clear();
         return;
     }
-    if (bytes_ && bytes_->size() == size) {
+    if (bytes_ && bytes_->bytes.size() == size) {
         return;
     }
-    if (!bytes_ || !bytes_.unique() || mutable_exposed_) {
+    if (!bytes_ || !bytes_.unique() || mutable_exposed_ ||
+        bytes_->accounting_allocation != 0) {
         auto replacement = bytes_
-            ? std::make_shared<std::vector<uint8_t>>(*bytes_)
-            : std::make_shared<std::vector<uint8_t>>();
-        replacement->resize(size);
+            ? std::make_shared<storage>(bytes_->bytes)
+            : std::make_shared<storage>();
+        replacement->bytes.resize(size);
         bytes_ = std::move(replacement);
         mutable_exposed_ = false;
         return;
     }
-    bytes_->resize(size);
+    bytes_->bytes.resize(size);
 }
 
 void common_shared_byte_buffer::assign(size_t size, uint8_t value) {
+    if (accounting_owned_) {
+        throw std::logic_error(
+            "cannot replace an accounted checkpoint allocation");
+    }
     if (size == 0) {
         clear();
         return;
     }
     auto replacement =
-        std::make_shared<std::vector<uint8_t>>(size, value);
+        std::make_shared<storage>(size);
+    std::fill(replacement->bytes.begin(), replacement->bytes.end(), value);
     bytes_ = std::move(replacement);
     mutable_exposed_ = false;
 }
 
 const uint8_t & common_shared_byte_buffer::operator[](
         size_t index) const noexcept {
-    return (*bytes_)[index];
+    return bytes_->bytes[index];
 }
 
 uint8_t & common_shared_byte_buffer::mutable_at(size_t index) {
@@ -2376,7 +2423,7 @@ uint8_t & common_shared_byte_buffer::mutable_at(size_t index) {
 const std::vector<uint8_t> & common_shared_byte_buffer::view()
         const noexcept {
     static const std::vector<uint8_t> empty;
-    return bytes_ ? *bytes_ : empty;
+    return bytes_ ? bytes_->bytes : empty;
 }
 
 bool common_shared_byte_buffer::shares_storage_with(
@@ -2384,8 +2431,66 @@ bool common_shared_byte_buffer::shares_storage_with(
     return bytes_ && bytes_ == other.bytes_;
 }
 
+const void * common_shared_byte_buffer::storage_identity() const noexcept {
+    return bytes_.get();
+}
+
 long common_shared_byte_buffer::storage_use_count() const noexcept {
     return bytes_ ? bytes_.use_count() : 0;
+}
+
+bool common_shared_byte_buffer::accounting_binding(
+        const void *& owner, uint64_t & allocation) const noexcept {
+    owner = nullptr;
+    allocation = 0;
+    if (!bytes_ || bytes_->accounting_owner == nullptr ||
+        bytes_->accounting_allocation == 0) {
+        return false;
+    }
+    owner = bytes_->accounting_owner;
+    allocation = bytes_->accounting_allocation;
+    return true;
+}
+
+bool common_shared_byte_buffer::owns_accounting_binding(
+        const void * owner, uint64_t allocation) const noexcept {
+    return accounting_owned_ && bytes_ &&
+           bytes_->accounting_owner == owner &&
+           bytes_->accounting_allocation == allocation;
+}
+
+bool common_shared_byte_buffer::bind_accounting(
+        const void * owner, uint64_t allocation) const noexcept {
+    if (!bytes_ || bytes_->bytes.empty() || owner == nullptr ||
+        allocation == 0 || mutable_exposed_) {
+        return false;
+    }
+    if (bytes_->accounting_owner != nullptr ||
+        bytes_->accounting_allocation != 0) {
+        const bool same = bytes_->accounting_owner == owner &&
+                          bytes_->accounting_allocation == allocation;
+        accounting_owned_ |= same;
+        return same;
+    }
+    bytes_->accounting_owner = owner;
+    bytes_->accounting_allocation = allocation;
+    accounting_owned_ = true;
+    return true;
+}
+
+bool common_shared_byte_buffer::unbind_accounting(
+        const void * owner, uint64_t allocation,
+        bool clear_storage_binding) const noexcept {
+    if (!bytes_ || bytes_->accounting_owner != owner ||
+        bytes_->accounting_allocation != allocation) {
+        return false;
+    }
+    accounting_owned_ = false;
+    if (clear_storage_binding) {
+        bytes_->accounting_owner = nullptr;
+        bytes_->accounting_allocation = 0;
+    }
+    return true;
 }
 
 bool operator==(

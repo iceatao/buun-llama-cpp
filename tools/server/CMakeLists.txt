@@ -114,6 +114,17 @@ if (LLAMA_BUILD_TESTS)
     set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
         LABELS main
         ENVIRONMENT "LLAMA_SERVER_FAULT=load_clone_fail")
+    add_test(NAME test-server-prompt-cache-accounting-fault
+        COMMAND test-server-prompt-cache --accounting-fault)
+    set_tests_properties(test-server-prompt-cache-accounting-fault PROPERTIES
+        LABELS main
+        ENVIRONMENT "LLAMA_SERVER_FAULT=cache_lifecycle_after_commit")
+    add_test(NAME test-server-prompt-cache-restore-checkpoint-fault
+        COMMAND test-server-prompt-cache --restore-checkpoint-fault)
+    set_tests_properties(
+        test-server-prompt-cache-restore-checkpoint-fault PROPERTIES
+        LABELS main
+        ENVIRONMENT "LLAMA_SERVER_FAULT=restore_checkpoint_artifact_missing")
 
     # The catalog test target is declared before the server targets. Add the
     # production prompt-cache seam to that translation unit instead of

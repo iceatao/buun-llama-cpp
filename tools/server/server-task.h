@@ -793,11 +793,12 @@ struct server_prompt_cache_state {
     // the server-local adapter/state codec contract.
     std::string vbr_execution_identity;
 
-    // C0 shadow accounting op ids, one per charged leaf category (zero id = not charged):
-    // the publish boundary, released when the entry leaves `states` [P2]
-    llama_cache_acct_op_id acct_op_snapshot;
-    llama_cache_acct_op_id acct_op_ckpt;
-    llama_cache_acct_op_id acct_op_accel;
+    // Exact accounting references held by this logical host node. Authority
+    // mode stores one snapshot reference plus one reference per unique shared
+    // checkpoint/accelerator allocation; lifecycle-off shadow mode retains
+    // its historical three aggregate category references.
+    std::vector<llama_cache_acct_op_id> acct_ops;
+    bool accounting_complete = false;
 
     // D-A2's non-policy recovery guard. List nodes are stable; authoritative
     // redundant eviction increments this before prepare and the raw eraser
@@ -810,8 +811,8 @@ struct server_prompt_cache_state {
     bool main_family = false;
     common_cache_family_binding cache_family;
 
-    std::array<llama_cache_acct_op_id, 3> release_ops() const noexcept {
-        return { acct_op_snapshot, acct_op_ckpt, acct_op_accel };
+    const std::vector<llama_cache_acct_op_id> & release_ops() const noexcept {
+        return acct_ops;
     }
 
     // Request-local observer identity. It lives on the list node so save-time
@@ -846,7 +847,6 @@ struct server_prompt_cache_payload_leaf {
     llama_cache_acct_category category =
         llama_cache_acct_category::full_snapshot_payload;
     uint64_t bytes = 0;
-    llama_cache_acct_op_id * operation = nullptr;
 };
 
 // Move-only storage transaction staged before llama_state_seq_set_data_ext().

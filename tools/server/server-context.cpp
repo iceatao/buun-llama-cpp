@@ -3019,10 +3019,7 @@ private:
                                     backing->prompt.tokens,
                                     int64_t(coverage),
                                     identity);
-                            for (const auto op : {
-                                    backing->acct_op_snapshot,
-                                    backing->acct_op_ckpt,
-                                    backing->acct_op_accel }) {
+                            for (const auto op : backing->release_ops()) {
                                 if (op) {
                                     candidate.release_ops.push_back(op);
                                 }
@@ -13066,6 +13063,98 @@ private:
                         }
                     }
 
+                    bool staged_checkpoint_published = false;
+                    bool staged_checkpoint_acquired_destination = false;
+                    server_retention_instance_key staged_checkpoint_key;
+                    if (do_checkpoint && slot.lifecycle_authority) {
+                        // The detached node has its final address, so publish and
+                        // account it before thinning any incumbent. A failed
+                        // checkpoint publication must be a no-mutation result for
+                        // the already-retained ring.
+                        auto & cur = staged.back();
+                        staged_checkpoint_key =
+                            server_retention_instance_key::for_checkpoint(
+                                slot.id, &cur);
+                        bool prepared = slot.retention_obs &&
+                            !slot.retention_geometry_failed;
+                        const bool frontier_valid =
+                            cur.computation_frontier.valid() &&
+                            cur.computation_frontier.token_count == cur.n_tokens &&
+                            cur.n_tokens >= 0 &&
+                            cur.n_tokens <= slot.task->n_tokens();
+                        server_cache_lease_identity checkpoint_identity;
+                        if (frontier_valid) {
+                            checkpoint_identity.execution_identity =
+                                cur.computation_frontier.execution_identity;
+                            checkpoint_identity.adapter_config_identity =
+                                cur.computation_frontier.adapter_config_identity;
+                            checkpoint_identity.media_content_identity =
+                                cur.computation_frontier.media_content_identity;
+                        }
+                        const auto live_lineage_source =
+                            server_retention_instance_key::for_slot(slot.id);
+                        if (prepared) {
+                            // Defer lineage activation until the payload operation
+                            // has been attached. This keeps policy inventory closed
+                            // throughout the fallible accounting preparation.
+                            prepared = slot.retention_obs->publish(
+                                staged_checkpoint_key,
+                                slot.retention_pool,
+                                slot.task->params.message_spans,
+                                !slot.task->params.message_spans.spans.empty(),
+                                uint64_t(slot.task->n_tokens()),
+                                uint64_t(cur.n_tokens),
+                                frontier_valid,
+                                checkpoint_identity.valid()
+                                    ? &checkpoint_identity : nullptr,
+                                nullptr,
+                                &live_lineage_source,
+                                slot.retention_destination.valid()
+                                    ? &slot.retention_destination : nullptr,
+                                true);
+                        }
+                        llama_cache_acct_artifact_id artifact;
+                        std::vector<llama_cache_acct_op_id> ops;
+                        if (prepared) {
+                            prepared = slot.retention_obs->
+                                checkpoint_admission_artifact(
+                                    staged_checkpoint_key, artifact) &&
+                                slot.lifecycle_authority->admit_live_checkpoint(
+                                    artifact, cur, ops) &&
+                                slot.retention_obs->attach_release_ops(
+                                    staged_checkpoint_key, std::move(ops));
+                        }
+                        if (prepared && !slot.retention_destination.valid()) {
+                            prepared = slot.retention_obs->acquire_lineage_ticket(
+                                staged_checkpoint_key,
+                                slot.retention_destination);
+                            staged_checkpoint_acquired_destination = prepared;
+                        }
+                        if (prepared && !slot.retention_branch_pending) {
+                            prepared = slot.retention_destination.valid() &&
+                                slot.retention_obs->activate_lineage_ticket(
+                                    slot.retention_destination);
+                        }
+                        if (!prepared) {
+                            if (slot.retention_obs) {
+                                slot.retention_obs->retire(
+                                    staged_checkpoint_key);
+                                if (staged_checkpoint_acquired_destination) {
+                                    slot.retention_obs->release_lineage_ticket(
+                                        slot.retention_destination);
+                                    staged_checkpoint_acquired_destination = false;
+                                }
+                            }
+                            slot.retention_geometry_failed = true;
+                            staged.clear();
+                            do_checkpoint = false;
+                            SLT_WRN(slot, "%s\n",
+                                "checkpoint publication/accounting preparation failed; retained ring is unchanged");
+                        } else {
+                            staged_checkpoint_published = true;
+                        }
+                    }
+
                     if (do_checkpoint) {
                         // [WS-1 / #25592] eviction: first THIN checkpoints that sit within
                         // checkpoint_min_step of the previous KEPT one (redundantly close), never
@@ -13216,6 +13305,16 @@ private:
                         }
 
                         if (!checkpoint_publication_allowed) {
+                            if (staged_checkpoint_published &&
+                                slot.retention_obs) {
+                                slot.retention_obs->retire(
+                                    staged_checkpoint_key);
+                                if (staged_checkpoint_acquired_destination) {
+                                    slot.retention_obs->release_lineage_ticket(
+                                        slot.retention_destination);
+                                    staged_checkpoint_acquired_destination = false;
+                                }
+                            }
                             staged.clear();
                         } else {
                             slot.prompt.checkpoints.splice(
@@ -13224,7 +13323,8 @@ private:
                                 slot.checkpoint_ring_changed();
                             }
                             const auto & cur = slot.prompt.checkpoints.back();
-                            if (slot.retention_obs &&
+                            if (!slot.lifecycle_authority &&
+                                slot.retention_obs &&
                                 !slot.retention_geometry_failed) {
                                 const bool frontier_valid =
                                     cur.computation_frontier.valid() &&
@@ -13274,31 +13374,6 @@ private:
                                             server_retention_instance_key::
                                                 for_checkpoint(slot.id, &cur),
                                             slot.retention_destination);
-                                }
-                                if (published && slot.lifecycle_authority) {
-                                    const auto key =
-                                        server_retention_instance_key::
-                                            for_checkpoint(slot.id, &cur);
-                                    const auto artifact =
-                                        slot.retention_obs->artifact_id(key);
-                                    std::vector<llama_cache_acct_op_id> ops;
-                                    const uint64_t accel_bytes =
-                                        cur.accel.size();
-                                    const uint64_t checkpoint_bytes =
-                                        cur.size() >= accel_bytes
-                                            ? cur.size() - accel_bytes
-                                            : 0;
-                                    if (slot.lifecycle_authority->
-                                            admit_live_checkpoint(
-                                                artifact,
-                                                checkpoint_bytes,
-                                                accel_bytes,
-                                                ops) &&
-                                        !slot.retention_obs->attach_release_ops(
-                                            key, std::move(ops))) {
-                                        SLT_WRN(slot, "%s\n",
-                                            "checkpoint payload ownership attach failed; member remains fail-closed");
-                                    }
                                 }
                             }
 

@@ -4059,14 +4059,91 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         prompt.tokens,
         fixture.package.manifest.identity.adapter_config_identity));
     CHECK(logical->payload.vbr_artifact() == owner.get());
-    CHECK((logical->release_ops() ==
-           std::array<llama_cache_acct_op_id, 3> {}));
+    CHECK(logical->release_ops().empty());
     // The catalog already owns every physical VBR allocation. Logical host
     // publication adds only its retention metadata leaf.
     CHECK(fixture.ledger.snapshot().live_ops == live_ops_before + 1);
     auto host_key =
         server_retention_instance_key::for_host_entry(&*logical);
     CHECK(retention.artifact_id(host_key).v != 0);
+
+    // Mixed fixed/VBR sizing must preserve the fixed cache's physical-union
+    // accounting. The host checkpoint aliases an independently accounted
+    // live checkpoint, so the host contributes only its 32-byte snapshot;
+    // the shared 100-byte plane is not charged a second time.
+    const uint64_t mixed_ops_before = fixture.ledger.snapshot().live_ops;
+    common_prompt_checkpoint shared_live;
+    shared_live.data_tgt.assign(100, 7);
+    const auto shared_allocation = fixture.ledger.new_alloc();
+    CHECK(shared_allocation);
+    const auto live_checkpoint_op = fixture.ledger.reserve(
+        llama_cache_acct_category::checkpoint_state_payload,
+        fixture.host, {}, 100, 100);
+    CHECK(live_checkpoint_op);
+    CHECK(fixture.ledger.stage(
+        live_checkpoint_op, shared_allocation, 100));
+    CHECK(fixture.ledger.commit(live_checkpoint_op, 100));
+    CHECK(shared_live.data_tgt.bind_accounting(
+        &fixture.ledger, shared_allocation.v));
+
+    server_prompt_cache_state shared_fixed;
+    shared_fixed.payload.fixed_state()->main.assign(32, 3);
+    shared_fixed.prompt.checkpoints.push_back(shared_live);
+    const auto fixed_snapshot_allocation = fixture.ledger.new_alloc();
+    CHECK(fixed_snapshot_allocation);
+    const auto fixed_snapshot_op = fixture.ledger.reserve(
+        llama_cache_acct_category::full_snapshot_payload,
+        fixture.host, {}, 32, 32);
+    CHECK(fixed_snapshot_op);
+    CHECK(fixture.ledger.stage(
+        fixed_snapshot_op, fixed_snapshot_allocation, 32));
+    CHECK(fixture.ledger.commit(fixed_snapshot_op, 32));
+    const auto host_checkpoint_op = fixture.ledger.reserve(
+        llama_cache_acct_category::checkpoint_state_payload,
+        fixture.host, {}, 100, 0);
+    CHECK(host_checkpoint_op);
+    CHECK(fixture.ledger.stage(
+        host_checkpoint_op, shared_allocation, 100));
+    CHECK(fixture.ledger.commit(host_checkpoint_op, 100));
+    CHECK(shared_fixed.prompt.checkpoints.front().data_tgt.bind_accounting(
+        &fixture.ledger, shared_allocation.v));
+    shared_fixed.acct_ops = { fixed_snapshot_op, host_checkpoint_op };
+    shared_fixed.accounting_complete = true;
+
+    server_prompt_cache mixed(/* limit_size_mib */ 0,
+                              /* limit_tokens */ 0);
+    server_cache_authority mixed_authority;
+    mixed.acct = &fixture.ledger;
+    mixed.publish_authority = &mixed_authority;
+    mixed.retention_obs = &retention;
+    mixed.states.push_back(std::move(shared_fixed));
+    CHECK(mixed.size() == 32);
+    CHECK(fixture.ledger.snapshot().live_ops == mixed_ops_before + 3);
+    const uint64_t mixed_exact_cap = uint64_t(owner->resident_bytes()) + 32;
+    mixed.limit_size = mixed_exact_cap;
+    auto mixed_vbr = mixed.stage_vbr(
+        prompt, payload,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(mixed_vbr.size() == 1);
+    CHECK(mixed.publish(
+        std::move(mixed_vbr), &prompt, source_slot));
+    CHECK(mixed.states.size() == 2);
+    CHECK(mixed.size() == mixed_exact_cap);
+    CHECK(fixture.ledger.snapshot().live_ops == mixed_ops_before + 4);
+    mixed.limit_size = mixed_exact_cap - 1;
+    mixed.update();
+    CHECK(mixed.states.size() == 1);
+    CHECK(mixed.states.front().payload.vbr_artifact() == owner.get());
+    CHECK(mixed.size() == owner->resident_bytes());
+    CHECK(fixture.ledger.snapshot().live_ops == mixed_ops_before + 2);
+    mixed.clear_accounting();
+    mixed.states.clear();
+    CHECK(fixture.ledger.snapshot().live_ops == mixed_ops_before + 1);
+    CHECK(shared_live.data_tgt.unbind_accounting(
+        &fixture.ledger, shared_allocation.v));
+    CHECK(fixture.ledger.release(live_checkpoint_op));
+    CHECK(fixture.ledger.snapshot().live_ops == mixed_ops_before);
 
     // Re-publishing an exact immutable owner is a net-zero physical capacity
     // operation. The preflight must account the allocation union and the

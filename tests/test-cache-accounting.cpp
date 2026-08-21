@@ -8,11 +8,15 @@
 #include "llama-cache-accounting.h"
 
 #include <atomic>
+#include <algorithm>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <string>
 #include <thread>
+#include <vector>
 
 static int failures = 0;
 
@@ -342,6 +346,15 @@ static void test_release_set_preview() {
     CHECK(preview.rows[0].domain == DOM);
     CHECK(preview.rows[0].logical_payload == 100);
     CHECK(preview.rows[0].resident_allocated == 128);
+    CHECK(preview.yield_rows.empty());
+    CHECK(ledger.preview_release_set(
+        { op0, op1 }, before.serial, preview, true));
+    CHECK(preview.rows.size() == 1);
+    CHECK(preview.yield_rows.size() == 1);
+    CHECK(preview.yield_rows[0].category == CAT);
+    CHECK(preview.yield_rows[0].domain == DOM);
+    CHECK(preview.yield_rows[0].logical_payload == 100);
+    CHECK(preview.yield_rows[0].resident_allocated == 128);
     CHECK(ledger.snapshot().serial == before.serial);
 
     CHECK(!ledger.preview_release_set(
@@ -393,6 +406,44 @@ static void test_release_set_preview() {
           invalid_before.allocations.size());
     CHECK(ledger.release_set_current({ op_a, op_b }) ==
           llama_cache_conditional_release_status::released);
+    CHECK(ledger.snapshot().live_ops == 0);
+}
+
+static void test_release_set_resident_batch_cardinality() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+    constexpr size_t count = 8192;
+    std::vector<llama_cache_acct_op_id> ops;
+    ops.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto allocation = ledger.new_alloc();
+        const auto op = ledger.reserve(CAT, DOM, {}, 1, 1);
+        CHECK(allocation.v != 0);
+        CHECK(op.v != 0);
+        CHECK(ledger.stage(op, allocation, 1));
+        CHECK(ledger.commit(op, 1));
+        ops.push_back(op);
+    }
+    std::vector<llama_cache_acct_release_set_view> sets;
+    sets.reserve(ops.size());
+    for (const auto & op : ops) {
+        sets.push_back({ &op, 1 });
+    }
+    std::vector<uint64_t> resident;
+    const auto begin = std::chrono::steady_clock::now();
+    CHECK(ledger.preview_release_set_resident_batch(
+        sets, ledger.serial(), resident));
+    const auto end = std::chrono::steady_clock::now();
+    CHECK(resident.size() == count);
+    CHECK(std::all_of(resident.begin(), resident.end(),
+        [](uint64_t value) { return value == 1; }));
+    std::fprintf(stderr,
+        "CACHE_RELEASE_BATCH cardinality=%zu elapsed_us=%" PRIu64 "\n",
+        count, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            end - begin).count()));
+    for (const auto op : ops) {
+        CHECK(ledger.release(op));
+    }
     CHECK(ledger.snapshot().live_ops == 0);
 }
 
@@ -867,6 +918,7 @@ int main() {
     test_charge_once();
     test_release_preview();
     test_release_set_preview();
+    test_release_set_resident_batch_cardinality();
     test_attribution_rows();
     test_overflow_latch();
     test_serial_on_fault();

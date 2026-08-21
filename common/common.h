@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -1381,14 +1382,25 @@ struct common_computation_frontier {
 // Empty buffers allocate nothing. This keeps common_prompt_checkpoint's
 // existing byte-oriented API while making fixed-cache fan-out zero-copy.
 class common_shared_byte_buffer {
+    struct storage {
+        storage() = default;
+        explicit storage(size_t size) : bytes(size) {}
+        explicit storage(const std::vector<uint8_t> & source)
+            : bytes(source) {}
+
+        std::vector<uint8_t> bytes;
+        const void * accounting_owner = nullptr;
+        uint64_t accounting_allocation = 0;
+    };
+
 public:
     common_shared_byte_buffer() = default;
     common_shared_byte_buffer(const common_shared_byte_buffer & other);
     common_shared_byte_buffer & operator=(
         const common_shared_byte_buffer & other);
-    common_shared_byte_buffer(common_shared_byte_buffer &&) noexcept = default;
+    common_shared_byte_buffer(common_shared_byte_buffer && other) noexcept;
     common_shared_byte_buffer & operator=(
-        common_shared_byte_buffer &&) noexcept = default;
+        common_shared_byte_buffer && other) noexcept;
 
     size_t size() const noexcept;
     bool empty() const noexcept;
@@ -1402,14 +1414,18 @@ public:
     // returns. The writer must not retain the supplied pointer.
     template<class Writer>
     void overwrite(size_t size, Writer && writer) {
+        if (accounting_owned_) {
+            throw std::logic_error(
+                "cannot overwrite an accounted checkpoint allocation");
+        }
         if (size == 0) {
             std::forward<Writer>(writer)(nullptr, 0);
             clear();
             return;
         }
         auto replacement =
-            std::make_shared<std::vector<uint8_t>>(size);
-        std::forward<Writer>(writer)(replacement->data(), size);
+            std::make_shared<storage>(size);
+        std::forward<Writer>(writer)(replacement->bytes.data(), size);
         bytes_ = std::move(replacement);
         mutable_exposed_ = false;
     }
@@ -1420,7 +1436,17 @@ public:
     const std::vector<uint8_t> & view() const noexcept;
     bool shares_storage_with(
         const common_shared_byte_buffer & other) const noexcept;
+    const void * storage_identity() const noexcept;
     long storage_use_count() const noexcept;
+    bool accounting_binding(
+        const void *& owner, uint64_t & allocation) const noexcept;
+    bool owns_accounting_binding(
+        const void * owner, uint64_t allocation) const noexcept;
+    bool bind_accounting(
+        const void * owner, uint64_t allocation) const noexcept;
+    bool unbind_accounting(
+        const void * owner, uint64_t allocation,
+        bool clear_storage_binding = true) const noexcept;
 
     friend bool operator==(
         const common_shared_byte_buffer & a,
@@ -1433,8 +1459,9 @@ public:
 
 private:
     std::vector<uint8_t> & mutable_view();
-    std::shared_ptr<std::vector<uint8_t>> bytes_;
+    std::shared_ptr<storage> bytes_;
     bool mutable_exposed_ = false;
+    mutable bool accounting_owned_ = false;
 };
 
 inline bool operator==(

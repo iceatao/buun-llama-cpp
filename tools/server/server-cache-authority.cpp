@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 
@@ -20,6 +21,183 @@ bool add_checked(uint64_t a, uint64_t b, uint64_t & out) noexcept {
     }
     out = a + b;
     return true;
+}
+
+struct server_shared_payload_claim {
+    const common_shared_byte_buffer * buffer = nullptr;
+    llama_cache_acct_category category =
+        llama_cache_acct_category::container_overhead;
+    uint64_t bytes = 0;
+    llama_cache_acct_artifact_id artifact;
+    llama_cache_acct_alloc_id allocation;
+    llama_cache_acct_op_id operation;
+    bool existing_binding = false;
+    bool newly_bound = false;
+    bool handle_newly_owned = false;
+};
+
+bool add_shared_payload_claim(
+        llama_cache_acct_ledger & ledger,
+        const common_shared_byte_buffer & buffer,
+        llama_cache_acct_category category,
+        std::vector<server_shared_payload_claim> & claims) {
+    if (buffer.empty() || buffer.storage_identity() == nullptr) {
+        return true;
+    }
+    for (const auto & current : claims) {
+        if (current.buffer && current.buffer->storage_identity() ==
+                buffer.storage_identity()) {
+            return current.category == category &&
+                   current.bytes == buffer.size();
+        }
+    }
+    server_shared_payload_claim claim;
+    claim.buffer = &buffer;
+    claim.category = category;
+    claim.bytes = uint64_t(buffer.size());
+    const void * owner = nullptr;
+    uint64_t allocation = 0;
+    if (buffer.accounting_binding(owner, allocation)) {
+        if (owner != &ledger) {
+            return false;
+        }
+        claim.allocation = { allocation };
+        claim.existing_binding = true;
+    }
+    claims.push_back(std::move(claim));
+    return true;
+}
+
+bool add_checkpoint_payload_claims(
+        llama_cache_acct_ledger & ledger,
+        const common_prompt_checkpoint & checkpoint,
+        std::vector<server_shared_payload_claim> & claims) {
+    return add_shared_payload_claim(
+               ledger, checkpoint.data_tgt,
+               llama_cache_acct_category::checkpoint_state_payload,
+               claims) &&
+           add_shared_payload_claim(
+               ledger, checkpoint.data_dft,
+               llama_cache_acct_category::checkpoint_state_payload,
+               claims) &&
+           add_shared_payload_claim(
+               ledger, checkpoint.accel.ring,
+               llama_cache_acct_category::typed_accelerator_payload,
+               claims) &&
+           add_shared_payload_claim(
+               ledger, checkpoint.accel.spec,
+               llama_cache_acct_category::typed_accelerator_payload,
+               claims);
+}
+
+bool execute_shared_payload_claims(
+        server_cache_authority & authority,
+        std::vector<server_shared_payload_claim> & claims,
+        bool fail_after_commit,
+        std::vector<llama_cache_acct_op_id> & committed) noexcept {
+    committed.clear();
+    uint64_t pending = 0;
+    try {
+        if (claims.empty()) {
+            return false;
+        }
+        for (const auto & claim : claims) {
+            if (claim.bytes == 0 ||
+                (!claim.allocation &&
+                 !add_checked(pending, claim.bytes, pending))) {
+                return false;
+            }
+        }
+        llama_cache_budget_config config;
+        if (!authority.sample_budget(config, pending)) {
+            return false;
+        }
+        std::vector<llama_cache_transaction_leaf> leaves;
+        leaves.reserve(claims.size());
+        const auto domain =
+            llama_cache_acct_resource_domain::non_device(
+                llama_cache_acct_residency::pageable_host);
+        for (auto & claim : claims) {
+            llama_cache_transaction_leaf leaf;
+            leaf.category = claim.category;
+            leaf.domain = domain;
+            leaf.attribution = {
+                llama_cache_acct_attr_kind::artifact,
+                -1,
+                claim.artifact,
+            };
+            leaf.expected_logical = claim.bytes;
+            leaf.reserve_resident = claim.allocation ? 0 : claim.bytes;
+            leaf.stage_resident = claim.bytes;
+            leaf.existing_allocation = claim.allocation;
+            leaf.committed_op = &claim.operation;
+            leaf.allocation_out = claim.allocation
+                ? nullptr : &claim.allocation;
+            leaves.push_back(leaf);
+        }
+        llama_cache_transaction_fault fault;
+        fault.fail_after_commit = fail_after_commit;
+        const auto transaction =
+            llama_cache_execute_reservation_transaction(
+                authority.ledger, config, leaves, fault);
+        authority.admission_retries += transaction.serial_retries;
+        authority.admission_rollbacks += transaction.rolled_back;
+        if (transaction.status !=
+                llama_cache_transaction_status::committed) {
+            return false;
+        }
+        size_t bound = 0;
+        for (; bound < claims.size(); ++bound) {
+            auto & claim = claims[bound];
+            if (claim.buffer) {
+                // Every independently retireable logical handle becomes
+                // immutable after its operation commits. Existing physical
+                // bindings still require this per-handle ownership mark.
+                const bool already_owned =
+                    claim.buffer->owns_accounting_binding(
+                        &authority.ledger, claim.allocation.v);
+                if (!claim.buffer->bind_accounting(
+                        &authority.ledger, claim.allocation.v)) {
+                    break;
+                }
+                claim.handle_newly_owned = !already_owned;
+                claim.newly_bound = !claim.existing_binding;
+            }
+        }
+        if (bound != claims.size()) {
+            for (auto & claim : claims) {
+                if (claim.handle_newly_owned) {
+                    (void) claim.buffer->unbind_accounting(
+                        &authority.ledger, claim.allocation.v,
+                        claim.newly_bound);
+                }
+                if (claim.operation) {
+                    (void) authority.ledger.release(claim.operation);
+                }
+            }
+            authority.admission_rollbacks += claims.size();
+            return false;
+        }
+        committed.reserve(claims.size());
+        for (const auto & claim : claims) {
+            committed.push_back(claim.operation);
+        }
+        return true;
+    } catch (...) {
+        for (auto & claim : claims) {
+            if (claim.handle_newly_owned) {
+                (void) claim.buffer->unbind_accounting(
+                    &authority.ledger, claim.allocation.v,
+                    claim.newly_bound);
+            }
+            if (claim.operation) {
+                (void) authority.ledger.release(claim.operation);
+                claim.operation = {};
+            }
+        }
+        committed.clear();
+        return false;
+    }
 }
 
 } // namespace
@@ -479,116 +657,42 @@ bool server_cache_authority::admit_host_entry(
                 "CACHE_AUTHORITY host publish refused: substrate unavailable");
         return false;
     }
-
-    std::array<server_prompt_cache_payload_leaf, 3> leaves;
-    if (!server_prompt_cache::payload_leaves(entry, leaves) ||
-        server_fault("acct_unavailable")) {
+    std::vector<server_shared_payload_claim> claims;
+    std::vector<llama_cache_acct_op_id> committed;
+    try {
+        const auto * fixed = entry.payload.fixed_state();
+        if (!fixed || fixed->size() == 0 ||
+            server_fault("acct_unavailable")) {
+            throw std::runtime_error("payload unavailable");
+        }
+        claims.reserve(1 + entry.prompt.checkpoints.size() * 4);
+        server_shared_payload_claim snapshot;
+        snapshot.category =
+            llama_cache_acct_category::full_snapshot_payload;
+        snapshot.bytes = uint64_t(fixed->size());
+        claims.push_back(snapshot);
+        for (auto & checkpoint : entry.prompt.checkpoints) {
+            if (!add_checkpoint_payload_claims(
+                    ledger, checkpoint, claims)) {
+                throw std::runtime_error("checkpoint binding unavailable");
+            }
+        }
+    } catch (...) {
         admission_refusals++;
         SRV_WRN("%s\n",
                 "CACHE_AUTHORITY host publish refused: payload accounting unavailable");
         return false;
     }
-
-    uint64_t pending_host_bytes = 0;
-    for (const auto & leaf : leaves) {
-        if (!add_checked(pending_host_bytes, leaf.bytes, pending_host_bytes)) {
-            admission_refusals++;
-            SRV_WRN("%s\n",
-                    "CACHE_AUTHORITY host publish refused: payload total overflow");
-            return false;
-        }
-    }
-
-    // One physical-capacity sample per publish. Serial-conflict retries refresh the coherent
-    // accounting snapshot inside the composer; they do not require re-reading physical capacity.
-    llama_cache_budget_config config;
-    if (!sample_budget(config, pending_host_bytes)) {
+    if (!execute_shared_payload_claims(
+            *this, claims,
+            server_fault("cache_lifecycle_after_commit"), committed)) {
         admission_refusals++;
         SRV_WRN("%s\n",
-                "CACHE_AUTHORITY host publish refused: budget sample failed");
+                "CACHE_AUTHORITY host publish refused: shared payload transaction failed");
         return false;
     }
-
-    std::array<llama_cache_acct_op_id, 3> committed = {};
-    std::vector<llama_cache_transaction_leaf> transaction_leaves;
-    try {
-        transaction_leaves.reserve(leaves.size());
-        for (size_t i = 0; i < leaves.size(); ++i) {
-            llama_cache_transaction_leaf leaf;
-            leaf.category = leaves[i].category;
-            leaf.domain =
-                llama_cache_acct_resource_domain::non_device(
-                    llama_cache_acct_residency::pageable_host);
-            leaf.expected_logical = leaves[i].bytes;
-            leaf.reserve_resident = leaves[i].bytes;
-            leaf.stage_resident = leaves[i].bytes;
-            leaf.committed_op = &committed[i];
-            transaction_leaves.push_back(leaf);
-        }
-    } catch (...) {
-        admission_refusals++;
-        SRV_WRN("%s\n",
-                "CACHE_AUTHORITY host publish refused: transaction setup failed");
-        return false;
-    }
-
-    llama_cache_transaction_fault fault;
-    fault.fail_after_commit =
-        server_fault("cache_lifecycle_after_commit");
-    const auto transaction =
-        llama_cache_execute_reservation_transaction(
-            ledger, config, transaction_leaves, fault);
-    admission_retries += transaction.serial_retries;
-    admission_rollbacks += transaction.rolled_back;
-
-    if (transaction.status !=
-            llama_cache_transaction_status::committed) {
-        admission_refusals++;
-        const auto category =
-            transaction.failed_leaf < leaves.size()
-                ? leaves[transaction.failed_leaf].category
-                : llama_cache_acct_category::container_overhead;
-        switch (transaction.status) {
-            case llama_cache_transaction_status::admission_refused:
-                SRV_WRN(
-                    "CACHE_AUTHORITY host publish refused: category=%u status=%s attempts=%u\n",
-                    unsigned(category),
-                    llama_cache_admission_status_name(
-                        transaction.admission_status),
-                    transaction.attempts);
-                break;
-            case llama_cache_transaction_status::stage_failed:
-                SRV_WRN(
-                    "CACHE_AUTHORITY host publish refused: category=%u status=stage_failed\n",
-                    unsigned(category));
-                break;
-            case llama_cache_transaction_status::commit_failed:
-                SRV_WRN(
-                    "CACHE_AUTHORITY host publish refused: category=%u status=commit_failed\n",
-                    unsigned(category));
-                break;
-            case llama_cache_transaction_status::post_commit_fault:
-                SRV_WRN("%s\n",
-                        "CACHE_AUTHORITY host publish refused: injected post-commit failure");
-                break;
-            case llama_cache_transaction_status::invalid_argument:
-            case llama_cache_transaction_status::after_admit_failed:
-            case llama_cache_transaction_status::internal_fault:
-            case llama_cache_transaction_status::_count:
-                SRV_WRN(
-                    "CACHE_AUTHORITY host publish refused: status=%s\n",
-                    llama_cache_transaction_status_name(
-                        transaction.status));
-                break;
-            case llama_cache_transaction_status::committed:
-                break;
-        }
-        return false;
-    }
-
-    for (size_t i = 0; i < leaves.size(); ++i) {
-        *leaves[i].operation = committed[i];
-    }
+    entry.acct_ops = std::move(committed);
+    entry.accounting_complete = true;
     admission_commits++;
     return true;
 }
@@ -604,99 +708,62 @@ bool server_cache_authority::admit_live_checkpoints(
         return false;
     };
 
-    uint64_t pending = 0;
     if (!configured || batch.empty()) {
         return refuse();
     }
+    std::vector<server_shared_payload_claim> claims;
+    std::vector<std::pair<size_t, size_t>> ranges;
     try {
+        ranges.reserve(batch.size());
         for (auto & member : batch) {
             member.committed.clear();
-            member.committed.reserve(member.accelerator_bytes > 0 ? 2 : 1);
-            uint64_t member_bytes = 0;
-            if (member.artifact.v == 0 || member.checkpoint_bytes == 0 ||
-                !add_checked(member.checkpoint_bytes,
-                             member.accelerator_bytes, member_bytes) ||
-                !add_checked(pending, member_bytes, pending)) {
+            if (member.artifact.v == 0 || !member.checkpoint ||
+                member.checkpoint->data_tgt.empty()) {
                 return refuse();
             }
+            std::vector<server_shared_payload_claim> member_claims;
+            member_claims.reserve(4);
+            if (!add_checkpoint_payload_claims(
+                    ledger, *member.checkpoint, member_claims) ||
+                member_claims.empty()) {
+                return refuse();
+            }
+            const size_t first = claims.size();
+            for (auto & claim : member_claims) {
+                claim.artifact = member.artifact;
+                claims.push_back(std::move(claim));
+            }
+            ranges.push_back({ first, claims.size() });
         }
     } catch (...) {
         return refuse();
     }
-
-    llama_cache_budget_config config;
-    if (!sample_budget(config, pending)) {
-        SRV_WRN("%s\n",
-                "CACHE_AUTHORITY checkpoint ownership refused: budget sample unavailable");
-        return refuse();
-    }
-
-    std::vector<std::array<llama_cache_acct_op_id, 2>> outputs;
-    std::vector<llama_cache_transaction_leaf> leaves;
-    try {
-        outputs.resize(batch.size());
-        leaves.reserve(batch.size() * 2);
-        for (size_t i = 0; i < batch.size(); ++i) {
-            const auto add_leaf = [&](llama_cache_acct_category category,
-                                      uint64_t bytes,
-                                      llama_cache_acct_op_id * output) {
-                if (bytes == 0) {
-                    return;
-                }
-                llama_cache_transaction_leaf leaf;
-                leaf.category = category;
-                leaf.domain = llama_cache_acct_resource_domain::non_device(
-                    llama_cache_acct_residency::pageable_host);
-                leaf.attribution = {
-                    llama_cache_acct_attr_kind::artifact, -1,
-                    batch[i].artifact,
-                };
-                leaf.expected_logical = bytes;
-                leaf.reserve_resident = bytes;
-                leaf.stage_resident = bytes;
-                leaf.artifact = batch[i].artifact;
-                leaf.committed_op = output;
-                leaves.push_back(leaf);
-            };
-            add_leaf(
-                llama_cache_acct_category::checkpoint_state_payload,
-                batch[i].checkpoint_bytes, &outputs[i][0]);
-            add_leaf(
-                llama_cache_acct_category::typed_accelerator_payload,
-                batch[i].accelerator_bytes, &outputs[i][1]);
-        }
-    } catch (...) {
-        return refuse();
-    }
-
-    const auto transaction = llama_cache_execute_reservation_transaction(
-        ledger, config, leaves);
-    admission_retries += transaction.serial_retries;
-    admission_rollbacks += transaction.rolled_back;
-    if (transaction.status != llama_cache_transaction_status::committed) {
+    std::vector<llama_cache_acct_op_id> committed;
+    if (!execute_shared_payload_claims(
+            *this, claims, false, committed)) {
         SRV_WRN(
-            "CACHE_AUTHORITY checkpoint ownership refused: status=%s admission=%s\n",
-            llama_cache_transaction_status_name(transaction.status),
-            llama_cache_admission_status_name(transaction.admission_status));
+            "%s\n",
+            "CACHE_AUTHORITY checkpoint ownership refused: shared payload transaction failed");
         return refuse();
     }
     try {
         for (size_t i = 0; i < batch.size(); ++i) {
-            for (const auto op : outputs[i]) {
-                if (op) {
-                    batch[i].committed.push_back(op);
-                }
-            }
+            batch[i].committed.assign(
+                committed.begin() + ranges[i].first,
+                committed.begin() + ranges[i].second);
         }
     } catch (...) {
-        for (const auto & member : outputs) {
-            for (const auto op : member) {
-                if (op) {
-                    (void) ledger.release(op);
-                }
+        for (auto & claim : claims) {
+            if (claim.handle_newly_owned && claim.buffer) {
+                (void) claim.buffer->unbind_accounting(
+                    &ledger, claim.allocation.v,
+                    claim.newly_bound);
             }
         }
-        admission_rollbacks += leaves.size();
+        for (const auto op : committed) {
+            (void) ledger.release(op);
+        }
+        admission_rollbacks += committed.size();
         return refuse();
     }
     // Preserve the established per-checkpoint admission counter semantics
@@ -707,15 +774,13 @@ bool server_cache_authority::admit_live_checkpoints(
 
 bool server_cache_authority::admit_live_checkpoint(
         llama_cache_acct_artifact_id artifact,
-        uint64_t checkpoint_bytes,
-        uint64_t accelerator_bytes,
+        const common_prompt_checkpoint & checkpoint,
         std::vector<llama_cache_acct_op_id> & committed) noexcept {
     committed.clear();
     try {
         std::vector<server_cache_live_checkpoint_admission> batch(1);
         batch[0].artifact = artifact;
-        batch[0].checkpoint_bytes = checkpoint_bytes;
-        batch[0].accelerator_bytes = accelerator_bytes;
+        batch[0].checkpoint = &checkpoint;
         if (!admit_live_checkpoints(batch)) {
             return false;
         }

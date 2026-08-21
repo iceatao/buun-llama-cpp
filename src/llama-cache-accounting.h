@@ -545,9 +545,26 @@ struct llama_cache_acct_release_set_row {
     uint64_t resident_allocated = 0;
 };
 
+struct llama_cache_acct_release_set_yield_row {
+    llama_cache_acct_category category =
+        llama_cache_acct_category::container_overhead;
+    llama_cache_acct_resource_domain domain;
+    uint64_t logical_payload = 0;
+    uint64_t resident_allocated = 0;
+};
+
+struct llama_cache_acct_release_set_view {
+    const llama_cache_acct_op_id * data = nullptr;
+    size_t size = 0;
+};
+
 struct llama_cache_acct_release_set_preview {
     uint64_t accounting_serial = 0;
     std::vector<llama_cache_acct_release_set_row> rows;
+    // Same exact last-reference union, additionally split by category for
+    // bounded lifecycle evidence. Capacity planning consumes the canonical
+    // domain-only rows above.
+    std::vector<llama_cache_acct_release_set_yield_row> yield_rows;
 };
 
 // F0a conditional-reserve outcome. A bare op id cannot separate expected optimistic-concurrency
@@ -665,7 +682,17 @@ struct llama_cache_acct_ledger {
     bool preview_release_set(
             const std::vector<llama_cache_acct_op_id> & ops,
             uint64_t expected_serial,
-            llama_cache_acct_release_set_preview & out) const noexcept;
+            llama_cache_acct_release_set_preview & out,
+            bool include_category_yields = false) const noexcept;
+
+    // Exact last-reference resident deltas for many independent candidate
+    // sets under one ledger lock. The views need only remain valid for this
+    // call. Output order matches input order; any malformed set or serial
+    // drift fails the complete batch and clears `out`.
+    bool preview_release_set_resident_batch(
+            const std::vector<llama_cache_acct_release_set_view> & sets,
+            uint64_t expected_serial,
+            std::vector<uint64_t> & out) const noexcept;
 
     // Commit a previously previewed canonical operation set atomically. The
     // caller must pass strictly increasing, nonzero operation ids; this keeps
