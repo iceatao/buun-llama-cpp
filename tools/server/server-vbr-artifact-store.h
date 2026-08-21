@@ -13,6 +13,7 @@
 #include <vector>
 
 class server_prompt_cache_vbr_payload;
+struct server_vbr_artifact_store_test_door;
 
 enum class server_vbr_artifact_capture_status : uint8_t {
     ok = 0,
@@ -315,4 +316,14 @@ private:
     struct impl;
     explicit server_vbr_artifact_store(std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;
+    friend struct server_vbr_artifact_store_test_door;
+};
+
+// Model-free production-wiring probe. It exposes the exact transport portion
+// of the same stage policy used by import(), without publishing a second raw
+// core or transport construction API.
+struct server_vbr_artifact_store_test_door {
+    static bool import_transport_policy(
+        const server_vbr_artifact_store & store,
+        vbr_adopt_stage_policy & policy) noexcept;
 };

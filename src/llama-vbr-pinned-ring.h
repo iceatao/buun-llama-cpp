@@ -10,8 +10,12 @@
 #include <vector>
 
 // One process-wide ceiling shared by capture (D2H) and adoption (H2D)
-// instances. Each ring is independently bounded below this ceiling.
+// instances. A production store uses one direction-neutral core for both.
 static constexpr uint64_t VBR_PINNED_RING_MAX_BYTES = 256ull*1024*1024;
+
+// Process-level pinned transport inventory for diagnostics and admission
+// tests. It counts physical ring bytes, not transient transfer claims.
+uint64_t vbr_pinned_ring_live_capacity_bytes() noexcept;
 
 enum class vbr_pinned_ring_create_failure : uint8_t {
     none = 0,
@@ -55,6 +59,34 @@ struct vbr_pinned_ring_accounting {
 };
 
 class vbr_bounded_pinned_ring_core;
+class vbr_pinned_chunk_ring;
+class vbr_h2d_chunk_ring;
+
+// Move-only nonblocking ownership of the complete ring pump. A shared
+// direction-neutral core may serve capture or adoption, but never lets the
+// two adapters consume each other's outstanding chunks.
+class vbr_pinned_ring_operation {
+public:
+    vbr_pinned_ring_operation() noexcept = default;
+    vbr_pinned_ring_operation(vbr_pinned_ring_operation && other) noexcept;
+    vbr_pinned_ring_operation & operator=(
+        vbr_pinned_ring_operation && other) noexcept;
+    ~vbr_pinned_ring_operation();
+
+    vbr_pinned_ring_operation(const vbr_pinned_ring_operation &) = delete;
+    vbr_pinned_ring_operation & operator=(
+        const vbr_pinned_ring_operation &) = delete;
+
+    explicit operator bool() const noexcept { return owner_ != nullptr; }
+
+private:
+    vbr_bounded_pinned_ring_core * owner_ = nullptr;
+    explicit vbr_pinned_ring_operation(
+        vbr_bounded_pinned_ring_core * owner) noexcept : owner_(owner) {}
+    void reset() noexcept;
+
+    friend class vbr_bounded_pinned_ring_core;
+};
 
 // Move-only ownership of one ring chunk between acquire and release. The
 // adapter that submits a transfer is responsible for waiting before release.
@@ -103,32 +135,34 @@ public:
     uint64_t capacity_bytes() const noexcept;
     size_t chunk_bytes() const noexcept;
     size_t lane_count() const noexcept;
-    const vbr_pinned_ring_lane * lane_binding(uint32_t lane) const noexcept;
 
-    // Returns an empty lease with would_block=true when the lane's next chunk
-    // is still owned by an outstanding transfer. The adapter then completes
-    // its oldest pending lease and retries; acquire never waits implicitly.
+private:
+    // Refuses immediately when the other direction currently owns the ring.
+    // Only direction adapters can mint the operation token, so the shared
+    // core necessarily outlives it.
+    vbr_pinned_ring_operation try_begin_operation() noexcept;
+    const vbr_pinned_ring_lane * lane_binding(uint32_t lane) const noexcept;
+    bool accounted_to(
+        const llama_cache_acct_ledger * ledger,
+        const llama_cache_acct_snapshot & snapshot,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_category category) const noexcept;
     vbr_pinned_chunk_lease acquire(
         uint32_t lane, bool & would_block) noexcept;
-
-    // Marks a filled chunk in flight and records an event when available.
-    // Without an event the backend is synchronized before returning.
     bool submit(
         vbr_pinned_chunk_lease & lease,
         size_t valid,
         ggml_backend_t backend,
         bool & synchronous_fallback) noexcept;
-
-    // Completes a submitted chunk. event_completion reports which completion
-    // path was used so the direction adapter preserves its historical stats.
     bool wait(
         vbr_pinned_chunk_lease & lease,
         bool & event_completion) noexcept;
-
     void release(vbr_pinned_chunk_lease & lease) noexcept;
-
-private:
+    void end_operation() noexcept;
     struct impl;
     explicit vbr_bounded_pinned_ring_core(std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;
+    friend class vbr_pinned_ring_operation;
+    friend class vbr_pinned_chunk_ring;
+    friend class vbr_h2d_chunk_ring;
 };

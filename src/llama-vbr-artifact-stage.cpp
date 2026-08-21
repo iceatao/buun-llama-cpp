@@ -40,7 +40,8 @@ const char * vbr_adopt_stage_status_name(
 }
 
 struct vbr_h2d_chunk_ring::impl {
-    std::unique_ptr<vbr_bounded_pinned_ring_core> core;
+    std::shared_ptr<vbr_bounded_pinned_ring_core> core;
+    std::vector<vbr_h2d_lane_binding> lanes;
 };
 
 vbr_h2d_chunk_ring::vbr_h2d_chunk_ring(
@@ -67,8 +68,9 @@ std::unique_ptr<vbr_h2d_chunk_ring> vbr_h2d_chunk_ring::create(
             });
         }
         std::unique_ptr<impl> state(new impl);
-        state->core = vbr_bounded_pinned_ring_core::create(
-            bindings, total_bytes, chunk_bytes, nullptr, reason);
+        state->core = std::shared_ptr<vbr_bounded_pinned_ring_core>(
+            vbr_bounded_pinned_ring_core::create(
+                bindings, total_bytes, chunk_bytes, nullptr, reason));
         if (!state->core) {
             status = reason == vbr_pinned_ring_create_failure::internal_error
                 ? vbr_h2d_status::internal_error
@@ -78,6 +80,7 @@ std::unique_ptr<vbr_h2d_chunk_ring> vbr_h2d_chunk_ring::create(
             }
             return nullptr;
         }
+        state->lanes = lanes;
         if (failure) {
             *failure = reason;
         }
@@ -93,6 +96,31 @@ std::unique_ptr<vbr_h2d_chunk_ring> vbr_h2d_chunk_ring::create(
     }
 }
 
+std::shared_ptr<vbr_h2d_chunk_ring> vbr_h2d_chunk_ring::attach(
+        std::shared_ptr<vbr_bounded_pinned_ring_core> core,
+        const std::vector<vbr_h2d_lane_binding> & lanes) noexcept {
+    try {
+        if (!core || core->lane_count() != lanes.size()) {
+            return nullptr;
+        }
+        for (size_t i = 0; i < lanes.size(); ++i) {
+            const auto * binding = core->lane_binding(uint32_t(i));
+            if (!binding || binding->device != lanes[i].device ||
+                binding->backend != lanes[i].backend ||
+                binding->force_synchronous != lanes[i].force_synchronous) {
+                return nullptr;
+            }
+        }
+        std::unique_ptr<impl> state(new impl);
+        state->core = std::move(core);
+        state->lanes = lanes;
+        return std::shared_ptr<vbr_h2d_chunk_ring>(
+            new vbr_h2d_chunk_ring(std::move(state)));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 uint64_t vbr_h2d_chunk_ring::capacity_bytes() const noexcept {
     return impl_ && impl_->core ? impl_->core->capacity_bytes() : 0;
 }
@@ -103,6 +131,33 @@ size_t vbr_h2d_chunk_ring::chunk_bytes() const noexcept {
 
 size_t vbr_h2d_chunk_ring::lane_count() const noexcept {
     return impl_ && impl_->core ? impl_->core->lane_count() : 0;
+}
+
+bool vbr_h2d_chunk_ring::compatible_with(
+        const llama_cache_acct_ledger * ledger,
+        const llama_cache_acct_snapshot & snapshot,
+        const llama_cache_acct_resource_domain & domain,
+        uint64_t capacity_bytes,
+        size_t chunk_bytes,
+        const std::vector<vbr_h2d_lane_binding> & lanes) const noexcept {
+    if (!impl_ || !impl_->core || impl_->lanes.size() != lanes.size() ||
+        impl_->core->capacity_bytes() != capacity_bytes ||
+        impl_->core->chunk_bytes() != chunk_bytes ||
+        !impl_->core->accounted_to(
+            ledger, snapshot, domain,
+            llama_cache_acct_category::pinned_preimage_ring)) {
+        return false;
+    }
+    for (size_t i = 0; i < lanes.size(); ++i) {
+        if (impl_->lanes[i].domain != lanes[i].domain ||
+            impl_->lanes[i].device != lanes[i].device ||
+            impl_->lanes[i].backend != lanes[i].backend ||
+            impl_->lanes[i].force_synchronous !=
+                lanes[i].force_synchronous) {
+            return false;
+        }
+    }
+    return true;
 }
 
 vbr_h2d_status vbr_h2d_chunk_ring::stream(
@@ -135,6 +190,10 @@ vbr_h2d_status vbr_h2d_chunk_ring::stream(
         }
     } else if (!transfer.fake.complete) {
         return vbr_h2d_status::invalid_argument;
+    }
+    auto operation = impl_->core->try_begin_operation();
+    if (!operation) {
+        return vbr_h2d_status::ring_unavailable;
     }
     const size_t chunk_size = impl_->core->chunk_bytes();
 
@@ -295,7 +354,7 @@ struct vbr_staged_payloads::impl {
     std::vector<llama_cache_acct_op_id> committed_ops;
     std::vector<llama_cache_acct_alloc_id> allocations;
     llama_cache_prepared_claim_group prepared;
-    std::unique_ptr<vbr_h2d_chunk_ring> ring;
+    std::shared_ptr<vbr_h2d_chunk_ring> ring;
     std::vector<uint64_t> downward_stashless;
     bool downward_resources = false;
 };
@@ -512,7 +571,17 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                 }
             }
         }
-        if (policy.ledger->snapshot().serial !=
+        const auto preflight_accounting = policy.ledger->snapshot();
+        if (policy.persistent_ring &&
+            !policy.persistent_ring->compatible_with(
+                policy.ledger, preflight_accounting,
+                policy.pinned_domain,
+                policy.pinned_ring_bytes, policy.chunk_bytes,
+                policy.lanes)) {
+            out.status = vbr_adopt_stage_status::ring_unavailable;
+            return out;
+        }
+        if (preflight_accounting.serial !=
                 out.manifest->target().accounting_serial) {
             out.status = vbr_adopt_stage_status::accounting_unavailable;
             return out;
@@ -620,7 +689,10 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             found->second = next;
             return true;
         };
-        if (!add_transfer(policy.pinned_domain, policy.pinned_ring_bytes)) {
+        // A persistent ring is already physically charged by its store owner.
+        // The standalone path still reserves and charges its per-stage ring.
+        if (!policy.persistent_ring &&
+            !add_transfer(policy.pinned_domain, policy.pinned_ring_bytes)) {
             out.status = vbr_adopt_stage_status::accounting_unavailable;
             return out;
         }
@@ -672,6 +744,14 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
         }
 
         const auto post_prepare = policy.ledger->snapshot();
+        if (policy.persistent_ring &&
+            !policy.persistent_ring->compatible_with(
+                policy.ledger, post_prepare, policy.pinned_domain,
+                policy.pinned_ring_bytes, policy.chunk_bytes,
+                policy.lanes)) {
+            out.status = vbr_adopt_stage_status::accounting_unavailable;
+            return out;
+        }
         llama_cache_budget_coordinator coordinator;
         llama_cache_budget_plan empty_plan;
         empty_plan.accounting_serial = post_prepare.serial;
@@ -692,13 +772,16 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             out.status = vbr_adopt_stage_status::ring_unavailable;
             return out;
         }
-        vbr_h2d_status ring_status;
-        state->ring = vbr_h2d_chunk_ring::create(
-            policy.lanes, policy.pinned_ring_bytes,
-            policy.chunk_bytes, ring_status);
-        if (!state->ring || ring_status != vbr_h2d_status::ok) {
-            out.status = vbr_adopt_stage_status::ring_unavailable;
-            return out;
+        state->ring = policy.persistent_ring;
+        if (!state->ring) {
+            vbr_h2d_status ring_status;
+            state->ring = vbr_h2d_chunk_ring::create(
+                policy.lanes, policy.pinned_ring_bytes,
+                policy.chunk_bytes, ring_status);
+            if (!state->ring || ring_status != vbr_h2d_status::ok) {
+                out.status = vbr_adopt_stage_status::ring_unavailable;
+                return out;
+            }
         }
 
         out.staged.reset(new vbr_staged_payloads(std::move(state)));

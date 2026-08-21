@@ -78,6 +78,11 @@ public:
         vbr_h2d_status & status,
         vbr_pinned_ring_create_failure * failure = nullptr) noexcept;
 
+    // Builds the H2D adapter over an already-accounted persistent core.
+    static std::shared_ptr<vbr_h2d_chunk_ring> attach(
+        std::shared_ptr<vbr_bounded_pinned_ring_core> core,
+        const std::vector<vbr_h2d_lane_binding> & lanes) noexcept;
+
     ~vbr_h2d_chunk_ring();
     vbr_h2d_chunk_ring(const vbr_h2d_chunk_ring &) = delete;
     vbr_h2d_chunk_ring & operator=(const vbr_h2d_chunk_ring &) = delete;
@@ -85,6 +90,13 @@ public:
     uint64_t capacity_bytes() const noexcept;
     size_t chunk_bytes() const noexcept;
     size_t lane_count() const noexcept;
+    bool compatible_with(
+        const llama_cache_acct_ledger * ledger,
+        const llama_cache_acct_snapshot & snapshot,
+        const llama_cache_acct_resource_domain & domain,
+        uint64_t capacity_bytes,
+        size_t chunk_bytes,
+        const std::vector<vbr_h2d_lane_binding> & lanes) const noexcept;
     vbr_h2d_status stream(
         const vbr_h2d_transfer & transfer,
         vbr_h2d_stats & stats) noexcept;
@@ -151,6 +163,9 @@ struct vbr_adopt_stage_policy {
     llama_cache_acct_resource_domain pinned_domain;
     uint64_t pinned_ring_bytes = 0;
     size_t chunk_bytes = 0;
+    // Production supplies the store-owned ring. When absent, explicit tests
+    // and standalone clients retain the legacy per-stage construction path.
+    std::shared_ptr<vbr_h2d_chunk_ring> persistent_ring;
     void * downward_context = nullptr;
     reserve_downward_fn reserve_downward = nullptr;
     vbr_adopt_stage_fault fault;

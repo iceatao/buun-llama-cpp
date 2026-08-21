@@ -422,40 +422,6 @@ const char * vbr_capture_ring_create_failure_name(
 
 namespace {
 
-vbr_capture_stream_status capture_status_for_ring_failure(
-        vbr_capture_ring_create_failure failure) noexcept {
-    switch (failure) {
-        case vbr_capture_ring_create_failure::budget_exceeded:
-            return vbr_capture_stream_status::accounting_refused;
-        case vbr_capture_ring_create_failure::invalid_accounting_binding:
-        case vbr_capture_ring_create_failure::existing_ring_charge:
-        case vbr_capture_ring_create_failure::accounting_update_failed:
-        case vbr_capture_ring_create_failure::budget_reset_failed:
-        case vbr_capture_ring_create_failure::budget_unavailable:
-        case vbr_capture_ring_create_failure::accounting_charge_failed:
-            return vbr_capture_stream_status::accounting_unavailable;
-        case vbr_capture_ring_create_failure::internal_error:
-            return vbr_capture_stream_status::internal_error;
-        case vbr_capture_ring_create_failure::none:
-        case vbr_capture_ring_create_failure::invalid_geometry:
-        case vbr_capture_ring_create_failure::global_capacity_exceeded:
-        case vbr_capture_ring_create_failure::invalid_lane_binding:
-        case vbr_capture_ring_create_failure::duplicate_device_lane:
-        case vbr_capture_ring_create_failure::host_buffer_type_unavailable:
-        case vbr_capture_ring_create_failure::host_buffer_allocation_failed:
-        case vbr_capture_ring_create_failure::host_buffer_too_small:
-        case vbr_capture_ring_create_failure::host_buffer_base_unavailable:
-        case vbr_capture_ring_create_failure::lane_underprovisioned:
-        case vbr_capture_ring_create_failure::_count:
-            return vbr_capture_stream_status::ring_unavailable;
-    }
-    return vbr_capture_stream_status::ring_unavailable;
-}
-
-} // namespace
-
-namespace {
-
 std::array<uint8_t, 32> capture_range_leaf_digest(
     uint64_t index,
     uint32_t size,
@@ -1165,7 +1131,7 @@ bool vbr_capture_range_verify(
 }
 
 struct vbr_pinned_chunk_ring::impl {
-    std::unique_ptr<vbr_bounded_pinned_ring_core> core;
+    std::shared_ptr<vbr_bounded_pinned_ring_core> core;
 };
 
 vbr_pinned_chunk_ring::vbr_pinned_chunk_ring(
@@ -1187,10 +1153,11 @@ vbr_pinned_chunk_ring::create(
         vbr_capture_ring_create_failure::none;
     try {
         std::unique_ptr<impl> state(new impl);
-        state->core = vbr_bounded_pinned_ring_core::create(
-            lanes, total_bytes, chunk_bytes, accounting, reason);
+        state->core = std::shared_ptr<vbr_bounded_pinned_ring_core>(
+            vbr_bounded_pinned_ring_core::create(
+                lanes, total_bytes, chunk_bytes, accounting, reason));
         if (!state->core) {
-            status = capture_status_for_ring_failure(reason);
+            status = vbr_capture_ring_failure_status(reason);
             if (failure) {
                 *failure = reason;
             }
@@ -1207,6 +1174,22 @@ vbr_pinned_chunk_ring::create(
         if (failure) {
             *failure = vbr_capture_ring_create_failure::internal_error;
         }
+        return nullptr;
+    }
+}
+
+std::unique_ptr<vbr_pinned_chunk_ring>
+vbr_pinned_chunk_ring::attach(
+        std::shared_ptr<vbr_bounded_pinned_ring_core> core) noexcept {
+    try {
+        if (!core) {
+            return nullptr;
+        }
+        std::unique_ptr<impl> state(new impl);
+        state->core = std::move(core);
+        return std::unique_ptr<vbr_pinned_chunk_ring>(
+            new vbr_pinned_chunk_ring(std::move(state)));
+    } catch (...) {
         return nullptr;
     }
 }
@@ -1247,7 +1230,8 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         artifact_segment_chain & destination,
         vbr_capture_stream_stats & stats) noexcept {
     stats = {};
-    if (source.lane >= impl_->core->lane_count() || source.size == 0 ||
+    if (!impl_ || !impl_->core ||
+        source.lane >= impl_->core->lane_count() || source.size == 0 ||
         ranges == nullptr || range_count == 0 || destination.size() != 0) {
         return vbr_capture_stream_status::invalid_argument;
     }
@@ -1285,6 +1269,10 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         }
     } else if (!source.read) {
         return vbr_capture_stream_status::invalid_argument;
+    }
+    auto operation = impl_->core->try_begin_operation();
+    if (!operation) {
+        return vbr_capture_stream_status::ring_unavailable;
     }
     const size_t chunk_size = impl_->core->chunk_bytes();
     const bool legacy_digest = !destination.authenticated();

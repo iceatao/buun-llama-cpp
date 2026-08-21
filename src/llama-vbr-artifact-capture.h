@@ -54,6 +54,35 @@ using vbr_capture_ring_create_failure =
 
 const char * vbr_capture_ring_create_failure_name(
     vbr_capture_ring_create_failure failure) noexcept;
+inline vbr_capture_stream_status vbr_capture_ring_failure_status(
+        vbr_capture_ring_create_failure failure) noexcept {
+    switch (failure) {
+        case vbr_capture_ring_create_failure::budget_exceeded:
+            return vbr_capture_stream_status::accounting_refused;
+        case vbr_capture_ring_create_failure::invalid_accounting_binding:
+        case vbr_capture_ring_create_failure::existing_ring_charge:
+        case vbr_capture_ring_create_failure::accounting_update_failed:
+        case vbr_capture_ring_create_failure::budget_reset_failed:
+        case vbr_capture_ring_create_failure::budget_unavailable:
+        case vbr_capture_ring_create_failure::accounting_charge_failed:
+            return vbr_capture_stream_status::accounting_unavailable;
+        case vbr_capture_ring_create_failure::internal_error:
+            return vbr_capture_stream_status::internal_error;
+        case vbr_capture_ring_create_failure::none:
+        case vbr_capture_ring_create_failure::invalid_geometry:
+        case vbr_capture_ring_create_failure::global_capacity_exceeded:
+        case vbr_capture_ring_create_failure::invalid_lane_binding:
+        case vbr_capture_ring_create_failure::duplicate_device_lane:
+        case vbr_capture_ring_create_failure::host_buffer_type_unavailable:
+        case vbr_capture_ring_create_failure::host_buffer_allocation_failed:
+        case vbr_capture_ring_create_failure::host_buffer_too_small:
+        case vbr_capture_ring_create_failure::host_buffer_base_unavailable:
+        case vbr_capture_ring_create_failure::lane_underprovisioned:
+        case vbr_capture_ring_create_failure::_count:
+            return vbr_capture_stream_status::ring_unavailable;
+    }
+    return vbr_capture_stream_status::ring_unavailable;
+}
 
 struct artifact_segment {
     std::shared_ptr<const std::vector<uint8_t>> storage;
@@ -336,6 +365,10 @@ public:
             nullptr,
         vbr_capture_ring_create_failure * failure =
             nullptr) noexcept;
+
+    // Builds the D2H adapter over an already-accounted persistent core.
+    static std::unique_ptr<vbr_pinned_chunk_ring> attach(
+        std::shared_ptr<vbr_bounded_pinned_ring_core> core) noexcept;
 
     ~vbr_pinned_chunk_ring();
     vbr_pinned_chunk_ring(const vbr_pinned_chunk_ring &) = delete;

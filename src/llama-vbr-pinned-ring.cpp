@@ -13,6 +13,11 @@ uint64_t vbr_pinned_ring_capacity_live = 0;
 
 } // namespace
 
+uint64_t vbr_pinned_ring_live_capacity_bytes() noexcept {
+    std::lock_guard<std::mutex> lock(vbr_pinned_ring_capacity_mutex);
+    return vbr_pinned_ring_capacity_live;
+}
+
 struct vbr_bounded_pinned_ring_core::impl {
     struct chunk {
         ggml_backend_buffer_t buffer = nullptr;
@@ -50,6 +55,7 @@ struct vbr_bounded_pinned_ring_core::impl {
     bool ring_charged = false;
 
     bool global_reserved = false;
+    std::mutex operation_mutex;
 
     ~impl() {
         // Release the process-wide bound only after every pinned allocation
@@ -66,6 +72,33 @@ struct vbr_bounded_pinned_ring_core::impl {
         }
     }
 };
+
+vbr_pinned_ring_operation::vbr_pinned_ring_operation(
+        vbr_pinned_ring_operation && other) noexcept
+    : owner_(other.owner_) {
+    other.owner_ = nullptr;
+}
+
+vbr_pinned_ring_operation & vbr_pinned_ring_operation::operator=(
+        vbr_pinned_ring_operation && other) noexcept {
+    if (this != &other) {
+        reset();
+        owner_ = other.owner_;
+        other.owner_ = nullptr;
+    }
+    return *this;
+}
+
+vbr_pinned_ring_operation::~vbr_pinned_ring_operation() {
+    reset();
+}
+
+void vbr_pinned_ring_operation::reset() noexcept {
+    if (owner_) {
+        owner_->end_operation();
+        owner_ = nullptr;
+    }
+}
 
 vbr_pinned_chunk_lease::vbr_pinned_chunk_lease(
         vbr_pinned_chunk_lease && other) noexcept
@@ -334,6 +367,54 @@ const vbr_pinned_ring_lane * vbr_bounded_pinned_ring_core::lane_binding(
         uint32_t lane) const noexcept {
     return impl_ && lane < impl_->lanes.size()
         ? &impl_->lanes[lane].binding : nullptr;
+}
+
+bool vbr_bounded_pinned_ring_core::accounted_to(
+        const llama_cache_acct_ledger * ledger,
+        const llama_cache_acct_snapshot & snapshot,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_category category) const noexcept {
+    if (!impl_ || !impl_->ring_charged || impl_->accounting != ledger ||
+        impl_->accounting_domain != domain ||
+        impl_->accounting_category != category ||
+        snapshot.completeness_manifest != llama_cache_acct_known::known) {
+        return false;
+    }
+    const auto found = std::find_if(
+        snapshot.cells.begin(), snapshot.cells.end(),
+        [&](const llama_cache_acct_cell_row & row) {
+            return row.category == category && row.domain == domain;
+        });
+    if (found == snapshot.cells.end() ||
+        found->certification != llama_cache_acct_known::known) {
+        return false;
+    }
+    const auto & logical = found->cell.measures[
+        size_t(llama_cache_acct_measure::logical_payload)];
+    const auto & resident = found->cell.measures[
+        size_t(llama_cache_acct_measure::resident_allocated)];
+    return logical.state == llama_cache_acct_known::known &&
+           resident.state == llama_cache_acct_known::known &&
+           logical.value == impl_->capacity &&
+           resident.value == impl_->capacity;
+}
+
+vbr_pinned_ring_operation
+vbr_bounded_pinned_ring_core::try_begin_operation() noexcept {
+    if (!impl_) {
+        return {};
+    }
+    try {
+        return impl_->operation_mutex.try_lock()
+            ? vbr_pinned_ring_operation(this)
+            : vbr_pinned_ring_operation{};
+    } catch (...) {
+        return {};
+    }
+}
+
+void vbr_bounded_pinned_ring_core::end_operation() noexcept {
+    impl_->operation_mutex.unlock();
 }
 
 vbr_pinned_chunk_lease vbr_bounded_pinned_ring_core::acquire(

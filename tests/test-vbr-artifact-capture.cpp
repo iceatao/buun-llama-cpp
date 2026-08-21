@@ -7,11 +7,13 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -44,6 +46,24 @@ static bool read_synthetic(
     std::memcpy(destination, source.bytes.data() + offset, size);
     return true;
 }
+
+struct blocking_capture_source {
+    synthetic_source source;
+    std::atomic<bool> entered { false };
+    std::atomic<bool> release { false };
+
+    static bool read(
+            const void * opaque, uint64_t offset,
+            uint8_t * destination, size_t size) noexcept {
+        auto & self = *const_cast<blocking_capture_source *>(
+            static_cast<const blocking_capture_source *>(opaque));
+        self.entered.store(true, std::memory_order_release);
+        while (!self.release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        return read_synthetic(&self.source, offset, destination, size);
+    }
+};
 
 static std::vector<uint8_t> read_chain(
         const artifact_segment_chain & chain) {
@@ -1447,6 +1467,74 @@ static void test_h2d_bounded_streaming() {
     CHECK(ring->stream(transfer, stats) ==
           vbr_h2d_status::transfer_failed);
     CHECK(failed.operations.empty());
+
+    // H1 production uses one physical direction-neutral ring. The two
+    // adapters share its exact capacity and contend at the whole-operation
+    // boundary rather than consuming one another's outstanding chunks.
+    vbr_pinned_ring_create_failure failure;
+    const uint64_t live_before =
+        vbr_pinned_ring_live_capacity_bytes();
+    auto core = std::shared_ptr<vbr_bounded_pinned_ring_core>(
+        vbr_bounded_pinned_ring_core::create(
+            { {} }, 16, 8, nullptr, failure));
+    CHECK(core);
+    CHECK(failure == vbr_pinned_ring_create_failure::none);
+    auto capture = vbr_pinned_chunk_ring::attach(core);
+    auto adoption = vbr_h2d_chunk_ring::attach(core, { { } });
+    CHECK(capture && adoption);
+    CHECK(capture && capture->capacity_bytes() == 16);
+    CHECK(adoption && adoption->capacity_bytes() == 16);
+    CHECK(vbr_pinned_ring_live_capacity_bytes() == live_before + 16);
+
+    blocking_capture_source d2h_input;
+    d2h_input.source.bytes.resize(9, 0x5a);
+    vbr_capture_stream_source d2h_source;
+    d2h_source.size = d2h_input.source.bytes.size();
+    d2h_source.context = &d2h_input;
+    d2h_source.read = blocking_capture_source::read;
+    artifact_segment_chain blocked_chain;
+    vbr_capture_stream_stats blocked_stats;
+    generated_h2d_source h2d_input { 9 };
+    fake_h2d_destination blocked_destination;
+    vbr_h2d_transfer blocked_transfer;
+    blocked_transfer.source = {
+        h2d_input.size, &h2d_input, generated_h2d_source::read,
+    };
+    blocked_transfer.size = h2d_input.size;
+    blocked_transfer.fake = {
+        &blocked_destination, fake_h2d_destination::issue,
+        fake_h2d_destination::complete, true,
+    };
+    vbr_capture_stream_status capture_result =
+        vbr_capture_stream_status::internal_error;
+    std::thread capture_thread([&]() {
+        capture_result = capture->stream(
+            d2h_source, blocked_chain, blocked_stats);
+    });
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(1);
+    while (!d2h_input.entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    CHECK(d2h_input.entered.load(std::memory_order_acquire));
+    CHECK(adoption->stream(blocked_transfer, stats) ==
+          vbr_h2d_status::ring_unavailable);
+    CHECK(blocked_chain.size() == 0);
+    CHECK(blocked_destination.bytes == 0);
+    d2h_input.release.store(true, std::memory_order_release);
+    capture_thread.join();
+    CHECK(capture_result == vbr_capture_stream_status::ok);
+    CHECK(read_chain(blocked_chain) == d2h_input.source.bytes);
+    CHECK(adoption->stream(blocked_transfer, stats) == vbr_h2d_status::ok);
+    CHECK(blocked_destination.valid);
+    CHECK(blocked_destination.bytes == h2d_input.size);
+
+    capture.reset();
+    adoption.reset();
+    CHECK(vbr_pinned_ring_live_capacity_bytes() == live_before + 16);
+    core.reset();
+    CHECK(vbr_pinned_ring_live_capacity_bytes() == live_before);
 }
 
 static uint64_t ring_resident(
@@ -1702,7 +1790,9 @@ static void test_server_store_construction_and_lifetime() {
     });
     config.lanes.push_back({});
     config.attention_children = 1;
-    config.ring_bytes = 16;
+    // The physical owner rounds down to complete chunks; both direction
+    // adapters must use that constructed capacity rather than the request.
+    config.ring_bytes = 17;
     config.chunk_bytes = 8;
     config.sample_budget = sample_unbounded_host_budget;
 
@@ -1731,6 +1821,8 @@ static void test_server_store_construction_and_lifetime() {
     CHECK(ring_resident(ledger, pinned) == 0);
     server_vbr_artifact_capture_status status;
     server_vbr_artifact_store_create_diagnostics diagnostics;
+    const uint64_t transport_before =
+        vbr_pinned_ring_live_capacity_bytes();
     {
         auto store =
             server_vbr_artifact_store::create(
@@ -1743,7 +1835,7 @@ static void test_server_store_construction_and_lifetime() {
               vbr_capture_stream_status::ok);
         CHECK(diagnostics.ring_failure ==
               vbr_capture_ring_create_failure::none);
-        CHECK(diagnostics.requested_ring_bytes == 16);
+        CHECK(diagnostics.requested_ring_bytes == 17);
         CHECK(diagnostics.constructed_ring_bytes == 16);
         if (!store) {
             return;
@@ -1752,9 +1844,25 @@ static void test_server_store_construction_and_lifetime() {
         CHECK(store->counters().pinned_bytes == 16);
         CHECK(store->counters().requested == 0);
         CHECK(ring_resident(ledger, pinned) == 16);
+        // Capture and import adapters share this one physical allocation.
+        CHECK(vbr_pinned_ring_live_capacity_bytes() ==
+              transport_before + 16);
+        vbr_adopt_stage_policy import_policy;
+        CHECK(server_vbr_artifact_store_test_door::
+              import_transport_policy(*store, import_policy));
+        CHECK(import_policy.ledger == &ledger);
+        CHECK(import_policy.persistent_ring);
+        CHECK(import_policy.pinned_domain == pinned);
+        CHECK(import_policy.pinned_ring_bytes == 16);
+        CHECK(import_policy.chunk_bytes == 8);
+        CHECK(import_policy.lanes.size() == 1);
+        CHECK(vbr_pinned_ring_live_capacity_bytes() ==
+              transport_before + 16);
+        import_policy.persistent_ring.reset();
     }
     const auto after = ledger.snapshot();
     CHECK(ring_resident(ledger, pinned) == 0);
+    CHECK(vbr_pinned_ring_live_capacity_bytes() == transport_before);
     CHECK(after.live_ops == baseline.live_ops);
     CHECK(after.faults_invalid_transition ==
           baseline.faults_invalid_transition);

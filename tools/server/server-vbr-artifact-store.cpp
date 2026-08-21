@@ -335,6 +335,7 @@ struct server_vbr_artifact_store::impl {
     llama_cache_acct_ledger * ledger = nullptr;
     llama_vbr_artifact_catalog catalog;
     std::unique_ptr<vbr_pinned_chunk_ring> ring;
+    std::shared_ptr<vbr_h2d_chunk_ring> import_ring;
     std::vector<vbr_artifact_portable_topology> topologies;
     std::vector<vbr_explicit_capture_pool_binding> pool_bindings;
     std::vector<llama_vbr_artifact_domain_binding> domain_bindings;
@@ -355,6 +356,20 @@ struct server_vbr_artifact_store::impl {
     explicit impl(llama_cache_acct_ledger & ledger)
         : ledger(&ledger), catalog(ledger) {
     }
+
+    bool bind_import_transport(vbr_adopt_stage_policy & policy) const noexcept {
+        if (!ledger || !import_ring || h2d_lanes.empty() ||
+            import_ring_bytes == 0 || import_chunk_bytes == 0) {
+            return false;
+        }
+        policy.ledger = ledger;
+        policy.lanes = h2d_lanes;
+        policy.pinned_domain = pinned_domain;
+        policy.pinned_ring_bytes = import_ring_bytes;
+        policy.chunk_bytes = import_chunk_bytes;
+        policy.persistent_ring = import_ring;
+        return true;
+    }
 };
 
 server_vbr_artifact_store::server_vbr_artifact_store(
@@ -363,6 +378,13 @@ server_vbr_artifact_store::server_vbr_artifact_store(
 }
 
 server_vbr_artifact_store::~server_vbr_artifact_store() = default;
+
+bool server_vbr_artifact_store_test_door::import_transport_policy(
+        const server_vbr_artifact_store & store,
+        vbr_adopt_stage_policy & policy) noexcept {
+    policy = {};
+    return store.impl_ && store.impl_->bind_import_transport(policy);
+}
 
 bool server_vbr_artifact_store_observe_empty_accounting(
         llama_cache_acct_ledger & ledger,
@@ -718,13 +740,31 @@ server_vbr_artifact_store::create(
         uint64_t attempt = config.ring_bytes;
         for (;;) {
             observed.attempted_ring_bytes = attempt;
-            state->ring = vbr_pinned_chunk_ring::create(
-                config.lanes, attempt, config.chunk_bytes,
-                observed.ring_status, &accounting,
-                &observed.ring_failure);
-            if (state->ring) {
+            auto core = std::shared_ptr<vbr_bounded_pinned_ring_core>(
+                vbr_bounded_pinned_ring_core::create(
+                    config.lanes, attempt, config.chunk_bytes,
+                    &accounting, observed.ring_failure));
+            if (core) {
+                state->ring = vbr_pinned_chunk_ring::attach(core);
+                state->import_ring = vbr_h2d_chunk_ring::attach(
+                    std::move(core), state->h2d_lanes);
+                observed.ring_status = state->ring && state->import_ring
+                    ? vbr_capture_stream_status::ok
+                    : vbr_capture_stream_status::internal_error;
+                if (!state->ring || !state->import_ring) {
+                    observed.ring_failure =
+                        vbr_capture_ring_create_failure::internal_error;
+                }
+            } else {
+                observed.ring_status =
+                    vbr_capture_ring_failure_status(
+                        observed.ring_failure);
+            }
+            if (state->ring && state->import_ring) {
                 break;
             }
+            state->ring.reset();
+            state->import_ring.reset();
             // Pinned allocation pressure is recoverable without weakening
             // the ring protocol: two chunks per physical lane are sufficient
             // for bounded producer/consumer overlap. Other failures are
@@ -746,15 +786,19 @@ server_vbr_artifact_store::create(
         }
         if (!state->ring) {
             status = observed.ring_status ==
-                    vbr_capture_stream_status::accounting_refused
+                        vbr_capture_stream_status::accounting_refused
                 ? server_vbr_artifact_capture_status::admission_refused
-                : server_vbr_artifact_capture_status::unavailable;
+                : observed.ring_status ==
+                        vbr_capture_stream_status::internal_error
+                    ? server_vbr_artifact_capture_status::internal_error
+                    : server_vbr_artifact_capture_status::unavailable;
             fail(server_vbr_artifact_store_create_failure::
                 ring_create_failed);
             return nullptr;
         }
         observed.constructed_ring_bytes =
             state->ring->capacity_bytes();
+        state->import_ring_bytes = observed.constructed_ring_bytes;
         state->counters.pinned_bytes =
             observed.constructed_ring_bytes;
         status = server_vbr_artifact_capture_status::ok;
@@ -1030,12 +1074,11 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import(
         }
 
         vbr_adopt_stage_policy stage_policy;
-        stage_policy.ledger = impl_->ledger;
+        if (!impl_->bind_import_transport(stage_policy)) {
+            return fail(server_vbr_artifact_import_status::stage_failed,
+                        impl_->counters.imports_refused);
+        }
         stage_policy.budget = &budget;
-        stage_policy.lanes = impl_->h2d_lanes;
-        stage_policy.pinned_domain = impl_->pinned_domain;
-        stage_policy.pinned_ring_bytes = impl_->import_ring_bytes;
-        stage_policy.chunk_bytes = impl_->import_chunk_bytes;
         stage_policy.downward_context = &context;
         stage_policy.reserve_downward = import_reserve_downward;
         auto staged = vbr_stage_validated_manifest(

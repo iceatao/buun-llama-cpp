@@ -3777,9 +3777,59 @@ static void test_validated_manifest_staging() {
         }
     }
     CHECK(fixture.base.ledger.snapshot().live_ops > baseline_ops);
+    const uint64_t legacy_live_ops =
+        fixture.base.ledger.snapshot().live_ops - baseline_ops;
     staged.staged.reset();
     CHECK(fixture.base.ledger.snapshot().live_ops == baseline_ops);
     CHECK(staged.manifest && staged.manifest->adoption_nonce() == nonce);
+
+    // A server-owned ring is already charged and remains physically stable
+    // across staging. It therefore removes exactly the per-request pinned
+    // transfer claim while retaining the device transfer reservations.
+    std::vector<vbr_pinned_ring_lane> persistent_lanes;
+    for (const auto & lane : policy.lanes) {
+        persistent_lanes.push_back({
+            lane.device, lane.backend, lane.force_synchronous,
+        });
+    }
+    vbr_pinned_ring_accounting persistent_accounting {
+        &fixture.base.ledger, policy.pinned_domain, &budget,
+    };
+    vbr_pinned_ring_create_failure persistent_failure;
+    auto persistent_core =
+        std::shared_ptr<vbr_bounded_pinned_ring_core>(
+            vbr_bounded_pinned_ring_core::create(
+                persistent_lanes, policy.pinned_ring_bytes,
+                policy.chunk_bytes, &persistent_accounting,
+                persistent_failure));
+    CHECK(persistent_core);
+    CHECK(persistent_failure == vbr_pinned_ring_create_failure::none);
+    policy.persistent_ring = vbr_h2d_chunk_ring::attach(
+        std::move(persistent_core), policy.lanes);
+    CHECK(policy.persistent_ring);
+    fixture.accounting = fixture.base.ledger.snapshot();
+    fixture.target.accounting_serial = fixture.accounting.serial;
+    fixture.serials.accounting = fixture.accounting.serial;
+    fixture.policy.accounting_snapshot = &fixture.accounting;
+    auto persistent_proof = validate(
+        fixture, fixture.target, fixture.policy);
+    CHECK(persistent_proof.proof);
+    const uint64_t persistent_capacity =
+        vbr_pinned_ring_live_capacity_bytes();
+    const uint64_t persistent_baseline =
+        fixture.base.ledger.snapshot().live_ops;
+    auto persistent_staged = vbr_stage_validated_manifest(
+        std::move(persistent_proof.proof), policy);
+    CHECK(persistent_staged.status == vbr_adopt_stage_status::staged);
+    CHECK(persistent_staged.staged);
+    CHECK(vbr_pinned_ring_live_capacity_bytes() == persistent_capacity);
+    CHECK(fixture.base.ledger.snapshot().live_ops >= persistent_baseline);
+    const uint64_t persistent_live_ops =
+        fixture.base.ledger.snapshot().live_ops - persistent_baseline;
+    CHECK(persistent_live_ops + 1 == legacy_live_ops);
+    persistent_staged.staged.reset();
+    CHECK(fixture.base.ledger.snapshot().live_ops == persistent_baseline);
+    policy.persistent_ring.reset();
 
     const auto run_failure = [&](vbr_adopt_stage_policy failed_policy,
                                  vbr_adopt_stage_status expected) {
@@ -3797,6 +3847,63 @@ static void test_validated_manifest_staging() {
         CHECK(!result.staged);
         CHECK(fixture.base.ledger.snapshot().live_ops == before);
     };
+
+    vbr_pinned_ring_accounting lane_accounting {
+        &fixture.base.ledger, policy.pinned_domain, &budget,
+    };
+    auto lane_core = std::shared_ptr<vbr_bounded_pinned_ring_core>(
+        vbr_bounded_pinned_ring_core::create(
+            persistent_lanes, policy.pinned_ring_bytes,
+            policy.chunk_bytes, &lane_accounting,
+            persistent_failure));
+    CHECK(lane_core);
+    auto lane_mismatch = policy;
+    lane_mismatch.persistent_ring = vbr_h2d_chunk_ring::attach(
+        std::move(lane_core), policy.lanes);
+    CHECK(lane_mismatch.persistent_ring);
+    lane_mismatch.lanes.front().domain =
+        llama_cache_acct_resource_domain::non_device(
+            llama_cache_acct_residency::pageable_host);
+    // If compatibility moves below source verification, this becomes the
+    // wrong source_hash_mismatch terminal instead of ring_unavailable.
+    lane_mismatch.fault.fail_source_verify_at = 0;
+    run_failure(lane_mismatch, vbr_adopt_stage_status::ring_unavailable);
+    lane_mismatch.persistent_ring.reset();
+
+    // A persistent adapter's cached owner identity is not enough: the live
+    // ledger row must still carry the complete physical charge. Refreshing
+    // validation after a corrupted zero gauge must remain fail closed.
+    auto drift_core = std::shared_ptr<vbr_bounded_pinned_ring_core>(
+        vbr_bounded_pinned_ring_core::create(
+            persistent_lanes, policy.pinned_ring_bytes,
+            policy.chunk_bytes, &lane_accounting,
+            persistent_failure));
+    CHECK(drift_core);
+    auto charged_drift = policy;
+    charged_drift.persistent_ring = vbr_h2d_chunk_ring::attach(
+        std::move(drift_core), policy.lanes);
+    CHECK(charged_drift.persistent_ring);
+    fixture.base.ledger.gauge_set(
+        llama_cache_acct_category::pinned_preimage_ring,
+        policy.pinned_domain,
+        llama_cache_acct_measure::logical_payload, 0);
+    fixture.base.ledger.gauge_set(
+        llama_cache_acct_category::pinned_preimage_ring,
+        policy.pinned_domain,
+        llama_cache_acct_measure::resident_allocated, 0);
+    run_failure(
+        charged_drift, vbr_adopt_stage_status::ring_unavailable);
+    charged_drift.persistent_ring.reset();
+
+    vbr_h2d_status unaccounted_status;
+    policy.persistent_ring = std::shared_ptr<vbr_h2d_chunk_ring>(
+        vbr_h2d_chunk_ring::create(
+            policy.lanes, policy.pinned_ring_bytes,
+            policy.chunk_bytes, unaccounted_status));
+    CHECK(policy.persistent_ring);
+    CHECK(unaccounted_status == vbr_h2d_status::ok);
+    run_failure(policy, vbr_adopt_stage_status::ring_unavailable);
+    policy.persistent_ring.reset();
 
     policy.fault.fail_source_verify_at = 0;
     run_failure(policy, vbr_adopt_stage_status::source_hash_mismatch);
