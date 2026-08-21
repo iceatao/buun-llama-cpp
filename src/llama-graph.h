@@ -123,6 +123,11 @@ struct llama_cross {
     };
     std::map<llama_seq_id, seq_cross> v_embd_per_seq;
 
+    // Request-owned DFlash2 selector draws, one row per proposed step. The
+    // shared block-diffusion driver refreshes these before each draft decode so graph
+    // reuse never reuses stochastic choices across cycles or slots.
+    std::map<llama_seq_id, std::vector<float>> dflash_proposal_uniforms;
+
     // needed to construct the cross-attention mask in the decoder
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
@@ -178,7 +183,7 @@ public:
 // device-resident capture stage (data set from cparams.dflash_inject_rows)
 class llm_graph_input_dflash_stage_rows : public llm_graph_input_i {
 public:
-    llm_graph_input_dflash_stage_rows(const llama_cparams & cparams) : cparams(cparams) {}
+    llm_graph_input_dflash_stage_rows(const llama_cparams & cparams) : inject_rows(cparams.dflash_inject_rows) {}
     virtual ~llm_graph_input_dflash_stage_rows() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -187,7 +192,7 @@ public:
 
     ggml_tensor * rows = nullptr; // I32 [n_batch]
 
-    const llama_cparams & cparams;
+    std::vector<int32_t> inject_rows;
 };
 
 // similar to llm_graph_input_embd but with an additional hidden state input
@@ -922,6 +927,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             cparams.dflash_inject_stage     == other.cparams.dflash_inject_stage     &&
             cparams.dflash_oneg_n_inject    == other.cparams.dflash_oneg_n_inject    &&
+            cparams.dflash_target_mmq_batch == other.cparams.dflash_target_mmq_batch &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -985,6 +991,9 @@ public:
     // row indices as vocabulary ids.
     ggml_tensor * t_logits_candidates = nullptr;
     ggml_tensor * t_logits_argmax = nullptr; // [n_tokens] int32, GPU argmax of logits
+    // DFlash2 proposal payload, present only for stochastic selector sampling.
+    ggml_tensor * t_dflash_candidate_ids = nullptr; // I32 [K, steps, blocks]
+    ggml_tensor * t_dflash_q_rows        = nullptr; // F32 [K, steps, blocks]
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm

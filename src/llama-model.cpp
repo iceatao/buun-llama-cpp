@@ -2542,6 +2542,20 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->res->set_outputs(params);
 
+    // On Ampere, narrow DFlash2 verification batches can run faster through
+    // MMQ than CUDA's ordinary quantized-matmul dispatch. The server only sets
+    // this exact width while submitting a pure DFlash2 verification batch.
+    if (params.cparams.dflash_target_mmq_batch > 0 &&
+            params.ubatch.n_tokens == (uint32_t) params.cparams.dflash_target_mmq_batch &&
+            params.n_outputs == params.ubatch.n_tokens) {
+        for (int i = 0; i < ggml_graph_n_nodes(llm->gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(llm->gf, i);
+            if (node->op == GGML_OP_MUL_MAT && node->src[0] && ggml_is_quantized(node->src[0]->type)) {
+                ggml_mul_mat_set_hint(node, GGML_HINT_FORCE_MMQ);
+            }
+        }
+    }
+
     return llm->res->get_gf();
 }
 
@@ -2892,8 +2906,23 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
     };
     ggml_tensor * embd_cp = copy_embd ? declare_copy(src->tok_embd) : nullptr;
     ggml_tensor * out_cp  = copy_out  ? declare_copy(src->output)   : nullptr;
+    const size_t copy_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
 
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    ggml_backend_buffer_t buf;
+    if (dst->hparams.no_alloc) {
+        // Fit probes need the real placement and byte accounting without allocating
+        // or copying the weights. This is the same dummy-buffer contract used by
+        // llama_model::load_tensors() under no_alloc.
+        buf = ggml_backend_buft_alloc_buffer(buft, 0);
+        if (embd_cp != nullptr) {
+            embd_cp->buffer = buf;
+        }
+        if (out_cp != nullptr) {
+            out_cp->buffer = buf;
+        }
+    } else {
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    }
     if (buf == nullptr) {
         GGML_ABORT("failed to allocate device-local tok_embd/output copies for the drafter "
                    "(the target's tensors are not schedulable on the drafter device)");
@@ -2904,11 +2933,13 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         ggml_backend_tensor_get(s, host.data(), 0, host.size());
         ggml_backend_tensor_set(d, host.data(), 0, host.size());
     };
-    if (embd_cp != nullptr) {
-        gather(src->tok_embd, embd_cp);
-    }
-    if (out_cp != nullptr) {
-        gather(src->output, out_cp);
+    if (!dst->hparams.no_alloc) {
+        if (embd_cp != nullptr) {
+            gather(src->tok_embd, embd_cp);
+        }
+        if (out_cp != nullptr) {
+            gather(src->output, out_cp);
+        }
     }
 
     dst->tok_embd = embd_cp != nullptr ? embd_cp : src->tok_embd;
@@ -2916,13 +2947,14 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
 
     dst->adopt_buffer(std::move(ctx_ptr), ggml_backend_buffer_ptr(buf));
 
-    LLAMA_LOG_INFO("%s: target tensors not drafter-schedulable — gathered %s%s%s to %s (%.1f MiB)\n",
+    LLAMA_LOG_INFO("%s: target tensors not drafter-schedulable — %s %s%s%s on %s (%.1f MiB)\n",
             __func__,
+            dst->hparams.no_alloc ? "projected" : "gathered",
             embd_cp != nullptr ? "tok_embd" : "",
             embd_cp != nullptr && out_cp != nullptr ? "+" : "",
             out_cp  != nullptr ? "output" : "",
             ggml_backend_buft_name(buft),
-            ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+            copy_bytes / 1024.0 / 1024.0);
 }
 
 int32_t llama_model_dflash_block_size(const llama_model * model) {
@@ -2952,6 +2984,10 @@ int32_t llama_model_dflash_target_layer_ids(const llama_model * model, int32_t *
 
 bool llama_model_dspark_has_markov_head(const llama_model * model) {
     return model->dspark_markov_w1 != nullptr;
+}
+
+extern "C" LLAMA_API bool llama_model_dflash2_has_selector(const llama_model * model) {
+    return model->dflash2_selector_hidden != nullptr;
 }
 
 bool llama_model_dflash_dsv4_backbone(const llama_model * model) {

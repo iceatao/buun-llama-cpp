@@ -153,11 +153,11 @@ better.
 | turbo2 | 2.5 | 5.964 | 0.01083 | 1013 | 28.2 |
 | turbo1_tcq | 1.25 | 6.012 | 0.02633 | 991 | 28.5 |
 
-## MTP + Vision (`--mmproj-gpu-swap`)
+## Speculative decoding + Vision (`--mmproj-gpu-swap`)
 
-On VRAM-constrained GPUs, MTP speculative decoding and the vision encoder (mmproj) may not fit in VRAM simultaneously. For example, Qwen3.6-27B Q6_K + MTP uses ~22.6 GiB on a 24 GiB RTX 3090, leaving no room for mmproj's ~1.1 GiB GPU footprint.
+On VRAM-constrained GPUs, a speculative context and the vision encoder (mmproj) may not fit in VRAM simultaneously. For example, Qwen3.6-27B Q6_K + MTP uses ~22.6 GiB on a 24 GiB RTX 3090, leaving no room for mmproj's ~1.1 GiB GPU footprint.
 
-`--mmproj-gpu-swap` solves this by keeping mmproj on CPU at startup, then temporarily swapping MTP out of VRAM when an image arrives, loading mmproj to GPU for fast encoding (~1-2s instead of 30-60s on CPU), and swapping back afterward. MTP has no persistent state, so the swap is lossless.
+`--mmproj-gpu-swap` solves this by keeping mmproj on CPU at startup, then temporarily unloading MTP or an external `draft-dflash` sidecar when an image arrives, loading mmproj to GPU for fast encoding (~1-2s instead of 30-60s on CPU), and restoring speculation afterward. MTP is recreated from the target model; an external DFlash sidecar is reloaded from its GGUF.
 
 ```sh
 ./build/bin/llama-server -m Qwen3.6-27B-Q6_K.gguf \

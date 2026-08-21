@@ -456,6 +456,9 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        // CUDA: bypass the small-batch MMVQ path and prefer MMA-backed MMQ when
+        // the matrix/type/architecture support it. Other backends ignore this.
+        GGML_HINT_FORCE_MMQ        = 2,
     };
 
     // model file types
@@ -588,6 +591,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DFLASH2_CONV,
         GGML_OP_GATED_DELTA_NET_TREE,
         GGML_OP_SSM_CONV_TREE,
         GGML_OP_TURBO_WHT,
@@ -2440,6 +2444,16 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // Stable variant orders equal values by ascending source index. Stable
+    // top-k currently supports k <= 64 on every backend.
+    GGML_API struct ggml_tensor * ggml_top_k_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            bool                  stable);
+
+    GGML_API bool ggml_top_k_is_stable(const struct ggml_tensor * tensor);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2728,6 +2742,17 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // DFlash2 grouped two-tap convolution. hidden [n_embd, n_tokens],
+    // projected [4*n_groups, n_tokens], base [n_embd, 2, 2].
+    GGML_API struct ggml_tensor * ggml_dflash2_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * hidden,
+            struct ggml_tensor  * projected,
+            struct ggml_tensor  * base,
+            int32_t               side,
+            int32_t               group_size,
+            int32_t               block_size);
 
     // custom operators
 

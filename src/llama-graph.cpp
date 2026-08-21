@@ -295,6 +295,8 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 }
 
 bool llm_graph_input_dflash_stage_rows::can_reuse(const llm_graph_params & params) {
+    inject_rows = params.cparams.dflash_inject_rows;
+
     // fused single-graph cycles gather a fixed n_inject rows; standalone injects
     // gather one row per ubatch token
     const int64_t n_expected = params.cparams.dflash_oneg_n_inject > 0
@@ -305,11 +307,11 @@ bool llm_graph_input_dflash_stage_rows::can_reuse(const llm_graph_params & param
 
 void llm_graph_input_dflash_stage_rows::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(rows);
-    GGML_ASSERT((int64_t) cparams.dflash_inject_rows.size() == rows->ne[0] &&
+    GGML_ASSERT((int64_t) inject_rows.size() == rows->ne[0] &&
             "dflash staged inject: row count mismatch (llama_set_dflash_inject_rows before decode)");
     GGML_UNUSED(ubatch);
 
-    ggml_backend_tensor_set(rows, cparams.dflash_inject_rows.data(), 0,
+    ggml_backend_tensor_set(rows, inject_rows.data(), 0,
             rows->ne[0] * ggml_element_size(rows));
 }
 
@@ -1565,6 +1567,8 @@ void llm_graph_result::reset() {
     t_logits            = nullptr;
     t_logits_candidates = nullptr;
     t_logits_argmax     = nullptr;
+    t_dflash_candidate_ids = nullptr;
+    t_dflash_q_rows        = nullptr;
     t_embd              = nullptr;
     t_embd_pooled       = nullptr;
     t_h_nextn       = nullptr;
@@ -1631,6 +1635,12 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_logits_argmax != nullptr) {
         ggml_set_output(t_logits_argmax);
+    }
+    if (t_dflash_candidate_ids != nullptr) {
+        ggml_set_output(t_dflash_candidate_ids);
+    }
+    if (t_dflash_q_rows != nullptr) {
+        ggml_set_output(t_dflash_q_rows);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);

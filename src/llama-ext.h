@@ -9,6 +9,29 @@
 #include <cstdint>
 #include <map>
 
+struct llama_dflash_proposal_view {
+    const int32_t * candidate_ids = nullptr; // [blocks, steps, top_k]
+    const float   * q_rows        = nullptr; // [blocks, steps, top_k]
+    int32_t top_k   = 0;
+    int32_t n_steps = 0;
+    int32_t n_blocks = 0;
+};
+
+// Internal model classifier used to select the DFlash2 driving protocol.
+extern "C" LLAMA_API bool llama_model_dflash2_has_selector(const struct llama_model * model);
+
+// Returns the stochastic DFlash2 proposal rows produced by the most recent
+// decode. The pointers remain valid until the next decode on this context.
+LLAMA_API bool llama_get_dflash_proposal(
+        struct llama_context * ctx,
+        struct llama_dflash_proposal_view * view);
+
+LLAMA_API void llama_set_dflash_proposal_uniforms(
+        struct llama_context * ctx,
+        llama_seq_id seq_id,
+        const float * values,
+        int32_t n);
+
 // Internal speculative memory operations: real mutations with ordinary accounting, but no global
 // checkpoint-lineage publication for a caller-proven disposable backup or rejected suffix.
 LLAMA_API bool llama_memory_seq_rm_transient(

@@ -959,6 +959,39 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
         return &pos->second;
     }
 
+    if (llm_kv.arch == LLM_ARCH_DFLASH) {
+        // DFlash2 was published with two GGUF naming conventions. Keep the fork's
+        // descriptive dotted names canonical, but accept the names emitted by the
+        // upstream converter as aliases so public sidecars load without rewriting.
+        static constexpr const char * dflash2_aliases[][2] = {
+            { "selector.hidden_proj.weight", "selector_hidden.weight"      },
+            { "selector.pred_codebook",      "selector_predecessor.weight" },
+            { "selector.succ_codebook",      "selector_successor.weight"   },
+            { ".attn_conv.base",             ".attn_conv_base"             },
+            { ".attn_conv.proj.weight",      ".attn_conv_proj.weight"      },
+            { ".ffn_conv.base",              ".ffn_conv_base"              },
+            { ".ffn_conv.proj.weight",       ".ffn_conv_proj.weight"       },
+        };
+        for (const auto & alias : dflash2_aliases) {
+            std::string alternate = name;
+            size_t at = alternate.find(alias[0]);
+            const char * from = alias[0];
+            const char * to   = alias[1];
+            if (at == std::string::npos) {
+                at   = alternate.find(alias[1]);
+                from = alias[1];
+                to   = alias[0];
+            }
+            if (at != std::string::npos) {
+                alternate.replace(at, std::strlen(from), to);
+                pos = weights_map.find(alternate);
+                if (pos != weights_map.end()) {
+                    return &pos->second;
+                }
+            }
+        }
+    }
+
     if (deepseek4_dspark_support) {
         const std::string raw_name = deepseek4_dspark_tensor_name(name);
         if (!raw_name.empty()) {

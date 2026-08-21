@@ -1166,6 +1166,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DFLASH2_CONV",
     "GATED_DELTA_NET_TREE",
     "SSM_CONV_TREE",
     "TURBO_WHT",
@@ -1186,7 +1187,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1285,6 +1286,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dflash2_conv(hidden, projected, base)",
     "gated_delta_net_tree(q, k, v, g, beta, s)",
     "ssm_conv_tree(x)",
     "turbo_wht(a)",
@@ -1305,7 +1307,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5520,14 +5522,29 @@ struct ggml_tensor * ggml_top_k(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         int                   k) {
+    return ggml_top_k_ext(ctx, a, k, false);
+}
+
+struct ggml_tensor * ggml_top_k_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k,
+        bool                  stable) {
     GGML_ASSERT(a->ne[0] >= k);
+    GGML_ASSERT(!stable || k <= 64);
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, a->ne[1], a->ne[2], a->ne[3]);
 
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
+    ggml_set_op_params_i32(result, 0, stable ? 1 : 0);
 
     return result;
+}
+
+bool ggml_top_k_is_stable(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor && tensor->op == GGML_OP_TOP_K);
+    return ggml_get_op_params_i32(tensor, 0) != 0;
 }
 
 // ggml_arange
@@ -6784,6 +6801,44 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[2] = post;
     result->src[3] = comb;
 
+    return result;
+}
+
+// ggml_dflash2_conv
+
+struct ggml_tensor * ggml_dflash2_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * projected,
+        struct ggml_tensor  * base,
+        int32_t               side,
+        int32_t               group_size,
+        int32_t               block_size) {
+    GGML_ASSERT(hidden->type == GGML_TYPE_F32);
+    GGML_ASSERT(projected->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F16 || base->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(hidden));
+    GGML_ASSERT(ggml_is_matrix(projected));
+    GGML_ASSERT(side == 0 || side == 1);
+    GGML_ASSERT(group_size > 0 && hidden->ne[0] % group_size == 0);
+    GGML_ASSERT(block_size > 1);
+
+    const int64_t n_embd   = hidden->ne[0];
+    const int64_t n_tokens = hidden->ne[1];
+    const int64_t n_groups = n_embd / group_size;
+
+    GGML_ASSERT(projected->ne[0] == 4*n_groups);
+    GGML_ASSERT(projected->ne[1] == n_tokens);
+    GGML_ASSERT(base->ne[0] == n_embd && base->ne[1] == 2 && base->ne[2] == 2);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_op_params_i32(result, 0, side);
+    ggml_set_op_params_i32(result, 1, group_size);
+    ggml_set_op_params_i32(result, 2, block_size);
+    result->op     = GGML_OP_DFLASH2_CONV;
+    result->src[0] = hidden;
+    result->src[1] = projected;
+    result->src[2] = base;
     return result;
 }
 

@@ -5,6 +5,24 @@
 
 struct common_speculative;
 
+// Select the shared DFlash driver while preserving composable extensions.
+void common_speculative_select_dflash2(common_params_speculative & params);
+
+// Select DFlash2 after the loaded draft model confirms selector support.
+void common_speculative_resolve_draft_model_type(
+        common_params_speculative & params,
+        const llama_model *         model_dft);
+
+struct common_speculative_proposal {
+    llama_tokens selected;
+    int32_t top_k = 0;
+    llama_tokens candidate_ids; // [selected.size(), top_k]
+    std::vector<float> q_rows;  // [selected.size(), top_k]
+    size_t q_covered_tokens = 0;
+    llama_seq_id seq_id = -1;
+    bool exact_q = false;
+};
+
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
@@ -109,6 +127,10 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
 // fork: DFlash slot routing
 void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id);
+void common_speculative_set_rng_seed(
+        common_speculative * spec,
+        llama_seq_id         seq_id,
+        uint32_t             seed);
 
 // fork: single-seq draft (returns tokens)
 llama_tokens common_speculative_draft(
@@ -131,7 +153,14 @@ void common_speculative_draft_batch(
 // at least one decode on a linked draft-model context.
 bool common_speculative_last_draft_model_decode_succeeded(const common_speculative * spec);
 
+// Proposal distribution owned by the DFlash state that produced the most
+// recent draft. Null means the current draft has no verified proposal payload.
+const common_speculative_proposal * common_speculative_get_proposal(
+        const common_speculative * spec,
+        llama_seq_id               seq_id);
+
 // fork: logit/state management
+void   common_speculative_update_logits(common_speculative * spec, llama_seq_id seq_id, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
 void   common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
 void   common_speculative_flush_prefill(common_speculative * spec);
 

@@ -1352,6 +1352,66 @@ bool llama_context::get_logits_argmax_gpu() {
     return logits_argmax_gpu;
 }
 
+void llama_context::clear_dflash_proposal() {
+    dflash_candidate_ids_buf.clear();
+    dflash_q_rows_buf.clear();
+    dflash_proposal_top_k = 0;
+    dflash_proposal_n_steps = 0;
+    dflash_proposal_n_blocks = 0;
+}
+
+void llama_context::extract_dflash_proposal(const llm_graph_result * res) {
+    auto * ids = res ? res->t_dflash_candidate_ids : nullptr;
+    auto * q   = res ? res->t_dflash_q_rows : nullptr;
+    if (!ids && !q) {
+        return;
+    }
+
+    GGML_ASSERT(ids && q);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && q->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->ne[0] == q->ne[0] && ids->ne[1] == q->ne[1] &&
+                ids->ne[2] == q->ne[2] && ids->ne[3] == q->ne[3]);
+
+    dflash_proposal_top_k    = (int32_t) ids->ne[0];
+    dflash_proposal_n_steps  = (int32_t) ids->ne[1];
+    dflash_proposal_n_blocks = (int32_t) (ids->ne[2] * ids->ne[3]);
+    const size_t n = (size_t) ggml_nelements(ids);
+    dflash_candidate_ids_buf.resize(n);
+    dflash_q_rows_buf.resize(n);
+
+    ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched.get(), ids);
+    ggml_backend_t q_backend   = ggml_backend_sched_get_tensor_backend(sched.get(), q);
+    GGML_ASSERT(ids_backend && q_backend);
+    ggml_backend_tensor_get_async(ids_backend, ids,
+            dflash_candidate_ids_buf.data(), 0, n * sizeof(int32_t));
+    ggml_backend_tensor_get_async(q_backend, q,
+            dflash_q_rows_buf.data(), 0, n * sizeof(float));
+}
+
+bool llama_context::get_dflash_proposal(
+        const int32_t ** candidate_ids,
+        const float   ** q_rows,
+        int32_t * top_k,
+        int32_t * n_steps,
+        int32_t * n_blocks) {
+    if (dflash_candidate_ids_buf.empty() || dflash_q_rows_buf.empty()) {
+        return false;
+    }
+    *candidate_ids = dflash_candidate_ids_buf.data();
+    *q_rows = dflash_q_rows_buf.data();
+    *top_k = dflash_proposal_top_k;
+    *n_steps = dflash_proposal_n_steps;
+    *n_blocks = dflash_proposal_n_blocks;
+    return true;
+}
+
+void llama_context::set_dflash_proposal_uniforms(
+        llama_seq_id seq_id,
+        const float * values,
+        int32_t n) {
+    cross.dflash_proposal_uniforms[seq_id].assign(values, values + n);
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -1722,6 +1782,17 @@ void llama_context::set_dflash_target_argmax(bool enable) {
         return;
     }
     cparams.dflash_target_argmax = enable;
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+void llama_context::set_dflash_target_mmq_batch(int32_t n_tokens) {
+    GGML_ASSERT(n_tokens >= 0);
+    if (cparams.dflash_target_mmq_batch == n_tokens) {
+        return;
+    }
+    cparams.dflash_target_mmq_batch = n_tokens;
     if (gf_res_prev) {
         gf_res_prev->reset();
     }
@@ -4071,6 +4142,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     logits_argmax_prob_buf.clear();
     logits_argmax_count = 0;
     logits_argmax_k = 1;
+    clear_dflash_proposal();
 
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -4174,6 +4246,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         logits_argmax_count = n_tokens;
         logits_argmax_k = K;
     }
+    extract_dflash_proposal(res);
 
     // extract logits (skip if GPU argmax available)
     if (logits.data && t_logits && !t_argmax_enc) {
@@ -4421,6 +4494,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     logits_argmax_prob_buf.clear();
     logits_argmax_count = 0;
     logits_argmax_k = 1;
+    clear_dflash_proposal();
 
      if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -4804,6 +4878,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             logits_argmax_count = n_outputs_prev + n_outputs;
             logits_argmax_k = K;
         }
+        extract_dflash_proposal(res);
 
         // extract logits (skip if argmax is available and no one needs raw logits)
         if (logits.data && t_logits && n_outputs > 0 && !t_argmax && needs_raw_logits(ubatch, sampling.samplers)) {
@@ -5296,6 +5371,13 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    // The DFlash2 selector builds a conditional K-way lattice for every block.
+    // Its graph grows with the evaluated block count, unlike ordinary DFlash's
+    // fixed transformer graph. Keep enough metadata for the selector's additional
+    // views and per-step path walk.
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash2_selector_rank > 0) {
+        return std::max<uint32_t>(1024u + 64u * n_tokens, 8u * model.n_tensors());
+    }
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
@@ -7065,6 +7147,29 @@ float * llama_get_logits_argmax_probs(llama_context * ctx) {
 
 bool llama_get_logits_argmax_gpu(llama_context * ctx) {
     return ctx->get_logits_argmax_gpu();
+}
+
+bool llama_get_dflash_proposal(
+        llama_context * ctx,
+        llama_dflash_proposal_view * view) {
+    if (!ctx || !view) {
+        return false;
+    }
+    ctx->synchronize();
+    return ctx->get_dflash_proposal(
+            &view->candidate_ids, &view->q_rows,
+            &view->top_k, &view->n_steps, &view->n_blocks);
+}
+
+void llama_set_dflash_proposal_uniforms(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        const float * values,
+        int32_t n) {
+    if (!ctx || seq_id < 0 || !values || n <= 0) {
+        return;
+    }
+    ctx->set_dflash_proposal_uniforms(seq_id, values, n);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

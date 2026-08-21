@@ -723,7 +723,7 @@ class DFlashModel(Qwen3Model):
         return super().filter_tensors((name, gen))
 
 
-@ModelBase.register("Qwen3DSparkModel")
+@ModelBase.register("Qwen3DSparkModel", "DSparkDraftModel")
 class DSparkModel(DFlashModel):
     # DSpark = DFlash + a semi-autoregressive Markov head
     model_arch = gguf.MODEL_ARCH.DFLASH
@@ -741,3 +741,33 @@ class DSparkModel(DFlashModel):
         if name.endswith(("embed_tokens.weight", "lm_head.weight")):
             return None
         return super().filter_tensors((name, gen))
+
+
+@ModelBase.register("DFlash2DraftModel")
+class DFlash2Model(DFlashModel):
+    """Qwen DFlash2: DFlash backbone plus local convolutions and path selector."""
+
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        dflash_config = self.hparams.get("dflash_config", {})
+        self.hparams["block_size"] = int(dflash_config["block_size"])
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        cfg = self.hparams["dflash_config"]
+        arch = self.gguf_writer.arch
+        self.gguf_writer.add_uint32(f"{arch}.conv_kernel_size", int(cfg["conv_kernel_size"]))
+        self.gguf_writer.add_uint32(f"{arch}.conv_group_size", int(cfg["conv_group_size"]))
+        self.gguf_writer.add_uint32(f"{arch}.selector_rank", int(cfg["selector_rank"]))
+        self.gguf_writer.add_uint32(f"{arch}.selector_top_k", int(cfg["selector_top_k"]))
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # These are learned BF16 parameters, but their upstream names do not end
+        # in `.weight`; without an override the generic converter promotes them
+        # to F32. F16 preserves their source precision without doubling the two
+        # vocabulary-sized selector codebooks.
+        if name.endswith(("_codebook", ".base_kernel")):
+            return gguf.GGMLQuantizationType.F16
+        return super().tensor_force_quant(name, new_name, bid, n_dims)

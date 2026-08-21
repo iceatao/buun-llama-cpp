@@ -290,6 +290,17 @@ struct llama_context {
     float   * get_logits_argmax_probs();
     bool      get_logits_argmax_gpu();
 
+    bool get_dflash_proposal(
+            const int32_t ** candidate_ids,
+            const float   ** q_rows,
+            int32_t * top_k,
+            int32_t * n_steps,
+            int32_t * n_blocks);
+    void set_dflash_proposal_uniforms(
+            llama_seq_id seq_id,
+            const float * values,
+            int32_t n);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -640,6 +651,7 @@ public:
     void set_dflash_topk(int k);
     void set_dflash_argmax(bool enable);
     void set_dflash_target_argmax(bool enable);
+    void set_dflash_target_mmq_batch(int32_t n_tokens);
     void set_dflash_fused_inject(bool enable);
 
     // upstream drafter device-staged capture (this ctx = target): allocate the
@@ -722,6 +734,15 @@ public:
     // whether the last argmax/top-K tail ran on a GPU backend (only the GPU kernels
     // implement the extended ids + log-probs layout; the CPU kernel does not)
     bool logits_argmax_gpu = false;
+
+    std::vector<int32_t> dflash_candidate_ids_buf;
+    std::vector<float>   dflash_q_rows_buf;
+    int32_t dflash_proposal_top_k   = 0;
+    int32_t dflash_proposal_n_steps = 0;
+    int32_t dflash_proposal_n_blocks = 0;
+
+    void clear_dflash_proposal();
+    void extract_dflash_proposal(const llm_graph_result * res);
 
     // upstream drafter device-staged capture (target ctx)
     ggml_context_ptr           dflash_stage_ctx;

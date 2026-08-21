@@ -10,6 +10,107 @@ using namespace cub;
 #    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
 #endif      // GGML_CUDA_USE_CUB
 
+static constexpr int stable_top_k_chunk = 4096;
+
+static __global__ void stable_top_k_collect_ties(
+        const float * src,
+        const int * dst,
+        int * tie_ids,
+        int * tie_counts,
+        int ncols,
+        int k,
+        int n_chunks) {
+    const int work = blockIdx.x;
+    const int row = work / n_chunks;
+    const int chunk = work - row * n_chunks;
+    const float * row_src = src + row * ncols;
+    const int * row_dst = dst + row * k;
+    const int lane = threadIdx.x;
+
+    float threshold = FLT_MAX;
+    if (lane == 0) {
+        for (int i = 0; i < k; ++i) {
+            threshold = min(threshold, row_src[row_dst[i]]);
+        }
+    }
+    threshold = __shfl_sync(0xffffffffULL, threshold, 0);
+
+    const int begin = chunk * stable_top_k_chunk;
+    const int end = min(begin + stable_top_k_chunk, ncols);
+    int stored = 0;
+    int * out = tie_ids + (size_t) work * k;
+    for (int base = begin; base < end; base += warpSize) {
+        const int id = base + lane;
+        const unsigned long long mask = __ballot_sync(0xffffffffULL,
+                id < end && row_src[id] == threshold);
+        const int n_match = __popcll(mask);
+        const int rank = __popcll(mask & ((1ULL << lane) - 1ULL));
+        if ((mask & (1ULL << lane)) && stored + rank < k) {
+            out[stored + rank] = id;
+        }
+        stored += n_match;
+    }
+    if (lane == 0) {
+        tie_counts[work] = min(stored, k);
+    }
+}
+
+static __global__ void stable_top_k_finalize(
+        const float * src,
+        int * dst,
+        const int * tie_ids,
+        const int * tie_counts,
+        int ncols,
+        int k,
+        int n_chunks) {
+    const int row = blockIdx.x;
+    const float * row_src = src + row * ncols;
+    int * row_dst = dst + row * k;
+    __shared__ int ids[64];
+
+    if (threadIdx.x == 0) {
+        float threshold = FLT_MAX;
+        for (int i = 0; i < k; ++i) {
+            threshold = min(threshold, row_src[row_dst[i]]);
+        }
+
+        int n_ids = 0;
+        for (int i = 0; i < k; ++i) {
+            const int id = row_dst[i];
+            if (row_src[id] > threshold) {
+                ids[n_ids++] = id;
+            }
+        }
+        for (int chunk = 0; chunk < n_chunks && n_ids < k; ++chunk) {
+            const int work = row * n_chunks + chunk;
+            const int n_ties = tie_counts[work];
+            const int * chunk_ids = tie_ids + (size_t) work * k;
+            for (int i = 0; i < n_ties && n_ids < k; ++i) {
+                ids[n_ids++] = chunk_ids[i];
+            }
+        }
+
+        for (int i = 1; i < k; ++i) {
+            const int id = ids[i];
+            const float value = row_src[id];
+            int j = i - 1;
+            while (j >= 0) {
+                const int prev_id = ids[j];
+                const float prev = row_src[prev_id];
+                if (prev > value || (prev == value && prev_id < id)) {
+                    break;
+                }
+                ids[j + 1] = prev_id;
+                --j;
+            }
+            ids[j + 1] = id;
+        }
+        for (int i = 0; i < k; ++i) {
+            row_dst[i] = ids[i];
+        }
+    }
+}
+
 #ifdef CUB_TOP_K_AVAILABLE
 
 static void top_k_cub(ggml_cuda_pool & pool,
@@ -24,10 +125,9 @@ static void top_k_cub(ggml_cuda_pool & pool,
     auto env          = cuda::std::execution::env{ stream_env, requirements };
 
     auto indexes_in = cuda::make_counting_iterator(0);
-
     size_t temp_storage_bytes = 0;
-    CUDA_CHECK(DeviceTopK::MaxPairs(nullptr, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst, ncols, k,
-                         env));
+    CUDA_CHECK(DeviceTopK::MaxPairs(nullptr, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst, ncols,
+                         k, env));
 
     ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
     void *                        d_temp_storage = temp_storage_alloc.get();
@@ -62,7 +162,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    ncols = src0->ne[0];
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
+    const bool       stable = ggml_top_k_is_stable(dst);
     ggml_cuda_pool & pool  = ctx.pool();
+    GGML_ASSERT(!stable || k <= 64);
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
@@ -102,4 +204,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
                                  cudaMemcpyDeviceToDevice, stream));
 #endif
+    if (stable) {
+        const int n_chunks = (ncols + stable_top_k_chunk - 1) / stable_top_k_chunk;
+        const size_t n_work = (size_t) nrows * n_chunks;
+        ggml_cuda_pool_alloc<int> tie_ids_alloc(pool, n_work * k);
+        ggml_cuda_pool_alloc<int> tie_counts_alloc(pool, n_work);
+        stable_top_k_collect_ties<<<n_work, WARP_SIZE, 0, stream>>>(
+                (const float *) src0->data, (const int *) dst->data,
+                tie_ids_alloc.get(), tie_counts_alloc.get(), ncols, k, n_chunks);
+        stable_top_k_finalize<<<nrows, 1, 0, stream>>>(
+                (const float *) src0->data, (int *) dst->data,
+                tie_ids_alloc.get(), tie_counts_alloc.get(), ncols, k, n_chunks);
+    }
 }

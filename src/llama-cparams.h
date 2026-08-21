@@ -95,6 +95,11 @@ struct llama_cparams {
     // deliberately ignores the drafter's temperature/top-K controls.
     bool dflash_target_argmax = false;
 
+    // DFlash2 target verification can prefer CUDA's MMA-backed quantized
+    // matrix path for one exact width during an explicitly marked verify
+    // submission. Zero keeps ordinary dispatch.
+    int32_t dflash_target_mmq_batch = 0;
+
     // Upstream block-diffusion drafter: fused encoder+injection. Decode embd batches
     // carry raw concatenated target features (n_embd_inp_enc wide); the injection graph
     // applies fc + enc-norm itself, replacing the separate llama_encode round-trip.

@@ -196,6 +196,22 @@ class TensorNameMap:
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
+        MODEL_TENSOR.DFLASH2_ATTN_CONV_BASE: (
+            "model.layers.{bid}.attention_conv.base_kernel",
+        ),
+
+        MODEL_TENSOR.DFLASH2_ATTN_CONV_PROJ: (
+            "model.layers.{bid}.attention_conv.kernel_projection",
+        ),
+
+        MODEL_TENSOR.DFLASH2_FFN_CONV_BASE: (
+            "model.layers.{bid}.mlp_conv.base_kernel",
+        ),
+
+        MODEL_TENSOR.DFLASH2_FFN_CONV_PROJ: (
+            "model.layers.{bid}.mlp_conv.kernel_projection",
+        ),
+
         # Attention norm
         MODEL_TENSOR.ATTN_NORM: (
             "gpt_neox.layers.{bid}.input_layernorm",                # gptneox
@@ -1330,6 +1346,18 @@ class TensorNameMap:
 
         MODEL_TENSOR.DSPARK_CONF_PROJ: (
             "model.confidence_head.proj", # dspark
+        ),
+
+        MODEL_TENSOR.DFLASH2_SELECTOR_HIDDEN: (
+            "model.candidate_selector.hidden_projection", # dflash2
+        ),
+
+        MODEL_TENSOR.DFLASH2_SELECTOR_PRED: (
+            "model.candidate_selector.predecessor_codebook", # dflash2
+        ),
+
+        MODEL_TENSOR.DFLASH2_SELECTOR_SUCC: (
+            "model.candidate_selector.successor_codebook", # dflash2
         ),
 
         MODEL_TENSOR.CLS: (

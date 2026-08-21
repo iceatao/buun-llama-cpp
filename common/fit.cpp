@@ -309,7 +309,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         common_vbr_fit_costs * vbr_costs = nullptr,
         bool plan_hint = false,
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
-        llama_context * ctx_parent = nullptr) {
+        llama_context * ctx_parent = nullptr,
+        bool share_parent_tensors = false) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -324,6 +325,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_context_params cparams_copy = *cparams;
     if (ctx_parent != nullptr) {
         cparams_copy.ctx_other = ctx_parent;
+        if (share_parent_tensors) {
+            // DFlash/DSpark sidecars omit the target embedding and output tensors.
+            // Mirror the real-load share-or-gather step before reserving their graph;
+            // a tensor-sharded parent's Meta tensors cannot execute in the ordinary
+            // (layer-split or pinned) draft scheduler.
+            llama_model_share_tensors(model.get(), llama_get_model(ctx_parent));
+        }
     }
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), cparams_copy));
@@ -507,7 +515,8 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool share_parent_tensors) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_parent_copy = *mparams_parent;
@@ -526,7 +535,7 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
 
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
-            log_level, nullptr, ctx_parent.get());
+            log_level, nullptr, false, nullptr, ctx_parent.get(), share_parent_tensors);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {

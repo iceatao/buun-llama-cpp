@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -305,8 +307,78 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+static llama_token_data_array make_distribution(
+        std::vector<llama_token_data> & storage,
+        const std::vector<float> &      probabilities) {
+    storage.clear();
+    storage.reserve(probabilities.size());
+    for (llama_token id = 0; id < (llama_token) probabilities.size(); ++id) {
+        storage.push_back({ id, 0.0f, probabilities[id] });
+    }
+    return { storage.data(), storage.size(), -1, false };
+}
+
+static void test_speculative_coupling() {
+    std::vector<llama_token_data> storage;
+
+    {
+        auto p = make_distribution(storage, { 0.2f, 0.8f });
+        const int32_t q_ids[] = { 0, 1 };
+        const float q[] = { 0.2f, 0.8f };
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 0, q_ids, q, 2) == 1.0);
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 1, q_ids, q, 2) == 1.0);
+    }
+
+    {
+        auto p = make_distribution(storage, { 0.2f, 0.8f });
+        const int32_t q_ids[] = { 0, 1 };
+        const float q[] = { 0.4f, 0.6f };
+        GGML_ASSERT(std::abs(common_sampler_speculative_acceptance_probability(&p, 0, q_ids, q, 2) - 0.5) < 1e-6);
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 1, q_ids, q, 2) == 1.0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 2, 0.0) == 1);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 2, 0.999999) == 1);
+    }
+
+    {
+        // The supports need not overlap. A rejected q-only proposal samples p.
+        auto p = make_distribution(storage, { 0.25f, 0.75f, 0.0f });
+        const int32_t q_ids[] = { 2 };
+        const float q[] = { 1.0f };
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 2, q_ids, q, 1) == 0.0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 1, 0.0) == 0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 1, 0.249999) == 0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 1, 0.25) == 1);
+    }
+
+    {
+        // K=16 and sparse q IDs outside p exercise the same O(V + K) path.
+        auto p = make_distribution(storage, { 0.4f, 0.3f, 0.2f, 0.1f });
+        const int32_t q_ids[] = { 0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 };
+        const float q[] = { 0.1f, 0.4f, 0.5f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 0, q_ids, q, 16) == 1.0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 16, 0.0) == 0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 16, 0.500001) == 2);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 16, 0.999999) == 3);
+    }
+
+    {
+        auto p = make_distribution(storage, { 0.5f, 0.5f });
+        const int32_t q_ids[] = { 0, 0 };
+        const float q[] = { 0.5f, 0.5f };
+        bool threw = false;
+        try {
+            common_sampler_speculative_sample_residual(&p, q_ids, q, 2, 0.5);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        GGML_ASSERT(threw);
+    }
+}
+
 int main(void) {
     ggml_time_init();
+
+    test_speculative_coupling();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

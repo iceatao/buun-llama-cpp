@@ -247,6 +247,12 @@ struct llama_layer {
     struct ggml_tensor * ssm_b_norm      = nullptr;
     struct ggml_tensor * ssm_c_norm      = nullptr;
 
+    // DFlash2 learned grouped-convolution parameters.
+    struct ggml_tensor * dflash2_attn_conv_base = nullptr;
+    struct ggml_tensor * dflash2_attn_conv_proj = nullptr;
+    struct ggml_tensor * dflash2_ffn_conv_base  = nullptr;
+    struct ggml_tensor * dflash2_ffn_conv_proj  = nullptr;
+
     // attention
     struct ggml_tensor * wq        = nullptr;
     struct ggml_tensor * wk        = nullptr;
@@ -616,6 +622,11 @@ struct llama_model {
     struct ggml_tensor * dspark_markov_w2   = nullptr;
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
+
+    // DFlash2 path selector.
+    struct ggml_tensor * dflash2_selector_hidden = nullptr;
+    struct ggml_tensor * dflash2_selector_pred   = nullptr;
+    struct ggml_tensor * dflash2_selector_succ   = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;

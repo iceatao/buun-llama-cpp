@@ -102,6 +102,66 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+#### DFlash2
+
+DFlash2 sidecars use the shared `draft-dflash` runtime. Their learned grouped
+convolutions and candidate selector are detected from GGUF metadata. Every
+backbone position and the selector's complete adjacent-candidate score lattice
+run in parallel; only the final path walk is sequential. At nonzero temperature,
+the selector also supplies its proposal probabilities to exact p/q speculative
+verification.
+
+```bash
+python convert_hf_to_gguf.py z-lab/Qwen3.8-27B-DFlash2 \
+    --target-model-dir Qwen/Qwen3.8-27B --outtype q8_0 --outfile Qwen3.8-27B-DFlash2-Q8_0.gguf
+
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
+    -fa on --jinja
+```
+
+The server detects DFlash2 from the sidecar, so `-md` does not require an
+explicit `--spec-type`. Unless `--spec-draft-n-max` is supplied, it also selects
+the sidecar's fastest measured full draft depth. The released Qwen3.8 sidecar
+advertises an eight-position block; the runtime defaults that geometry to the
+faster measured `anchor + 12` block. `--spec-dflash-default` remains a compatible
+spelling. Set
+`GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8` to restore the checkpoint metadata, or use
+another value from 3 through 64 for experimentation:
+
+```bash
+GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8 llama-server \
+    -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
+    -fa on --jinja
+```
+
+The shared driver keeps independent adaptive-depth and proposal state for every
+server slot, and batches armed slots into one drafter decode. The legacy
+`--dflash-max-slots` cap does not apply to it. Tensor-sharded targets are
+supported; the sidecar itself falls back to layer placement and can be pinned
+with `--spec-draft-device`. Adaptive depth is enabled by default; set
+`GGML_DFLASH_DRAFT_ADAPTIVE=0` to hold every cycle at the configured maximum.
+By default, DFlash2 matches the server's resolved main sampling temperature
+(the target GGUF default, or an explicit `--temp`). Use `--spec-draft-temp T`
+to override it; an explicit value of `0` keeps greedy draft proposals. Legacy
+DFlash sidecars retain their greedy default.
+
+CopySpec can be composed with DFlash2 explicitly using
+`--spec-type draft-dflash,copyspec`. It is not enabled automatically: on an RTX
+3090 copy-heavy passage it improved 242.05 to 337.52 t/s, while the standard
+quicksort probe fell from 217.67 to 199.97 t/s. Both fixed-seed comparisons
+produced identical target output. Use the combination for workloads that often
+repeat long spans from their input, not as a general DFlash2 default.
+
+`--mmproj-gpu-swap` can unload and recreate an external DFlash sidecar around
+image encoding. On NVIDIA Ampere, `GGML_DFLASH2_TARGET_MMQ=1` experimentally
+forces MMQ for pure DFlash2 verification batches; benchmark it on the intended
+model and batch width. It can change greedy trajectories at close decisions, so
+ordinary CUDA dispatch remains the default. A DFlash2 selector score is not an
+independent-token probability, so `--spec-draft-p-min` is ignored for these
+sidecars. The learned selector is required model computation, so ordinary DFlash's
+`--no-spec-draft-backend-sampling` and `GGML_DFLASH_DRAFT_GPUSAMPLE=0` controls
+do not disable it.
+
 See:
 
 - #22105

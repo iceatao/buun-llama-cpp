@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -126,10 +127,18 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // Independent randomness for maximal-coupling speculative verification.
+    // The ordinary sampler still runs once per verified row, so all configured
+    // sampler RNGs advance exactly once; these draws choose accept/reject and,
+    // on rejection, the residual p-q distribution.
+    uint32_t speculative_seed;
+    std::mt19937 speculative_rng;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+        speculative_rng.seed(speculative_seed);
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -439,6 +448,14 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    uint32_t speculative_seed = llama_sampler_get_seed(chain);
+    if (speculative_seed == LLAMA_DEFAULT_SEED) {
+        speculative_seed = params.seed;
+    }
+    // Keep the verifier stream distinct from the target sampler stream even
+    // when both originate from the same request seed.
+    speculative_seed ^= 0x9e3779b9U;
+
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .raw_argmax_exact = */ false,
@@ -448,6 +465,8 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .speculative_seed = */ speculative_seed,
+        /* .speculative_rng  = */ std::mt19937(speculative_seed),
     };
 
     int32_t n_suppress = 0;
@@ -576,6 +595,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .speculative_seed = */ gsmpl->speculative_seed,
+        /* .speculative_rng  = */ gsmpl->speculative_rng,
     };
 }
 
@@ -774,6 +795,241 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+static double common_sampler_probability_sum(const llama_token_data_array * distribution) {
+    if (!distribution || distribution->size == 0) {
+        throw std::runtime_error("speculative distribution is empty");
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < distribution->size; ++i) {
+        const float probability = distribution->data[i].p;
+        if (!std::isfinite(probability) || probability < 0.0f) {
+            throw std::runtime_error("speculative distribution contains an invalid probability");
+        }
+        sum += probability;
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        throw std::runtime_error("speculative distribution has zero mass");
+    }
+    return sum;
+}
+
+static double common_sampler_sparse_probability_sum(
+        const float * probabilities,
+        size_t        size) {
+    if (!probabilities || size == 0) {
+        throw std::runtime_error("sparse speculative distribution is empty");
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < size; ++i) {
+        if (!std::isfinite(probabilities[i]) || probabilities[i] < 0.0f) {
+            throw std::runtime_error("sparse speculative distribution contains an invalid probability");
+        }
+        sum += probabilities[i];
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        throw std::runtime_error("sparse speculative distribution has zero mass");
+    }
+    return sum;
+}
+
+double common_sampler_speculative_acceptance_probability(
+        const llama_token_data_array * p,
+        llama_token                    proposed,
+        const int32_t *                q_ids,
+        const float *                  q_probs,
+        size_t                         q_size) {
+    if (!q_ids) {
+        throw std::runtime_error("sparse speculative distribution has no token IDs");
+    }
+
+    const double p_sum = common_sampler_probability_sum(p);
+    const double q_sum = common_sampler_sparse_probability_sum(q_probs, q_size);
+
+    double p_proposed = 0.0;
+    for (size_t i = 0; i < p->size; ++i) {
+        if (p->data[i].id == proposed) {
+            p_proposed = p->data[i].p / p_sum;
+            break;
+        }
+    }
+
+    double q_proposed = 0.0;
+    for (size_t i = 0; i < q_size; ++i) {
+        if (q_ids[i] == proposed) {
+            q_proposed = q_probs[i] / q_sum;
+            break;
+        }
+    }
+    if (!(q_proposed > 0.0)) {
+        throw std::runtime_error("proposed token has no sparse speculative probability");
+    }
+
+    return std::min(1.0, p_proposed / q_proposed);
+}
+
+llama_token common_sampler_speculative_sample_residual(
+        const llama_token_data_array * p,
+        const int32_t *                q_ids,
+        const float *                  q_probs,
+        size_t                         q_size,
+        double                         uniform_draw) {
+    if (!q_ids || !(uniform_draw >= 0.0 && uniform_draw < 1.0)) {
+        throw std::runtime_error("invalid sparse speculative residual input");
+    }
+
+    const double p_sum = common_sampler_probability_sum(p);
+    const double q_sum = common_sampler_sparse_probability_sum(q_probs, q_size);
+
+    std::unordered_map<llama_token, double> q_by_token;
+    q_by_token.reserve(q_size * 2);
+    for (size_t i = 0; i < q_size; ++i) {
+        if (!q_by_token.emplace(q_ids[i], q_probs[i] / q_sum).second) {
+            throw std::runtime_error("sparse speculative distribution contains duplicate token IDs");
+        }
+    }
+
+    const auto residual_weight = [&](const llama_token_data & candidate) {
+        const auto it = q_by_token.find(candidate.id);
+        const double q = it == q_by_token.end() ? 0.0 : it->second;
+        return std::max(0.0, candidate.p / p_sum - q);
+    };
+
+    double residual_sum = 0.0;
+    for (size_t i = 0; i < p->size; ++i) {
+        residual_sum += residual_weight(p->data[i]);
+    }
+    if (!(residual_sum > 0.0) || !std::isfinite(residual_sum)) {
+        throw std::runtime_error("speculative residual distribution is empty after rejection");
+    }
+
+    double threshold = uniform_draw * residual_sum;
+    llama_token fallback = LLAMA_TOKEN_NULL;
+    for (size_t i = 0; i < p->size; ++i) {
+        const double weight = residual_weight(p->data[i]);
+        if (weight > 0.0) {
+            fallback = p->data[i].id;
+        }
+        if (threshold < weight) {
+            return p->data[i].id;
+        }
+        threshold -= weight;
+    }
+
+    // Floating-point rounding can leave the threshold a few ulps above the
+    // cumulative sum. Return the final token with residual mass.
+    if (fallback != LLAMA_TOKEN_NULL) {
+        return fallback;
+    }
+    throw std::runtime_error("failed to sample speculative residual distribution");
+}
+
+bool common_sampler_sample_and_accept_n_q(
+        struct common_sampler *      gsmpl,
+        struct llama_context *       ctx,
+        const std::vector<int> &     idxs,
+        const llama_tokens &         draft,
+        int32_t                      top_k,
+        const std::vector<int32_t> & candidate_ids,
+        const std::vector<float> &   q_rows,
+        size_t                       q_covered,
+        std::vector<llama_token> &   result) {
+    if (!gsmpl || !ctx || idxs.size() != draft.size() + 1 ||
+            top_k <= 0 || q_covered == 0 || q_covered > draft.size() ||
+            candidate_ids.size() != q_covered * (size_t) top_k ||
+            q_rows.size() != candidate_ids.size()) {
+        return false;
+    }
+
+    // These selectors update persistent adaptation state from the token they
+    // sampled inside apply(). Maximal coupling can choose a different token,
+    // so using their prepared distribution would corrupt that state. All
+    // ordinary truncation, penalty, XTC, grammar, and reasoning-budget paths
+    // update either before selection or from the subsequently accepted token.
+    if (gsmpl->params.mirostat != 0 ||
+            std::find(gsmpl->params.samplers.begin(), gsmpl->params.samplers.end(),
+                COMMON_SAMPLER_TYPE_ADAPTIVE_P) != gsmpl->params.samplers.end()) {
+        return false;
+    }
+
+    // Reject malformed q before advancing any sampler state. Duplicate IDs
+    // would make the sparse subtraction ambiguous, and every actually emitted
+    // draft token must have positive proposal mass in its row.
+    constexpr double q_sum_tol = 2e-4;
+    for (size_t row = 0; row < q_covered; ++row) {
+        double sum = 0.0;
+        bool found = false;
+        for (int32_t k = 0; k < top_k; ++k) {
+            const size_t i = row * (size_t) top_k + k;
+            const float q = q_rows[i];
+            if (candidate_ids[i] < 0 || !std::isfinite(q) || q < 0.0f) {
+                return false;
+            }
+            for (int32_t j = 0; j < k; ++j) {
+                if (candidate_ids[i] == candidate_ids[row * (size_t) top_k + j]) {
+                    return false;
+                }
+            }
+            sum += q;
+            found |= candidate_ids[i] == draft[row] && q > 0.0f;
+        }
+        if (!found || std::abs(sum - 1.0) > q_sum_tol) {
+            return false;
+        }
+    }
+
+    auto uniform = [&]() {
+        return std::generate_canonical<double, 53>(gsmpl->speculative_rng);
+    };
+
+    result.clear();
+    result.reserve(draft.size() + 1);
+
+    for (size_t row = 0; row < draft.size(); ++row) {
+        if (row >= q_covered) {
+            const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[row], true);
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+            if (id != draft[row]) {
+                return true;
+            }
+            continue;
+        }
+
+        // Run the real target sampler once. This both produces the fully
+        // transformed target distribution p (including grammar) and advances
+        // each configured sampler RNG once, just as non-speculative sampling
+        // would. The sampled token itself is only a discarded coupling draw.
+        common_sampler_sample(gsmpl, ctx, idxs[row], true);
+        const llama_token_data_array * p_data = common_sampler_get_candidates(gsmpl, false);
+        if (!p_data || p_data->size == 0) {
+            throw std::runtime_error("target sampler produced an empty speculative distribution");
+        }
+
+        const size_t q_off = row * (size_t) top_k;
+        const llama_token proposed = draft[row];
+        const double accept_p = common_sampler_speculative_acceptance_probability(
+                p_data, proposed, candidate_ids.data() + q_off, q_rows.data() + q_off, top_k);
+        llama_token id = proposed;
+        if (uniform() >= accept_p) {
+            id = common_sampler_speculative_sample_residual(
+                    p_data, candidate_ids.data() + q_off, q_rows.data() + q_off, top_k, uniform());
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        if (id != proposed) {
+            return true;
+        }
+    }
+
+    const llama_token bonus = common_sampler_sample(gsmpl, ctx, idxs[draft.size()], true);
+    common_sampler_accept(gsmpl, bonus, true);
+    result.push_back(bonus);
+    return true;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

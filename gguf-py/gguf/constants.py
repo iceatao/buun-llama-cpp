@@ -1075,6 +1075,13 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
     DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
     DSPARK_CONF_PROJ       = auto()  # confidence head
+    DFLASH2_SELECTOR_HIDDEN = auto() # candidate selector hidden projection
+    DFLASH2_SELECTOR_PRED   = auto() # candidate selector predecessor codebook
+    DFLASH2_SELECTOR_SUCC   = auto() # candidate selector successor codebook
+    DFLASH2_ATTN_CONV_BASE  = auto() # per-layer attention convolution base kernel
+    DFLASH2_ATTN_CONV_PROJ  = auto() # per-layer attention convolution coefficient projection
+    DFLASH2_FFN_CONV_BASE   = auto() # per-layer MLP convolution base kernel
+    DFLASH2_FFN_CONV_PROJ   = auto() # per-layer MLP convolution coefficient projection
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1780,6 +1787,13 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
+    MODEL_TENSOR.DFLASH2_SELECTOR_HIDDEN:    "selector.hidden_proj",
+    MODEL_TENSOR.DFLASH2_SELECTOR_PRED:      "selector.pred_codebook",
+    MODEL_TENSOR.DFLASH2_SELECTOR_SUCC:      "selector.succ_codebook",
+    MODEL_TENSOR.DFLASH2_ATTN_CONV_BASE:     "blk.{bid}.attn_conv.base",
+    MODEL_TENSOR.DFLASH2_ATTN_CONV_PROJ:     "blk.{bid}.attn_conv.proj",
+    MODEL_TENSOR.DFLASH2_FFN_CONV_BASE:      "blk.{bid}.ffn_conv.base",
+    MODEL_TENSOR.DFLASH2_FFN_CONV_PROJ:      "blk.{bid}.ffn_conv.proj",
     MODEL_TENSOR.D2T:                       "d2t",
 }
 
@@ -4653,6 +4667,14 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DSPARK_MARKOV_W1,
         MODEL_TENSOR.DSPARK_MARKOV_W2,
         MODEL_TENSOR.DSPARK_CONF_PROJ,
+        # optional DFlash2 local-convolution and candidate-selector weights
+        MODEL_TENSOR.DFLASH2_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DFLASH2_SELECTOR_PRED,
+        MODEL_TENSOR.DFLASH2_SELECTOR_SUCC,
+        MODEL_TENSOR.DFLASH2_ATTN_CONV_BASE,
+        MODEL_TENSOR.DFLASH2_ATTN_CONV_PROJ,
+        MODEL_TENSOR.DFLASH2_FFN_CONV_BASE,
+        MODEL_TENSOR.DFLASH2_FFN_CONV_PROJ,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,

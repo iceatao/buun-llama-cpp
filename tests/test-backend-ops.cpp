@@ -4033,6 +4033,50 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_DFLASH2_CONV
+struct test_dflash2_conv : public test_case {
+    const ggml_type base_type;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int32_t group_size;
+    const int32_t block_size;
+    const int32_t side;
+
+    test_dflash2_conv(
+            ggml_type base_type,
+            int64_t n_embd,
+            int64_t n_tokens,
+            int32_t group_size,
+            int32_t block_size,
+            int32_t side) :
+        base_type(base_type), n_embd(n_embd), n_tokens(n_tokens),
+        group_size(group_size), block_size(block_size), side(side) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(base_type, n_embd, n_tokens, group_size, block_size, side);
+    }
+
+    double max_nmse_err() override {
+        return 1e-12;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(n_embd % group_size == 0);
+        const int64_t n_groups = n_embd / group_size;
+        ggml_tensor * hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * projected = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*n_groups, n_tokens);
+        ggml_tensor * base = ggml_new_tensor_3d(ctx, base_type, n_embd, 2, 2);
+        ggml_set_name(hidden, "hidden");
+        ggml_set_name(projected, "projected");
+        ggml_set_name(base, "base");
+
+        ggml_tensor * out = ggml_dflash2_conv(
+                ctx, hidden, projected, base, side, group_size, block_size);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -6027,16 +6071,17 @@ struct test_top_k : public test_case {
     const std::array<int64_t, 4> ne;
     const int k;
     const bool ties;
+    const bool stable;
     ggml_tensor * input {};
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, k, ties);
+        return VARS_TO_STR5(type, ne, k, ties, stable);
     }
 
     test_top_k(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            int k = 4, bool ties = false)
-        : type(type), ne(ne), k(k), ties(ties) {}
+            int k = 4, bool ties = false, bool stable = false)
+        : type(type), ne(ne), k(k), ties(ties), stable(stable) {}
 
     double max_err() override {
         return 0.0;
@@ -6052,7 +6097,7 @@ struct test_top_k : public test_case {
         // can be different but the input values they correspond to should be
         // the same. The logic for ties could work for non-ties, but only for
         // the output tensor, not for the sentinel tensors.
-        if (ties) {
+        if (ties && !stable) {
             std::vector<float> src(ggml_nelements(input));
 
             ggml_backend_tensor_get(input, src.data(), 0, ggml_nelements(input) * ggml_type_size(type));
@@ -6114,7 +6159,7 @@ struct test_top_k : public test_case {
         // Save 'a' for err()
         input = a;
 
-        ggml_tensor * out = ggml_top_k(ctx, a, k);
+        ggml_tensor * out = ggml_top_k_ext(ctx, a, k, stable);
         ggml_set_name(out, "out");
 
         return out;
@@ -8270,6 +8315,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
 
+    for (ggml_type base_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_dflash2_conv(base_type, 80,  8, 16,  8, 0));
+        test_cases.emplace_back(new test_dflash2_conv(base_type, 80, 13, 16, 13, 1));
+        test_cases.emplace_back(new test_dflash2_conv(base_type, 80, 26, 16, 13, 0));
+        test_cases.emplace_back(new test_dflash2_conv(base_type, 80, 19, 16, 13, 1));
+    }
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_clamp_swiglu_fusion(type, { 128, 2, 2, 2 }));
@@ -9566,6 +9618,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
+        }
+    }
+    for (int64_t n : {4095, 4096, 4097, 16385}) {
+        for (int k : {1, 16, 64}) {
+            test_cases.emplace_back(new test_top_k(
+                    GGML_TYPE_F32, {n, 7, 1, 1}, k, true, true));
         }
     }
     for (int i = 0; i < 20; ++i) {

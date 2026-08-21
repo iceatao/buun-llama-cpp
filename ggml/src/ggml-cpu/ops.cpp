@@ -8421,8 +8421,9 @@ void ggml_compute_forward_argsort(
 
 struct cmp_top_k {
     const float * data;
+    bool stable;
     bool operator()(int32_t a, int32_t b) const {
-        return data[a] > data[b];
+        return data[a] != data[b] ? data[a] > data[b] : stable && a < b;
     }
 };
 
@@ -8442,6 +8443,7 @@ static void ggml_compute_forward_top_k_f32(
     const int64_t nr = ggml_nrows(src0);
 
     const int top_k = ne0;
+    const bool stable = ggml_top_k_is_stable(dst);
 
     int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
@@ -8452,14 +8454,14 @@ static void ggml_compute_forward_top_k_f32(
             tmp[j] = j;
         }
 
-        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data});
+        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data, stable});
 
         int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
 
         std::copy(tmp, tmp + top_k, dst_data);
 
         // emphasize that the order is not important
-        if (top_k > 1) {
+        if (!stable && top_k > 1) {
             std::swap(dst_data[0], dst_data[1]);
         }
     }
@@ -11701,6 +11703,44 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+void ggml_compute_forward_dflash2_conv(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * hidden    = dst->src[0];
+    const ggml_tensor * projected = dst->src[1];
+    const ggml_tensor * base      = dst->src[2];
+    GGML_ASSERT(hidden->type == GGML_TYPE_F32 && projected->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(hidden) && ggml_is_contiguous(projected) && ggml_is_contiguous(base));
+
+    const int32_t side       = ggml_get_op_params_i32(dst, 0);
+    const int32_t group_size = ggml_get_op_params_i32(dst, 1);
+    const int32_t block_size = ggml_get_op_params_i32(dst, 2);
+    const int64_t n_embd     = hidden->ne[0];
+    const int64_t n_groups   = n_embd / group_size;
+    const int64_t n_coeff    = 4*n_groups;
+    const int64_t begin      = (ggml_nelements(dst)*params->ith)/params->nth;
+    const int64_t end        = (ggml_nelements(dst)*(params->ith + 1))/params->nth;
+
+    const float * x     = (const float *) hidden->data;
+    const float * delta = (const float *) projected->data;
+    float * y           = (float *) dst->data;
+    for (int64_t i = begin; i < end; ++i) {
+        const int64_t token = i / n_embd;
+        const int64_t ch    = i - token*n_embd;
+        const int64_t group = ch / group_size;
+        const int64_t dbase = token*n_coeff + side*2*n_groups + group;
+        const int64_t bbase = side*2*n_embd + ch;
+        const float b0 = base->type == GGML_TYPE_F16
+            ? GGML_FP16_TO_FP32(((const ggml_fp16_t *) base->data)[bbase])
+            : ((const float *) base->data)[bbase];
+        const float b1 = base->type == GGML_TYPE_F16
+            ? GGML_FP16_TO_FP32(((const ggml_fp16_t *) base->data)[bbase + n_embd])
+            : ((const float *) base->data)[bbase + n_embd];
+        const float prev = token % block_size ? x[i - n_embd] : 0.0f;
+        y[i] = (b0 + delta[dbase])*x[i] + (b1 + delta[dbase + n_groups])*prev;
     }
 }
 

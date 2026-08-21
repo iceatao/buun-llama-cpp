@@ -99,6 +99,38 @@ std::vector<llama_token> common_sampler_accept_draft(
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// Distribution-preserving speculative verification for a sparse proposal q.
+// The first q_covered rows describe draft[0..q_covered), each as top_k token
+// IDs followed by its normalized probabilities. Returns false without touching
+// sampler state when the configured target sampler is not supported.
+bool common_sampler_sample_and_accept_n_q(
+        struct common_sampler *      gsmpl,
+        struct llama_context *       ctx,
+        const std::vector<int> &     idxs,
+        const llama_tokens &         draft,
+        int32_t                      top_k,
+        const std::vector<int32_t> & candidate_ids,
+        const std::vector<float> &   q_rows,
+        size_t                       q_covered,
+        std::vector<llama_token> &   result);
+
+// Pure distribution helpers used by sparse-q speculative verification. The
+// proposal arrays contain one row of unique token IDs and non-negative masses;
+// neither p nor q has to be pre-normalized.
+double common_sampler_speculative_acceptance_probability(
+        const llama_token_data_array * p,
+        llama_token                    proposed,
+        const int32_t *                q_ids,
+        const float *                  q_probs,
+        size_t                         q_size);
+
+llama_token common_sampler_speculative_sample_residual(
+        const llama_token_data_array * p,
+        const int32_t *                q_ids,
+        const float *                  q_probs,
+        size_t                         q_size,
+        double                         uniform_draw);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // returns true if grammar is actively constraining output (for lazy grammars, only after trigger fired)

@@ -182,6 +182,10 @@ struct llama_hparams {
     uint32_t dflash_n_target_features = 25600;
     uint32_t dflash_n_target_layers   = 0;
     uint32_t dflash_target_layer_ids[8] = {};
+    uint32_t dflash2_conv_kernel_size = 0;
+    uint32_t dflash2_conv_group_size  = 0;
+    uint32_t dflash2_selector_rank     = 0;
+    uint32_t dflash2_selector_top_k    = 0;
 
     bool ssm_dt_b_c_rms = false;
 

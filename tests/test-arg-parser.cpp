@@ -200,9 +200,23 @@ static void test(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+    assert(params.speculative.draft.n_max_set);
+
+    {
+        common_params draft_temp_params;
+        assert(draft_temp_params.speculative.sample_temp == 0.0f);
+        assert(!draft_temp_params.speculative.sample_temp_set);
+
+        argv = {"binary_name", "--spec-draft-temp", "0"};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(), draft_temp_params, LLAMA_EXAMPLE_SERVER));
+        assert(draft_temp_params.speculative.sample_temp == 0.0f);
+        assert(draft_temp_params.speculative.sample_temp_set);
+    }
 
     {
         common_params default_params;
+        assert(!default_params.speculative.draft.n_max_set);
         assert(default_params.speculative.draft.mtp_vocab_size == 0);
     }
 
