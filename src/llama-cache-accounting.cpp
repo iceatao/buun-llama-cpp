@@ -1011,6 +1011,19 @@ llama_cache_acct_ledger::release_set_if_serial(
     if (state.serial != expected_serial) {
         return llama_cache_conditional_release_status::serial_conflict;
     }
+    return release_set_locked(selected);
+}
+
+llama_cache_conditional_release_status
+llama_cache_acct_ledger::release_set_current(
+        const std::vector<llama_cache_acct_op_id> & selected) noexcept {
+    std::lock_guard<std::mutex> lock(mtx);
+    return release_set_locked(selected);
+}
+
+llama_cache_conditional_release_status
+llama_cache_acct_ledger::release_set_locked(
+        const std::vector<llama_cache_acct_op_id> & selected) noexcept {
     // An empty exact union is a valid known-zero release. Live-slot clearing
     // drops logical sequence ownership from fixed pooled KV allocations, so
     // there may be no transactional allocation to discharge. Preserve the

@@ -100,6 +100,9 @@ struct llama_vbr_artifact_catalog::impl {
         std::vector<llama_cache_acct_op_id> operations;
         std::vector<allocation> allocations;
         uint64_t borrow_count = 0;
+        bool host_owned = false;
+        bool retire_pending = false;
+        uint64_t prepared_retire_token = 0;
     };
 
     struct txn_leaf {
@@ -224,10 +227,49 @@ struct llama_vbr_artifact_catalog::impl {
     uint64_t next_artifact = 1;
     uint64_t next_content = 1;
     uint64_t next_lineage = 1;
+    uint64_t next_retire_token = 1;
     uint64_t n_published = 0;
     uint64_t n_adopted = 0;
     uint64_t n_refusals = 0;
     uint64_t n_staging_overlap_refusals = 0;
+
+    void erase_orphan_storage(
+            const std::vector<vbr_unit_version_id> & affected_units,
+            const std::vector<vbr_stash_payload_id> & affected_stashes)
+            noexcept {
+        for (const auto & affected : affected_units) {
+            const auto key = affected.bytes();
+            const bool live = std::any_of(
+                references.begin(), references.end(), [&](const auto & row) {
+                    return std::any_of(
+                        row.second.unit_ids.begin(), row.second.unit_ids.end(),
+                        [&](const auto & id) {
+                            return id.bytes() == key;
+                        });
+                });
+            if (!live) {
+                blobs.erase(key);
+            }
+        }
+        for (const auto & affected : affected_stashes) {
+            if (!affected.valid()) {
+                continue;
+            }
+            const auto key = affected.bytes();
+            const bool live = std::any_of(
+                references.begin(), references.end(), [&](const auto & row) {
+                    return std::any_of(
+                        row.second.stash_ids.begin(),
+                        row.second.stash_ids.end(),
+                        [&](const auto & id) {
+                            return id.valid() && id.bytes() == key;
+                        });
+                });
+            if (!live) {
+                stashes.erase(key);
+            }
+        }
+    }
 };
 
 struct vbr_artifact_package_view::storage {
@@ -237,6 +279,15 @@ struct vbr_artifact_package_view::storage {
     std::vector<vbr_artifact_unit_view> units;
     std::vector<vbr_artifact_companion_view> companions;
     std::vector<vbr_artifact_allocation_view> reference_allocations;
+};
+
+struct vbr_artifact_prepared_retire::impl {
+    llama_vbr_artifact_catalog * owner = nullptr;
+    uint64_t token = 0;
+    std::vector<llama_cache_acct_artifact_id> references;
+    std::vector<vbr_unit_version_id> unit_ids;
+    std::vector<vbr_stash_payload_id> stash_ids;
+    llama_cache_prepared_release_set release;
 };
 
 namespace {
@@ -635,11 +686,71 @@ llama_vbr_artifact_catalog::llama_vbr_artifact_catalog(
         llama_cache_acct_ledger & ledger)
     : impl_(new impl(ledger)) {}
 
+vbr_artifact_prepared_retire::vbr_artifact_prepared_retire() noexcept =
+    default;
+
+vbr_artifact_prepared_retire::vbr_artifact_prepared_retire(
+        vbr_artifact_prepared_retire && other) noexcept
+    : impl_(std::move(other.impl_)) {}
+
+vbr_artifact_prepared_retire &
+vbr_artifact_prepared_retire::operator=(
+        vbr_artifact_prepared_retire && other) noexcept {
+    if (this != &other) {
+        reset();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+
+vbr_artifact_prepared_retire::~vbr_artifact_prepared_retire() {
+    reset();
+}
+
+bool vbr_artifact_prepared_retire::ready() const noexcept {
+    return impl_ && impl_->owner && impl_->token != 0 &&
+           impl_->release.ready();
+}
+
+const llama_cache_acct_release_set_preview &
+vbr_artifact_prepared_retire::preview() const noexcept {
+    static const llama_cache_acct_release_set_preview empty;
+    return ready() ? impl_->release.preview() : empty;
+}
+
+vbr_artifact_prepared_retire_status
+vbr_artifact_prepared_retire::commit() noexcept {
+    if (!ready()) {
+        return vbr_artifact_prepared_retire_status::unavailable;
+    }
+    auto state = std::move(impl_);
+    const auto status = state->owner->commit_owned_retire(
+        state->token, state->references, state->unit_ids,
+        state->stash_ids, state->release);
+    if (status == vbr_artifact_prepared_retire_status::unavailable) {
+        state->owner->cancel_owned_retire(
+            state->token, state->references, state->unit_ids,
+            state->stash_ids, state->release);
+    }
+    return status;
+}
+
+void vbr_artifact_prepared_retire::reset() noexcept {
+    if (impl_ && impl_->owner && impl_->token != 0) {
+        impl_->owner->cancel_owned_retire(
+            impl_->token, impl_->references, impl_->unit_ids,
+            impl_->stash_ids, impl_->release);
+    }
+    impl_.reset();
+}
+
 vbr_artifact_package_view::vbr_artifact_package_view(
         vbr_artifact_package_view && other) noexcept
     : owner_(other.owner_),
-      storage_(std::move(other.storage_)) {
+      storage_(std::move(other.storage_)),
+      host_owned_(other.host_owned_) {
     other.owner_ = nullptr;
+    other.host_owned_ = false;
 }
 
 vbr_artifact_package_view & vbr_artifact_package_view::operator=(
@@ -648,7 +759,9 @@ vbr_artifact_package_view & vbr_artifact_package_view::operator=(
         reset();
         owner_ = other.owner_;
         storage_ = std::move(other.storage_);
+        host_owned_ = other.host_owned_;
         other.owner_ = nullptr;
+        other.host_owned_ = false;
     }
     return *this;
 }
@@ -660,10 +773,12 @@ vbr_artifact_package_view::~vbr_artifact_package_view() {
 void vbr_artifact_package_view::reset() noexcept {
     auto * owner = owner_;
     const auto reference = reference_artifact();
+    const bool host_owned = host_owned_;
     owner_ = nullptr;
+    host_owned_ = false;
     storage_.reset();
     if (owner != nullptr) {
-        owner->release_reference_lease(reference);
+        owner->release_reference_lease(reference, host_owned);
     }
 }
 
@@ -675,6 +790,42 @@ vbr_artifact_package_view::reference_artifact() const noexcept {
 bool vbr_artifact_package_view::accounted_by(
         const llama_cache_acct_ledger * ledger) const noexcept {
     return owner_ != nullptr && storage_ && owner_->accounted_by(ledger);
+}
+
+bool vbr_artifact_package_view::claim_host_ownership() noexcept {
+    if (owner_ == nullptr || !storage_ || host_owned_) {
+        return false;
+    }
+    if (!owner_->claim_host_ownership(storage_->reference)) {
+        return false;
+    }
+    host_owned_ = true;
+    return true;
+}
+
+bool vbr_artifact_package_view::prepare_owned_retire(
+        const std::vector<const vbr_artifact_package_view *> & packages,
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept {
+    out.reset();
+    if (owner_ == nullptr || !storage_ || packages.empty()) {
+        return false;
+    }
+    try {
+        std::vector<llama_cache_acct_artifact_id> references;
+        references.reserve(packages.size());
+        for (const auto * package : packages) {
+            if (!package || package->owner_ != owner_ ||
+                !package->storage_ || !package->host_owned_) {
+                return false;
+            }
+            references.push_back(package->storage_->reference);
+        }
+        return owner_->prepare_owned_retire(
+            references, expected_serial, out);
+    } catch (...) {
+        return false;
+    }
 }
 
 const std::vector<vbr_artifact_portable_topology> &
@@ -2684,7 +2835,9 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
         if (it == impl_->references.end()) {
             return vbr_artifact_resolve_status::not_found;
         }
-        if (it->second.borrow_count == UINT64_MAX) {
+        if (it->second.host_owned || it->second.retire_pending ||
+            it->second.prepared_retire_token != 0 ||
+            it->second.borrow_count == UINT64_MAX) {
             return vbr_artifact_resolve_status::busy;
         }
 
@@ -2765,13 +2918,253 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
     }
 }
 
-void llama_vbr_artifact_catalog::release_reference_lease(
+bool llama_vbr_artifact_catalog::claim_host_ownership(
         llama_cache_acct_artifact_id reference) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto it = impl_->references.find(reference.v);
+        if (it == impl_->references.end() ||
+            it->second.borrow_count != 1 || it->second.host_owned ||
+            it->second.retire_pending ||
+            it->second.prepared_retire_token != 0) {
+            return false;
+        }
+        std::sort(
+            it->second.operations.begin(), it->second.operations.end());
+        if ((!it->second.operations.empty() &&
+             !it->second.operations.front()) ||
+            std::adjacent_find(
+                it->second.operations.begin(),
+                it->second.operations.end()) !=
+                it->second.operations.end()) {
+            return false;
+        }
+        it->second.host_owned = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool llama_vbr_artifact_catalog::prepare_owned_retire(
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) noexcept {
+    out.reset();
+    try {
+        if (references.empty() || expected_serial == 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        std::vector<llama_cache_acct_artifact_id> canonical = references;
+        std::sort(canonical.begin(), canonical.end(),
+            [](const auto & a, const auto & b) { return a.v < b.v; });
+        if (canonical.front().v == 0 ||
+            std::adjacent_find(
+                canonical.begin(), canonical.end(),
+                [](const auto & a, const auto & b) { return a == b; }) !=
+                    canonical.end()) {
+            return false;
+        }
+
+        std::vector<llama_cache_acct_op_id> operations;
+        std::vector<vbr_unit_version_id> unit_ids;
+        std::vector<vbr_stash_payload_id> stash_ids;
+        for (const auto reference : canonical) {
+            const auto it = impl_->references.find(reference.v);
+            if (it == impl_->references.end() || !it->second.host_owned ||
+                it->second.retire_pending ||
+                it->second.prepared_retire_token != 0 ||
+                it->second.borrow_count != 1) {
+                return false;
+            }
+            if (it->second.operations.size() > SIZE_MAX - operations.size()) {
+                return false;
+            }
+            operations.insert(
+                operations.end(), it->second.operations.begin(),
+                it->second.operations.end());
+            unit_ids.insert(
+                unit_ids.end(), it->second.unit_ids.begin(),
+                it->second.unit_ids.end());
+            stash_ids.insert(
+                stash_ids.end(), it->second.stash_ids.begin(),
+                it->second.stash_ids.end());
+        }
+        const auto digest_less = [](const auto & a, const auto & b) {
+            return a.bytes() < b.bytes();
+        };
+        const auto digest_equal = [](const auto & a, const auto & b) {
+            return a.bytes() == b.bytes();
+        };
+        std::sort(unit_ids.begin(), unit_ids.end(), digest_less);
+        unit_ids.erase(
+            std::unique(unit_ids.begin(), unit_ids.end(), digest_equal),
+            unit_ids.end());
+        std::sort(stash_ids.begin(), stash_ids.end(), digest_less);
+        stash_ids.erase(
+            std::unique(stash_ids.begin(), stash_ids.end(), digest_equal),
+            stash_ids.end());
+        auto release = llama_cache_prepare_release_set(
+            impl_->ledger, operations, expected_serial);
+        if (!release.ready()) {
+            return false;
+        }
+
+        if (impl_->next_retire_token == 0 ||
+            impl_->next_retire_token == UINT64_MAX) {
+            return false;
+        }
+        const uint64_t token = impl_->next_retire_token++;
+        auto state = std::unique_ptr<vbr_artifact_prepared_retire::impl>(
+            new vbr_artifact_prepared_retire::impl);
+        state->owner = this;
+        state->token = token;
+        state->references = std::move(canonical);
+        state->unit_ids = std::move(unit_ids);
+        state->stash_ids = std::move(stash_ids);
+        state->release = std::move(release);
+        for (const auto reference : state->references) {
+            impl_->references.find(reference.v)->second.prepared_retire_token =
+                token;
+        }
+        out.impl_ = std::move(state);
+        return true;
+    } catch (...) {
+        out.reset();
+        return false;
+    }
+}
+
+vbr_artifact_prepared_retire_status
+llama_vbr_artifact_catalog::commit_owned_retire(
+        uint64_t token,
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        const std::vector<vbr_unit_version_id> & unit_ids,
+        const std::vector<vbr_stash_payload_id> & stash_ids,
+        llama_cache_prepared_release_set & release) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (token == 0 || references.empty() || !release.ready()) {
+            return vbr_artifact_prepared_retire_status::unavailable;
+        }
+        for (const auto reference : references) {
+            const auto it = impl_->references.find(reference.v);
+            if (it == impl_->references.end() || !it->second.host_owned ||
+                !it->second.retire_pending || it->second.borrow_count != 0 ||
+                it->second.prepared_retire_token != token) {
+                return vbr_artifact_prepared_retire_status::unavailable;
+            }
+        }
+        const auto status = release.commit();
+        if (status != llama_cache_conditional_release_status::released) {
+            if (impl_->ledger.release_set_current(release.ops()) !=
+                    llama_cache_conditional_release_status::released) {
+                return vbr_artifact_prepared_retire_status::unavailable;
+            }
+            for (const auto reference : references) {
+                impl_->references.erase(reference.v);
+            }
+            impl_->erase_orphan_storage(unit_ids, stash_ids);
+            return vbr_artifact_prepared_retire_status::
+                retired_projection_stale;
+        }
+        for (const auto reference : references) {
+            impl_->references.erase(reference.v);
+        }
+        impl_->erase_orphan_storage(unit_ids, stash_ids);
+        return vbr_artifact_prepared_retire_status::retired;
+    } catch (...) {
+        return vbr_artifact_prepared_retire_status::unavailable;
+    }
+}
+
+void llama_vbr_artifact_catalog::cancel_owned_retire(
+        uint64_t token,
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        const std::vector<vbr_unit_version_id> & unit_ids,
+        const std::vector<vbr_stash_payload_id> & stash_ids,
+        llama_cache_prepared_release_set & release) noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    bool all_gone = !references.empty();
+    for (const auto reference : references) {
+        const auto it = impl_->references.find(reference.v);
+        if (it == impl_->references.end() ||
+            it->second.prepared_retire_token != token) {
+            all_gone = false;
+            continue;
+        }
+        all_gone &= it->second.host_owned && it->second.retire_pending &&
+                    it->second.borrow_count == 0;
+    }
+    if (!all_gone) {
+        bool erased = false;
+        for (const auto reference : references) {
+            const auto it = impl_->references.find(reference.v);
+            if (it != impl_->references.end() &&
+                it->second.prepared_retire_token == token) {
+                it->second.prepared_retire_token = 0;
+                if (it->second.host_owned && it->second.retire_pending &&
+                    it->second.borrow_count == 0) {
+                    if (impl_->ledger.release_set_current(
+                            it->second.operations) !=
+                            llama_cache_conditional_release_status::released) {
+                        return;
+                    }
+                    impl_->references.erase(it);
+                    erased = true;
+                }
+            }
+        }
+        if (erased) {
+            impl_->erase_orphan_storage(unit_ids, stash_ids);
+        }
+        return;
+    }
+
+    auto status = release.ready()
+        ? release.commit()
+        : llama_cache_conditional_release_status::serial_conflict;
+    if (status != llama_cache_conditional_release_status::released) {
+        // `release.ops()` remains the canonical sorted union after a failed
+        // conditional commit, so retrying at the current serial needs no
+        // allocation or per-operation ledger lock.
+        if (impl_->ledger.release_set_current(release.ops()) !=
+                llama_cache_conditional_release_status::released) {
+            return;
+        }
+    }
+    for (const auto reference : references) {
+        impl_->references.erase(reference.v);
+    }
+    impl_->erase_orphan_storage(unit_ids, stash_ids);
+}
+
+void llama_vbr_artifact_catalog::release_reference_lease(
+        llama_cache_acct_artifact_id reference,
+        bool host_owned) noexcept {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto it = impl_->references.find(reference.v);
     GGML_ASSERT(it != impl_->references.end() &&
-                it->second.borrow_count > 0);
+                it->second.borrow_count > 0 &&
+                (!host_owned || it->second.host_owned));
     --it->second.borrow_count;
+    if (host_owned) {
+        it->second.retire_pending = true;
+    }
+    if (it->second.borrow_count != 0 ||
+        !it->second.retire_pending ||
+        it->second.prepared_retire_token != 0) {
+        return;
+    }
+    if (impl_->ledger.release_set_current(it->second.operations) !=
+            llama_cache_conditional_release_status::released) {
+        return;
+    }
+    auto unit_ids = std::move(it->second.unit_ids);
+    auto stash_ids = std::move(it->second.stash_ids);
+    impl_->references.erase(it);
+    impl_->erase_orphan_storage(unit_ids, stash_ids);
 }
 
 bool llama_vbr_artifact_catalog::accounted_by(
@@ -2787,62 +3180,21 @@ vbr_artifact_retire_status llama_vbr_artifact_catalog::retire(
         if (it == impl_->references.end()) {
             return vbr_artifact_retire_status::not_found;
         }
-        if (it->second.borrow_count != 0) {
+        if (it->second.borrow_count != 0 || it->second.host_owned ||
+            it->second.retire_pending ||
+            it->second.prepared_retire_token != 0) {
             return vbr_artifact_retire_status::busy;
         }
-        const auto serial = impl_->ledger.snapshot().serial;
-        llama_cache_acct_release_set_preview preview;
-        if (!impl_->ledger.preview_release_set(
-                it->second.operations, serial, preview)) {
+        auto prepared = llama_cache_prepare_release_set(
+            impl_->ledger, it->second.operations, impl_->ledger.serial());
+        if (!prepared.ready() || prepared.commit() !=
+                llama_cache_conditional_release_status::released) {
             return vbr_artifact_retire_status::internal_error;
         }
-        for (const auto op : it->second.operations) {
-            const bool released = impl_->ledger.release(op);
-            GGML_ASSERT(released);
-            if (!released) {
-                return vbr_artifact_retire_status::internal_error;
-            }
-        }
-        const auto units = it->second.unit_ids;
-        const auto stashes = it->second.stash_ids;
+        auto units = std::move(it->second.unit_ids);
+        auto stashes = std::move(it->second.stash_ids);
         impl_->references.erase(it);
-
-        for (const auto & unit_id : units) {
-            const auto unit = unit_id.bytes();
-            const bool unit_live = std::any_of(
-                impl_->references.begin(), impl_->references.end(),
-                [&](const auto & row) {
-                    return std::any_of(
-                        row.second.unit_ids.begin(),
-                        row.second.unit_ids.end(),
-                        [&](const auto & candidate) {
-                            return candidate.bytes() == unit;
-                        });
-                });
-            if (!unit_live) {
-                impl_->blobs.erase(unit);
-            }
-        }
-        for (const auto & stash_id : stashes) {
-            if (!stash_id.valid()) {
-                continue;
-            }
-            const auto stash = stash_id.bytes();
-            const bool stash_live = std::any_of(
-                impl_->references.begin(), impl_->references.end(),
-                [&](const auto & row) {
-                    return std::any_of(
-                        row.second.stash_ids.begin(),
-                        row.second.stash_ids.end(),
-                        [&](const auto & candidate) {
-                            return candidate.valid() &&
-                                   candidate.bytes() == stash;
-                        });
-                });
-            if (!stash_live) {
-                impl_->stashes.erase(stash);
-            }
-        }
+        impl_->erase_orphan_storage(units, stashes);
         return vbr_artifact_retire_status::retired;
     } catch (...) {
         return vbr_artifact_retire_status::internal_error;

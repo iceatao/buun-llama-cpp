@@ -1750,6 +1750,244 @@ static void test_catalog_charge_once_and_retire() {
           empty.references == 0);
 }
 
+static void test_catalog_owned_union_retirement() {
+    catalog_fixture f;
+    const auto first =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    const auto second =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(first.status == llama_vbr_artifact_publish_status::published);
+    CHECK(second.status == llama_vbr_artifact_publish_status::adopted);
+
+    vbr_artifact_package_view first_view;
+    vbr_artifact_package_view second_view;
+    CHECK(f.catalog->resolve_reference(
+              first.reference_artifact, first_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(f.catalog->resolve_reference(
+              second.reference_artifact, second_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(first_view.claim_host_ownership());
+    CHECK(second_view.claim_host_ownership());
+    CHECK(f.catalog->retire(first.reference_artifact) ==
+          vbr_artifact_retire_status::busy);
+
+    const auto before = f.ledger.snapshot();
+    uint64_t expected_logical = 0;
+    uint64_t expected_resident = 0;
+    for (const auto & allocation : before.allocations) {
+        CHECK(allocation.logical_bytes <=
+              UINT64_MAX - expected_logical);
+        CHECK(allocation.resident_bytes <=
+              UINT64_MAX - expected_resident);
+        expected_logical += allocation.logical_bytes;
+        expected_resident += allocation.resident_bytes;
+    }
+
+    vbr_artifact_prepared_retire prepared;
+    CHECK(first_view.prepare_owned_retire(
+        { &first_view, &second_view }, before.serial, prepared));
+    CHECK(prepared.ready());
+    uint64_t projected_logical = 0;
+    uint64_t projected_resident = 0;
+    for (const auto & row : prepared.preview().rows) {
+        CHECK(row.logical_payload <= UINT64_MAX - projected_logical);
+        CHECK(row.resident_allocated <= UINT64_MAX - projected_resident);
+        projected_logical += row.logical_payload;
+        projected_resident += row.resident_allocated;
+    }
+    // Two references share the unit/stash allocations. The prepared union
+    // releases those bytes once while retaining both reference leaves.
+    CHECK(projected_logical == expected_logical);
+    CHECK(projected_resident == expected_resident);
+
+    // Abandoning a quote before the logical owners move is a no-op. The same
+    // exact reference set can be prepared again at the unchanged serial.
+    prepared.reset();
+    CHECK(first_view.prepare_owned_retire(
+        { &second_view, &first_view }, before.serial, prepared));
+    CHECK(prepared.ready());
+    CHECK(f.ledger.snapshot().live_ops == before.live_ops);
+
+    first_view.reset();
+    second_view.reset();
+    CHECK(f.ledger.snapshot().live_ops == before.live_ops);
+    CHECK(prepared.commit() ==
+          vbr_artifact_prepared_retire_status::retired);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+    CHECK(f.catalog->snapshot().references == 0);
+    CHECK(f.catalog->resolve_reference(
+              first.reference_artifact, first_view) ==
+          vbr_artifact_resolve_status::not_found);
+
+    // The server wrapper carries the same ownership capability without
+    // exposing catalog internals. It is releasable only when the logical
+    // payload is the sole immutable owner.
+    const auto third =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(third.status == llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view third_view;
+    CHECK(f.catalog->resolve_reference(
+              third.reference_artifact, third_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto owner = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(third_view));
+    CHECK(owner);
+    auto payload = server_prompt_cache_payload::from_vbr(owner);
+    CHECK(payload.vbr_retirement_owned());
+    CHECK(!payload.vbr_retirement_exclusive());
+    owner.reset();
+    CHECK(payload.vbr_retirement_exclusive());
+    vbr_artifact_prepared_retire payload_retire;
+    CHECK(payload.prepare_vbr_retire(
+        f.ledger.serial(), payload_retire));
+    const auto unrelated = f.ledger.reserve(
+        llama_cache_acct_category::artifact_reference_metadata,
+        f.host, {}, 0, 0);
+    CHECK(unrelated);
+    CHECK(f.ledger.abort(unrelated));
+    payload = {};
+    CHECK(payload_retire.commit() ==
+          vbr_artifact_prepared_retire_status::retired_projection_stale);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+
+    // A host-owned reference that still shares its segment allocations with
+    // an independent catalog reference quotes only the metadata it will
+    // truly free. Logical payload size is deliberately not victim currency.
+    const auto shared_host =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    const auto shared_control =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(shared_host.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(shared_control.status ==
+          llama_vbr_artifact_publish_status::adopted);
+    vbr_artifact_package_view shared_view;
+    CHECK(f.catalog->resolve_reference(
+              shared_host.reference_artifact, shared_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto shared_owner = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(shared_view));
+    CHECK(shared_owner);
+    auto shared_payload = server_prompt_cache_payload::from_vbr(
+        shared_owner);
+    shared_owner.reset();
+    vbr_artifact_prepared_retire marginal;
+    CHECK(shared_payload.prepare_vbr_retire(
+        f.ledger.serial(), marginal));
+    uint64_t marginal_resident = 0;
+    for (const auto & row : marginal.preview().rows) {
+        CHECK(row.resident_allocated <=
+              UINT64_MAX - marginal_resident);
+        marginal_resident += row.resident_allocated;
+    }
+    CHECK(marginal_resident > 0);
+    CHECK(marginal_resident < shared_payload.size());
+    shared_payload = {};
+    CHECK(marginal.commit() ==
+          vbr_artifact_prepared_retire_status::retired);
+    CHECK(f.catalog->snapshot().references == 1);
+    CHECK(f.ledger.snapshot().live_ops > 0);
+    CHECK(f.catalog->retire(shared_control.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+
+    // An early commit is a harmless refusal: it returns the claim token so
+    // the later last-owner drop can still execute its cleanup terminal.
+    const auto abandoned =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(abandoned.status ==
+          llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view abandoned_view;
+    CHECK(f.catalog->resolve_reference(
+              abandoned.reference_artifact, abandoned_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto abandoned_owner = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(abandoned_view));
+    auto abandoned_payload = server_prompt_cache_payload::from_vbr(
+        abandoned_owner);
+    abandoned_owner.reset();
+    vbr_artifact_prepared_retire abandoned_retire;
+    CHECK(abandoned_payload.prepare_vbr_retire(
+        f.ledger.serial(), abandoned_retire));
+    CHECK(abandoned_retire.commit() ==
+          vbr_artifact_prepared_retire_status::unavailable);
+    CHECK(f.catalog->snapshot().references == 1);
+    abandoned_payload = {};
+    CHECK(f.catalog->snapshot().references == 0);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+
+    const auto unprepared =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(unprepared.status ==
+          llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view unprepared_view;
+    CHECK(f.catalog->resolve_reference(
+              unprepared.reference_artifact, unprepared_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto unprepared_owner = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(unprepared_view));
+    CHECK(unprepared_owner);
+    unprepared_owner.reset();
+    CHECK(f.catalog->snapshot().references == 0);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+
+    const auto cancelled =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(cancelled.status ==
+          llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view cancelled_view;
+    CHECK(f.catalog->resolve_reference(
+              cancelled.reference_artifact, cancelled_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto cancelled_owner = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(cancelled_view));
+    auto cancelled_payload = server_prompt_cache_payload::from_vbr(
+        cancelled_owner);
+    cancelled_owner.reset();
+    vbr_artifact_prepared_retire cancelled_retire;
+    CHECK(cancelled_payload.prepare_vbr_retire(
+        f.ledger.serial(), cancelled_retire));
+    // Once the owner has gone, capability cancellation becomes the cleanup
+    // terminal rather than leaking a claimed reference into teardown.
+    cancelled_payload = {};
+    cancelled_retire.reset();
+    CHECK(f.catalog->snapshot().references == 0);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+
+    const auto partial_a =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    const auto partial_b =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(partial_a.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(partial_b.status ==
+          llama_vbr_artifact_publish_status::adopted);
+    vbr_artifact_package_view partial_a_view;
+    vbr_artifact_package_view partial_b_view;
+    CHECK(f.catalog->resolve_reference(
+              partial_a.reference_artifact, partial_a_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(f.catalog->resolve_reference(
+              partial_b.reference_artifact, partial_b_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(partial_a_view.claim_host_ownership());
+    CHECK(partial_b_view.claim_host_ownership());
+    vbr_artifact_prepared_retire partial_retire;
+    CHECK(partial_a_view.prepare_owned_retire(
+        { &partial_a_view, &partial_b_view },
+        f.ledger.serial(), partial_retire));
+    partial_a_view.reset();
+    partial_retire.reset();
+    CHECK(f.catalog->snapshot().references == 1);
+    CHECK(partial_b_view);
+    CHECK(partial_b_view.validate() == vbr_artifact_status::ok);
+    CHECK(f.ledger.snapshot().live_ops > 0);
+    partial_b_view.reset();
+    CHECK(f.catalog->snapshot().references == 0);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+}
+
 static void test_catalog_all_shard_failures_and_rollback() {
     for (uint32_t mode = 0; mode < 6; ++mode) {
         catalog_fixture f;
@@ -3838,6 +4076,7 @@ int main() {
     test_catalog_multi_unit_atomic_publish();
     test_catalog_streaming_companion_lifetime();
     test_catalog_charge_once_and_retire();
+    test_catalog_owned_union_retirement();
     test_catalog_all_shard_failures_and_rollback();
     test_catalog_destructor_releases_live_references();
     test_catalog_dedup_race();

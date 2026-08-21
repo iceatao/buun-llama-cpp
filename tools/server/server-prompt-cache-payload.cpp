@@ -287,6 +287,15 @@ server_prompt_cache_vbr_payload::adopt(
     }
 }
 
+std::shared_ptr<const server_prompt_cache_vbr_payload>
+server_prompt_cache_vbr_payload::adopt_owned(
+        vbr_artifact_package_view && package) noexcept {
+    if (!package.claim_host_ownership()) {
+        return {};
+    }
+    return adopt(std::move(package));
+}
+
 server_prompt_cache_vbr_payload::server_prompt_cache_vbr_payload(
         std::unique_ptr<impl> state) noexcept
     : impl_(std::move(state)) {}
@@ -319,6 +328,10 @@ server_prompt_cache_vbr_payload::package() const noexcept {
 bool server_prompt_cache_vbr_payload::accounted_by(
         const llama_cache_acct_ledger * ledger) const noexcept {
     return impl_ && impl_->package.accounted_by(ledger);
+}
+
+bool server_prompt_cache_vbr_payload::retirement_owned() const noexcept {
+    return impl_ && impl_->package.host_owned();
 }
 
 std::shared_ptr<const server_prompt_cache_vbr_variant_set>
@@ -422,6 +435,37 @@ bool server_prompt_cache_vbr_variant_set::accounted_by(
            (!impl_->anchor || impl_->anchor->accounted_by(ledger));
 }
 
+bool server_prompt_cache_vbr_variant_set::retirement_owned() const noexcept {
+    return impl_ && impl_->compact && impl_->compact->retirement_owned() &&
+           (!impl_->anchor || impl_->anchor->retirement_owned());
+}
+
+bool server_prompt_cache_vbr_variant_set::retirement_exclusive() const noexcept {
+    return retirement_owned() && impl_->compact.use_count() == 1 &&
+           (!impl_->anchor || impl_->anchor.use_count() == 1);
+}
+
+bool server_prompt_cache_vbr_variant_set::prepare_retire(
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept {
+    out.reset();
+    if (!retirement_exclusive()) {
+        return false;
+    }
+    try {
+        std::vector<const vbr_artifact_package_view *> packages;
+        packages.reserve(impl_->anchor ? 2 : 1);
+        packages.push_back(&impl_->compact->package());
+        if (impl_->anchor) {
+            packages.push_back(&impl_->anchor->package());
+        }
+        return packages.front()->prepare_owned_retire(
+            packages, expected_serial, out);
+    } catch (...) {
+        return false;
+    }
+}
+
 server_prompt_cache_payload server_prompt_cache_payload::from_vbr(
         vbr_owner owner) noexcept {
     return from_vbr_variants(
@@ -483,6 +527,26 @@ bool server_prompt_cache_payload::accounted_by(
         const llama_cache_acct_ledger * ledger) const noexcept {
     const auto * variants = vbr_variants();
     return variants && variants->accounted_by(ledger);
+}
+
+bool server_prompt_cache_payload::vbr_retirement_owned() const noexcept {
+    const auto * variants = vbr_variants();
+    return variants && variants->retirement_owned();
+}
+
+bool server_prompt_cache_payload::vbr_retirement_exclusive() const noexcept {
+    const auto * owner = std::get_if<vbr_variant_owner>(&storage_);
+    return owner && *owner && owner->use_count() == 1 &&
+           (*owner)->retirement_exclusive();
+}
+
+bool server_prompt_cache_payload::prepare_vbr_retire(
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept {
+    out.reset();
+    const auto * variants = vbr_variants();
+    return vbr_retirement_exclusive() &&
+           variants->prepare_retire(expected_serial, out);
 }
 
 size_t server_prompt_cache_payload::size() const noexcept {

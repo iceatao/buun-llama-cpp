@@ -117,6 +117,40 @@ struct vbr_artifact_companion_view {
 
 class llama_vbr_artifact_catalog;
 
+enum class vbr_artifact_prepared_retire_status : uint8_t {
+    retired = 0,
+    retired_projection_stale,
+    unavailable,
+    _count,
+};
+
+// Move-only scheduler capability for retiring one or more host-owned catalog
+// references through one exact accounting union. Preparation performs every
+// allocation and last-reference preview; commit is allocation-free.
+class vbr_artifact_prepared_retire {
+public:
+    vbr_artifact_prepared_retire() noexcept;
+    vbr_artifact_prepared_retire(vbr_artifact_prepared_retire &&) noexcept;
+    vbr_artifact_prepared_retire & operator=(
+        vbr_artifact_prepared_retire &&) noexcept;
+    ~vbr_artifact_prepared_retire();
+
+    vbr_artifact_prepared_retire(
+        const vbr_artifact_prepared_retire &) = delete;
+    vbr_artifact_prepared_retire & operator=(
+        const vbr_artifact_prepared_retire &) = delete;
+
+    bool ready() const noexcept;
+    const llama_cache_acct_release_set_preview & preview() const noexcept;
+    vbr_artifact_prepared_retire_status commit() noexcept;
+    void reset() noexcept;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> impl_;
+    friend class llama_vbr_artifact_catalog;
+};
+
 // A catalog lease exposes only immutable restore inputs that passed the
 // catalog's sealed publication transaction. Resolving or retaining a view is
 // therefore an O(metadata) capability operation, not a request to re-read and
@@ -141,6 +175,15 @@ public:
     // ledger; logical aliases must never duplicate those physical bytes in a
     // second host-cache accounting transaction.
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
+    // Transfer the catalog reference's retirement authority to this view.
+    // The view already owns one borrow; later aliases retain that immutable
+    // view rather than minting another physical reference.
+    bool claim_host_ownership() noexcept;
+    bool host_owned() const noexcept { return host_owned_; }
+    bool prepare_owned_retire(
+        const std::vector<const vbr_artifact_package_view *> & packages,
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept;
     llama_cache_acct_artifact_id reference_artifact() const noexcept;
     const std::vector<vbr_artifact_portable_topology> & topologies() const noexcept;
     const vbr_artifact_reference_manifest & manifest() const noexcept;
@@ -158,6 +201,7 @@ private:
     friend class llama_vbr_artifact_catalog;
     llama_vbr_artifact_catalog * owner_ = nullptr;
     std::shared_ptr<const storage> storage_;
+    bool host_owned_ = false;
 };
 
 class llama_vbr_artifact_catalog : public vbr_unit_version_sink {
@@ -244,9 +288,29 @@ private:
 
     friend class llama_vbr_artifact_catalog_stream_build;
     friend class vbr_artifact_package_view;
+    friend class vbr_artifact_prepared_retire;
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
-    void release_reference_lease(
+    bool claim_host_ownership(
         llama_cache_acct_artifact_id reference) noexcept;
+    bool prepare_owned_retire(
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) noexcept;
+    vbr_artifact_prepared_retire_status commit_owned_retire(
+        uint64_t token,
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        const std::vector<vbr_unit_version_id> & unit_ids,
+        const std::vector<vbr_stash_payload_id> & stash_ids,
+        llama_cache_prepared_release_set & release) noexcept;
+    void cancel_owned_retire(
+        uint64_t token,
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        const std::vector<vbr_unit_version_id> & unit_ids,
+        const std::vector<vbr_stash_payload_id> & stash_ids,
+        llama_cache_prepared_release_set & release) noexcept;
+    void release_reference_lease(
+        llama_cache_acct_artifact_id reference,
+        bool host_owned) noexcept;
 };
 
 const char * llama_vbr_artifact_publish_status_name(

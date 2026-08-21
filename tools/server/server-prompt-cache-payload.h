@@ -9,6 +9,7 @@
 #include <vector>
 
 class vbr_artifact_package_view;
+class vbr_artifact_prepared_retire;
 struct vbr_artifact_allocation_view;
 
 struct server_prompt_cache_vbr_accounting_summary {
@@ -42,6 +43,10 @@ class server_prompt_cache_vbr_payload {
 public:
     static std::shared_ptr<const server_prompt_cache_vbr_payload> adopt(
         vbr_artifact_package_view && package) noexcept;
+    // Transfer the catalog reference into cache-owned retirement authority.
+    // Unlike adopt(), dropping the last immutable owner retires the reference.
+    static std::shared_ptr<const server_prompt_cache_vbr_payload> adopt_owned(
+        vbr_artifact_package_view && package) noexcept;
 
     ~server_prompt_cache_vbr_payload();
     server_prompt_cache_vbr_payload(
@@ -55,6 +60,7 @@ public:
     size_t allocation_count() const noexcept;
     const vbr_artifact_package_view & package() const noexcept;
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
+    bool retirement_owned() const noexcept;
 
 private:
     struct impl;
@@ -87,6 +93,11 @@ public:
     uint64_t resident_bytes() const noexcept;
     size_t allocation_count() const noexcept;
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
+    bool retirement_owned() const noexcept;
+    bool retirement_exclusive() const noexcept;
+    bool prepare_retire(
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept;
 
 private:
     struct impl;
@@ -127,6 +138,11 @@ public:
     bool publishable() const noexcept;
     bool restorable() const noexcept;
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
+    bool vbr_retirement_owned() const noexcept;
+    bool vbr_retirement_exclusive() const noexcept;
+    bool prepare_vbr_retire(
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) const noexcept;
     size_t size() const noexcept;
     bool same_storage(const server_prompt_cache_payload & other) const noexcept;
 

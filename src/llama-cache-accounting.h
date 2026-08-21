@@ -673,6 +673,11 @@ struct llama_cache_acct_ledger {
     llama_cache_conditional_release_status release_set_if_serial(
             const std::vector<llama_cache_acct_op_id> & ops,
             uint64_t expected_serial) noexcept;
+    // Exact unconditional cleanup terminal for an owner that has already
+    // disappeared. The canonical op set must be strictly increasing. It
+    // validates the complete union and releases it under one ledger lock.
+    llama_cache_conditional_release_status release_set_current(
+            const std::vector<llama_cache_acct_op_id> & ops) noexcept;
 
     // Direct gauge reporting for non-transactional producers (live state, metadata gauges).
     // Checked: overflow latches the cell unavailable and counts a fault.
@@ -765,6 +770,8 @@ private:
     // validates the complete batch before invoking it, structurally excluding
     // a partial-release error return.
     void apply_release_locked(llama_cache_acct_op_id op) noexcept;
+    llama_cache_conditional_release_status release_set_locked(
+            const std::vector<llama_cache_acct_op_id> & ops) noexcept;
 
     // Unlocked helpers (callers hold the mutex). Aggregate rows are pre-created atomically
     // with the required-producer manifest, so the gauge and failure paths never allocate.

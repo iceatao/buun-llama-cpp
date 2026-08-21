@@ -359,6 +359,41 @@ static void test_release_set_preview() {
                llama_cache_acct_measure::logical_payload).value == 0);
     CHECK(cell(terminal, CAT, DOM,
                llama_cache_acct_measure::resident_allocated).value == 0);
+
+    // Owner-gone cleanup cannot depend on an optimistic serial fence. It
+    // still validates and applies the complete canonical set under one lock.
+    const auto cleanup_alloc = ledger.new_alloc();
+    const auto cleanup_op = ledger.reserve(CAT, DOM, {}, 7, 8);
+    CHECK(ledger.stage(cleanup_op, cleanup_alloc, 8));
+    CHECK(ledger.commit(cleanup_op, 7));
+    const uint64_t stale_serial = ledger.serial();
+    const auto unrelated = ledger.reserve(CAT, DOM, {}, 0, 0);
+    CHECK(unrelated);
+    CHECK(ledger.abort(unrelated));
+    CHECK(ledger.release_set_if_serial({ cleanup_op }, stale_serial) ==
+          llama_cache_conditional_release_status::serial_conflict);
+    CHECK(ledger.release_set_current({ cleanup_op }) ==
+          llama_cache_conditional_release_status::released);
+    CHECK(ledger.snapshot().live_ops == 0);
+
+    const auto alloc_a = ledger.new_alloc();
+    const auto alloc_b = ledger.new_alloc();
+    const auto op_a = ledger.reserve(CAT, DOM, {}, 1, 1);
+    const auto op_b = ledger.reserve(CAT, DOM, {}, 1, 1);
+    CHECK(ledger.stage(op_a, alloc_a, 1));
+    CHECK(ledger.stage(op_b, alloc_b, 1));
+    CHECK(ledger.commit(op_a, 1));
+    CHECK(ledger.commit(op_b, 1));
+    const auto invalid_before = ledger.snapshot();
+    CHECK(ledger.release_set_current({ op_b, op_a }) ==
+          llama_cache_conditional_release_status::ledger_fault);
+    const auto invalid_after = ledger.snapshot();
+    CHECK(invalid_after.live_ops == invalid_before.live_ops);
+    CHECK(invalid_after.allocations.size() ==
+          invalid_before.allocations.size());
+    CHECK(ledger.release_set_current({ op_a, op_b }) ==
+          llama_cache_conditional_release_status::released);
+    CHECK(ledger.snapshot().live_ops == 0);
 }
 
 // Sol verify-r2 finding 3: a RETIRED allocation id can never name a new physical allocation.
