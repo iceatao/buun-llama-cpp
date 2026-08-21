@@ -295,8 +295,13 @@ vbr_explicit_capture_status stream_status(
             return vbr_explicit_capture_status::admission_refused;
         case vbr_capture_stream_status::publication_failed:
             return vbr_explicit_capture_status::publication_failed;
+        case vbr_capture_stream_status::snapshot_changed:
+            return vbr_explicit_capture_status::source_changed;
+        case vbr_capture_stream_status::snapshot_unavailable:
+            return vbr_explicit_capture_status::generation_unavailable;
         case vbr_capture_stream_status::format_rejected:
             return vbr_explicit_capture_status::dedup_validation_failed;
+        case vbr_capture_stream_status::projection_invalid:
         case vbr_capture_stream_status::invalid_argument:
         case vbr_capture_stream_status::duplicate_segment:
         case vbr_capture_stream_status::missing_segment:

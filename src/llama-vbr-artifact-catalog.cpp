@@ -1550,6 +1550,9 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
                 case vbr_capture_stream_status::invalid_argument:
                 case vbr_capture_stream_status::ring_unavailable:
                 case vbr_capture_stream_status::late_segment:
+                case vbr_capture_stream_status::projection_invalid:
+                case vbr_capture_stream_status::snapshot_unavailable:
+                case vbr_capture_stream_status::snapshot_changed:
                 case vbr_capture_stream_status::internal_error:
                 case vbr_capture_stream_status::_count:
                     out.status =

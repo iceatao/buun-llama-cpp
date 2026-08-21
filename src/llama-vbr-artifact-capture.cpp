@@ -41,10 +41,33 @@ bool capture_cursor_after(
 
 } // namespace
 
+vbr_capture_projection::vbr_capture_projection(
+        std::shared_ptr<const vbr_capture_projection_plan> plan) noexcept
+    : plan_(std::move(plan)) {}
+
+const vbr_capture_projection_plan *
+vbr_capture_projection::operator->() const noexcept {
+    return plan_.get();
+}
+
+const vbr_capture_projection_plan &
+vbr_capture_projection::operator*() const noexcept {
+    return *plan_;
+}
+
+vbr_capture_projection::operator bool() const noexcept {
+    return bool(plan_);
+}
+
+bool vbr_capture_projection::operator==(
+        const vbr_capture_projection & other) const noexcept {
+    return plan_ == other.plan_;
+}
+
 bool vbr_artifact_project_capture_union(
         const vbr_capture_projection_batch & batch,
         const vbr_capture_projection_limits & limits,
-        vbr_capture_projection_plan & output) noexcept {
+        vbr_capture_projection & output) noexcept {
     output = {};
     try {
         const auto & manifests = batch.manifests;
@@ -245,7 +268,9 @@ bool vbr_artifact_project_capture_union(
         if (plan.streams.empty()) {
             return false;
         }
-        output = std::move(plan);
+        output = vbr_capture_projection(
+            std::make_shared<const vbr_capture_projection_plan>(
+                std::move(plan)));
         return true;
     } catch (...) {
         output = {};
@@ -271,6 +296,9 @@ const char * vbr_capture_stream_status_name(
         case vbr_capture_stream_status::stage_failed:         return "stage_failed";
         case vbr_capture_stream_status::commit_failed:        return "commit_failed";
         case vbr_capture_stream_status::publication_failed:  return "publication_failed";
+        case vbr_capture_stream_status::projection_invalid:   return "projection_invalid";
+        case vbr_capture_stream_status::snapshot_unavailable: return "snapshot_unavailable";
+        case vbr_capture_stream_status::snapshot_changed:     return "snapshot_changed";
         case vbr_capture_stream_status::internal_error:      return "internal_error";
         case vbr_capture_stream_status::_count:              break;
     }
@@ -369,6 +397,7 @@ vbr_capture_stream_status capture_status_for_ring_failure(
 
 struct artifact_segment_chain::impl {
     std::vector<artifact_segment> segments;
+    std::vector<uint64_t> segment_ends;
     uint64_t total = 0;
     size_t max_segment = 0;
 };
@@ -389,6 +418,24 @@ bool artifact_segment_chain::append(
                 impl_->total) {
             return false;
         }
+        if (impl_->segments.size() == impl_->segments.capacity()) {
+            const size_t next = impl_->segments.empty() ? 1 :
+                impl_->segments.size() <= SIZE_MAX/2 ?
+                    impl_->segments.size()*2 : SIZE_MAX;
+            if (next == SIZE_MAX) {
+                return false;
+            }
+            impl_->segments.reserve(next);
+        }
+        if (impl_->segment_ends.size() == impl_->segment_ends.capacity()) {
+            const size_t next = impl_->segment_ends.empty() ? 1 :
+                impl_->segment_ends.size() <= SIZE_MAX/2 ?
+                    impl_->segment_ends.size()*2 : SIZE_MAX;
+            if (next == SIZE_MAX) {
+                return false;
+            }
+            impl_->segment_ends.reserve(next);
+        }
         auto bytes =
             std::make_shared<std::vector<uint8_t>>();
         if (size != 0) {
@@ -398,6 +445,7 @@ bool artifact_segment_chain::append(
             std::move(bytes), 0, uint64_t(size),
         });
         impl_->total += size;
+        impl_->segment_ends.push_back(impl_->total);
         impl_->max_segment =
             std::max(impl_->max_segment, size);
         return true;
@@ -426,14 +474,18 @@ bool artifact_segment_chain::read(
         size > impl_->total - offset) {
         return false;
     }
-    uint64_t cursor = 0;
+    if (size == 0) {
+        return true;
+    }
+    const auto first = std::upper_bound(
+        impl_->segment_ends.begin(), impl_->segment_ends.end(), offset);
+    size_t segment_index = size_t(first - impl_->segment_ends.begin());
+    uint64_t cursor = segment_index == 0 ? 0 :
+        impl_->segment_ends[segment_index - 1];
     size_t remaining = size;
-    for (const auto & segment : impl_->segments) {
-        const uint64_t end = cursor + segment.length;
-        if (offset >= end) {
-            cursor = end;
-            continue;
-        }
+    for (; segment_index < impl_->segments.size(); ++segment_index) {
+        const auto & segment = impl_->segments[segment_index];
+        const uint64_t end = impl_->segment_ends[segment_index];
         const uint64_t within = offset > cursor
             ? offset - cursor : 0;
         const size_t available =
@@ -563,9 +615,42 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
         const vbr_capture_stream_source & source,
         artifact_segment_chain & destination,
         vbr_capture_stream_stats & stats) noexcept {
+    const vbr_capture_stream_range range { 0, source.size };
+    return stream_ranges_impl(source, &range, 1, destination, stats);
+}
+
+vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges(
+        const vbr_capture_stream_source & source,
+        const std::vector<vbr_capture_stream_range> & ranges,
+        artifact_segment_chain & destination,
+        vbr_capture_stream_stats & stats) noexcept {
+    return stream_ranges_impl(
+        source, ranges.data(), ranges.size(), destination, stats);
+}
+
+vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
+        const vbr_capture_stream_source & source,
+        const vbr_capture_stream_range * ranges,
+        size_t range_count,
+        artifact_segment_chain & destination,
+        vbr_capture_stream_stats & stats) noexcept {
     stats = {};
-    if (source.lane >= impl_->core->lane_count() || source.size == 0) {
+    if (source.lane >= impl_->core->lane_count() || source.size == 0 ||
+        ranges == nullptr || range_count == 0 || destination.size() != 0) {
         return vbr_capture_stream_status::invalid_argument;
+    }
+    uint64_t transfer_bytes = 0;
+    uint64_t prior_end = 0;
+    for (size_t i = 0; i < range_count; ++i) {
+        const auto & range = ranges[i];
+        if (range.size == 0 || range.source_offset < prior_end ||
+            range.source_offset > source.size ||
+            range.size > source.size - range.source_offset ||
+            !capture_checked_add(
+                transfer_bytes, range.size, transfer_bytes)) {
+            return vbr_capture_stream_status::invalid_argument;
+        }
+        prior_end = range.source_offset + range.size;
     }
     const auto * lane = impl_->core->lane_binding(source.lane);
     const bool tensor_source = source.tensor != nullptr;
@@ -596,7 +681,7 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
     static constexpr char domain_label[] =
         "buun.vbr.capture.segment-stream";
     hash.string(domain_label, sizeof(domain_label) - 1);
-    hash.u64(source.size);
+    hash.u64(transfer_bytes);
 
     const auto synchronize_only = [&]() noexcept {
         for (auto & entry : pending) {
@@ -641,8 +726,9 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
 
     // TODO(F4.2a follow-up): lift shared drive(fill,consume) pump into the core.
     try {
-        uint64_t offset = 0;
-        while (offset < source.size) {
+        size_t range_index = 0;
+        uint64_t range_offset = 0;
+        while (range_index < range_count) {
             bool would_block = false;
             auto entry = impl_->core->acquire(source.lane, would_block);
             if (!entry && would_block) {
@@ -658,24 +744,39 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
                 synchronize_only();
                 return vbr_capture_stream_status::internal_error;
             }
-            const size_t count = size_t(std::min<uint64_t>(
-                chunk_size, source.size - offset));
-            if (tensor_source) {
-                ggml_backend_tensor_get_async(
-                    source.backend, source.tensor,
-                    entry.data(),
-                    size_t(source.tensor_offset + offset),
-                    count);
-            } else if (!source.read(
-                           source.context, offset,
-                           entry.data(), count)) {
-                impl_->core->release(entry);
-                synchronize_only();
-                return vbr_capture_stream_status::short_read;
+            size_t filled = 0;
+            while (filled < chunk_size && range_index < range_count) {
+                const auto & range = ranges[range_index];
+                const size_t count = size_t(std::min<uint64_t>(
+                    chunk_size - filled, range.size - range_offset));
+                const uint64_t source_offset =
+                    range.source_offset + range_offset;
+                if (tensor_source) {
+                    // Multiple gets are queued on the same backend stream;
+                    // submit records one completion event after the complete
+                    // packed chunk rather than one event per logical range.
+                    ggml_backend_tensor_get_async(
+                        source.backend, source.tensor,
+                        entry.data() + filled,
+                        size_t(source.tensor_offset + source_offset),
+                        count);
+                } else if (!source.read(
+                               source.context, source_offset,
+                               entry.data() + filled, count)) {
+                    impl_->core->release(entry);
+                    synchronize_only();
+                    return vbr_capture_stream_status::short_read;
+                }
+                filled += count;
+                range_offset += count;
+                if (range_offset == range.size) {
+                    ++range_index;
+                    range_offset = 0;
+                }
             }
             bool synchronous_fallback = false;
             if (!impl_->core->submit(
-                    entry, count,
+                    entry, filled,
                     tensor_source ? source.backend : nullptr,
                     synchronous_fallback)) {
                 impl_->core->release(entry);
@@ -686,7 +787,6 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
                 stats.synchronous_fallbacks++;
             }
             pending.push_back(std::move(entry));
-            offset += count;
         }
         while (!pending.empty()) {
             const auto drained = drain_front();
@@ -695,7 +795,7 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
                 return drained;
             }
         }
-        if (stats.bytes != source.size) {
+        if (stats.bytes != transfer_bytes) {
             return vbr_capture_stream_status::short_read;
         }
         stats.max_segment_size =
@@ -705,6 +805,432 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
     } catch (...) {
         synchronize_only();
         stats = {};
+        return vbr_capture_stream_status::internal_error;
+    }
+}
+
+bool vbr_capture_projected_shard_topology(
+        const std::vector<vbr_capture_projected_shard_source> & sources,
+        uint32_t & shard_count,
+        std::array<uint8_t, 32> & digest) noexcept {
+    shard_count = 0;
+    digest = {};
+    try {
+        if (sources.empty() || sources.size() > UINT32_MAX) {
+            return false;
+        }
+        std::vector<const vbr_capture_projected_shard_source *> ordered;
+        ordered.reserve(sources.size());
+        for (const auto & source : sources) {
+            ordered.push_back(&source);
+        }
+        std::sort(ordered.begin(), ordered.end(),
+            [](const auto * lhs, const auto * rhs) {
+                return lhs->shard_index < rhs->shard_index;
+            });
+        llama_sha256_writer hash;
+        static constexpr char DOMAIN[] =
+            "buun.vbr.capture/projected-shard-topology";
+        hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+        hash.u32(uint32_t(ordered.size()));
+        for (uint32_t i = 0; i < ordered.size(); ++i) {
+            const auto & source = *ordered[i];
+            if (source.shard_index != i || source.source_identity == 0 ||
+                source.row_count == 0 || source.row_bytes == 0 ||
+                source.source.size == 0) {
+                return false;
+            }
+            hash.u32(source.shard_index);
+            hash.u32(source.row_count);
+            hash.u64(source.row_bytes);
+            hash.u64(source.source_identity);
+            hash.u64(source.source.size);
+            hash.u32(source.source.lane);
+            // This digest is deliberately process-local: bind the exact
+            // provider-issued byte-source capability as well as its stable
+            // identity so an accidental callback/tensor substitution cannot
+            // reuse otherwise identical geometry.
+            hash.bytes(&source.source.context,
+                       sizeof(source.source.context));
+            hash.bytes(&source.source.read,
+                       sizeof(source.source.read));
+            hash.bytes(&source.source.backend,
+                       sizeof(source.source.backend));
+            hash.bytes(&source.source.device,
+                       sizeof(source.source.device));
+            hash.bytes(&source.source.tensor,
+                       sizeof(source.source.tensor));
+            hash.u64(source.source.tensor_offset);
+        }
+        shard_count = uint32_t(ordered.size());
+        digest = hash.finish();
+        return std::any_of(
+            digest.begin(), digest.end(), [](uint8_t value) {
+                return value != 0;
+            });
+    } catch (...) {
+        shard_count = 0;
+        digest = {};
+        return false;
+    }
+}
+
+namespace {
+
+bool projected_snapshot_valid(
+        const vbr_capture_unit_snapshot & snapshot) noexcept {
+    const auto & generation = snapshot.generation;
+    return snapshot.source_namespace != 0 &&
+           snapshot.child_id != UINT32_MAX &&
+           snapshot.logical_unit_id != UINT32_MAX &&
+           snapshot.controller_generation != 0 &&
+           (snapshot.mutation_serial & 1u) == 0 &&
+           generation.repr_gen != 0 &&
+           (generation.publish_seq & 1u) == 0 &&
+           generation.current_type >= 0 &&
+           generation.current_type < GGML_TYPE_COUNT &&
+           generation.last_source_type >= 0 &&
+           generation.last_source_type < GGML_TYPE_COUNT &&
+           generation.domain <= vbr_repr_domain::tapped &&
+           generation.last_transition <=
+               vbr_repr_transition::recovery_invalidate &&
+           generation.flags == 0 && snapshot.shard_count != 0 &&
+           std::any_of(
+               snapshot.shard_topology_digest.begin(),
+               snapshot.shard_topology_digest.end(),
+               [](uint8_t value) { return value != 0; });
+}
+
+} // namespace
+
+vbr_capture_stream_status vbr_capture_projected_unit_transfer(
+        vbr_capture_projection projection,
+        uint32_t child_id,
+        uint32_t stream_index,
+        uint32_t logical_unit_id,
+        const std::vector<vbr_capture_projected_shard_source> & sources,
+        const vbr_capture_projected_transfer_limits & limits,
+        const vbr_capture_unit_snapshot_provider & snapshots,
+        vbr_pinned_chunk_ring & ring,
+        vbr_capture_projected_unit & output) noexcept {
+    output = {};
+    try {
+        if (!projection || projection->source_namespace == 0 ||
+            child_id == UINT32_MAX || stream_index == UINT32_MAX ||
+            logical_unit_id == UINT32_MAX || sources.empty() ||
+            limits.max_shards == 0 ||
+            sources.size() > limits.max_shards ||
+            limits.max_shard_segment_references == 0 ||
+            limits.max_source_operations == 0 ||
+            limits.max_total_packed_bytes == 0 ||
+            !snapshots.acquire || !snapshots.recheck ||
+            !snapshots.release ||
+            projection->dependency_references !=
+                projection->dependent_manifest_ids.size()) {
+            return vbr_capture_stream_status::projection_invalid;
+        }
+        const vbr_capture_projection_stream * selected = nullptr;
+        for (const auto & stream : projection->streams) {
+            if (stream.child_id == child_id &&
+                stream.stream_index == stream_index) {
+                if (selected != nullptr) {
+                    return vbr_capture_stream_status::projection_invalid;
+                }
+                selected = &stream;
+            }
+        }
+        if (!selected || selected->segments.empty() ||
+            selected->segments.size() > UINT32_MAX) {
+            return vbr_capture_stream_status::projection_invalid;
+        }
+
+        uint64_t prior_end = 0;
+        for (const auto & segment : selected->segments) {
+            if (segment.cell_count == 0 ||
+                segment.first_dependency >
+                    projection->dependent_manifest_ids.size() ||
+                segment.dependency_count == 0 ||
+                segment.dependency_count >
+                    projection->dependent_manifest_ids.size() -
+                        segment.first_dependency ||
+                uint64_t(segment.first_physical_cell) < prior_end) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
+            const uint64_t end =
+                uint64_t(segment.first_physical_cell) +
+                segment.cell_count;
+            if (end > uint64_t(UINT32_MAX) + 1) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
+            const auto dependency_begin =
+                projection->dependent_manifest_ids.begin() +
+                segment.first_dependency;
+            const auto dependency_end =
+                dependency_begin + segment.dependency_count;
+            if (*dependency_begin == 0 ||
+                std::adjacent_find(
+                    dependency_begin, dependency_end) != dependency_end ||
+                !std::is_sorted(dependency_begin, dependency_end)) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
+            prior_end = end;
+        }
+
+        std::vector<const vbr_capture_projected_shard_source *> ordered;
+        ordered.reserve(sources.size());
+        for (const auto & source : sources) {
+            ordered.push_back(&source);
+        }
+        std::sort(ordered.begin(), ordered.end(),
+            [](const auto * lhs, const auto * rhs) {
+                return lhs->shard_index < rhs->shard_index;
+            });
+        uint32_t topology_count = 0;
+        std::array<uint8_t, 32> topology_digest = {};
+        if (!vbr_capture_projected_shard_topology(
+                sources, topology_count, topology_digest) ||
+            topology_count != ordered.size() ||
+            selected->segments.size() >
+                limits.max_shard_segment_references/sources.size()) {
+            return vbr_capture_stream_status::projection_invalid;
+        }
+
+        std::vector<vbr_capture_projected_slice> slices;
+        slices.reserve(selected->segments.size());
+        struct cell_range { uint32_t first = 0; uint32_t count = 0; };
+        std::vector<cell_range> cell_ranges;
+        cell_ranges.reserve(selected->segments.size());
+        uint64_t packed_rows = 0;
+        for (uint32_t i = 0; i < selected->segments.size(); ++i) {
+            const auto & segment = selected->segments[i];
+            slices.push_back({ i, packed_rows, segment.cell_count });
+            packed_rows += segment.cell_count;
+            if (!cell_ranges.empty() &&
+                uint64_t(cell_ranges.back().first) +
+                        cell_ranges.back().count ==
+                    segment.first_physical_cell &&
+                segment.cell_count <=
+                    UINT32_MAX - cell_ranges.back().count) {
+                cell_ranges.back().count += segment.cell_count;
+            } else {
+                cell_ranges.push_back({
+                    segment.first_physical_cell, segment.cell_count,
+                });
+            }
+        }
+        std::vector<uint64_t> shard_packed_bytes;
+        shard_packed_bytes.reserve(ordered.size());
+        uint64_t total_packed_bytes = 0;
+        uint64_t source_operations = 0;
+        const uint64_t chunk_bytes = ring.chunk_bytes();
+        if (chunk_bytes == 0) {
+            return vbr_capture_stream_status::projection_invalid;
+        }
+        for (const auto * source : ordered) {
+            if (source->row_count == 0 || source->row_bytes == 0 ||
+                source->row_count > UINT64_MAX/source->row_bytes ||
+                uint64_t(source->row_count)*source->row_bytes >
+                    source->source.size) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
+            for (const auto & segment : selected->segments) {
+                const uint64_t end =
+                    uint64_t(segment.first_physical_cell) +
+                    segment.cell_count;
+                if (end > source->row_count ||
+                    segment.first_physical_cell >
+                        UINT64_MAX/source->row_bytes ||
+                    segment.cell_count >
+                        UINT64_MAX/source->row_bytes) {
+                    return vbr_capture_stream_status::projection_invalid;
+                }
+                if (uint64_t(segment.first_physical_cell)*
+                            source->row_bytes > source->source.size ||
+                    uint64_t(segment.cell_count)*source->row_bytes >
+                        source->source.size -
+                            uint64_t(segment.first_physical_cell)*
+                                source->row_bytes) {
+                    return vbr_capture_stream_status::projection_invalid;
+                }
+            }
+            if (packed_rows > UINT64_MAX/source->row_bytes) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
+            const uint64_t packed_bytes = packed_rows*source->row_bytes;
+            if (packed_bytes == 0 ||
+                packed_bytes > limits.max_total_packed_bytes -
+                    total_packed_bytes) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
+            total_packed_bytes += packed_bytes;
+            shard_packed_bytes.push_back(packed_bytes);
+
+            uint64_t packed_cursor = 0;
+            for (const auto & range : cell_ranges) {
+                const uint64_t bytes =
+                    uint64_t(range.count)*source->row_bytes;
+                const uint64_t first_capacity =
+                    chunk_bytes - packed_cursor%chunk_bytes;
+                uint64_t operations = 1;
+                if (bytes > first_capacity) {
+                    const uint64_t remaining = bytes - first_capacity;
+                    operations += remaining/chunk_bytes;
+                    operations += remaining%chunk_bytes != 0;
+                }
+                if (operations >
+                        limits.max_source_operations - source_operations) {
+                    return vbr_capture_stream_status::projection_invalid;
+                }
+                source_operations += operations;
+                packed_cursor += bytes;
+            }
+            if (packed_cursor != packed_bytes) {
+                return vbr_capture_stream_status::projection_invalid;
+            }
+        }
+
+        // One reusable byte-range workspace is allocated before the unit
+        // lease. Segment boundaries remain in the shared slice map; adjacent
+        // physical runs and small disjoint runs are packed by the ring.
+        std::vector<vbr_capture_stream_range> ranges(cell_ranges.size());
+
+        // Hash the immutable projection before acquiring the unit-version
+        // lease. Only bounded source reads and snapshot-dependent sealing
+        // remain inside the lease interval.
+        llama_sha256_writer layout_hash;
+        static constexpr char LAYOUT_DOMAIN[] =
+            "buun.vbr.capture/projected-layout";
+        layout_hash.string(LAYOUT_DOMAIN, sizeof(LAYOUT_DOMAIN) - 1);
+        layout_hash.u64(projection->source_namespace);
+        layout_hash.u32(child_id);
+        layout_hash.u32(stream_index);
+        layout_hash.u32(logical_unit_id);
+        layout_hash.bytes(topology_digest.data(), topology_digest.size());
+        layout_hash.u64(selected->segments.size());
+        for (const auto & segment : selected->segments) {
+            layout_hash.u32(segment.first_physical_cell);
+            layout_hash.u32(segment.cell_count);
+            layout_hash.u32(segment.dependency_count);
+            for (uint32_t i = 0; i < segment.dependency_count; ++i) {
+                layout_hash.u64(projection->dependent_manifest_ids[
+                    segment.first_dependency + i]);
+            }
+        }
+        layout_hash.u64(slices.size());
+        for (const auto & slice : slices) {
+            layout_hash.u32(slice.projection_segment);
+            layout_hash.u64(slice.packed_first_row);
+            layout_hash.u32(slice.row_count);
+        }
+        const auto layout_digest = layout_hash.finish();
+
+        vbr_capture_unit_snapshot snapshot;
+        if (!snapshots.acquire(
+                snapshots.context, projection->source_namespace,
+                child_id, logical_unit_id, snapshot)) {
+            return vbr_capture_stream_status::snapshot_unavailable;
+        }
+        struct release_guard {
+            const vbr_capture_unit_snapshot_provider * provider = nullptr;
+            const vbr_capture_unit_snapshot * snapshot = nullptr;
+            bool active = false;
+            ~release_guard() {
+                if (active) {
+                    provider->release(provider->context, *snapshot);
+                }
+            }
+        } release { &snapshots, &snapshot, true };
+        if (!projected_snapshot_valid(snapshot) ||
+            snapshot.source_namespace != projection->source_namespace ||
+            snapshot.child_id != child_id ||
+            snapshot.logical_unit_id != logical_unit_id ||
+            snapshot.shard_count != topology_count ||
+            snapshot.shard_topology_digest != topology_digest) {
+            return vbr_capture_stream_status::snapshot_unavailable;
+        }
+
+        vbr_capture_projected_unit result;
+        result.projection = std::move(projection);
+        result.snapshot = snapshot;
+        result.child_id = child_id;
+        result.stream_index = stream_index;
+        result.logical_unit_id = logical_unit_id;
+        result.packed_bytes = total_packed_bytes;
+        result.slices = std::move(slices);
+        result.shards.reserve(ordered.size());
+        llama_sha256_writer unit_hash;
+        static constexpr char UNIT_DOMAIN[] =
+            "buun.vbr.capture/projected-unit";
+        unit_hash.string(UNIT_DOMAIN, sizeof(UNIT_DOMAIN) - 1);
+        unit_hash.bytes(layout_digest.data(), layout_digest.size());
+        unit_hash.u64(snapshot.controller_generation);
+        unit_hash.u64(snapshot.mutation_serial);
+        unit_hash.u64(snapshot.generation.repr_gen);
+        unit_hash.u64(snapshot.generation.publish_seq);
+        unit_hash.u32(uint32_t(snapshot.generation.current_type));
+        unit_hash.u32(uint32_t(snapshot.generation.last_source_type));
+        unit_hash.u32(uint32_t(snapshot.generation.domain));
+        unit_hash.u32(snapshot.generation.promote_hops);
+        unit_hash.u32(uint32_t(snapshot.generation.last_transition));
+        for (size_t shard_index = 0;
+             shard_index < ordered.size(); ++shard_index) {
+            const auto * shard = ordered[shard_index];
+            for (size_t i = 0; i < cell_ranges.size(); ++i) {
+                ranges[i] = {
+                    uint64_t(cell_ranges[i].first)*shard->row_bytes,
+                    uint64_t(cell_ranges[i].count)*shard->row_bytes,
+                };
+            }
+            auto chain = std::make_shared<artifact_segment_chain>();
+            vbr_capture_stream_stats stats;
+            const auto streamed = ring.stream_ranges(
+                shard->source, ranges, *chain, stats);
+            if (streamed != vbr_capture_stream_status::ok) {
+                return streamed;
+            }
+            if (stats.bytes != shard_packed_bytes[shard_index] ||
+                stats.bytes > UINT64_MAX - result.transfer.bytes ||
+                stats.chunks > UINT64_MAX - result.transfer.chunks ||
+                stats.backpressure_waits >
+                    UINT64_MAX - result.transfer.backpressure_waits ||
+                stats.event_completions >
+                    UINT64_MAX - result.transfer.event_completions ||
+                stats.synchronous_fallbacks >
+                    UINT64_MAX - result.transfer.synchronous_fallbacks) {
+                return vbr_capture_stream_status::internal_error;
+            }
+            result.transfer.bytes += stats.bytes;
+            result.transfer.chunks += stats.chunks;
+            result.transfer.backpressure_waits += stats.backpressure_waits;
+            result.transfer.event_completions += stats.event_completions;
+            result.transfer.synchronous_fallbacks +=
+                stats.synchronous_fallbacks;
+            result.transfer.max_segment_size = std::max(
+                result.transfer.max_segment_size,
+                stats.max_segment_size);
+            unit_hash.u32(shard->shard_index);
+            unit_hash.u32(shard->row_count);
+            unit_hash.u64(shard->row_bytes);
+            unit_hash.u64(shard->source_identity);
+            unit_hash.bytes(
+                stats.streaming_digest.data(),
+                stats.streaming_digest.size());
+            result.shards.push_back({
+                shard->shard_index,
+                std::move(chain),
+                stats.streaming_digest,
+            });
+        }
+        result.transfer.streaming_digest = unit_hash.finish();
+        if (!snapshots.recheck(snapshots.context, snapshot)) {
+            return vbr_capture_stream_status::snapshot_changed;
+        }
+        snapshots.release(snapshots.context, snapshot);
+        release.active = false;
+        output = std::move(result);
+        return vbr_capture_stream_status::ok;
+    } catch (...) {
+        output = {};
         return vbr_capture_stream_status::internal_error;
     }
 }

@@ -6,6 +6,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -153,6 +154,37 @@ static void test_cpu_ring_boundaries() {
     CHECK(vbr_capture_stream_digest(legacy) == stats.streaming_digest);
     CHECK(legacy.segment_count() == stats.chunks);
 
+    artifact_segment_chain projected;
+    vbr_capture_stream_stats projected_stats;
+    const std::vector<vbr_capture_stream_range> ranges {
+        { 2, 3 }, { 10, 5 }, { 20, 1 },
+    };
+    CHECK(ring->stream_ranges(
+              source, ranges, projected, projected_stats) ==
+          vbr_capture_stream_status::ok);
+    std::vector<uint8_t> projected_expected;
+    for (const auto & range : ranges) {
+        projected_expected.insert(
+            projected_expected.end(),
+            input.bytes.begin() + range.source_offset,
+            input.bytes.begin() + range.source_offset + range.size);
+    }
+    CHECK(read_chain(projected) == projected_expected);
+    CHECK(projected_stats.bytes == projected_expected.size());
+    CHECK(projected_stats.chunks == 2);
+    CHECK(projected.segment_count() == 2);
+    CHECK(projected_stats.streaming_digest ==
+          vbr_capture_stream_digest(projected));
+
+    artifact_segment_chain invalid_ranges;
+    projected_stats.bytes = 99;
+    CHECK(ring->stream_ranges(
+              source, { { 4, 3 }, { 6, 2 } },
+              invalid_ranges, projected_stats) ==
+          vbr_capture_stream_status::invalid_argument);
+    CHECK(projected_stats.bytes == 0);
+    CHECK(invalid_ranges.size() == 0);
+
     auto other = vbr_pinned_chunk_ring::create(
         { {} }, 14, 7, status);
     CHECK(other);
@@ -175,6 +207,399 @@ static void test_cpu_ring_boundaries() {
     CHECK(other->stream(
         source, failed_completion, other_stats) ==
             vbr_capture_stream_status::transfer_failed);
+}
+
+struct projected_snapshot_fixture {
+    vbr_capture_unit_snapshot snapshot;
+    uint32_t acquired = 0;
+    uint32_t rechecked = 0;
+    uint32_t released = 0;
+    bool acquire_ok = true;
+    bool recheck_ok = true;
+
+    static bool acquire(
+            void * context,
+            uint64_t source_namespace,
+            uint32_t child_id,
+            uint32_t logical_unit_id,
+            vbr_capture_unit_snapshot & output) noexcept {
+        auto & self = *static_cast<projected_snapshot_fixture *>(context);
+        self.acquired++;
+        output = self.snapshot;
+        return self.acquire_ok &&
+               output.source_namespace == source_namespace &&
+               output.child_id == child_id &&
+               output.logical_unit_id == logical_unit_id;
+    }
+
+    static bool recheck(
+            void * context,
+            const vbr_capture_unit_snapshot & expected) noexcept {
+        auto & self = *static_cast<projected_snapshot_fixture *>(context);
+        self.rechecked++;
+        return self.recheck_ok &&
+               expected.generation.repr_gen ==
+                   self.snapshot.generation.repr_gen &&
+               expected.generation.publish_seq ==
+                   self.snapshot.generation.publish_seq &&
+               expected.generation.current_type ==
+                   self.snapshot.generation.current_type &&
+               expected.generation.last_source_type ==
+                   self.snapshot.generation.last_source_type &&
+               expected.generation.domain ==
+                   self.snapshot.generation.domain &&
+               expected.generation.promote_hops ==
+                   self.snapshot.generation.promote_hops &&
+               expected.generation.last_transition ==
+                   self.snapshot.generation.last_transition &&
+               expected.controller_generation ==
+                   self.snapshot.controller_generation &&
+               expected.mutation_serial == self.snapshot.mutation_serial;
+    }
+
+    static void release(
+            void * context,
+            const vbr_capture_unit_snapshot &) noexcept {
+        static_cast<projected_snapshot_fixture *>(context)->released++;
+    }
+
+    vbr_capture_unit_snapshot_provider provider() {
+        return { this, acquire, recheck, release };
+    }
+};
+
+static vbr_artifact_stream_placement projected_placement(
+        uint64_t manifest,
+        llama_seq_id sequence,
+        std::initializer_list<uint32_t> cells) {
+    GGML_UNUSED(manifest);
+    vbr_artifact_stream_placement placement;
+    placement.child_id = 0;
+    placement.stream_index = 0;
+    placement.source_sequence = sequence;
+    placement.computation_frontier = 8;
+    llama_pos position = 0;
+    for (uint32_t cell : cells) {
+        placement.cells.push_back({ cell, position++, 0, 0 });
+    }
+    return placement;
+}
+
+static std::vector<uint8_t> projected_rows(
+        const std::vector<uint8_t> & source,
+        uint64_t row_bytes,
+        std::initializer_list<uint32_t> cells) {
+    std::vector<uint8_t> output;
+    for (uint32_t cell : cells) {
+        const size_t offset = size_t(cell*row_bytes);
+        output.insert(
+            output.end(), source.begin() + offset,
+            source.begin() + offset + row_bytes);
+    }
+    return output;
+}
+
+static void test_projected_unit_transfer() {
+    vbr_capture_projection_manifest one;
+    one.manifest_id = 1;
+    one.placements.push_back(projected_placement(1, 1, { 1, 2, 5 }));
+    vbr_capture_projection_manifest two;
+    two.manifest_id = 2;
+    two.placements.push_back(projected_placement(2, 2, { 2, 3 }));
+    vbr_capture_projection projection;
+    CHECK(vbr_artifact_project_capture_union(
+        { 91, { one, two } }, {}, projection));
+
+    synthetic_source first;
+    synthetic_source second;
+    first.bytes.resize(8*2);
+    second.bytes.resize(8*3);
+    for (size_t i = 0; i < first.bytes.size(); ++i) {
+        first.bytes[i] = uint8_t(10 + i);
+    }
+    for (size_t i = 0; i < second.bytes.size(); ++i) {
+        second.bytes[i] = uint8_t(100 + i);
+    }
+    vbr_capture_projected_shard_source shard_zero;
+    shard_zero.shard_index = 0;
+    shard_zero.row_count = 8;
+    shard_zero.row_bytes = 2;
+    shard_zero.source_identity = 101;
+    shard_zero.source.size = first.bytes.size();
+    shard_zero.source.context = &first;
+    shard_zero.source.read = read_synthetic;
+    vbr_capture_projected_shard_source shard_one;
+    shard_one.shard_index = 1;
+    shard_one.row_count = 8;
+    shard_one.row_bytes = 3;
+    shard_one.source_identity = 102;
+    shard_one.source.size = second.bytes.size();
+    shard_one.source.context = &second;
+    shard_one.source.read = read_synthetic;
+    std::vector<vbr_capture_projected_shard_source> sources {
+        shard_one, shard_zero,
+    };
+
+    projected_snapshot_fixture snapshot;
+    snapshot.snapshot.source_namespace = 91;
+    snapshot.snapshot.child_id = 0;
+    snapshot.snapshot.logical_unit_id = 7;
+    snapshot.snapshot.controller_generation = 11;
+    snapshot.snapshot.mutation_serial = 0;
+    snapshot.snapshot.generation.repr_gen = 13;
+    snapshot.snapshot.generation.publish_seq = 14;
+    snapshot.snapshot.generation.current_type = GGML_TYPE_F16;
+    snapshot.snapshot.generation.last_source_type = GGML_TYPE_F16;
+    CHECK(vbr_capture_projected_shard_topology(
+        sources, snapshot.snapshot.shard_count,
+        snapshot.snapshot.shard_topology_digest));
+
+    vbr_capture_stream_status status;
+    auto ring = vbr_pinned_chunk_ring::create(
+        { {} }, 16, 4, status);
+    CHECK(ring);
+    CHECK(status == vbr_capture_stream_status::ok);
+    vbr_capture_projected_unit captured;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources,
+              {},
+              snapshot.provider(), *ring, captured) ==
+          vbr_capture_stream_status::ok);
+    CHECK(snapshot.acquired == 1);
+    CHECK(snapshot.rechecked == 1);
+    CHECK(snapshot.released == 1);
+    CHECK(captured.projection == projection);
+    CHECK(captured.shards.size() == 2);
+    CHECK(captured.packed_bytes == 20);
+    CHECK(captured.transfer.bytes == 20);
+    CHECK(std::any_of(
+        captured.transfer.streaming_digest.begin(),
+        captured.transfer.streaming_digest.end(),
+        [](uint8_t value) { return value != 0; }));
+    auto rebound_sources = sources;
+    rebound_sources[0].source.context = &first;
+    uint32_t rebound_count = 0;
+    std::array<uint8_t, 32> rebound_digest = {};
+    CHECK(vbr_capture_projected_shard_topology(
+        rebound_sources, rebound_count, rebound_digest));
+    CHECK(rebound_digest != captured.snapshot.shard_topology_digest);
+    rebound_sources = sources;
+    rebound_sources[0].source.tensor_offset = 1;
+    CHECK(vbr_capture_projected_shard_topology(
+        rebound_sources, rebound_count, rebound_digest));
+    CHECK(rebound_digest != captured.snapshot.shard_topology_digest);
+    if (captured.shards.size() == 2) {
+        CHECK(captured.shards[0].shard_index == 0);
+        CHECK(captured.shards[1].shard_index == 1);
+        CHECK(read_chain(*captured.shards[0].bytes) ==
+              projected_rows(first.bytes, 2, { 1, 2, 3, 5 }));
+        CHECK(read_chain(*captured.shards[1].bytes) ==
+              projected_rows(second.bytes, 3, { 1, 2, 3, 5 }));
+        CHECK(captured.slices.size() == 4);
+        if (captured.slices.size() == 4) {
+            CHECK(captured.slices[0].packed_first_row == 0);
+            CHECK(captured.slices[1].packed_first_row == 1);
+            CHECK(captured.slices[2].packed_first_row == 2);
+            CHECK(captured.slices[3].packed_first_row == 3);
+        }
+    }
+
+    // Equal packed bytes under a different manifest dependency geometry must
+    // produce a different authenticated unit digest.
+    vbr_capture_projection_manifest combined;
+    combined.manifest_id = 3;
+    combined.placements.push_back(projected_placement(
+        3, 3, { 1, 2, 3, 5 }));
+    vbr_capture_projection combined_projection;
+    CHECK(vbr_artifact_project_capture_union(
+        { 91, { combined } }, {}, combined_projection));
+    projected_snapshot_fixture combined_snapshot;
+    combined_snapshot.snapshot = captured.snapshot;
+    vbr_capture_projected_unit combined_capture;
+    CHECK(vbr_capture_projected_unit_transfer(
+              combined_projection, 0, 0, 7, sources, {},
+              combined_snapshot.provider(), *ring, combined_capture) ==
+          vbr_capture_stream_status::ok);
+    CHECK(combined_capture.packed_bytes == captured.packed_bytes);
+    CHECK(combined_capture.transfer.streaming_digest !=
+          captured.transfer.streaming_digest);
+
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    snapshot.recheck_ok = false;
+    vbr_capture_projected_unit changed = captured;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources,
+              {},
+              snapshot.provider(), *ring, changed) ==
+          vbr_capture_stream_status::snapshot_changed);
+    CHECK(snapshot.acquired == 1);
+    CHECK(snapshot.rechecked == 1);
+    CHECK(snapshot.released == 1);
+    CHECK(!changed.projection);
+    CHECK(changed.shards.empty());
+
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    sources[0].source.fail_completion_at = 0;
+    vbr_capture_projected_unit failed = captured;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources,
+              {},
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::transfer_failed);
+    CHECK(snapshot.acquired == 1);
+    CHECK(snapshot.rechecked == 0);
+    CHECK(snapshot.released == 1);
+    CHECK(!failed.projection);
+    CHECK(failed.shards.empty());
+
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    snapshot.acquire_ok = false;
+    sources[0].source.fail_completion_at = UINT64_MAX;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources,
+              {},
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::snapshot_unavailable);
+    CHECK(snapshot.acquired == 1);
+    CHECK(snapshot.rechecked == 0);
+    CHECK(snapshot.released == 0);
+
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot.controller_generation = 0;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources,
+              {},
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::snapshot_unavailable);
+    CHECK(snapshot.acquired == 1);
+    CHECK(snapshot.rechecked == 0);
+    CHECK(snapshot.released == 1);
+
+    // Stable zero serials are valid; odd mutation/publish serials are not.
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot.mutation_serial = 1;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, {},
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::snapshot_unavailable);
+    CHECK(snapshot.released == 1);
+    const auto expect_invalid_snapshot = [&](vbr_capture_unit_snapshot value) {
+        projected_snapshot_fixture invalid;
+        invalid.snapshot = value;
+        CHECK(vbr_capture_projected_unit_transfer(
+                  projection, 0, 0, 7, sources, {},
+                  invalid.provider(), *ring, failed) ==
+              vbr_capture_stream_status::snapshot_unavailable);
+        CHECK(invalid.acquired == 1);
+        CHECK(invalid.rechecked == 0);
+        CHECK(invalid.released == 1);
+    };
+    auto invalid_snapshot = captured.snapshot;
+    invalid_snapshot.generation.last_source_type = -1;
+    expect_invalid_snapshot(invalid_snapshot);
+    invalid_snapshot = captured.snapshot;
+    invalid_snapshot.generation.current_type = GGML_TYPE_COUNT;
+    expect_invalid_snapshot(invalid_snapshot);
+    invalid_snapshot = captured.snapshot;
+    invalid_snapshot.generation.domain = vbr_repr_domain(255);
+    expect_invalid_snapshot(invalid_snapshot);
+    invalid_snapshot = captured.snapshot;
+    invalid_snapshot.generation.last_transition = vbr_repr_transition(255);
+    expect_invalid_snapshot(invalid_snapshot);
+    invalid_snapshot = captured.snapshot;
+    invalid_snapshot.generation.flags = 1;
+    expect_invalid_snapshot(invalid_snapshot);
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    snapshot.snapshot.generation.publish_seq = 15;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, {},
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::snapshot_unavailable);
+    CHECK(snapshot.released == 1);
+
+    // The snapshot authenticates the complete shard set. Reordering is
+    // normalized, while omission, sparse/sentinel IDs, and substitution fail.
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    auto omitted = sources;
+    omitted.erase(omitted.begin());
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, omitted, {},
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::snapshot_unavailable);
+    auto substituted = sources;
+    substituted[0].source_identity++;
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, substituted, {},
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::snapshot_unavailable);
+    auto sparse = sources;
+    sparse[0].shard_index = 3;
+    uint32_t invalid_count = 9;
+    std::array<uint8_t, 32> invalid_digest = { 1 };
+    CHECK(!vbr_capture_projected_shard_topology(
+        sparse, invalid_count, invalid_digest));
+    CHECK(invalid_count == 0);
+    auto sentinel = sources;
+    sentinel[0].shard_index = UINT32_MAX;
+    CHECK(!vbr_capture_projected_shard_topology(
+        sentinel, invalid_count, invalid_digest));
+
+    vbr_capture_projected_transfer_limits tight;
+    tight.max_shards = 1;
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, tight,
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::projection_invalid);
+    CHECK(snapshot.acquired == 0);
+    tight = {};
+    tight.max_shard_segment_references = 7;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, tight,
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::projection_invalid);
+    tight = {};
+    tight.max_source_operations = 6;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, tight,
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::projection_invalid);
+    CHECK(snapshot.acquired == 0);
+    tight.max_source_operations = 7;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, tight,
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::ok);
+    CHECK(snapshot.acquired == 1);
+    CHECK(snapshot.rechecked == 1);
+    CHECK(snapshot.released == 1);
+    tight = {};
+    tight.max_total_packed_bytes = 19;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, tight,
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::projection_invalid);
+
+    snapshot = {};
+    snapshot.snapshot = captured.snapshot;
+    sources[0].row_count = 3;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources,
+              {},
+              snapshot.provider(), *ring, failed) ==
+          vbr_capture_stream_status::projection_invalid);
+    CHECK(snapshot.acquired == 0);
+    CHECK(snapshot.released == 0);
 }
 
 struct generated_h2d_source {
@@ -908,10 +1333,60 @@ static void test_cuda_ring() {
     ggml_backend_free(backend);
 }
 
+static void benchmark_fragmented_range_packing() {
+    static constexpr uint32_t RANGE_COUNT = 1048576;
+    static constexpr size_t CHUNK_BYTES = 64*1024;
+    generated_h2d_source generated;
+    generated.size = uint64_t(RANGE_COUNT)*2;
+    std::vector<vbr_capture_stream_range> ranges;
+    ranges.reserve(RANGE_COUNT);
+    for (uint32_t i = 0; i < RANGE_COUNT; ++i) {
+        ranges.push_back({ uint64_t(i)*2, 1 });
+    }
+    vbr_capture_stream_source source;
+    source.size = generated.size;
+    source.context = &generated;
+    source.read = generated_h2d_source::read;
+    vbr_capture_stream_status status;
+    auto ring = vbr_pinned_chunk_ring::create(
+        { {} }, 2*CHUNK_BYTES, CHUNK_BYTES, status);
+    CHECK(ring);
+    artifact_segment_chain chain;
+    vbr_capture_stream_stats stats;
+    const auto begin = std::chrono::steady_clock::now();
+    CHECK(ring && ring->stream_ranges(
+              source, ranges, chain, stats) ==
+          vbr_capture_stream_status::ok);
+    const auto elapsed = std::chrono::duration_cast<
+        std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+    CHECK(stats.bytes == RANGE_COUNT);
+    CHECK(stats.chunks == RANGE_COUNT/CHUNK_BYTES);
+    CHECK(chain.segment_count() == stats.chunks);
+    CHECK(chain.max_segment_size() == CHUNK_BYTES);
+    std::vector<uint8_t> packed(RANGE_COUNT);
+    CHECK(chain.read(0, packed.data(), packed.size()));
+    for (uint32_t i = 0; i < RANGE_COUNT; ++i) {
+        if (packed[i] != generated_h2d_source::byte_at(uint64_t(i)*2)) {
+            CHECK(false);
+            break;
+        }
+    }
+    printf("VBR_CAPTURE_RANGE_PACK_BENCH ranges=%u chunks=%" PRIu64
+           " bytes=%" PRIu64 " elapsed_us=%lld\n",
+           RANGE_COUNT, stats.chunks, stats.bytes, (long long) elapsed);
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 &&
+        std::string(argv[1]) == "--range-pack-bench") {
+        benchmark_fragmented_range_packing();
+        return failures == 0 ? 0 : 1;
+    }
     test_segment_chain_offsets();
     test_registry_quiescence_query();
     test_cpu_ring_boundaries();
+    test_projected_unit_transfer();
     test_h2d_bounded_streaming();
     test_ring_accounting_once();
     test_capture_reservation_domain_preparation();

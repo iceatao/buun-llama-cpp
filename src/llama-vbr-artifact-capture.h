@@ -2,6 +2,7 @@
 
 #include "llama-cache-authority.h"
 #include "llama-vbr-artifact.h"
+#include "llama-vbr-generation.h"
 #include "llama-vbr-pinned-ring.h"
 
 #include "ggml-backend.h"
@@ -33,6 +34,9 @@ enum class vbr_capture_stream_status : uint8_t {
     stage_failed,
     commit_failed,
     publication_failed,
+    projection_invalid,
+    snapshot_unavailable,
+    snapshot_changed,
     internal_error,
     _count,
 };
@@ -110,6 +114,11 @@ struct vbr_capture_stream_source {
     uint64_t fail_completion_at = UINT64_MAX;
 };
 
+struct vbr_capture_stream_range {
+    uint64_t source_offset = 0;
+    uint64_t size = 0;
+};
+
 struct vbr_capture_stream_stats {
     uint64_t bytes = 0;
     uint64_t chunks = 0;
@@ -171,12 +180,35 @@ struct vbr_capture_projection_plan {
     std::vector<uint64_t> dependent_manifest_ids;
 };
 
+class vbr_pinned_chunk_ring;
+
+// Process-local sealed projection capability. Construction is owned by the
+// planner, so no mutable shared_ptr alias can outlive validation and race a
+// projected transfer. Copying this handle shares immutable plan storage.
+class vbr_capture_projection {
+public:
+    vbr_capture_projection() = default;
+    const vbr_capture_projection_plan * operator->() const noexcept;
+    const vbr_capture_projection_plan & operator*() const noexcept;
+    explicit operator bool() const noexcept;
+    bool operator==(const vbr_capture_projection & other) const noexcept;
+
+private:
+    explicit vbr_capture_projection(
+        std::shared_ptr<const vbr_capture_projection_plan> plan) noexcept;
+    std::shared_ptr<const vbr_capture_projection_plan> plan_;
+    friend bool vbr_artifact_project_capture_union(
+        const vbr_capture_projection_batch &,
+        const vbr_capture_projection_limits &,
+        vbr_capture_projection &) noexcept;
+};
+
 // Allocation failure, malformed placement evidence, duplicate identities, or
 // any limit violation clears output and returns false.
 bool vbr_artifact_project_capture_union(
     const vbr_capture_projection_batch & batch,
     const vbr_capture_projection_limits & limits,
-    vbr_capture_projection_plan & output) noexcept;
+    vbr_capture_projection & output) noexcept;
 
 // One globally-bounded ring split across per-device lanes. A null device lane
 // is the deterministic CPU test path. Real lanes allocate that device's host
@@ -207,11 +239,126 @@ public:
         artifact_segment_chain & destination,
         vbr_capture_stream_stats & stats) noexcept;
 
+    // Streams an ordered, non-overlapping set of subranges into one packed
+    // immutable chain and one digest pass. Source offsets remain relative to
+    // source.tensor_offset (tensor) or the read callback's logical source.
+    vbr_capture_stream_status stream_ranges(
+        const vbr_capture_stream_source & source,
+        const std::vector<vbr_capture_stream_range> & ranges,
+        artifact_segment_chain & destination,
+        vbr_capture_stream_stats & stats) noexcept;
+
 private:
     struct impl;
     explicit vbr_pinned_chunk_ring(std::unique_ptr<impl> state) noexcept;
+    vbr_capture_stream_status stream_ranges_impl(
+        const vbr_capture_stream_source & source,
+        const vbr_capture_stream_range * ranges,
+        size_t range_count,
+        artifact_segment_chain & destination,
+        vbr_capture_stream_stats & stats) noexcept;
     std::unique_ptr<impl> impl_;
 };
+
+struct vbr_capture_unit_snapshot {
+    uint64_t source_namespace = 0;
+    uint32_t child_id = UINT32_MAX;
+    uint32_t logical_unit_id = UINT32_MAX;
+    uint64_t controller_generation = 0;
+    uint64_t mutation_serial = 0;
+    vbr_unit_generation generation;
+    uint32_t shard_count = 0;
+    std::array<uint8_t, 32> shard_topology_digest = {};
+};
+
+// acquire() obtains the short unit-version lease and snapshots the exact
+// representation tuple. recheck() runs after every shard has completed;
+// release() is called exactly once on every post-acquire terminal.
+struct vbr_capture_unit_snapshot_provider {
+    using acquire_fn = bool (*)(
+        void * context,
+        uint64_t source_namespace,
+        uint32_t child_id,
+        uint32_t logical_unit_id,
+        vbr_capture_unit_snapshot & output) noexcept;
+    using recheck_fn = bool (*)(
+        void * context,
+        const vbr_capture_unit_snapshot & expected) noexcept;
+    using release_fn = void (*)(
+        void * context,
+        const vbr_capture_unit_snapshot & snapshot) noexcept;
+
+    void * context = nullptr;
+    acquire_fn acquire = nullptr;
+    recheck_fn recheck = nullptr;
+    release_fn release = nullptr;
+};
+
+struct vbr_capture_projected_shard_source {
+    uint32_t shard_index = UINT32_MAX;
+    uint32_t row_count = 0;
+    uint64_t row_bytes = 0;
+    // Provider-owned stable identity for this physical shard source. The
+    // snapshot authenticates the complete ordered identity/geometry set.
+    uint64_t source_identity = 0;
+    vbr_capture_stream_source source;
+};
+
+struct vbr_capture_projected_slice {
+    uint32_t projection_segment = UINT32_MAX;
+    uint64_t packed_first_row = 0;
+    uint32_t row_count = 0;
+};
+
+struct vbr_capture_projected_shard {
+    uint32_t shard_index = UINT32_MAX;
+    std::shared_ptr<const artifact_segment_chain> bytes;
+    std::array<uint8_t, 32> streaming_digest = {};
+};
+
+struct vbr_capture_projected_transfer_limits {
+    uint32_t max_shards = 128;
+    uint64_t max_shard_segment_references = 1048576;
+    // Exact aggregate source reads / async D2H enqueues while the unit-version
+    // lease is held. More fragmented unions must use a bounded packed view.
+    uint32_t max_source_operations = 4096;
+    uint64_t max_total_packed_bytes = uint64_t(16)*1024*1024*1024;
+};
+
+struct vbr_capture_projected_unit {
+    vbr_capture_projection projection;
+    vbr_capture_unit_snapshot snapshot;
+    uint32_t child_id = UINT32_MAX;
+    uint32_t stream_index = UINT32_MAX;
+    uint32_t logical_unit_id = UINT32_MAX;
+    uint64_t packed_bytes = 0;
+    vbr_capture_stream_stats transfer;
+    std::vector<vbr_capture_projected_slice> slices;
+    std::vector<vbr_capture_projected_shard> shards;
+};
+
+// Computes the canonical topology identity consumed by the snapshot owner.
+// Sources may be supplied in any order, but must form exactly [0, count).
+bool vbr_capture_projected_shard_topology(
+    const std::vector<vbr_capture_projected_shard_source> & sources,
+    uint32_t & shard_count,
+    std::array<uint8_t, 32> & digest) noexcept;
+
+// Captures one complete logical tensor unit across the exact shard topology
+// authenticated by the snapshot owner. No output becomes visible unless every
+// range transfers and the unit snapshot recheck succeeds. The sealed
+// projection capability keeps each slice's dependency offsets immutable for
+// the lifetime of the result.
+vbr_capture_stream_status vbr_capture_projected_unit_transfer(
+    vbr_capture_projection projection,
+    uint32_t child_id,
+    uint32_t stream_index,
+    uint32_t logical_unit_id,
+    const std::vector<vbr_capture_projected_shard_source> & sources,
+    const vbr_capture_projected_transfer_limits & limits,
+    const vbr_capture_unit_snapshot_provider & snapshots,
+    vbr_pinned_chunk_ring & ring,
+    vbr_capture_projected_unit & output) noexcept;
 
 struct vbr_verified_segment {
     uint32_t unit_index = UINT32_MAX;
