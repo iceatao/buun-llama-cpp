@@ -14,9 +14,11 @@
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -38,6 +40,8 @@ struct vbr_target_unit_snapshot;
 class vbr_import_receipt_group;
 struct vbr_capture_stream_stats;
 struct vbr_capture_projected_shard_source;
+struct vbr_capture_unit_snapshot;
+struct vbr_capture_unit_snapshot_provider;
 enum class vbr_explicit_generation_failure : uint8_t;
 enum class vbr_explicit_size_failure : uint8_t;
 struct vbr_artifact_stream_placement;
@@ -450,6 +454,25 @@ private:
         std::vector<geometry> units;
     };
 
+    // One synchronous projected transfer owns this stack-scoped callback
+    // context. The session borrows its immutable size-pass plan; acquire()
+    // rebinds the live sources under the unit reader lease before exposing a
+    // snapshot, and release() is idempotent as a defensive terminal.
+    struct vbr_capture_snapshot_session {
+        const llama_kv_cache * cache = nullptr;
+        const vbr_capture_unit_plan * plan = nullptr;
+        uint64_t source_namespace = 0;
+        uint32_t shard_count = 0;
+        std::array<uint8_t, 32> shard_topology_digest = {};
+        bool active = false;
+
+        vbr_capture_snapshot_session() = default;
+        ~vbr_capture_snapshot_session();
+        vbr_capture_snapshot_session(const vbr_capture_snapshot_session &) = delete;
+        vbr_capture_snapshot_session & operator=(const vbr_capture_snapshot_session &) = delete;
+        vbr_capture_unit_snapshot_provider provider() noexcept;
+    };
+
     bool vbr_capture_settle() noexcept;
     bool vbr_capture_size_pass(
         const vbr_capture_unit_request & request,
@@ -468,6 +491,26 @@ private:
     bool vbr_capture_projected_sources(
         const vbr_capture_unit_plan & plan,
         std::vector<vbr_capture_projected_shard_source> & output) const noexcept;
+    bool vbr_capture_projected_sources_leased(
+        const vbr_capture_unit_plan & plan,
+        std::vector<vbr_capture_projected_shard_source> & output,
+        const vbr_capture_snapshot_session & session) const noexcept;
+    bool vbr_capture_projected_sources_impl(
+        const vbr_capture_unit_plan & plan,
+        std::vector<vbr_capture_projected_shard_source> & output,
+        bool unit_leased) const noexcept;
+    bool vbr_capture_snapshot_bind(
+        const vbr_capture_unit_plan & plan,
+        const std::vector<vbr_capture_projected_shard_source> & sources,
+        uint64_t source_namespace,
+        vbr_capture_snapshot_session & output) const noexcept;
+    static bool vbr_capture_snapshot_acquire(
+        void * context, uint64_t source_namespace, uint32_t child_id,
+        uint32_t logical_unit_id, vbr_capture_unit_snapshot & output) noexcept;
+    static bool vbr_capture_snapshot_recheck(
+        void * context, const vbr_capture_unit_snapshot & expected) noexcept;
+    static void vbr_capture_snapshot_release(
+        void * context, const vbr_capture_unit_snapshot & snapshot) noexcept;
     bool vbr_capture_stability_matches(
         const vbr_capture_stability_token & token) const noexcept;
     bool vbr_capture_generation_record(
@@ -842,6 +885,7 @@ private:
         std::vector<ggml_type> types_before;
         std::vector<ggml_type> types_after;
         std::vector<size_t> sealed_deferred;
+        std::vector<size_t> capture_deferred;
     };
     struct vbr_tx_step {
         size_t child_idx = 0;
@@ -886,6 +930,21 @@ private:
         size_t child_idx = 0;
         vbr_grant_row row;
     };
+    class vbr_unit_retier_guard {
+    public:
+        vbr_unit_retier_guard() = default;
+        vbr_unit_retier_guard(llama_kv_cache * cache, uint32_t logical_unit) noexcept;
+        ~vbr_unit_retier_guard();
+        vbr_unit_retier_guard(const vbr_unit_retier_guard &) = delete;
+        vbr_unit_retier_guard & operator=(const vbr_unit_retier_guard &) = delete;
+        vbr_unit_retier_guard(vbr_unit_retier_guard && other) noexcept;
+        vbr_unit_retier_guard & operator=(vbr_unit_retier_guard && other) noexcept;
+        explicit operator bool() const noexcept { return active_; }
+    private:
+        llama_kv_cache * cache_ = nullptr;
+        uint32_t logical_unit_ = UINT32_MAX;
+        bool active_ = false;
+    };
     struct vbr_shed_tx {
         int demanded_device = -1;
         uint64_t target = 0;
@@ -905,11 +964,13 @@ private:
         std::map<vbr_tx_pool_key, uint64_t> gross_by_pool;
         std::map<vbr_tx_pool_key, uint64_t> deferred_by_pool;
         std::vector<vbr_tx_grant_plan> planned_grants;
+        std::vector<vbr_unit_retier_guard> unit_guards;
         bool snapshot_open = true;
     };
     bool vbr_tx_settle_tree();
     bool vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const;
     bool vbr_tx_hard_seal_allowed(vbr_shed_tx & tx);
+    bool vbr_tx_capture_leases_allowed(vbr_shed_tx & tx);
     bool vbr_tx_preflight(vbr_shed_tx & tx);
     bool vbr_tx_map_endpoints(vbr_shed_tx & tx);
     bool vbr_tx_prepare_commit(vbr_shed_tx & tx, const llama_vram_peer_claim & c);
@@ -931,6 +992,10 @@ private:
     std::vector<vbr_hard_seal_subject> vbr_hard_seal_evidence_;
     std::vector<size_t> vbr_hard_seal_deferred_;
     std::vector<uint8_t> vbr_hard_seal_attempted_;
+    std::vector<size_t> vbr_capture_retier_deferred_;
+    std::vector<uint8_t> vbr_capture_retier_attempted_;
+    uint64_t vbr_capture_retier_attempt_boundary_ = UINT64_MAX;
+    std::vector<uint64_t> vbr_capture_unit_attempt_boundary_;
     bool vbr_hard_seal_step_blocked(
             size_t order_ordinal,
             vbr_hard_seal_consult_session & session) const;
@@ -976,6 +1041,29 @@ private:
     uint64_t vbr_retier_reconciles_         = 0;
     uint64_t vbr_retier_outer_deferred_base_ = 0;
     bool     vbr_retier_reconcile_pending_  = false;
+    struct vbr_capture_unit_lease_state {
+        uint32_t readers = 0;
+        uint64_t mutation_serial = 0;
+        bool writer = false;
+        bool mutation_deferred = false;
+    };
+    mutable std::mutex vbr_capture_unit_leases_mutex_;
+    mutable std::vector<vbr_capture_unit_lease_state> vbr_capture_unit_leases_;
+    mutable bool vbr_capture_controller_writer_ = false;
+    mutable std::atomic<bool> vbr_capture_reconcile_pending_ { false };
+    bool vbr_capture_unit_read_begin(uint32_t logical_unit) const noexcept;
+    bool vbr_capture_unit_read_serial(
+        uint32_t logical_unit, uint64_t & output) const noexcept;
+    void vbr_capture_unit_read_end(uint32_t logical_unit) const noexcept;
+    bool vbr_capture_watermark_contains(
+        const vbr_pool & pool, uint32_t planned) const noexcept;
+    void vbr_capture_watermark_publish(
+        vbr_pool & pool, uint32_t value) noexcept;
+    bool vbr_capture_unit_write_begin(uint32_t logical_unit) noexcept;
+    bool vbr_capture_unit_write_plan_available(uint32_t logical_unit) const noexcept;
+    void vbr_capture_unit_write_end(uint32_t logical_unit) noexcept;
+    bool vbr_capture_controller_write_begin() noexcept;
+    void vbr_capture_controller_write_end() noexcept;
     bool     vbr_retier_defer(const char * decision);
     bool     vbr_retier_take_reconcile(const char * boundary);
     // WS-0 (P1) schedule-trace recorder — env VBR_TRACE=<path>, TEST/GATING ONLY. One line per
@@ -1280,7 +1368,13 @@ private:
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
-    enum class vbr_degrade_result { applied, exhausted, reserve_failed, hard_lease_blocked };
+    enum class vbr_degrade_result {
+        applied,
+        exhausted,
+        reserve_failed,
+        hard_lease_blocked,
+        capture_lease_blocked,
+    };
     vbr_degrade_result vbr_degrade_next(uint32_t wm_next);
                                                       // wm_next = projected watermark incl. the
                                                       // incoming batch (bounds live pages/scrub)

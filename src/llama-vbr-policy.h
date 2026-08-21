@@ -32,6 +32,10 @@ struct child {
     // beyond one of these ordinals must defer it for a later boundary rather
     // than losing it behind the monotone cursor.
     std::vector<size_t> blocked_order_indices;
+    // Capture-leased units are omitted before prefix selection so one busy
+    // unit cannot freeze unrelated tree shedding. The selected units are
+    // still guarded again at commit preflight to close the TOCTOU window.
+    std::vector<size_t> capture_blocked_order_indices;
 };
 
 struct selection {

@@ -1005,6 +1005,7 @@ class vbr_kv_import_session {
                 metadata.logical_unit, metadata.target_type);
         }
         cache_->vbr_degrade_cursor_ = size_t(final_cursor_);
+        cache_->vbr_capture_retier_deferred_.clear();
         cache_->vbr_attention_content_changed();
         published_ = true;
         armed_ = false;

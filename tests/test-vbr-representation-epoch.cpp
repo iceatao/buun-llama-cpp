@@ -181,7 +181,37 @@ struct llama_kv_cache_vbr_epoch_test {
                 request, units, stability, nullptr) || units.empty()) {
             return false;
         }
+        llama_pos frontier = 0;
+        for (const auto & cells : kv->v_cells) {
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.seq_has(cell, 0)) {
+                    frontier = std::max(
+                        frontier, cells.pos_get(cell) + 1);
+                }
+            }
+        }
+        vbr_checkpoint_generation_controller generation;
+        vbr_artifact_stream_placement placement;
+        if (frontier <= 0 || !kv->vbr_capture_generation_record(
+                child_id,
+                checkpoint_child_dependency_mode::live_guarded,
+                0, frontier, generation, &placement, nullptr) ||
+            placement.cells.empty()) {
+            return false;
+        }
+        const uint64_t source_namespace = instance.lo != 0
+            ? instance.lo : instance.hi;
+        vbr_capture_projection_manifest manifest;
+        manifest.manifest_id = 1;
+        manifest.placements.push_back(placement);
+        vbr_capture_projection projection;
+        if (!vbr_artifact_project_capture_union(
+                { source_namespace, { std::move(manifest) } },
+                {}, projection)) {
+            return false;
+        }
         std::vector<uint64_t> identities;
+        bool transferred = false;
         for (const auto & unit : units) {
             std::vector<vbr_capture_projected_shard_source> sources;
             if (!kv->vbr_capture_projected_sources(unit, sources) ||
@@ -226,6 +256,159 @@ struct llama_kv_cache_vbr_epoch_test {
                 identities.push_back(source.source_identity);
             }
 
+            if (!transferred) {
+                llama_kv_cache::vbr_capture_snapshot_session session;
+                if (!kv->vbr_capture_snapshot_bind(
+                    unit, sources, source_namespace, session)) {
+                    return false;
+                }
+                auto provider = session.provider();
+                vbr_capture_unit_snapshot snapshot;
+                if (!provider.acquire(
+                    provider.context, source_namespace, child_id,
+                    unit.logical_unit, snapshot) ||
+                    snapshot.source_namespace != source_namespace ||
+                    snapshot.child_id != child_id ||
+                    snapshot.logical_unit_id != unit.logical_unit ||
+                    snapshot.generation.repr_gen != unit.generation.repr_gen ||
+                    snapshot.shard_count != sources.size() ||
+                    !provider.recheck(provider.context, snapshot)) {
+                    return false;
+                }
+                auto * leased_pool = static_cast<llama_kv_cache::vbr_pool *>(
+                    unit.shards.front().pool);
+                if (leased_pool == nullptr || leased_pool->wm_cells == 0 ||
+                    leased_pool->wm_cells > (UINT32_MAX - 1) / 2) {
+                    return false;
+                }
+                const uint32_t leased_wm = leased_pool->wm_cells;
+                const uint32_t raised_wm = leased_wm * 2 + 1;
+                kv->vbr_capture_watermark_publish(*leased_pool, raised_wm);
+                kv->vbr_shrink_watermark();
+                if (leased_pool->wm_cells != raised_wm ||
+                    !provider.recheck(provider.context, snapshot)) {
+                    kv->vbr_capture_watermark_publish(*leased_pool, leased_wm);
+                    return false;
+                }
+                kv->vbr_capture_watermark_publish(*leased_pool, leased_wm);
+                // A conflicting writer is refused without taking a controller-wide
+                // freeze; another logical unit remains independently writable.
+                llama_kv_cache::vbr_unit_retier_guard conflict(
+                    kv, unit.logical_unit);
+                if (conflict) {
+                    return false;
+                }
+                const uint32_t other_unit = unit.logical_unit == 0 ? 1 : 0;
+                if (other_unit < kv->vbr_capture_unit_leases_.size()) {
+                    llama_kv_cache::vbr_unit_retier_guard unrelated(
+                    kv, other_unit);
+                    if (!unrelated) {
+                        return false;
+                    }
+                }
+                if (kv->vbr_capture_controller_write_begin()) {
+                    kv->vbr_capture_controller_write_end();
+                    return false;
+                }
+                provider.release(provider.context, snapshot);
+                if (session.active) {
+                    return false;
+                }
+                {
+                    llama_kv_cache::vbr_unit_retier_guard reopened(
+                    kv, unit.logical_unit);
+                    if (!reopened) {
+                        return false;
+                    }
+                }
+                if (!kv->vbr_capture_controller_write_begin()) {
+                    return false;
+                }
+                if (kv->vbr_capture_controller_write_begin()) {
+                    kv->vbr_capture_controller_write_end();
+                    return false;
+                }
+                if (kv->vbr_capture_unit_read_begin(unit.logical_unit)) {
+                    kv->vbr_capture_unit_read_end(unit.logical_unit);
+                    kv->vbr_capture_controller_write_end();
+                    return false;
+                }
+                kv->vbr_capture_controller_write_end();
+                if (!kv->vbr_retier_take_reconcile("capture_lease_test")) {
+                    return false;
+                }
+
+                std::vector<vbr_capture_lane> lanes;
+                for (const auto & source : sources) {
+                    if (source.source.lane >= 128) {
+                        return false;
+                    }
+                    if (lanes.size() <= source.source.lane) {
+                        lanes.resize(source.source.lane + 1);
+                    }
+                    auto & lane = lanes[source.source.lane];
+                    if (lane.device != nullptr &&
+                        (lane.device != source.source.device ||
+                         lane.backend != source.source.backend)) {
+                        return false;
+                    }
+                    lane.device = source.source.device;
+                    lane.backend = source.source.backend;
+                }
+                constexpr size_t chunk_bytes = 64*1024;
+                vbr_capture_stream_status ring_status;
+                auto ring = vbr_pinned_chunk_ring::create(
+                    lanes, uint64_t(lanes.size())*4*chunk_bytes,
+                    chunk_bytes, ring_status);
+                llama_kv_cache::vbr_capture_snapshot_session transfer_session;
+                if (!ring || ring_status != vbr_capture_stream_status::ok ||
+                    !kv->vbr_capture_snapshot_bind(
+                        unit, sources, source_namespace, transfer_session)) {
+                    return false;
+                }
+                // A pool watermark is shared by all units on that device. An
+                // unrelated request may extend it while this unit is leased;
+                // the planned prefix remains valid and the transfer must keep
+                // using its frozen row/payload bounds.
+                struct watermark_restore {
+                    llama_kv_cache * cache = nullptr;
+                    std::vector<std::pair<llama_kv_cache::vbr_pool *, uint32_t>> values;
+                    ~watermark_restore() {
+                        for (const auto & [pool, value] : values) {
+                            cache->vbr_capture_watermark_publish(*pool, value);
+                        }
+                    }
+                } restore { kv, {} };
+                for (const auto & shard : unit.shards) {
+                    auto * pool = static_cast<llama_kv_cache::vbr_pool *>(shard.pool);
+                    if (pool == nullptr || pool->wm_cells == UINT32_MAX) {
+                        return false;
+                    }
+                    const auto found = std::find_if(
+                        restore.values.begin(), restore.values.end(),
+                        [&](const auto & value) { return value.first == pool; });
+                    if (found == restore.values.end()) {
+                        restore.values.push_back({ pool, pool->wm_cells });
+                        kv->vbr_capture_watermark_publish(
+                            *pool, pool->wm_cells + 1);
+                    }
+                }
+                vbr_capture_projected_unit captured;
+                if (vbr_capture_projected_unit_transfer(
+                        projection, child_id, placement.stream_index,
+                        unit.logical_unit, sources, {},
+                        transfer_session.provider(), *ring, captured) !=
+                            vbr_capture_stream_status::ok ||
+                    captured.packed_bytes == 0 ||
+                    captured.shards.size() != sources.size() ||
+                    captured.snapshot.generation.repr_gen !=
+                        unit.generation.repr_gen ||
+                    transfer_session.active) {
+                    return false;
+                }
+                transferred = true;
+            }
+
             auto malformed = unit;
             ++malformed.shards.front().row_bytes;
             std::vector<vbr_capture_projected_shard_source> refused = sources;
@@ -248,7 +431,7 @@ struct llama_kv_cache_vbr_epoch_test {
                 return false;
             }
         }
-        return !identities.empty();
+        return transferred && !identities.empty();
     }
 
     // This test owns the representation-epoch mechanism, not the model/card-specific pricing
@@ -269,6 +452,158 @@ struct llama_kv_cache_vbr_epoch_test {
             llama_kv_cache::vbr_degrade_result::applied;
         kv->vbr_degrade_limit_ = saved_limit;
         return changed;
+    }
+
+    static bool capture_lease_skips_only_conflicting_degrade(
+            llama_kv_cache * kv, uint32_t child_id) {
+        if (!kv || !kv->vbr_capture_settle()) {
+            return false;
+        }
+        const auto instance = kv->vbr_instance_id();
+        std::vector<vbr_explicit_capture_pool_binding> bindings;
+        for (const auto & pool : kv->vbr_pools_) {
+            if (std::none_of(bindings.begin(), bindings.end(),
+                    [&](const auto & value) {
+                        return value.device == pool.device;
+                    })) {
+                bindings.push_back({
+                    instance, pool.device, 0,
+                    uint16_t(bindings.size()),
+                    uint32_t(bindings.size()),
+                });
+            }
+        }
+        llama_kv_cache::vbr_capture_unit_request request;
+        request.child_id = child_id;
+        request.bindings = &bindings;
+        std::vector<llama_kv_cache::vbr_capture_unit_plan> plans;
+        llama_kv_cache::vbr_capture_stability_token stability;
+        if (!kv->vbr_capture_size_pass(
+                request, plans, stability, nullptr)) {
+            return false;
+        }
+
+        const size_t saved_limit = kv->vbr_degrade_limit_;
+        kv->vbr_degrade_limit_ = kv->vbr_degrade_order_.size();
+        const auto restore_limit = [&]() {
+            kv->vbr_degrade_limit_ = saved_limit;
+        };
+        const llama_kv_cache::vbr_capture_unit_plan * target = nullptr;
+        size_t target_ordinal = SIZE_MAX;
+        std::vector<ggml_type> simulated;
+        kv->vbr_sim_seed(
+            simulated, /* pooled_only = */ true,
+            GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+            nullptr, nullptr, nullptr);
+        for (size_t ordinal = kv->vbr_degrade_cursor_;
+             ordinal < kv->vbr_degrade_limit_; ++ordinal) {
+            const auto & step = kv->vbr_degrade_order_[ordinal];
+            size_t slot = 0;
+            const ggml_tensor * tensor = nullptr;
+            ggml_type target_type = GGML_TYPE_COUNT;
+            if (!kv->vbr_sim_step(
+                    simulated, ordinal, slot, tensor, target_type)) {
+                continue;
+            }
+            auto found = std::find_if(plans.begin(), plans.end(),
+                [&](const auto & plan) {
+                    return plan.logical_unit == slot;
+                });
+            if (found == plans.end()) {
+                continue;
+            }
+            const auto & units = kv->vbr_units_of(
+                slot/2, step.is_v != 0);
+            if (tensor != nullptr && !units.empty() &&
+                std::all_of(units.begin(), units.end(),
+                    [](const auto & value) {
+                        return value.first->wm_cells > 0;
+                    })) {
+                target = &*found;
+                target_ordinal = ordinal;
+                break;
+            }
+        }
+        if (target == nullptr) {
+            restore_limit();
+            return false;
+        }
+        std::vector<vbr_capture_projected_shard_source> sources;
+        llama_kv_cache::vbr_capture_snapshot_session session;
+        const uint64_t source_namespace = instance.lo != 0
+            ? instance.lo : instance.hi;
+        if (!kv->vbr_capture_projected_sources(*target, sources) ||
+            !kv->vbr_capture_snapshot_bind(
+                *target, sources, source_namespace, session)) {
+            restore_limit();
+            return false;
+        }
+        auto provider = session.provider();
+        vbr_capture_unit_snapshot snapshot;
+        if (!provider.acquire(
+                provider.context, source_namespace, child_id,
+                target->logical_unit, snapshot)) {
+            restore_limit();
+            return false;
+        }
+        const auto & target_units = kv->vbr_units_of(
+            target->logical_unit / 2,
+            (target->logical_unit & 1u) != 0);
+        if (target_ordinal == SIZE_MAX || target_units.empty()) {
+            restore_limit();
+            return false;
+        }
+        const auto policy = kv->vbr_policy_child_stream(
+            target_units.front().first->device,
+            kv->vbr_watermark_cells(0));
+        if (std::find(policy.capture_blocked_order_indices.begin(),
+                      policy.capture_blocked_order_indices.end(),
+                      target_ordinal) ==
+                policy.capture_blocked_order_indices.end() ||
+            std::any_of(policy.steps.begin(), policy.steps.end(),
+                [&](const auto & step) {
+                    return step.order_index == target_ordinal;
+                }) ||
+            policy.steps.empty()) {
+            restore_limit();
+            return false;
+        }
+        const auto * tracker = kv->vbr_generation_tracker_get();
+        const auto target_before = tracker->unit_generation(
+            target->logical_unit);
+        const uint64_t epoch_before = kv->vbr_representation_epoch_;
+        const auto skipped = kv->vbr_degrade_next(
+            kv->vbr_watermark_cells(0));
+        const bool isolated =
+            skipped == llama_kv_cache::vbr_degrade_result::applied &&
+            kv->vbr_representation_epoch_ > epoch_before &&
+            tracker->unit_generation(target->logical_unit).repr_gen ==
+                target_before.repr_gen &&
+            provider.recheck(provider.context, snapshot);
+        const auto second = isolated
+            ? kv->vbr_degrade_next(kv->vbr_watermark_cells(0))
+            : llama_kv_cache::vbr_degrade_result::exhausted;
+        const bool coalesced = isolated &&
+            second != llama_kv_cache::vbr_degrade_result::reserve_failed &&
+            tracker->unit_generation(target->logical_unit).repr_gen ==
+                target_before.repr_gen &&
+            target->logical_unit <
+                kv->vbr_capture_unit_attempt_boundary_.size() &&
+            kv->vbr_capture_unit_attempt_boundary_[target->logical_unit] ==
+                kv->vbr_boundary_count_;
+        provider.release(provider.context, snapshot);
+        const bool reconciled = coalesced &&
+            kv->vbr_retier_take_reconcile("capture_degrade_test");
+        const auto retried = reconciled
+            ? kv->vbr_degrade_next(kv->vbr_watermark_cells(0))
+            : llama_kv_cache::vbr_degrade_result::exhausted;
+        const bool target_changed = reconciled &&
+            retried == llama_kv_cache::vbr_degrade_result::applied &&
+            tracker->unit_generation(target->logical_unit).repr_gen >
+                target_before.repr_gen &&
+            kv->vbr_capture_retier_deferred_.empty();
+        restore_limit();
+        return target_changed;
     }
 
     static void full_reset(llama_kv_cache * kv) {
@@ -2130,8 +2465,9 @@ int main(int argc, char ** argv) {
     }
 
     // The two independently mutating children must surface an ordered tuple, never a sum.
-    if (!llama_kv_cache_vbr_epoch_test::force_degrade(base)) {
-        fprintf(stderr, "failed to force base degrade\n");
+    if (!llama_kv_cache_vbr_epoch_test::capture_lease_skips_only_conflicting_degrade(
+            base, 0)) {
+        fprintf(stderr, "per-unit capture lease did not isolate and retry base degrade\n");
         return 1;
     }
     const auto base_degraded = llama_memory_vbr_state(mem, 0, 0);
@@ -2292,7 +2628,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (normal_final.retier_reconciles !=
-        before_freeze.retier_reconciles + 1) {
+        before_freeze.retier_reconciles + 2) {
         fprintf(stderr, "ordinary phase changed the reconcile count after reconciliation\n");
         return 1;
     }

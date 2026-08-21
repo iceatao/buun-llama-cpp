@@ -1671,6 +1671,11 @@ llama_kv_cache::llama_kv_cache(
         // experiment overrides.
         if (vbr_vmm_active()) {
             vbr_load_degrade_order();
+            vbr_capture_retier_deferred_.reserve(vbr_degrade_order_.size());
+            vbr_capture_retier_attempted_.assign(
+                vbr_degrade_order_.size(), 0);
+            vbr_capture_unit_attempt_boundary_.assign(
+                layers.size() * 2, UINT64_MAX);
             // co-tenancy band cap: demand-driven sheds may only spend the leading f16->t8
             // band of the price order — the one cheap AND domain-reversible rung (sub-t8
             // sheds imprint irreversible re-encode error into existing tokens). A custom
@@ -1857,6 +1862,7 @@ llama_kv_cache::llama_kv_cache(
             if (vbr_budget_bytes_ > 0) {
                 vbr_generation_ = std::make_unique<vbr_generation_tracker>(
                         n_stream, kv_size, static_cast<uint32_t>(layers.size() * 2));
+                vbr_capture_unit_leases_.resize(layers.size() * 2);
                 // F4.0 has no capture/import refusal surface yet. Keep construction fail-closed;
                 // F4.1 will route unavailable durable lineage into its typed refusal path.
                 GGML_ASSERT(vbr_generation_->active());
@@ -2971,6 +2977,15 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                     if (degrade == vbr_degrade_result::hard_lease_blocked) {
                         LLAMA_LOG_WARN("%s: VBR pressure reached the hard-lease seal; "
                                 "failing this batch recoverably\n", __func__);
+                        vbr_tree_force();
+                        vbr_arm_wave_fences();
+                        return {};
+                    }
+                    if (degrade == vbr_degrade_result::capture_lease_blocked) {
+                        LLAMA_LOG_DEBUG(
+                            "%s: VBR pressure reached an active per-unit capture "
+                            "lease; retrying from fresh controller state\n",
+                            __func__);
                         vbr_tree_force();
                         vbr_arm_wave_fences();
                         return {};
@@ -4278,7 +4293,7 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
                 }
             }
         }
-        pool.wm_cells = wm;
+        vbr_capture_watermark_publish(pool, wm);
     }
     return true;
 }
@@ -4821,6 +4836,11 @@ bool llama_kv_cache::vbr_policy_priced_steps(
         if (seal_session != nullptr &&
             vbr_hard_seal_step_blocked(i, *seal_session)) {
             out.blocked_order_indices.push_back(i);
+            continue;
+        }
+        if (!vbr_capture_unit_write_plan_available(
+                static_cast<uint32_t>(slot))) {
+            out.capture_blocked_order_indices.push_back(i);
             continue;
         }
         out.steps.push_back({
@@ -6269,15 +6289,36 @@ uint64_t vbr_capture_shard_source_identity(
 bool llama_kv_cache::vbr_capture_projected_sources(
         const vbr_capture_unit_plan & plan,
         std::vector<vbr_capture_projected_shard_source> & output) const noexcept {
+    return vbr_capture_projected_sources_impl(plan, output, false);
+}
+
+bool llama_kv_cache::vbr_capture_projected_sources_leased(
+        const vbr_capture_unit_plan & plan,
+        std::vector<vbr_capture_projected_shard_source> & output,
+        const vbr_capture_snapshot_session & session) const noexcept {
+    uint64_t mutation_serial = 0;
+    if (!session.active || session.cache != this || session.plan != &plan ||
+        !vbr_capture_unit_read_serial(plan.logical_unit, mutation_serial)) {
+        output.clear();
+        return false;
+    }
+    return vbr_capture_projected_sources_impl(plan, output, true);
+}
+
+bool llama_kv_cache::vbr_capture_projected_sources_impl(
+        const vbr_capture_unit_plan & plan,
+        std::vector<vbr_capture_projected_shard_source> & output,
+        bool unit_leased) const noexcept {
     output.clear();
     if (other != nullptr) {
-        return other->vbr_capture_projected_sources(plan, output);
+        return other->vbr_capture_projected_sources_impl(
+            plan, output, unit_leased);
     }
     try {
         const auto * tracker = vbr_generation_tracker_get();
         const auto instance = vbr_instance_id();
         if (!vbr_operation_armed() || tracker == nullptr ||
-            !tracker->active() || !tracker->stable() ||
+            !tracker->active() || (!unit_leased && !tracker->stable()) ||
             !vbr_controller_instance_id_is_set(instance) ||
             plan.child_id == UINT32_MAX ||
             plan.logical_unit >= tracker->unit_count() ||
@@ -6307,7 +6348,7 @@ bool llama_kv_cache::vbr_capture_projected_sources(
                 shard.topology_index == UINT32_MAX ||
                 shard.device_ordinal == UINT16_MAX ||
                 shard.payload_bytes == 0 || shard.row_bytes == 0 ||
-                pool->wm_cells != plan.wm_cells ||
+                !vbr_capture_watermark_contains(*pool, plan.wm_cells) ||
                 pool->backend == nullptr || extent->t == nullptr ||
                 ggml_backend_get_device(pool->backend) == nullptr ||
                 extent->t->type != plan.generation.current_type ||
@@ -6345,7 +6386,8 @@ bool llama_kv_cache::vbr_capture_projected_sources(
         std::array<uint8_t, 32> topology = {};
         if (!vbr_capture_projected_shard_topology(
                 prepared, shard_count, topology) ||
-            shard_count != prepared.size() || !tracker->stable() ||
+            shard_count != prepared.size() ||
+            (!unit_leased && !tracker->stable()) ||
             !vbr_capture_generation_equal(
                 tracker->unit_generation(plan.logical_unit),
                 plan.generation)) {
@@ -6357,6 +6399,170 @@ bool llama_kv_cache::vbr_capture_projected_sources(
         output.clear();
         return false;
     }
+}
+
+llama_kv_cache::vbr_capture_snapshot_session::~vbr_capture_snapshot_session() {
+    if (active && cache != nullptr && plan != nullptr) {
+        cache->vbr_capture_unit_read_end(plan->logical_unit);
+    }
+}
+
+vbr_capture_unit_snapshot_provider
+llama_kv_cache::vbr_capture_snapshot_session::provider() noexcept {
+    return {
+        this,
+        &llama_kv_cache::vbr_capture_snapshot_acquire,
+        &llama_kv_cache::vbr_capture_snapshot_recheck,
+        &llama_kv_cache::vbr_capture_snapshot_release,
+    };
+}
+
+bool llama_kv_cache::vbr_capture_snapshot_bind(
+        const vbr_capture_unit_plan & plan,
+        const std::vector<vbr_capture_projected_shard_source> & sources,
+        uint64_t source_namespace,
+        vbr_capture_snapshot_session & output) const noexcept {
+    if (output.active || output.cache != nullptr || source_namespace == 0 ||
+        plan.child_id == UINT32_MAX || sources.empty()) {
+        return false;
+    }
+    uint32_t shard_count = 0;
+    std::array<uint8_t, 32> topology = {};
+    std::vector<vbr_capture_projected_shard_source> current;
+    if (!vbr_capture_projected_shard_topology(
+            sources, shard_count, topology) ||
+        !vbr_capture_projected_sources(plan, current) ||
+        current.size() != sources.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < sources.size(); ++i) {
+        if (current[i].shard_index != sources[i].shard_index ||
+            current[i].row_count != sources[i].row_count ||
+            current[i].row_bytes != sources[i].row_bytes ||
+            current[i].source_identity != sources[i].source_identity ||
+            current[i].source.backend != sources[i].source.backend ||
+            current[i].source.device != sources[i].source.device ||
+            current[i].source.tensor != sources[i].source.tensor ||
+            current[i].source.size != sources[i].source.size ||
+            current[i].source.lane != sources[i].source.lane) {
+            return false;
+        }
+    }
+    output.cache = this;
+    output.plan = &plan;
+    output.source_namespace = source_namespace;
+    output.shard_count = shard_count;
+    output.shard_topology_digest = topology;
+    return true;
+}
+
+bool llama_kv_cache::vbr_capture_snapshot_acquire(
+        void * context, uint64_t source_namespace, uint32_t child_id,
+        uint32_t logical_unit_id, vbr_capture_unit_snapshot & output) noexcept {
+    output = {};
+    auto * session = static_cast<vbr_capture_snapshot_session *>(context);
+    if (session == nullptr || session->cache == nullptr || session->plan == nullptr ||
+        session->active || source_namespace == 0 ||
+        source_namespace != session->source_namespace ||
+        child_id != session->plan->child_id ||
+        logical_unit_id != session->plan->logical_unit ||
+        !session->cache->vbr_capture_unit_read_begin(logical_unit_id)) {
+        return false;
+    }
+    session->active = true;
+    const auto fail = [&]() {
+        session->cache->vbr_capture_unit_read_end(logical_unit_id);
+        session->active = false;
+        output = {};
+        return false;
+    };
+    try {
+        const auto * tracker = session->cache->vbr_generation_tracker_get();
+        std::vector<vbr_capture_projected_shard_source> current;
+        uint32_t shard_count = 0;
+        uint64_t unit_mutation_serial = 0;
+        std::array<uint8_t, 32> topology = {};
+        if (tracker == nullptr || !tracker->active() ||
+            tracker->runtime_instance() != session->cache->vbr_instance_id() ||
+            logical_unit_id >= tracker->unit_count() ||
+            !session->cache->vbr_capture_projected_sources_leased(
+                *session->plan, current, *session) ||
+            !vbr_capture_projected_shard_topology(
+                current, shard_count, topology) ||
+            !session->cache->vbr_capture_unit_read_serial(
+                logical_unit_id, unit_mutation_serial) ||
+            shard_count != session->shard_count ||
+            topology != session->shard_topology_digest) {
+            return fail();
+        }
+        output.source_namespace = source_namespace;
+        output.child_id = child_id;
+        output.logical_unit_id = logical_unit_id;
+        output.controller_generation = tracker->controller_generation();
+        output.mutation_serial = unit_mutation_serial;
+        output.generation = tracker->unit_generation(logical_unit_id);
+        output.shard_count = shard_count;
+        output.shard_topology_digest = topology;
+        if (!vbr_capture_generation_equal(
+                output.generation,
+                tracker->unit_generation(logical_unit_id))) {
+            return fail();
+        }
+        return true;
+    } catch (...) {
+        return fail();
+    }
+}
+
+bool llama_kv_cache::vbr_capture_snapshot_recheck(
+        void * context,
+        const vbr_capture_unit_snapshot & expected) noexcept {
+    auto * session = static_cast<vbr_capture_snapshot_session *>(context);
+    if (session == nullptr || session->cache == nullptr ||
+        session->plan == nullptr || !session->active ||
+        expected.source_namespace != session->source_namespace ||
+        expected.child_id != session->plan->child_id ||
+        expected.logical_unit_id != session->plan->logical_unit ||
+        expected.shard_count != session->shard_count ||
+        expected.shard_topology_digest != session->shard_topology_digest) {
+        return false;
+    }
+    try {
+        const auto * tracker = session->cache->vbr_generation_tracker_get();
+        std::vector<vbr_capture_projected_shard_source> current;
+        uint32_t shard_count = 0;
+        uint64_t unit_mutation_serial = 0;
+        std::array<uint8_t, 32> topology = {};
+        return tracker != nullptr && tracker->active() &&
+            tracker->controller_generation() == expected.controller_generation &&
+            session->cache->vbr_capture_unit_read_serial(
+                expected.logical_unit_id, unit_mutation_serial) &&
+            unit_mutation_serial == expected.mutation_serial &&
+            vbr_capture_generation_equal(
+                expected.generation,
+                tracker->unit_generation(expected.logical_unit_id)) &&
+            session->cache->vbr_capture_projected_sources_leased(
+                *session->plan, current, *session) &&
+            vbr_capture_projected_shard_topology(
+                current, shard_count, topology) &&
+            shard_count == expected.shard_count &&
+            topology == expected.shard_topology_digest;
+    } catch (...) {
+        return false;
+    }
+}
+
+void llama_kv_cache::vbr_capture_snapshot_release(
+        void * context,
+        const vbr_capture_unit_snapshot & snapshot) noexcept {
+    auto * session = static_cast<vbr_capture_snapshot_session *>(context);
+    if (session == nullptr || session->cache == nullptr ||
+        session->plan == nullptr || !session->active) {
+        return;
+    }
+    GGML_ASSERT(snapshot.logical_unit_id == session->plan->logical_unit);
+    session->cache->vbr_capture_unit_read_end(session->plan->logical_unit);
+    session->active = false;
 }
 
 bool llama_kv_cache::vbr_capture_stability_matches(
@@ -7008,7 +7214,222 @@ bool llama_kv_cache::vbr_retier_defer(const char * decision) {
     return true;
 }
 
+bool llama_kv_cache::vbr_capture_unit_read_begin(
+        uint32_t logical_unit) const noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_unit_read_begin(logical_unit);
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    if (logical_unit >= vbr_capture_unit_leases_.size() ||
+        vbr_capture_controller_writer_) {
+        return false;
+    }
+    auto & state = vbr_capture_unit_leases_[logical_unit];
+    if (state.writer || state.readers == UINT32_MAX) {
+        return false;
+    }
+    ++state.readers;
+    return true;
+}
+
+bool llama_kv_cache::vbr_capture_unit_read_serial(
+        uint32_t logical_unit, uint64_t & output) const noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_unit_read_serial(logical_unit, output);
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    if (logical_unit >= vbr_capture_unit_leases_.size()) {
+        return false;
+    }
+    const auto & state = vbr_capture_unit_leases_[logical_unit];
+    if (state.readers == 0 || state.writer ||
+        (state.mutation_serial & 1u) != 0) {
+        return false;
+    }
+    output = state.mutation_serial;
+    return true;
+}
+
+void llama_kv_cache::vbr_capture_unit_read_end(
+        uint32_t logical_unit) const noexcept {
+    if (other != nullptr) {
+        other->vbr_capture_unit_read_end(logical_unit);
+        return;
+    }
+    bool reconcile = false;
+    {
+        std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+        GGML_ASSERT(logical_unit < vbr_capture_unit_leases_.size());
+        auto & state = vbr_capture_unit_leases_[logical_unit];
+        GGML_ASSERT(state.readers > 0 && !state.writer);
+        --state.readers;
+        if (state.readers == 0 && state.mutation_deferred) {
+            state.mutation_deferred = false;
+            reconcile = true;
+        }
+    }
+    if (reconcile) {
+        vbr_capture_reconcile_pending_.store(true, std::memory_order_release);
+    }
+}
+
+bool llama_kv_cache::vbr_capture_watermark_contains(
+        const vbr_pool & pool, uint32_t planned) const noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_watermark_contains(pool, planned);
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    return pool.wm_cells >= planned;
+}
+
+void llama_kv_cache::vbr_capture_watermark_publish(
+        vbr_pool & pool, uint32_t value) noexcept {
+    if (other != nullptr) {
+        other->vbr_capture_watermark_publish(pool, value);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    pool.wm_cells = value;
+}
+
+bool llama_kv_cache::vbr_capture_unit_write_begin(
+        uint32_t logical_unit) noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_unit_write_begin(logical_unit);
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    if (logical_unit >= vbr_capture_unit_leases_.size() ||
+        vbr_capture_controller_writer_) {
+        return false;
+    }
+    auto & state = vbr_capture_unit_leases_[logical_unit];
+    if (state.writer || state.readers != 0 ||
+        state.mutation_serial > UINT64_MAX - 2) {
+        if (state.readers != 0) {
+            state.mutation_deferred = true;
+        }
+        return false;
+    }
+    state.writer = true;
+    ++state.mutation_serial;
+    return true;
+}
+
+bool llama_kv_cache::vbr_capture_unit_write_plan_available(
+        uint32_t logical_unit) const noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_unit_write_plan_available(logical_unit);
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    if (logical_unit >= vbr_capture_unit_leases_.size() ||
+        vbr_capture_controller_writer_) {
+        return false;
+    }
+    auto & state = vbr_capture_unit_leases_[logical_unit];
+    if (state.writer || state.readers != 0 ||
+        state.mutation_serial > UINT64_MAX - 2) {
+        if (state.readers != 0) {
+            state.mutation_deferred = true;
+        }
+        return false;
+    }
+    return true;
+}
+
+void llama_kv_cache::vbr_capture_unit_write_end(
+        uint32_t logical_unit) noexcept {
+    if (other != nullptr) {
+        other->vbr_capture_unit_write_end(logical_unit);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    GGML_ASSERT(logical_unit < vbr_capture_unit_leases_.size());
+    auto & state = vbr_capture_unit_leases_[logical_unit];
+    GGML_ASSERT(state.writer && state.readers == 0 &&
+                (state.mutation_serial & 1u) != 0 &&
+                state.mutation_serial != UINT64_MAX);
+    ++state.mutation_serial;
+    state.writer = false;
+}
+
+bool llama_kv_cache::vbr_capture_controller_write_begin() noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_controller_write_begin();
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    if (vbr_capture_controller_writer_) {
+        return false;
+    }
+    for (auto & state : vbr_capture_unit_leases_) {
+        if (state.writer || state.readers != 0) {
+            if (state.readers != 0) {
+                state.mutation_deferred = true;
+            }
+            return false;
+        }
+    }
+    vbr_capture_controller_writer_ = true;
+    return true;
+}
+
+void llama_kv_cache::vbr_capture_controller_write_end() noexcept {
+    if (other != nullptr) {
+        other->vbr_capture_controller_write_end();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(vbr_capture_unit_leases_mutex_);
+    GGML_ASSERT(vbr_capture_controller_writer_);
+    vbr_capture_controller_writer_ = false;
+}
+
+llama_kv_cache::vbr_unit_retier_guard::vbr_unit_retier_guard(
+        llama_kv_cache * cache, uint32_t logical_unit) noexcept
+    : cache_(cache), logical_unit_(logical_unit),
+      active_(cache != nullptr &&
+              cache->vbr_capture_unit_write_begin(logical_unit)) {
+}
+
+llama_kv_cache::vbr_unit_retier_guard::~vbr_unit_retier_guard() {
+    if (active_) {
+        cache_->vbr_capture_unit_write_end(logical_unit_);
+    }
+}
+
+llama_kv_cache::vbr_unit_retier_guard::vbr_unit_retier_guard(
+        vbr_unit_retier_guard && other) noexcept
+    : cache_(other.cache_), logical_unit_(other.logical_unit_),
+      active_(other.active_) {
+    other.cache_ = nullptr;
+    other.logical_unit_ = UINT32_MAX;
+    other.active_ = false;
+}
+
+llama_kv_cache::vbr_unit_retier_guard &
+llama_kv_cache::vbr_unit_retier_guard::operator=(
+        vbr_unit_retier_guard && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (active_) {
+        cache_->vbr_capture_unit_write_end(logical_unit_);
+    }
+    cache_ = other.cache_;
+    logical_unit_ = other.logical_unit_;
+    active_ = other.active_;
+    other.cache_ = nullptr;
+    other.logical_unit_ = UINT32_MAX;
+    other.active_ = false;
+    return *this;
+}
+
 bool llama_kv_cache::vbr_retier_take_reconcile(const char * boundary) {
+    if (vbr_capture_reconcile_pending_.exchange(
+            false, std::memory_order_acq_rel)) {
+        vbr_retier_reconcile_pending_ = true;
+        vbr_capture_retier_attempt_boundary_ = UINT64_MAX;
+        std::fill(vbr_capture_unit_attempt_boundary_.begin(),
+                  vbr_capture_unit_attempt_boundary_.end(), UINT64_MAX);
+    }
     if (vbr_retier_freeze_depth_ > 0 || !vbr_retier_reconcile_pending_) {
         return false;
     }
@@ -7036,6 +7457,15 @@ void llama_kv_cache::vbr_full_reset() {
     if (vbr_retier_defer("full_reset")) {
         return;
     }
+    if (!vbr_capture_controller_write_begin()) {
+        return;
+    }
+    struct capture_controller_guard {
+        llama_kv_cache * cache;
+        ~capture_controller_guard() {
+            cache->vbr_capture_controller_write_end();
+        }
+    } capture_guard { this };
     // in-flight safety before ripping pages: settle the side streams and the devices once
     // (session-boundary event — the sync cost is irrelevant)
     vbr_flush_deferred_unmaps();
@@ -7070,11 +7500,12 @@ void llama_kv_cache::vbr_full_reset() {
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off, slot);
             }
         }
-        pool.wm_cells = 0;
+        vbr_capture_watermark_publish(pool, 0);
         mapped += pool.be->vmm_pool_mapped(pool.vmm);
     }
     vbr_degrade_cursor_    = 0;
     vbr_hard_seal_deferred_.clear();
+    vbr_capture_retier_deferred_.clear();
     vbr_budget_warned_     = false;
     vbr_stash_dirty_       = false;
     vbr_quiet_boundaries_  = 0;
@@ -7116,7 +7547,22 @@ void llama_kv_cache::vbr_full_reset() {
 // valid current-tier bytes, so no scrub is needed; regrowth remaps zero-filled pages on demand.
 // 25% hysteresis so growth/trim jitter cannot thrash map/unmap.
 void llama_kv_cache::vbr_shrink_watermark() {
-    const uint32_t wm_now = vbr_watermark_cells(0);
+    uint32_t wm_now = vbr_watermark_cells(0);
+    const bool shrink_needed = std::any_of(
+        vbr_pools_.begin(), vbr_pools_.end(), [&](const auto & pool) {
+            return pool.vmm != nullptr &&
+                wm_now + wm_now / 4 < pool.wm_cells;
+        });
+    if (!shrink_needed || !vbr_capture_controller_write_begin()) {
+        return;
+    }
+    struct capture_controller_guard {
+        llama_kv_cache * cache;
+        ~capture_controller_guard() {
+            cache->vbr_capture_controller_write_end();
+        }
+    } capture_guard { this };
+    wm_now = vbr_watermark_cells(0);
     for (auto & pool : vbr_pools_) {
         if (pool.vmm == nullptr || wm_now + wm_now / 4 >= pool.wm_cells) {
             continue;
@@ -7141,7 +7587,7 @@ void llama_kv_cache::vbr_shrink_watermark() {
         LLAMA_LOG_INFO("%s: VBR watermark shrink (device %d): %u -> %u cells (%.2f MiB mapped)\n",
                 __func__, pool.device, pool.wm_cells, wm_now,
                 pool.be->vmm_pool_mapped(pool.vmm)/1024.0/1024.0);
-        pool.wm_cells = wm_now;
+        vbr_capture_watermark_publish(pool, wm_now);
     }
 }
 
@@ -7240,6 +7686,12 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
             }
         }
 
+        vbr_unit_retier_guard capture_guard(
+            this, static_cast<uint32_t>(ikv * 2 + (st.is_v != 0)));
+        if (!capture_guard) {
+            return false;
+        }
+
         // the footprint GROWS: back it in EVERY pool before any transcode writes into it (new
         // pages zero-fill, so [keep, keep_pad) only needs the scrub for previously-mapped stale
         // tier-A bytes). All maps must succeed BEFORE the flip; on a mid-way failure the extra
@@ -7330,6 +7782,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
     }
     const size_t cursor_entry = vbr_degrade_cursor_;
     bool saw_hard_lease_block = false;
+    bool saw_capture_lease_block = false;
     vbr_hard_seal_consult_session seal_session;
     GGML_ASSERT(!vbr_hard_seal_guard_ ||
         vbr_hard_seal_attempted_.size() == vbr_degrade_order_.size());
@@ -7338,19 +7791,50 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
         std::fill(vbr_hard_seal_attempted_.begin(),
                   vbr_hard_seal_attempted_.end(), 0);
     }
+    bool capture_attempted_ready =
+        !vbr_capture_retier_deferred_.empty() &&
+        vbr_capture_retier_attempt_boundary_ != vbr_boundary_count_;
+    if (capture_attempted_ready) {
+        std::fill(vbr_capture_retier_attempted_.begin(),
+                  vbr_capture_retier_attempted_.end(), 0);
+        vbr_capture_retier_attempt_boundary_ = vbr_boundary_count_;
+    }
+    size_t capture_deferred_scan = 0;
     while (true) {
         size_t order_ordinal = 0;
         bool from_deferred = false;
-        if (!vbr_hard_seal_next_order_step(
-                vbr_degrade_cursor_,
-                std::min(vbr_degrade_order_.size(), vbr_degrade_limit_),
-                vbr_hard_seal_deferred_, vbr_hard_seal_attempted_,
-                order_ordinal, from_deferred)) {
-            break;
+        bool from_capture_deferred = false;
+        if (capture_attempted_ready) {
+            for (; capture_deferred_scan < vbr_capture_retier_deferred_.size();
+                 ++capture_deferred_scan) {
+                const size_t ordinal =
+                    vbr_capture_retier_deferred_[capture_deferred_scan];
+                if (ordinal < vbr_capture_retier_attempted_.size() &&
+                    !vbr_capture_retier_attempted_[ordinal]) {
+                    vbr_capture_retier_attempted_[ordinal] = 1;
+                    order_ordinal = ordinal;
+                    from_capture_deferred = true;
+                    ++capture_deferred_scan;
+                    break;
+                }
+            }
+        }
+        if (!from_capture_deferred) {
+            if (!vbr_hard_seal_next_order_step(
+                    vbr_degrade_cursor_,
+                    std::min(vbr_degrade_order_.size(), vbr_degrade_limit_),
+                    vbr_hard_seal_deferred_, vbr_hard_seal_attempted_,
+                    order_ordinal, from_deferred)) {
+                break;
+            }
         }
         const auto & st = vbr_degrade_order_[order_ordinal];
 
         const auto retire_deferred = [&]() {
+            if (from_capture_deferred) {
+                vbr_hard_seal_retire_step(
+                    vbr_capture_retier_deferred_, order_ordinal);
+            }
             if (!from_deferred) {
                 return;
             }
@@ -7411,6 +7895,46 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
         if (from_deferred) {
             LLAMA_LOG_INFO("%s: hard-lease release reopened VBR order step %zu (L%d %c)\n",
                     __func__, order_ordinal, (int) st.il, st.is_v ? 'V' : 'K');
+        }
+
+        const uint32_t logical_unit =
+            static_cast<uint32_t>(ikv * 2 + (st.is_v != 0));
+        if (logical_unit < vbr_capture_unit_attempt_boundary_.size() &&
+            vbr_capture_unit_attempt_boundary_[logical_unit] ==
+                vbr_boundary_count_) {
+            saw_capture_lease_block = true;
+            if (!from_capture_deferred) {
+                vbr_hard_seal_defer_step(
+                    vbr_capture_retier_deferred_, order_ordinal,
+                    &vbr_capture_retier_attempted_);
+            }
+            continue;
+        }
+        vbr_unit_retier_guard capture_guard(this, logical_unit);
+        if (!capture_guard) {
+            saw_capture_lease_block = true;
+            if (logical_unit < vbr_capture_unit_attempt_boundary_.size()) {
+                vbr_capture_unit_attempt_boundary_[logical_unit] =
+                    vbr_boundary_count_;
+            }
+            if (!from_capture_deferred) {
+                if (vbr_capture_retier_attempt_boundary_ !=
+                        vbr_boundary_count_) {
+                    std::fill(vbr_capture_retier_attempted_.begin(),
+                              vbr_capture_retier_attempted_.end(), 0);
+                    vbr_capture_retier_attempt_boundary_ =
+                        vbr_boundary_count_;
+                }
+                vbr_hard_seal_defer_step(
+                    vbr_capture_retier_deferred_, order_ordinal,
+                    &vbr_capture_retier_attempted_);
+            }
+            LLAMA_LOG_DEBUG(
+                "%s: capture leased VBR order step %zu (L%d %c); "
+                "trying the next unit\n",
+                __func__, order_ordinal, (int) st.il,
+                st.is_v ? 'V' : 'K');
+            continue;
         }
 
         // Determine and land every stash page this unit can touch before starting any side stream,
@@ -7575,6 +8099,9 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
     if (saw_hard_lease_block) {
         vbr_hard_seal_blocked_ = true;
         return vbr_degrade_result::hard_lease_blocked;
+    }
+    if (saw_capture_lease_block) {
+        return vbr_degrade_result::capture_lease_blocked;
     }
     return vbr_degrade_result::exhausted;
 }
@@ -8026,6 +8553,15 @@ bool llama_kv_cache::vbr_retier_freeze_begin(
                 vbr_retier_freeze_depth_);
         return false;
     }
+    if (vbr_retier_freeze_depth_ == 0 &&
+        !vbr_capture_controller_write_begin()) {
+        LLAMA_LOG_DEBUG(
+            "VBR_OPERATION event=reject reason=capture_unit_leased owner=%s "
+            "operation_id=%llu\n",
+            owner != nullptr ? owner : "-",
+            (unsigned long long) operation_id.value);
+        return false;
+    }
     const uint64_t now = llama_vram_ledger_now_ns();
     if (vbr_retier_freeze_depth_ == 0) {
         vbr_retier_outer_deferred_base_ = vbr_retier_deferred_decisions_;
@@ -8069,6 +8605,9 @@ void llama_kv_cache::vbr_retier_freeze_end(
         // Even a no-op trim can change the controller's future occupancy inputs. Force a fresh
         // decision pass at the next safe boundary; never execute a stale queued choice here.
         vbr_retier_reconcile_pending_ = true;
+    }
+    if (vbr_retier_freeze_depth_ == 0) {
+        vbr_capture_controller_write_end();
     }
     LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=exit controller=%s owner=%s operation_id=%llu "
             "depth=%u duration_us=%llu "
@@ -9115,6 +9654,46 @@ bool llama_kv_cache::vbr_tx_hard_seal_allowed(vbr_shed_tx & tx) {
     return true;
 }
 
+bool llama_kv_cache::vbr_tx_capture_leases_allowed(vbr_shed_tx & tx) {
+    tx.unit_guards.clear();
+    try {
+        std::vector<std::pair<llama_kv_cache *, uint32_t>> units;
+        units.reserve(tx.steps.size());
+        for (const auto & step : tx.steps) {
+            if (step.child_idx >= tx.children.size()) {
+                return false;
+            }
+            auto * child = tx.children[step.child_idx].cache;
+            if (child == nullptr || step.ikv > (UINT32_MAX - 1)/2) {
+                return false;
+            }
+            units.push_back({
+                child,
+                static_cast<uint32_t>(step.ikv*2 + (step.is_v ? 1 : 0)),
+            });
+        }
+        std::sort(units.begin(), units.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.first != rhs.first) {
+                return std::less<llama_kv_cache *>{}(lhs.first, rhs.first);
+            }
+            return lhs.second < rhs.second;
+        });
+        units.erase(std::unique(units.begin(), units.end()), units.end());
+        tx.unit_guards.reserve(units.size());
+        for (const auto & [cache, logical_unit] : units) {
+            tx.unit_guards.emplace_back(cache, logical_unit);
+            if (!tx.unit_guards.back()) {
+                tx.unit_guards.clear();
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        tx.unit_guards.clear();
+        return false;
+    }
+}
+
 bool llama_kv_cache::vbr_tx_prepare_commit(
         vbr_shed_tx & tx, const llama_vram_peer_claim & c) {
     tx.gross_by_pool.clear();
@@ -9446,10 +10025,24 @@ void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, vbr_operation_id operation_i
             child->vbr_hard_seal_deferred_,
             state.sealed_deferred,
             state.final_cursor);
+        vbr_hard_seal_defer_jumped_steps(
+            child->vbr_capture_retier_deferred_,
+            state.capture_deferred,
+            state.final_cursor);
+        if (!state.capture_deferred.empty()) {
+            child->vbr_capture_retier_attempt_boundary_ =
+                child->vbr_boundary_count_;
+            for (const size_t ordinal : state.capture_deferred) {
+                if (ordinal < child->vbr_capture_retier_attempted_.size()) {
+                    child->vbr_capture_retier_attempted_[ordinal] = 1;
+                }
+            }
+        }
         child->vbr_degrade_cursor_ = state.final_cursor;
         for (auto & p : child->vbr_pools_) {
             if (p.vmm != nullptr) {
-                p.wm_cells = std::max(p.wm_cells, state.incoming_wm);
+                child->vbr_capture_watermark_publish(
+                    p, std::max(p.wm_cells, state.incoming_wm));
                 p.budget_eff_stamp = ~0ull;
                 p.scratch_rows_epoch = ~0ull;
             }
@@ -9529,6 +10122,8 @@ llama_kv_cache::vbr_tx_result llama_kv_cache::vbr_execute_tree_shed(
         auto policy = tx.children[i].cache->vbr_policy_child_stream(
             tx.demanded_device, tx.children[i].incoming_wm);
         tx.children[i].sealed_deferred = policy.blocked_order_indices;
+        tx.children[i].capture_deferred =
+            policy.capture_blocked_order_indices;
         policy_children.push_back(std::move(policy));
     }
 
@@ -9559,7 +10154,8 @@ llama_kv_cache::vbr_tx_result llama_kv_cache::vbr_execute_tree_shed(
     }
     GGML_ASSERT(planned);
 
-    if (!root->vbr_tx_hard_seal_allowed(tx)) {
+    if (!root->vbr_tx_hard_seal_allowed(tx) ||
+        !root->vbr_tx_capture_leases_allowed(tx)) {
         result.status = vbr_tx_status::retryable_no_tier_mutation;
         return result;
     }
