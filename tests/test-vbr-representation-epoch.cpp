@@ -2,6 +2,8 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-io.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-vbr-artifact-capture.h"
+#include "llama-vbr-explicit-capture.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -140,6 +142,113 @@ struct llama_kv_cache_vbr_epoch_test {
     static bool map_seed_watermark(llama_kv_cache * kv) {
         const uint32_t wm = kv->vbr_watermark_cells(1);
         return wm > 0 && kv->vbr_vmm_try_map(wm);
+    }
+
+    static bool projected_backend_sources_exact(
+            llama_kv_cache * kv, uint32_t child_id) {
+        if (!kv || kv->other != nullptr || kv->vbr_pools_.empty()) {
+            return false;
+        }
+        if (!kv->vbr_capture_settle()) {
+            return false;
+        }
+        const auto instance = kv->vbr_instance_id();
+        if (!vbr_controller_instance_id_is_set(instance)) {
+            return false;
+        }
+        std::vector<vbr_explicit_capture_pool_binding> bindings;
+        for (size_t i = 0; i < kv->vbr_pools_.size(); ++i) {
+            const auto & pool = kv->vbr_pools_[i];
+            const auto duplicate = std::find_if(
+                bindings.begin(), bindings.end(),
+                [&](const auto & value) {
+                    return value.device == pool.device;
+                });
+            if (duplicate == bindings.end()) {
+                bindings.push_back({
+                    instance, pool.device, 0,
+                    uint16_t(bindings.size()),
+                    uint32_t(bindings.size()),
+                });
+            }
+        }
+        llama_kv_cache::vbr_capture_unit_request request;
+        request.child_id = child_id;
+        request.bindings = &bindings;
+        std::vector<llama_kv_cache::vbr_capture_unit_plan> units;
+        llama_kv_cache::vbr_capture_stability_token stability;
+        if (!kv->vbr_capture_size_pass(
+                request, units, stability, nullptr) || units.empty()) {
+            return false;
+        }
+        std::vector<uint64_t> identities;
+        for (const auto & unit : units) {
+            std::vector<vbr_capture_projected_shard_source> sources;
+            if (!kv->vbr_capture_projected_sources(unit, sources) ||
+                sources.size() != unit.shards.size()) {
+                return false;
+            }
+            uint32_t topology_count = 0;
+            std::array<uint8_t, 32> topology_digest = {};
+            if (!vbr_capture_projected_shard_topology(
+                    sources, topology_count, topology_digest) ||
+                topology_count != sources.size()) {
+                return false;
+            }
+            std::vector<vbr_capture_projected_shard_source> repeated;
+            if (!kv->vbr_capture_projected_sources(unit, repeated) ||
+                repeated.size() != sources.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < sources.size(); ++i) {
+                const auto & source = sources[i];
+                const auto & again = repeated[i];
+                const auto & shard = unit.shards[i];
+                const auto * pool = static_cast<const llama_kv_cache::vbr_pool *>(
+                    shard.pool);
+                const auto * extent = static_cast<const llama_kv_cache::vbr_extent *>(
+                    shard.extent);
+                if (!pool || !extent || source.shard_index != i ||
+                    source.row_count != unit.wm_cells ||
+                    source.row_bytes != shard.row_bytes ||
+                    source.source_identity == 0 ||
+                    source.source_identity != again.source_identity ||
+                    source.source.size != shard.payload_bytes ||
+                    source.source.lane != shard.lane ||
+                    source.source.backend != pool->backend ||
+                    source.source.device !=
+                        ggml_backend_get_device(pool->backend) ||
+                    source.source.tensor != extent->t ||
+                    std::find(identities.begin(), identities.end(),
+                              source.source_identity) != identities.end()) {
+                    return false;
+                }
+                identities.push_back(source.source_identity);
+            }
+
+            auto malformed = unit;
+            ++malformed.shards.front().row_bytes;
+            std::vector<vbr_capture_projected_shard_source> refused = sources;
+            if (kv->vbr_capture_projected_sources(malformed, refused) ||
+                !refused.empty()) {
+                return false;
+            }
+            auto stale = unit;
+            ++stale.generation.repr_gen;
+            refused = sources;
+            if (kv->vbr_capture_projected_sources(stale, refused) ||
+                !refused.empty()) {
+                return false;
+            }
+            auto wrong_side = unit;
+            wrong_side.is_v = !wrong_side.is_v;
+            refused = sources;
+            if (kv->vbr_capture_projected_sources(wrong_side, refused) ||
+                !refused.empty()) {
+                return false;
+            }
+        }
+        return !identities.empty();
     }
 
     // This test owns the representation-epoch mechanism, not the model/card-specific pricing
@@ -1813,6 +1922,13 @@ int main(int argc, char ** argv) {
     const auto & seeded = seeded_v2.state;
     if (seeded_v2.used_cells_exclusive == 0 || seeded.used_cells_other != 0) {
         fprintf(stderr, "exclusive VBR cell ownership did not match the seeded sequence\n");
+        return 1;
+    }
+    if (!llama_kv_cache_vbr_epoch_test::projected_backend_sources_exact(
+            base, 0) ||
+        !llama_kv_cache_vbr_epoch_test::projected_backend_sources_exact(
+            swa, 1)) {
+        fprintf(stderr, "live VBR backend did not produce exact projected capture sources\n");
         return 1;
     }
     const auto seeded_base = base->memory_vbr_state_v2(0, 0);

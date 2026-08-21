@@ -6115,21 +6115,23 @@ bool llama_kv_cache::vbr_capture_stream_unit(
         return other->vbr_capture_stream_unit(plan, sink, ring, stats);
     }
     try {
-        for (const auto & shard : plan.shards) {
+        std::vector<vbr_capture_projected_shard_source> sources;
+        if (!vbr_capture_projected_sources(plan, sources) ||
+            sources.size() != plan.shards.size()) {
+            return false;
+        }
+        for (size_t shard_index = 0;
+             shard_index < plan.shards.size(); ++shard_index) {
+            const auto & shard = plan.shards[shard_index];
             auto * pool = static_cast<vbr_pool *>(shard.pool);
             auto * extent = static_cast<vbr_extent *>(shard.extent);
             if (pool == nullptr || extent == nullptr) {
                 return false;
             }
-            vbr_capture_stream_source source;
-            source.lane = shard.lane;
-            source.size = shard.payload_bytes;
-            source.backend = pool->backend;
-            source.device = ggml_backend_get_device(pool->backend);
-            source.tensor = extent->t;
             auto chain = std::make_shared<artifact_segment_chain>();
             vbr_capture_stream_stats one;
-            const auto status = ring.stream(source, *chain, one);
+            const auto status = ring.stream(
+                sources[shard_index].source, *chain, one);
             if (status != vbr_capture_stream_status::ok) {
                 return false;
             }
@@ -6209,6 +6211,150 @@ bool llama_kv_cache::vbr_capture_stream_unit(
         }
         return true;
     } catch (...) {
+        return false;
+    }
+}
+
+namespace {
+
+bool vbr_capture_generation_equal(
+        const vbr_unit_generation & lhs,
+        const vbr_unit_generation & rhs) noexcept {
+    return lhs.repr_gen == rhs.repr_gen &&
+           lhs.publish_seq == rhs.publish_seq &&
+           lhs.current_type == rhs.current_type &&
+           lhs.last_source_type == rhs.last_source_type &&
+           lhs.domain == rhs.domain &&
+           lhs.promote_hops == rhs.promote_hops &&
+           lhs.last_transition == rhs.last_transition &&
+           lhs.flags == rhs.flags;
+}
+
+uint64_t vbr_capture_shard_source_identity(
+        vbr_controller_instance_id instance,
+        uint32_t child_id,
+        uint32_t logical_unit,
+        uint32_t shard_index,
+        uint32_t topology_index,
+        uint16_t device_ordinal,
+        uint32_t lane,
+        const void * pool,
+        const void * extent) noexcept {
+    try {
+        llama_sha256_writer hash;
+        static constexpr char DOMAIN[] =
+            "buun.vbr.capture/live-shard-source/v1";
+        hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+        hash.u64(instance.hi);
+        hash.u64(instance.lo);
+        hash.u32(child_id);
+        hash.u32(logical_unit);
+        hash.u32(shard_index);
+        hash.u32(topology_index);
+        hash.u32(device_ordinal);
+        hash.u32(lane);
+        hash.bytes(&pool, sizeof(pool));
+        hash.bytes(&extent, sizeof(extent));
+        const auto digest = hash.finish();
+        uint64_t identity = 0;
+        std::memcpy(&identity, digest.data(), sizeof(identity));
+        return identity == 0 ? 1 : identity;
+    } catch (...) {
+        return 0;
+    }
+}
+
+} // namespace
+
+bool llama_kv_cache::vbr_capture_projected_sources(
+        const vbr_capture_unit_plan & plan,
+        std::vector<vbr_capture_projected_shard_source> & output) const noexcept {
+    output.clear();
+    if (other != nullptr) {
+        return other->vbr_capture_projected_sources(plan, output);
+    }
+    try {
+        const auto * tracker = vbr_generation_tracker_get();
+        const auto instance = vbr_instance_id();
+        if (!vbr_operation_armed() || tracker == nullptr ||
+            !tracker->active() || !tracker->stable() ||
+            !vbr_controller_instance_id_is_set(instance) ||
+            plan.child_id == UINT32_MAX ||
+            plan.logical_unit >= tracker->unit_count() ||
+            plan.logical_unit/2 >= layers.size() ||
+            plan.is_v != ((plan.logical_unit & 1u) != 0) ||
+            plan.n_stream != n_stream || plan.unified != (n_stream == 1) ||
+            plan.shards.empty() || plan.wm_cells == 0 ||
+            !vbr_capture_generation_equal(
+                tracker->unit_generation(plan.logical_unit),
+                plan.generation)) {
+            return false;
+        }
+        const auto & extents = vbr_units_of(
+            plan.logical_unit/2, (plan.logical_unit & 1u) != 0);
+        if (extents.size() != plan.shards.size()) {
+            return false;
+        }
+        std::vector<vbr_capture_projected_shard_source> prepared;
+        prepared.reserve(plan.shards.size());
+        for (size_t i = 0; i < plan.shards.size(); ++i) {
+            const auto & shard = plan.shards[i];
+            auto * pool = static_cast<vbr_pool *>(shard.pool);
+            auto * extent = static_cast<vbr_extent *>(shard.extent);
+            if (pool == nullptr || extent == nullptr ||
+                extents[i].first != pool || extents[i].second != extent ||
+                shard.shard_index != i || shard.lane == UINT32_MAX ||
+                shard.topology_index == UINT32_MAX ||
+                shard.device_ordinal == UINT16_MAX ||
+                shard.payload_bytes == 0 || shard.row_bytes == 0 ||
+                pool->wm_cells != plan.wm_cells ||
+                pool->backend == nullptr || extent->t == nullptr ||
+                ggml_backend_get_device(pool->backend) == nullptr ||
+                extent->t->type != plan.generation.current_type ||
+                extent->promote_hops != plan.generation.promote_hops ||
+                extent->t->ne[0] <= 0 ||
+                uint64_t(extent->t->ne[0]) != shard.columns ||
+                ggml_row_size(extent->t->type, extent->t->ne[0]) !=
+                    shard.row_bytes ||
+                plan.wm_cells > UINT64_MAX/shard.row_bytes ||
+                uint64_t(plan.wm_cells)*shard.row_bytes !=
+                    shard.payload_bytes ||
+                shard.payload_bytes > ggml_nbytes(extent->t)) {
+                return false;
+            }
+            vbr_capture_projected_shard_source source;
+            source.shard_index = shard.shard_index;
+            source.row_count = plan.wm_cells;
+            source.row_bytes = shard.row_bytes;
+            source.source_identity = vbr_capture_shard_source_identity(
+                instance, plan.child_id, plan.logical_unit,
+                shard.shard_index, shard.topology_index,
+                shard.device_ordinal, shard.lane, pool, extent);
+            source.source.lane = shard.lane;
+            source.source.size = shard.payload_bytes;
+            source.source.backend = pool->backend;
+            source.source.device =
+                ggml_backend_get_device(pool->backend);
+            source.source.tensor = extent->t;
+            if (source.source_identity == 0) {
+                return false;
+            }
+            prepared.push_back(source);
+        }
+        uint32_t shard_count = 0;
+        std::array<uint8_t, 32> topology = {};
+        if (!vbr_capture_projected_shard_topology(
+                prepared, shard_count, topology) ||
+            shard_count != prepared.size() || !tracker->stable() ||
+            !vbr_capture_generation_equal(
+                tracker->unit_generation(plan.logical_unit),
+                plan.generation)) {
+            return false;
+        }
+        output = std::move(prepared);
+        return true;
+    } catch (...) {
+        output.clear();
         return false;
     }
 }

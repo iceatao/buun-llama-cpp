@@ -37,6 +37,7 @@ struct vbr_validated_child_plan;
 struct vbr_target_unit_snapshot;
 class vbr_import_receipt_group;
 struct vbr_capture_stream_stats;
+struct vbr_capture_projected_shard_source;
 enum class vbr_explicit_generation_failure : uint8_t;
 enum class vbr_explicit_size_failure : uint8_t;
 struct vbr_artifact_stream_placement;
@@ -460,6 +461,13 @@ private:
         vbr_unit_build & sink,
         vbr_pinned_chunk_ring & ring,
         vbr_capture_stream_stats & stats) const noexcept;
+    // Converts one exact size-pass unit into the process-local backend
+    // capabilities consumed by sequence-projected capture. This is a
+    // preparation seam only: the later snapshot provider must still acquire
+    // the unit-version lease before any source is read.
+    bool vbr_capture_projected_sources(
+        const vbr_capture_unit_plan & plan,
+        std::vector<vbr_capture_projected_shard_source> & output) const noexcept;
     bool vbr_capture_stability_matches(
         const vbr_capture_stability_token & token) const noexcept;
     bool vbr_capture_generation_record(
