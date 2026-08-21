@@ -9,6 +9,11 @@
 #include "llama-vbr-identity-digest.h"
 #include "llama-sha256.h"
 
+#ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+#include "server-task.h"
+#include "server-retention-sidecar.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -2217,12 +2222,16 @@ static void test_prompt_cache_vbr_payload_fanout_lifetime() {
     CHECK(owner->resident_bytes() == expected_resident);
     CHECK(owner->allocation_count() == expected_allocations);
     CHECK(owner->package().units().size() == 2);
+    CHECK(owner->accounted_by(&f.ledger));
+    llama_cache_acct_ledger unrelated_ledger;
+    CHECK(!owner->accounted_by(&unrelated_ledger));
 
     auto payload = server_prompt_cache_payload::from_vbr(owner);
     CHECK(payload.kind() ==
           server_prompt_cache_payload_kind::vbr_artifact);
     CHECK(payload.valid());
-    CHECK(!payload.publishable());
+    CHECK(payload.publishable());
+    CHECK(!payload.restorable());
     CHECK(payload.size() == expected_resident);
     CHECK(payload.vbr_artifact() == owner.get());
 
@@ -2428,10 +2437,12 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
 
     auto typed = server_prompt_cache_payload::from_vbr_variants(variants);
     CHECK(typed.valid());
-    CHECK(!typed.publishable());
+    CHECK(typed.publishable());
+    CHECK(!typed.restorable());
     CHECK(typed.vbr_variants() == variants.get());
     CHECK(typed.vbr_artifact() == compact.get());
     CHECK(typed.size() == variants->resident_bytes());
+    CHECK(typed.accounted_by(&f.ledger));
     auto alias = typed;
     CHECK(alias.same_storage(typed));
     auto independently_wrapped =
@@ -3569,7 +3580,252 @@ static void test_validated_manifest_staging() {
     run_failure(policy, vbr_adopt_stage_status::source_unavailable);
 }
 
+#ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+static void test_prompt_cache_vbr_atomic_logical_publication() {
+    catalog_fixture fixture;
+
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens { 101, 102 }, false);
+    prompt.sequence_epoch = 3;
+    std::string media_identity;
+    CHECK(prompt.tokens.media_content_identity(
+        prompt.n_tokens(), media_identity));
+    fixture.package.manifest.identity.media_content_identity =
+        media_identity;
+    fixture.package.manifest.identity.next_position =
+        prompt.tokens.pos_next();
+
+    const auto published = fixture.catalog->publish(
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(published.status ==
+          llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view view;
+    CHECK(fixture.catalog->resolve_reference(
+              published.reference_artifact, view) ==
+          vbr_artifact_resolve_status::ok);
+    auto owner = server_prompt_cache_vbr_payload::adopt(
+        std::move(view));
+    CHECK(owner);
+    if (!owner) {
+        return;
+    }
+    auto payload = server_prompt_cache_payload::from_vbr(owner);
+
+    server_retention_sidecar_store retention;
+    retention.configure(&fixture.ledger, fixture.host);
+    CHECK(retention.enable_prefix_tracking());
+    constexpr int32_t source_slot = 4;
+    const auto source_key =
+        server_retention_instance_key::for_slot(source_slot);
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+    CHECK(retention.publish(
+        source_key, common_retention_pool::attention,
+        spans, true, prompt.n_tokens(), prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        retention, source_key, prompt,
+        fixture.package.manifest.identity.adapter_config_identity,
+        prompt.n_tokens()));
+
+    server_prompt_cache cache(/* limit_size_mib */ 0,
+                              /* limit_tokens */ 0);
+    cache.acct = &fixture.ledger;
+    cache.retention_obs = &retention;
+
+    auto staged = cache.stage_vbr(
+        prompt, payload,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(staged.size() == 1);
+    CHECK(staged.front().payload.publishable());
+    CHECK(!staged.front().payload.restorable());
+    CHECK(staged.front().payload.accounted_by(&fixture.ledger));
+    CHECK(staged.front().payload.size() == owner->resident_bytes());
+
+    if (server_fault("vbr_prompt_cache_prefix_fail")) {
+        const auto destination_key =
+            server_retention_instance_key::for_host_entry(&staged.front());
+        const auto source_artifact = retention.artifact_id(source_key);
+        const auto ledger_before = fixture.ledger.snapshot();
+        CHECK(!cache.publish(
+            std::move(staged), &prompt, source_slot));
+        const auto ledger_after = fixture.ledger.snapshot();
+        CHECK(cache.states.empty());
+        CHECK(retention.artifact_id(destination_key).v == 0);
+        CHECK(retention.artifact_id(source_key) == source_artifact);
+        CHECK(retention.prefix_tracking_available());
+        CHECK(ledger_after.live_ops == ledger_before.live_ops);
+        CHECK(ledger_after.serial >= ledger_before.serial);
+        return;
+    }
+
+    const uint64_t live_ops_before =
+        fixture.ledger.snapshot().live_ops;
+    server_prompt_cache::iterator logical;
+    CHECK(cache.publish(
+        std::move(staged), &prompt, source_slot, &logical));
+    CHECK(logical != cache.states.end());
+    CHECK(cache.states.size() == 1);
+    CHECK(!cache.contains(
+        prompt.tokens,
+        fixture.package.manifest.identity.adapter_config_identity));
+    CHECK(logical->payload.vbr_artifact() == owner.get());
+    CHECK((logical->release_ops() ==
+           std::array<llama_cache_acct_op_id, 3> {}));
+    // The catalog already owns every physical VBR allocation. Logical host
+    // publication adds only its retention metadata leaf.
+    CHECK(fixture.ledger.snapshot().live_ops == live_ops_before + 1);
+    auto host_key =
+        server_retention_instance_key::for_host_entry(&*logical);
+    CHECK(retention.artifact_id(host_key).v != 0);
+
+    // Re-publishing an exact immutable owner is a net-zero physical capacity
+    // operation. The preflight must account the allocation union and the
+    // later replacement set rather than temporarily charging both aliases.
+    cache.limit_size = logical->size();
+    cache.limit_tokens = prompt.n_tokens();
+    auto refreshed_stage = cache.stage_vbr(
+        prompt, payload,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(refreshed_stage.size() == 1);
+    server_prompt_cache::iterator refreshed;
+    CHECK(cache.publish(
+        std::move(refreshed_stage), &prompt, source_slot, &refreshed));
+    CHECK(refreshed != cache.states.end());
+    CHECK(cache.states.size() == 1);
+    CHECK(fixture.ledger.snapshot().live_ops == live_ops_before + 1);
+    CHECK(retention.artifact_id(host_key).v == 0);
+    logical = refreshed;
+    host_key = server_retention_instance_key::for_host_entry(&*logical);
+    CHECK(retention.artifact_id(host_key).v != 0);
+    cache.limit_size = 0;
+    cache.limit_tokens = 0;
+
+    // H1 does not yet own the catalog-reference release transaction needed
+    // to make VBR bytes disappear under cache pressure. A maintenance pass
+    // must therefore preserve the logical node instead of erasing it while
+    // falsely claiming progress.
+    const size_t logical_bytes = logical->size();
+    CHECK(logical_bytes > 0);
+    cache.limit_size = logical_bytes - 1;
+    cache.update();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().payload.vbr_artifact() == owner.get());
+
+    // A fixed peer remains a lawful pressure victim. Skipping the VBR node
+    // must not disable ordinary FIFO progress when releasable storage exists.
+    cache.limit_size = 0;
+    auto fixed_peer = cache.stage(
+        prompt, 64, 0,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(fixed_peer.size() == 1);
+    CHECK(cache.publish(std::move(fixed_peer)));
+    CHECK(cache.states.size() == 2);
+    CHECK(retention.artifact_id(host_key).v != 0);
+    cache.limit_size = logical_bytes;
+    cache.update();
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().payload.vbr_artifact() == owner.get());
+    CHECK(retention.artifact_id(host_key).v != 0);
+    cache.limit_size = 0;
+
+    // A fixed incoming publication cannot be mistaken for a successfully
+    // reclaimed incumbent merely because all older nodes are protected VBR
+    // borrows. The refusal terminal removes it and never returns its dead
+    // iterator as a published entry.
+    cache.limit_size = logical_bytes;
+    auto refused_fixed = cache.stage(prompt, 64, 0, "pressure-incoming");
+    CHECK(refused_fixed.size() == 1);
+    server_prompt_cache::iterator refused_result = cache.states.begin();
+    CHECK(!cache.publish(
+        std::move(refused_fixed), nullptr, -1, &refused_result));
+    CHECK(refused_result == cache.states.end());
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().payload.vbr_artifact() == owner.get());
+    cache.limit_size = 0;
+
+    // Every identity component is checked before allocation/publication.
+    server_prompt wrong_epoch = prompt.clone();
+    wrong_epoch.sequence_epoch++;
+    CHECK(cache.stage_vbr(
+        wrong_epoch, payload,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity).empty());
+    CHECK(cache.stage_vbr(
+        prompt, payload, "wrong-execution",
+        fixture.package.manifest.identity.adapter_config_identity).empty());
+    CHECK(cache.stage_vbr(
+        prompt, payload,
+        fixture.package.manifest.identity.execution_identity,
+        "wrong-adapter").empty());
+
+    // Publication binds the logical host lineage to the exact live source
+    // frontier; a caller cannot attach sealed bytes to an unrelated/stale
+    // source association merely because that slot key exists.
+    server_prompt wrong_source = prompt.clone();
+    wrong_source.sequence_epoch++;
+    auto wrong_source_stage = cache.stage_vbr(
+        prompt, payload,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(wrong_source_stage.size() == 1);
+    CHECK(!cache.publish(
+        std::move(wrong_source_stage), &wrong_source, source_slot));
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().payload.vbr_artifact() == owner.get());
+
+    // A catalog lease from another accounting owner cannot enter this cache,
+    // and refusal leaves both the logical cache and source lineage untouched.
+    llama_cache_acct_ledger unrelated;
+    server_prompt_cache wrong_ledger(/* limit_size_mib */ 0,
+                                     /* limit_tokens */ 0);
+    wrong_ledger.acct = &unrelated;
+    wrong_ledger.retention_obs = &retention;
+    auto wrong_owner = wrong_ledger.stage_vbr(
+        prompt, payload,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(wrong_owner.size() == 1);
+    CHECK(!wrong_ledger.publish(
+        std::move(wrong_owner), &prompt, source_slot));
+    CHECK(wrong_ledger.states.empty());
+
+    // H1 does not synchronously destroy another host entry to publish VBR
+    // until the refcount-aware release transaction lands.
+    const size_t mib = 1024*1024;
+    server_prompt_cache bounded(/* limit_size_mib */ 1,
+                                /* limit_tokens */ 0);
+    bounded.acct = &fixture.ledger;
+    bounded.retention_obs = &retention;
+    auto fixed = bounded.stage(prompt, mib, 0, "fixed");
+    CHECK(fixed.size() == 1);
+    CHECK(bounded.publish(std::move(fixed)));
+    auto would_displace = bounded.stage_vbr(
+        prompt, payload,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(would_displace.size() == 1);
+    CHECK(!bounded.publish(
+        std::move(would_displace), &prompt, source_slot));
+    CHECK(bounded.states.size() == 1);
+    CHECK(bounded.states.front().payload.restorable());
+}
+
+#endif
 int main() {
+#ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+    if (server_fault("vbr_prompt_cache_prefix_fail")) {
+        test_prompt_cache_vbr_atomic_logical_publication();
+        if (failures != 0) {
+            fprintf(stderr, "%d VBR prefix rollback test(s) failed\n",
+                    failures);
+            return 1;
+        }
+        printf("VBR prompt-cache prefix rollback: PASS\n");
+        return 0;
+    }
+#endif
     test_golden_and_native_lineage();
     test_v1_decode_and_v2_restore_metadata();
     test_identity_and_reference_separation();
@@ -3592,6 +3848,9 @@ int main() {
     test_prompt_cache_vbr_same_frontier_variants();
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
+#ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+    test_prompt_cache_vbr_atomic_logical_publication();
+#endif
     if (failures != 0) {
         fprintf(stderr, "%d VBR artifact test(s) failed\n", failures);
         return 1;

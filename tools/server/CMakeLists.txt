@@ -114,4 +114,21 @@ if (LLAMA_BUILD_TESTS)
     set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
         LABELS main
         ENVIRONMENT "LLAMA_SERVER_FAULT=load_clone_fail")
+
+    # The catalog test target is declared before the server targets. Add the
+    # production prompt-cache seam to that translation unit instead of
+    # compiling its large fixture under a second main(). Internal artifact
+    # tests are intentionally absent on shared-library Windows builds.
+    if (TARGET test-vbr-artifact)
+        target_compile_definitions(test-vbr-artifact PRIVATE
+            VBR_PROMPT_CACHE_PUBLICATION_TEST=1)
+        target_link_libraries(test-vbr-artifact PRIVATE server-context mtmd)
+        target_include_directories(test-vbr-artifact PRIVATE
+            ${CMAKE_SOURCE_DIR}/tools/mtmd)
+        add_test(NAME test-vbr-artifact-vbr-prefix-fault
+            COMMAND test-vbr-artifact)
+        set_tests_properties(test-vbr-artifact-vbr-prefix-fault PROPERTIES
+            LABELS main
+            ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_prompt_cache_prefix_fail")
+    endif()
 endif()

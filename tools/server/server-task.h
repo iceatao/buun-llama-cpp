@@ -788,6 +788,11 @@ struct server_prompt_cache_state {
     // only served from an entry whose key matches the requesting slot's current adapter config
     std::string adapter_config_key;
 
+    // Exact model/execution identity for a sealed VBR payload. Fixed entries
+    // leave this empty because their historical compatibility check remains
+    // the server-local adapter/state codec contract.
+    std::string vbr_execution_identity;
+
     // C0 shadow accounting op ids, one per charged leaf category (zero id = not charged):
     // the publish boundary, released when the entry leaves `states` [P2]
     llama_cache_acct_op_id acct_op_snapshot;
@@ -1102,6 +1107,16 @@ struct server_prompt_cache {
     // publish() may also return false after removing only its just-spliced incoming node; every
     // previously retained hard-leased/recovery-pinned entry remains untouched.
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
+
+    // H1 detached logical publication for an already-sealed catalog payload.
+    // This validates the exact capture frontier and allocates/clones all
+    // logical metadata without copying artifact bytes. H2 will later consume
+    // these entries through the VBR restore transaction.
+    std::list<server_prompt_cache_state> stage_vbr(
+        const server_prompt & prompt,
+        server_prompt_cache_payload payload,
+        const std::string & execution_identity,
+        std::string adapter_config_key);
     // Allocation-free preflight for the live lineage records that a compound
     // host save must mirror. The production save path calls this before
     // allocating or writing its state image; publish() rechecks it at the

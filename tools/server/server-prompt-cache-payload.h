@@ -54,6 +54,7 @@ public:
     uint64_t resident_bytes() const noexcept;
     size_t allocation_count() const noexcept;
     const vbr_artifact_package_view & package() const noexcept;
+    bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
 
 private:
     struct impl;
@@ -85,6 +86,7 @@ public:
     uint64_t logical_bytes() const noexcept;
     uint64_t resident_bytes() const noexcept;
     size_t allocation_count() const noexcept;
+    bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
 
 private:
     struct impl;
@@ -100,9 +102,8 @@ enum class server_prompt_cache_payload_kind : uint8_t {
 };
 
 // One logical host entry may carry either the legacy fixed state image or an
-// immutable VBR catalog lease. Automatic cache publication/restoration stays
-// fixed-only until H1's VBR transaction is wired; nevertheless the real VBR
-// owner can now cross this boundary without copying its sealed segments.
+// immutable VBR catalog lease. H1 may publish either payload, but only fixed
+// state is restorable until H2 wires VBR import/adoption.
 class server_prompt_cache_payload {
 public:
     using vbr_owner = server_prompt_cache_vbr_owner;
@@ -124,6 +125,8 @@ public:
 
     bool valid() const noexcept;
     bool publishable() const noexcept;
+    bool restorable() const noexcept;
+    bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
     size_t size() const noexcept;
     bool same_storage(const server_prompt_cache_payload & other) const noexcept;
 

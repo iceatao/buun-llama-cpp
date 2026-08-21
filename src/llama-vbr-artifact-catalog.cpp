@@ -672,6 +672,11 @@ vbr_artifact_package_view::reference_artifact() const noexcept {
     return storage_ ? storage_->reference : llama_cache_acct_artifact_id{};
 }
 
+bool vbr_artifact_package_view::accounted_by(
+        const llama_cache_acct_ledger * ledger) const noexcept {
+    return owner_ != nullptr && storage_ && owner_->accounted_by(ledger);
+}
+
 const std::vector<vbr_artifact_portable_topology> &
 vbr_artifact_package_view::topologies() const noexcept {
     static const std::vector<vbr_artifact_portable_topology> empty;
@@ -2767,6 +2772,11 @@ void llama_vbr_artifact_catalog::release_reference_lease(
     GGML_ASSERT(it != impl_->references.end() &&
                 it->second.borrow_count > 0);
     --it->second.borrow_count;
+}
+
+bool llama_vbr_artifact_catalog::accounted_by(
+        const llama_cache_acct_ledger * ledger) const noexcept {
+    return ledger != nullptr && &impl_->ledger == ledger;
 }
 
 vbr_artifact_retire_status llama_vbr_artifact_catalog::retire(

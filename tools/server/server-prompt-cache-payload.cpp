@@ -316,6 +316,11 @@ server_prompt_cache_vbr_payload::package() const noexcept {
     return impl_ ? impl_->package : empty;
 }
 
+bool server_prompt_cache_vbr_payload::accounted_by(
+        const llama_cache_acct_ledger * ledger) const noexcept {
+    return impl_ && impl_->package.accounted_by(ledger);
+}
+
 std::shared_ptr<const server_prompt_cache_vbr_variant_set>
 server_prompt_cache_vbr_variant_set::create(
         server_prompt_cache_vbr_owner compact_current,
@@ -411,6 +416,12 @@ size_t server_prompt_cache_vbr_variant_set::allocation_count() const noexcept {
     return impl_ ? impl_->allocations : 0;
 }
 
+bool server_prompt_cache_vbr_variant_set::accounted_by(
+        const llama_cache_acct_ledger * ledger) const noexcept {
+    return impl_ && impl_->compact && impl_->compact->accounted_by(ledger) &&
+           (!impl_->anchor || impl_->anchor->accounted_by(ledger));
+}
+
 server_prompt_cache_payload server_prompt_cache_payload::from_vbr(
         vbr_owner owner) noexcept {
     return from_vbr_variants(
@@ -460,11 +471,18 @@ bool server_prompt_cache_payload::valid() const noexcept {
 }
 
 bool server_prompt_cache_payload::publishable() const noexcept {
-    // H1 has not yet installed the VBR restore/admission transaction. Keeping
-    // this fixed-only prevents a sealed lease from being mistaken for a state
-    // image while allowing the real backend owner to exist behind the type.
+    return valid();
+}
+
+bool server_prompt_cache_payload::restorable() const noexcept {
     const auto * fixed = fixed_state();
     return fixed && !fixed->main.empty();
+}
+
+bool server_prompt_cache_payload::accounted_by(
+        const llama_cache_acct_ledger * ledger) const noexcept {
+    const auto * variants = vbr_variants();
+    return variants && variants->accounted_by(ledger);
 }
 
 size_t server_prompt_cache_payload::size() const noexcept {

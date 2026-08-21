@@ -136,6 +136,11 @@ public:
     bool same_catalog(const vbr_artifact_package_view & other) const noexcept {
         return owner_ != nullptr && owner_ == other.owner_;
     }
+    // Process-local ownership check used by the automatic prompt-cache
+    // adapter. A sealed catalog package is already charged in exactly one
+    // ledger; logical aliases must never duplicate those physical bytes in a
+    // second host-cache accounting transaction.
+    bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
     llama_cache_acct_artifact_id reference_artifact() const noexcept;
     const std::vector<vbr_artifact_portable_topology> & topologies() const noexcept;
     const vbr_artifact_reference_manifest & manifest() const noexcept;
@@ -239,6 +244,7 @@ private:
 
     friend class llama_vbr_artifact_catalog_stream_build;
     friend class vbr_artifact_package_view;
+    bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
     void release_reference_lease(
         llama_cache_acct_artifact_id reference) noexcept;
 };

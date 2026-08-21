@@ -1813,7 +1813,10 @@ server_prompt_cache::iterator server_prompt_cache::find_state_exact(
     return std::find_if(states.begin(), states.end(), [&](const auto & state) {
         // Identity-scoped [I6]: token equality under another adapter is not a
         // durable copy. Equal length closes the recurrent/hybrid prefix hole.
-        return state.payload.publishable() &&
+        // contains() is the existing durable-recovery predicate used before
+        // a live slot may be cleared. A published H1 VBR logical node is not
+        // recovery authority until H2 wires its restore transaction.
+        return state.payload.restorable() &&
                state.adapter_config_key == adapter_config_key &&
                state.prompt.tokens.size() == tokens.size() &&
                state.prompt.tokens.get_common_prefix(tokens) == tokens.size();
@@ -1891,6 +1894,74 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
     return staged;
 }
 
+static bool server_prompt_cache_vbr_frontier_matches(
+        const server_prompt & prompt,
+        const server_prompt_cache_payload & payload,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key) noexcept {
+    try {
+        const auto * artifact = payload.vbr_artifact();
+        if (!artifact || execution_identity.empty()) {
+            return false;
+        }
+        const auto & package = artifact->package();
+        if (!package) {
+            return false;
+        }
+        const auto & manifest = package.manifest();
+        const auto & identity = manifest.identity;
+        if (identity.execution_identity != execution_identity ||
+            identity.adapter_config_identity != adapter_config_key ||
+            identity.sequence_epoch != prompt.sequence_epoch ||
+            identity.token_count != prompt.n_tokens() ||
+            identity.next_position != prompt.tokens.pos_next() ||
+            manifest.token_block.tokens !=
+                prompt.tokens.retention_token_ids()) {
+            return false;
+        }
+        std::string media_identity;
+        return prompt.tokens.media_content_identity(
+                   prompt.n_tokens(), media_identity) &&
+               media_identity == identity.media_content_identity;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::list<server_prompt_cache_state> server_prompt_cache::stage_vbr(
+        const server_prompt & prompt,
+        server_prompt_cache_payload payload,
+        const std::string & execution_identity,
+        std::string adapter_config_key) {
+    if (payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
+        !payload.publishable() ||
+        !prompt.checkpoints.empty() ||
+        !server_prompt_cache_vbr_frontier_matches(
+            prompt, payload, execution_identity, adapter_config_key)) {
+        return {};
+    }
+    const size_t payload_size = payload.size();
+    if (payload_size == 0 ||
+        (limit_size > 0 && payload_size > limit_size)) {
+        return {};
+    }
+
+    std::list<server_prompt_cache_state> staged;
+    try {
+        staged.emplace_back();
+        auto & entry = staged.back();
+        entry.prompt.tokens = prompt.tokens.clone();
+        entry.prompt.sequence_epoch = prompt.sequence_epoch;
+        entry.payload = std::move(payload);
+        entry.adapter_config_key = std::move(adapter_config_key);
+        entry.vbr_execution_identity = execution_identity;
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate VBR prompt cache metadata: %s\n", e.what());
+        return {};
+    }
+    return staged;
+}
+
 bool server_prompt_cache::payload_bytes(
         const server_prompt_cache_state & st,
         uint64_t & snapshot_bytes,
@@ -1961,7 +2032,11 @@ bool server_prompt_cache::payload_leaves(
 // non-throwing by contract, so no accounting failure can escape into the shipped cache path;
 // the `acct_unavailable` fault seam proves that invariance in the gate.
 void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
-    if (!acct) {
+    if (!acct || st.payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact) {
+        // Sealed VBR allocations were already admitted and charged by their
+        // catalog transaction. The logical cache node owns a borrow, not a
+        // second physical allocation.
         return;
     }
     const auto domain = llama_cache_acct_resource_domain::non_device(
@@ -2031,12 +2106,12 @@ static bool server_prompt_retention_exact_scope(
         uint64_t(coverage_tokens) > prompt.tokens.size()) {
         return false;
     }
-    std::string media_identity;
-    if (!prompt.tokens.media_content_identity(
-            coverage_tokens, media_identity)) {
-        return false;
-    }
     try {
+        std::string media_identity;
+        if (!prompt.tokens.media_content_identity(
+                coverage_tokens, media_identity)) {
+            return false;
+        }
         const uint64_t adapter_size = adapter_config_key.size();
         const uint64_t media_size = media_identity.size();
         size_t total = sizeof(adapter_size);
@@ -2107,24 +2182,28 @@ static void server_prompt_cache_mirror_lease(
         const server_cache_lease_subject & destination,
         const server_prompt & prompt,
         const std::string & adapter_identity,
-        int64_t coverage_tokens) {
+        int64_t coverage_tokens) noexcept {
     if (!mirrored || !cache.lease_obs) {
         return;
     }
-    server_cache_lease_identity identity;
-    if (destination.valid() &&
-        cache.lease_execution_identity &&
-        server_cache_lease_build_identity(
-            *cache.lease_execution_identity, adapter_identity,
-            prompt.tokens, coverage_tokens, identity)) {
-        if (source) {
-            (void) cache.lease_obs->artifact_cloned(
-                *source, destination, identity);
+    try {
+        server_cache_lease_identity identity;
+        if (destination.valid() &&
+            cache.lease_execution_identity &&
+            server_cache_lease_build_identity(
+                *cache.lease_execution_identity, adapter_identity,
+                prompt.tokens, coverage_tokens, identity)) {
+            if (source) {
+                (void) cache.lease_obs->artifact_cloned(
+                    *source, destination, identity);
+            } else {
+                (void) cache.lease_obs->artifact_rebound(
+                    destination.artifact, identity);
+            }
         } else {
-            (void) cache.lease_obs->artifact_rebound(
-                destination.artifact, identity);
+            cache.lease_obs->artifact_identity_unavailable(destination);
         }
-    } else {
+    } catch (...) {
         cache.lease_obs->artifact_identity_unavailable(destination);
     }
 }
@@ -3795,13 +3874,19 @@ bool server_prompt_cache::exactly_redundant(
         const server_prompt_cache_state & victim,
         const server_prompt_cache_state & survivor) noexcept {
     try {
+        const bool vbr = victim.payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact;
         if (&victim == &survivor ||
+            victim.payload.kind() != survivor.payload.kind() ||
             victim.adapter_config_key != survivor.adapter_config_key ||
+            victim.vbr_execution_identity !=
+                survivor.vbr_execution_identity ||
+            (vbr && !victim.payload.same_storage(survivor.payload)) ||
             victim.prompt.sequence_epoch != survivor.prompt.sequence_epoch ||
             victim.prompt.n_tokens() > survivor.prompt.n_tokens() ||
             victim.prompt.tokens.get_common_prefix(survivor.prompt.tokens) !=
                 size_t(victim.prompt.n_tokens()) ||
-            !victim.payload.same_storage(survivor.payload) ||
+            (!vbr && !victim.payload.same_storage(survivor.payload)) ||
             victim.prompt.checkpoints.size() !=
                 survivor.prompt.checkpoints.size()) {
             return false;
@@ -4268,6 +4353,14 @@ bool server_prompt_cache::destroy_priced_host_entry(
             if (it == incoming) {
                 continue;
             }
+            // H1 logical VBR nodes borrow catalog-owned allocations. Until
+            // the refcount-aware release transaction lands, erasing one here
+            // would not free the bytes used to satisfy this pressure wave.
+            // Keep it as durable retained coverage instead of manufacturing
+            // false progress through the fixed-state terminal.
+            if (!it->payload.restorable()) {
+                continue;
+            }
             if (it->recovery_pins != 0) {
                 recovery_pin_excluded = true;
                 emit_recovery_pin_excluded(*this, *it);
@@ -4302,6 +4395,14 @@ bool server_prompt_cache::destroy_priced_host_entry(
         uint32_t ordinal = 0;
         for (auto it = states.begin(); it != states.end(); ++it, ++ordinal) {
             if (it == incoming) {
+                continue;
+            }
+            // Only fixed-state payloads have the three-leaf destruction
+            // capability consumed by this pricing/pressure terminal. VBR
+            // rows remain represented in the retention inventory, making a
+            // DF2 projection fail closed rather than treating their borrowed
+            // catalog bytes as a releasable singleton.
+            if (!it->payload.restorable()) {
                 continue;
             }
             if (it->recovery_pins != 0) {
@@ -4611,7 +4712,16 @@ bool server_prompt_cache::evict_front_under_pressure(
     // lifecycle authority exists, the floor skips recovery pins and admits
     // only entries whose inspected lease is known non-hard.
     if (!publish_authority) {
-        legacy_floor = states.begin();
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            // The historical fixed-state FIFO floor is unchanged. H1 VBR
+            // nodes are temporarily non-releasable because their catalog
+            // allocation release is not part of this terminal. The incoming
+            // publication owns a separate refusal terminal below.
+            if (it != incoming && it->payload.restorable()) {
+                legacy_floor = it;
+                break;
+            }
+        }
     }
     if (legacy_floor != states.end()) {
         const auto floor_artifact = host_entry_artifact_id(
@@ -4870,6 +4980,57 @@ bool server_prompt_cache::publish(
     if (entry.size() != 1 || !entry.front().payload.publishable()) {
         return false;
     }
+    auto & staged = entry.front();
+    const bool is_vbr = staged.payload.kind() ==
+        server_prompt_cache_payload_kind::vbr_artifact;
+
+    // This slice publishes an already-sealed VBR capability, so its physical
+    // allocations must belong to the cache's canonical ledger. It never
+    // creates the duplicate fixed-snapshot accounting leaves below. Until
+    // H1's refcount-aware pressure release transaction lands, VBR insertion
+    // is admitted only when it requires no synchronous victim mutation.
+    if (is_vbr) {
+        if (!server_prompt_cache_vbr_frontier_matches(
+                staged.prompt, staged.payload,
+                staged.vbr_execution_identity,
+                staged.adapter_config_key) ||
+            !source_prompt ||
+            !server_prompt_cache_vbr_frontier_matches(
+                *source_prompt, staged.payload,
+                staged.vbr_execution_identity,
+                staged.adapter_config_key) ||
+            !acct || !staged.payload.accounted_by(acct) ||
+            !retention_obs || source_slot < 0 ||
+            !retention_obs->prefix_tracking_enabled() ||
+            !retention_obs->prefix_tracking_available() ||
+            !staged.prompt.checkpoints.empty() ||
+            !retention_obs->clone_source_available(
+                server_retention_instance_key::for_slot(source_slot))) {
+            return false;
+        }
+        size_t total_bytes = staged.size();
+        size_t total_tokens = size_t(staged.prompt.n_tokens());
+        for (const auto & state : states) {
+            // An unpinned exact alias is replaced later in this same
+            // scheduler transaction. Excluding it makes republication
+            // idempotent at an exact byte/token limit; a pinned alias remains
+            // a separate logical node and keeps its token charge.
+            if (state.recovery_pins == 0 &&
+                exactly_redundant(state, staged)) {
+                continue;
+            }
+            if (state.size() > SIZE_MAX - total_bytes ||
+                size_t(state.prompt.n_tokens()) > SIZE_MAX - total_tokens) {
+                return false;
+            }
+            total_bytes += state.size();
+            total_tokens += size_t(state.prompt.n_tokens());
+        }
+        if ((limit_size > 0 && total_bytes > limit_size) ||
+            (limit_tokens > 0 && total_tokens > limit_tokens)) {
+            return false;
+        }
+    }
 
     // A host save is one compound payload: the host entry plus every copied
     // checkpoint. Validate all lineage sources before the payload admission
@@ -4879,7 +5040,7 @@ bool server_prompt_cache::publish(
     // reason to poison the complete retention/accounting catalog. The bound
     // is the configured checkpoint-ring size (default 32), and this runs only
     // on the host-save path.
-    if (retention_obs && source_prompt && source_slot >= 0) {
+    if (!is_vbr && retention_obs && source_prompt && source_slot >= 0) {
         if (source_prompt->checkpoints.size() !=
                 entry.front().prompt.checkpoints.size() ||
             !retention_sources_available(*source_prompt, source_slot)) {
@@ -4891,9 +5052,50 @@ bool server_prompt_cache::publish(
     // changed yet. Refusal drops only this detached node; the live slot remains the sole copy.
     // The callback commits all accounting leaves before returning true, and states.splice below
     // is allocation-free/noexcept, so accounting can never lag a published entry.
-    if (publish_authority &&
+    if (!is_vbr && publish_authority &&
         !publish_authority->admit_host_entry(entry.front())) {
         return false;
+    }
+
+    // The detached list node has its final stable address before splice.
+    // Prepare the logical lineage/prefix first so every fallible VBR metadata
+    // operation precedes the allocation-free cache publication. On refusal,
+    // retire the provisional destination; the live source and sealed catalog
+    // capability remain valid. The shared prefix index may separately latch
+    // unavailable under its canonical fail-closed contract.
+    if (is_vbr) {
+        const auto source_key =
+            server_retention_instance_key::for_slot(source_slot);
+        const auto destination_key =
+            server_retention_instance_key::for_host_entry(&staged);
+        const bool cloned = retention_obs->clone(
+            source_key, destination_key);
+        const bool indexed = cloned &&
+            !server_fault("vbr_prompt_cache_prefix_fail") &&
+            server_prompt_retention_publish_exact_prefix(
+                *retention_obs, destination_key, staged.prompt,
+                staged.adapter_config_key, staged.prompt.n_tokens());
+        if (!indexed) {
+            // A real prefix-index insertion failure deliberately makes the
+            // shared policy evidence unavailable (the sidecar's canonical
+            // fail-closed terminal). Either way, no logical cache node is
+            // published and this provisional association is retired.
+            retention_obs->retire(destination_key);
+            return false;
+        }
+        const server_cache_lease_subject source {
+            retention_obs->artifact_id(source_key),
+            common_retention_artifact_kind::live_slot,
+            source_slot,
+        };
+        const server_cache_lease_subject destination {
+            retention_obs->artifact_id(destination_key),
+            common_retention_artifact_kind::host_entry,
+            -1,
+        };
+        server_prompt_cache_mirror_lease(
+            *this, true, &source, destination, staged.prompt,
+            staged.adapter_config_key, staged.prompt.n_tokens());
     }
 
     // Splice the pre-allocated node in FIRST (no allocation, no throw) so the new entry is durably
@@ -4908,7 +5110,7 @@ bool server_prompt_cache::publish(
     if (acct && !publish_authority) {
         acct_charge_entry(*self);
     }
-    if (retention_obs && source_prompt && source_slot >= 0) {
+    if (!is_vbr && retention_obs && source_prompt && source_slot >= 0) {
         const auto source_key =
             server_retention_instance_key::for_slot(source_slot);
         const auto destination_key =
@@ -4947,8 +5149,20 @@ bool server_prompt_cache::publish(
 
     for (auto it = states.begin(); it != states.end();) {
         if (it != self && it->adapter_config_key == self->adapter_config_key) {
-            const int len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
-            if (len == (int) it->prompt.tokens.size()) {
+            int len = -1;
+            bool obsolete = false;
+            if (is_vbr) {
+                // Immutable owner identity rejects distinct VBR packages in
+                // O(1) before exactly_redundant examines their long prefix.
+                obsolete = exactly_redundant(*it, *self);
+                if (obsolete) {
+                    len = it->prompt.n_tokens();
+                }
+            } else if (it->payload.restorable()) {
+                len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
+                obsolete = len == (int) it->prompt.tokens.size();
+            }
+            if (obsolete) {
                 // A D-A recovery citation outlives its destruction commit
                 // through the dependent B execution. Dedup is another victim
                 // enumerator: it must leave the cited physical host node in
@@ -4972,7 +5186,7 @@ bool server_prompt_cache::publish(
     // are already committed, so a local make-room loop would prevent no memory spike and, being
     // size-only, would skip the token limit. update() enforces both and evicts oldest-first,
     // preserving the just-added entry.
-    if (!update_impl(self)) {
+    if (!is_vbr && !update_impl(self)) {
         return false;
     }
     if (published) {
@@ -5232,6 +5446,12 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     // nullptr = inventory overflow — the provider's state latches and rows stop, the
     // shipped scan is untouched.
     for (auto it = states.begin(); it != states.end(); ++it) {
+        // Keep execution inventory byte-identical to the planner: an H1 VBR
+        // node is retained metadata, not yet a restore candidate. Reject it
+        // before assigning a bounded source ID or scanning its long prefix.
+        if (!it->payload.restorable()) {
+            continue;
+        }
         [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
         [[maybe_unused]] int32_t obs_source = -1;
         if constexpr (Observed) {
@@ -5262,18 +5482,10 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         if constexpr (Observed) {
             lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
             server_cache_plan_apply_host(row, server_cache_plan_evaluate_host(
-                it->payload.publishable(),
+                it->payload.restorable(),
                 it->adapter_config_key == adapter_config_key,
                 lcp_cur, tokens_new.size(), it->prompt.tokens.size(),
                 it->payload.size()));
-        }
-
-        // never select a structurally-empty entry [I7/I10]: a size-0 main would "restore" as a
-        // false success (0 == 0) and leave the slot on empty state, then continue as if a prefix
-        // were present -> pos_min == -1 with n_past > 0 abort. The transactional save/load here
-        // never produces an empty-main entry, but guard the selector so a stray one is inert.
-        if (!it->payload.publishable()) {
-            continue;
         }
 
         // never serve state built under a different adapter configuration [I6]: token-LCP alone

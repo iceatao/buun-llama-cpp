@@ -7358,6 +7358,13 @@ private:
             return true;
         }
         for (auto & state : prompt_cache->states) {
+            // H1 VBR nodes are durable logical inventory, but they do not
+            // become request-plan/restore providers until H2 installs the
+            // import transaction. Skip them before source-ID allocation and
+            // long-prefix work so they cannot exhaust fixed-host inventory.
+            if (!state.payload.restorable()) {
+                continue;
+            }
             int32_t host_source_id = -1;
             if (!source_registry.get(
                     *prompt_cache, state, host_source_id)) {
@@ -7368,7 +7375,7 @@ private:
             }
             const uint64_t lcp = state.prompt.tokens.get_common_prefix(task.tokens);
             const auto host_eval = server_cache_plan_evaluate_host(
-                state.payload.publishable(),
+                state.payload.restorable(),
                 state.adapter_config_key == incoming_adapter,
                 lcp, task.tokens.size(), state.prompt.tokens.size(),
                 state.payload.size());
@@ -7578,7 +7585,7 @@ private:
             for (auto & state : prompt_cache->states) {
                 int32_t observed = -1;
                 if (prompt_cache->cache_plan_get_source_id(state, observed) &&
-                    observed == source_id && state.payload.publishable() &&
+                    observed == source_id && state.payload.restorable() &&
                     state.adapter_config_key == incoming_adapter) {
                     return &state;
                 }
