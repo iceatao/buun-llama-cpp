@@ -1227,15 +1227,22 @@ private:
             common_cache_plan_destruction_reason & floor_reason,
             bool & recovery_pin_excluded,
             bool competition_wave_valid,
-            bool & observe_retention_shadow);
+            bool & observe_retention_shadow,
+            uint64_t & released_bytes,
+            size_t & released_tokens);
     bool evict_front_under_pressure(
         server_cache_destruction_reason reason,
         iterator incoming,
         bool competition_wave_valid,
-        bool observe_retention_shadow);
+        bool observe_retention_shadow,
+        uint64_t & released_bytes,
+        size_t & released_tokens);
     bool destroy_df2_entry(
         iterator it,
-        server_cache_destruction_reason reason);
+        server_cache_destruction_reason reason,
+        vbr_artifact_prepared_retire * vbr_retire = nullptr,
+        uint64_t * released_bytes = nullptr,
+        size_t * released_tokens = nullptr);
     bool update_impl(iterator incoming);
     void observe_retention_pressure_choice(
             server_cache_destruction_reason reason,

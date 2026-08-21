@@ -95,9 +95,18 @@ public:
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
     bool retirement_owned() const noexcept;
     bool retirement_exclusive() const noexcept;
+    bool logical_erase_preserves_storage() const noexcept;
+    bool has_quality_anchor() const noexcept;
+    bool preview_retire(
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept;
     bool prepare_retire(
         uint64_t expected_serial,
         vbr_artifact_prepared_retire & out) const noexcept;
+    static bool preview_retire_union(
+        const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) noexcept;
 
 private:
     struct impl;
@@ -140,9 +149,18 @@ public:
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
     bool vbr_retirement_owned() const noexcept;
     bool vbr_retirement_exclusive() const noexcept;
+    bool vbr_logical_erase_only() const noexcept;
+    bool vbr_has_quality_anchor() const noexcept;
+    bool preview_vbr_retire(
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept;
     bool prepare_vbr_retire(
         uint64_t expected_serial,
         vbr_artifact_prepared_retire & out) const noexcept;
+    static bool preview_vbr_retire_union(
+        const std::vector<const server_prompt_cache_payload *> & payloads,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) noexcept;
     size_t size() const noexcept;
     bool same_storage(const server_prompt_cache_payload & other) const noexcept;
 

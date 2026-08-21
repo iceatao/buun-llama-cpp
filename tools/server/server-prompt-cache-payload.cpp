@@ -445,6 +445,38 @@ bool server_prompt_cache_vbr_variant_set::retirement_exclusive() const noexcept 
            (!impl_->anchor || impl_->anchor.use_count() == 1);
 }
 
+bool server_prompt_cache_vbr_variant_set::logical_erase_preserves_storage()
+        const noexcept {
+    return retirement_owned() && impl_->compact.use_count() > 1 &&
+           (!impl_->anchor || impl_->anchor.use_count() > 1);
+}
+
+bool server_prompt_cache_vbr_variant_set::has_quality_anchor() const noexcept {
+    return impl_ && bool(impl_->anchor);
+}
+
+bool server_prompt_cache_vbr_variant_set::preview_retire(
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept {
+    out = {};
+    if (!retirement_exclusive()) {
+        return false;
+    }
+    try {
+        std::vector<const vbr_artifact_package_view *> packages;
+        packages.reserve(impl_->anchor ? 2 : 1);
+        packages.push_back(&impl_->compact->package());
+        if (impl_->anchor) {
+            packages.push_back(&impl_->anchor->package());
+        }
+        return packages.front()->preview_owned_retire(
+            packages, expected_serial, out);
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
 bool server_prompt_cache_vbr_variant_set::prepare_retire(
         uint64_t expected_serial,
         vbr_artifact_prepared_retire & out) const noexcept {
@@ -462,6 +494,37 @@ bool server_prompt_cache_vbr_variant_set::prepare_retire(
         return packages.front()->prepare_owned_retire(
             packages, expected_serial, out);
     } catch (...) {
+        return false;
+    }
+}
+
+bool server_prompt_cache_vbr_variant_set::preview_retire_union(
+        const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) noexcept {
+    out = {};
+    if (variants.empty()) {
+        return false;
+    }
+    try {
+        std::vector<const vbr_artifact_package_view *> packages;
+        for (const auto * variant : variants) {
+            if (!variant || !variant->retirement_owned() ||
+                !variant->impl_ || !variant->impl_->compact) {
+                return false;
+            }
+            packages.push_back(&variant->impl_->compact->package());
+            if (variant->impl_->anchor) {
+                packages.push_back(&variant->impl_->anchor->package());
+            }
+        }
+        std::sort(packages.begin(), packages.end(), std::less<>());
+        packages.erase(
+            std::unique(packages.begin(), packages.end()), packages.end());
+        return packages.front()->preview_owned_retire(
+            packages, expected_serial, out);
+    } catch (...) {
+        out = {};
         return false;
     }
 }
@@ -540,6 +603,27 @@ bool server_prompt_cache_payload::vbr_retirement_exclusive() const noexcept {
            (*owner)->retirement_exclusive();
 }
 
+bool server_prompt_cache_payload::vbr_logical_erase_only() const noexcept {
+    const auto * owner = std::get_if<vbr_variant_owner>(&storage_);
+    return owner && *owner && (*owner)->retirement_owned() &&
+           (owner->use_count() > 1 ||
+            (*owner)->logical_erase_preserves_storage());
+}
+
+bool server_prompt_cache_payload::vbr_has_quality_anchor() const noexcept {
+    const auto * variants = vbr_variants();
+    return variants && variants->has_quality_anchor();
+}
+
+bool server_prompt_cache_payload::preview_vbr_retire(
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept {
+    out = {};
+    const auto * variants = vbr_variants();
+    return vbr_retirement_exclusive() &&
+           variants->preview_retire(expected_serial, out);
+}
+
 bool server_prompt_cache_payload::prepare_vbr_retire(
         uint64_t expected_serial,
         vbr_artifact_prepared_retire & out) const noexcept {
@@ -547,6 +631,39 @@ bool server_prompt_cache_payload::prepare_vbr_retire(
     const auto * variants = vbr_variants();
     return vbr_retirement_exclusive() &&
            variants->prepare_retire(expected_serial, out);
+}
+
+bool server_prompt_cache_payload::preview_vbr_retire_union(
+        const std::vector<const server_prompt_cache_payload *> & payloads,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) noexcept {
+    out = {};
+    if (payloads.empty()) {
+        return false;
+    }
+    try {
+        std::vector<const server_prompt_cache_vbr_variant_set *> variants;
+        variants.reserve(payloads.size());
+        for (const auto * payload : payloads) {
+            if (!payload) {
+                return false;
+            }
+            const auto * owner = std::get_if<vbr_variant_owner>(
+                &payload->storage_);
+            if (!owner || !*owner || !(*owner)->retirement_owned()) {
+                return false;
+            }
+            variants.push_back(owner->get());
+        }
+        std::sort(variants.begin(), variants.end(), std::less<>());
+        variants.erase(
+            std::unique(variants.begin(), variants.end()), variants.end());
+        return server_prompt_cache_vbr_variant_set::preview_retire_union(
+            variants, expected_serial, out);
+    } catch (...) {
+        out = {};
+        return false;
+    }
 }
 
 size_t server_prompt_cache_payload::size() const noexcept {

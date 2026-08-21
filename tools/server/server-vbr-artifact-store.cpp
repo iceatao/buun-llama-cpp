@@ -1142,7 +1142,8 @@ bool server_vbr_artifact_store::retain_host_payload(
         !package) {
         return false;
     }
-    payload = server_prompt_cache_vbr_payload::adopt(std::move(package));
+    payload = server_prompt_cache_vbr_payload::adopt_owned(
+        std::move(package));
     return bool(payload);
 }
 

@@ -1788,13 +1788,45 @@ bool server_prompt_cache::enable_retention_shadow() noexcept {
 }
 
 size_t server_prompt_cache::size() const {
-    size_t res = 0;
-
+    size_t naive = 0;
+    bool has_vbr = false;
     for (const auto & state : states) {
-        res += state.size();
+        naive += state.size();
+        has_vbr |= state.payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact;
     }
-
-    return res;
+    if (!has_vbr || !acct) {
+        return naive;
+    }
+    try {
+        std::vector<const server_prompt_cache_payload *> payloads;
+        payloads.reserve(states.size());
+        size_t fixed_bytes = 0;
+        for (const auto & state : states) {
+            if (state.payload.kind() ==
+                    server_prompt_cache_payload_kind::vbr_artifact) {
+                payloads.push_back(&state.payload);
+            } else {
+                fixed_bytes += state.size();
+            }
+        }
+        llama_cache_acct_release_set_preview preview;
+        if (!server_prompt_cache_payload::preview_vbr_retire_union(
+                payloads, acct->serial(), preview)) {
+            return naive;
+        }
+        uint64_t vbr_bytes = 0;
+        for (const auto & row : preview.rows) {
+            if (row.resident_allocated > UINT64_MAX - vbr_bytes) {
+                return naive;
+            }
+            vbr_bytes += row.resident_allocated;
+        }
+        return vbr_bytes <= SIZE_MAX - fixed_bytes
+            ? fixed_bytes + size_t(vbr_bytes) : naive;
+    } catch (...) {
+        return naive;
+    }
 }
 
 size_t server_prompt_cache::n_tokens() const {
@@ -1894,6 +1926,19 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
     return staged;
 }
 
+static size_t server_prompt_cache_effective_token_limit(
+        size_t limit_size,
+        size_t limit_tokens,
+        size_t cache_bytes,
+        size_t cache_tokens) noexcept {
+    if (limit_size == 0) {
+        return limit_tokens;
+    }
+    const float size_per_token = std::max<float>(
+        1.0f, float(cache_bytes) / std::max<size_t>(1, cache_tokens));
+    return std::max<size_t>(limit_tokens, limit_size / size_per_token);
+}
+
 static bool server_prompt_cache_vbr_frontier_matches(
         const server_prompt & prompt,
         const server_prompt_cache_payload & payload,
@@ -1942,7 +1987,9 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage_vbr(
     }
     const size_t payload_size = payload.size();
     if (payload_size == 0 ||
-        (limit_size > 0 && payload_size > limit_size)) {
+        (limit_size > 0 && payload_size > limit_size) ||
+        (limit_size == 0 && limit_tokens > 0 &&
+         size_t(prompt.n_tokens()) > limit_tokens)) {
         return {};
     }
 
@@ -2934,7 +2981,7 @@ bool checkpoint_payload_equal(
            a.accel.spec == b.accel.spec;
 }
 
-bool build_host_destruction_artifact(
+bool build_host_retention_artifact(
         server_prompt_cache & cache,
         server_prompt_cache_state & state,
         server_cache_destruction_artifact & out) noexcept {
@@ -2967,17 +3014,33 @@ bool build_host_destruction_artifact(
         out.candidate.lease = cache.lease_obs->inspect(
             catalog.artifact_id, identity);
         out.candidate.identity_known = true;
-        out.candidate.release_ops.reserve(3);
-        for (const auto op : state.release_ops()) {
-            if (!op) {
-                return false;
-            }
-            out.candidate.release_ops.push_back(op);
-        }
         out.kind = common_retention_artifact_kind::host_entry;
         out.host_source_id = state.cache_plan_source_id;
         out.pool = catalog.record.stamp.pool;
         out.mandatory_anchor = catalog.record.stamp.mandatory_anchor;
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
+bool build_host_destruction_artifact(
+        server_prompt_cache & cache,
+        server_prompt_cache_state & state,
+        server_cache_destruction_artifact & out) noexcept {
+    if (!build_host_retention_artifact(cache, state, out)) {
+        return false;
+    }
+    try {
+        out.candidate.release_ops.reserve(3);
+        for (const auto op : state.release_ops()) {
+            if (!op) {
+                out = {};
+                return false;
+            }
+            out.candidate.release_ops.push_back(op);
+        }
         return true;
     } catch (...) {
         out = {};
@@ -3412,12 +3475,40 @@ struct host_trade_candidate {
     server_prompt_cache::iterator victim;
     server_prompt_cache::iterator recovery;
     host_trade_ranking ranking;
+    uint64_t marginal_resident_bytes = 0;
     bool attempted = false;
     bool lease_known = false;
     bool main_family = false;
     bool soft_leased = false;
     bool hard_leased = false;
+    bool vbr = false;
+    bool vbr_logical_alias = false;
+    bool retirement_ready = false;
 };
+
+bool vbr_release_resident_bytes(
+        const llama_cache_acct_release_set_preview & preview,
+        uint64_t & bytes) noexcept {
+    bytes = 0;
+    if (preview.accounting_serial == 0) {
+        return false;
+    }
+    for (const auto & row : preview.rows) {
+        if (row.resident_allocated > UINT64_MAX - bytes) {
+            bytes = 0;
+            return false;
+        }
+        bytes += row.resident_allocated;
+    }
+    return true;
+}
+
+bool vbr_release_resident_bytes(
+        const vbr_artifact_prepared_retire & prepared,
+        uint64_t & bytes) noexcept {
+    return prepared.ready() &&
+           vbr_release_resident_bytes(prepared.preview(), bytes);
+}
 
 uint64_t server_prompt_cache_shadow_hash(uint64_t value) noexcept {
     value ^= value >> 30;
@@ -3443,6 +3534,7 @@ bool host_trade_price(
         server_prompt_cache & cache,
         server_prompt_cache::iterator victim,
         uint32_t ordinal,
+        server_cache_destruction_reason reason,
         const common_cache_plan_calib * calib,
         host_trade_candidate & out) noexcept {
     out = {};
@@ -3455,7 +3547,11 @@ bool host_trade_price(
     try {
         auto & authority = *cache.publish_authority;
         server_cache_destruction_artifact artifact;
-        if (!build_host_destruction_artifact(cache, *victim, artifact)) {
+        out.vbr = victim->payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact;
+        if (!(out.vbr
+                ? build_host_retention_artifact(cache, *victim, artifact)
+                : build_host_destruction_artifact(cache, *victim, artifact))) {
             return false;
         }
         out.ranking.artifact_id = artifact.candidate.artifact_id;
@@ -3468,6 +3564,40 @@ bool host_trade_price(
             server_cache_lease_class::soft;
         out.hard_leased = server_cache_lease_is_hard(
             artifact.candidate.lease);
+        if (out.vbr) {
+            out.vbr_logical_alias =
+                victim->payload.vbr_logical_erase_only();
+            if (out.vbr_logical_alias && !out.hard_leased) {
+                out.retirement_ready = true;
+                return true;
+            }
+            // H1 ordinary pressure owns only compact-current entries. A
+            // quality anchor has a separate budget/competition terminal in
+            // a later slice and must not be hidden in compact victim bytes.
+            if (out.hard_leased || !cache.acct ||
+                victim->payload.vbr_has_quality_anchor()) {
+                return false;
+            }
+            if (!victim->payload.vbr_retirement_exclusive()) {
+                return false;
+            }
+            if (reason ==
+                    server_cache_destruction_reason::host_capacity) {
+                llama_cache_acct_release_set_preview preview;
+                if (!victim->payload.preview_vbr_retire(
+                        cache.acct->serial(), preview) ||
+                    !vbr_release_resident_bytes(
+                        preview, out.marginal_resident_bytes)) {
+                    return false;
+                }
+            }
+            out.retirement_ready = true;
+            // VBR payloads are not restore authorities until H2. They enter
+            // the DF2 avoided-prefill projection below, but never the fixed
+            // calibrated exact-recovery ladder.
+            return true;
+        }
+        out.retirement_ready = true;
         if (!calib) {
             return false;
         }
@@ -3668,6 +3798,7 @@ host_trade_df2_projection project_host_trade_df2(
         }
         row->backing_known = true;
         row->releasable = !candidate.hard_leased &&
+            candidate.retirement_ready &&
             candidate.victim != incoming &&
             candidate.victim->recovery_pins == 0;
         if (!row->releasable) {
@@ -3676,6 +3807,8 @@ host_trade_df2_projection project_host_trade_df2(
         result.candidate_count++;
         if (reason == server_cache_destruction_reason::host_token_limit) {
             row->resource = candidate.victim->prompt.n_tokens();
+        } else if (candidate.vbr) {
+            row->resource = candidate.marginal_resident_bytes;
         } else {
             // Published host entries own three independent accounting leaves.
             // Their immutable payload sizes are the exact resident bytes
@@ -4329,7 +4462,11 @@ bool server_prompt_cache::destroy_priced_host_entry(
         common_cache_plan_destruction_reason & floor_reason,
         bool & recovery_pin_excluded,
         bool competition_wave_valid,
-        bool & observe_retention_shadow) {
+        bool & observe_retention_shadow,
+        uint64_t & released_bytes,
+        size_t & released_tokens) {
+    released_bytes = 0;
+    released_tokens = 0;
     legacy_floor = states.end();
     floor_reason = common_cache_plan_destruction_reason::capacity_refused;
     recovery_pin_excluded = false;
@@ -4353,11 +4490,10 @@ bool server_prompt_cache::destroy_priced_host_entry(
             if (it == incoming) {
                 continue;
             }
-            // H1 logical VBR nodes borrow catalog-owned allocations. Until
-            // the refcount-aware release transaction lands, erasing one here
-            // would not free the bytes used to satisfy this pressure wave.
-            // Keep it as durable retained coverage instead of manufacturing
-            // false progress through the fixed-state terminal.
+            // Without the complete lease/accounting substrate, no learned
+            // authority may inspect or retire a VBR capability. Keep it as
+            // durable retained coverage instead of bypassing a potentially
+            // hard lease through the fixed-state terminal.
             if (!it->payload.restorable()) {
                 continue;
             }
@@ -4397,14 +4533,6 @@ bool server_prompt_cache::destroy_priced_host_entry(
             if (it == incoming) {
                 continue;
             }
-            // Only fixed-state payloads have the three-leaf destruction
-            // capability consumed by this pricing/pressure terminal. VBR
-            // rows remain represented in the retention inventory, making a
-            // DF2 projection fail closed rather than treating their borrowed
-            // catalog bytes as a releasable singleton.
-            if (!it->payload.restorable()) {
-                continue;
-            }
             if (it->recovery_pins != 0) {
                 recovery_pin_excluded = true;
                 emit_recovery_pin_excluded(*this, *it);
@@ -4412,7 +4540,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
             }
             host_trade_candidate candidate;
             (void) host_trade_price(
-                *this, it, ordinal, calib, candidate);
+                *this, it, ordinal, reason, calib, candidate);
             if (candidate.hard_leased) {
                 candidate.attempted = true;
                 const uint64_t quote_sequence =
@@ -4433,6 +4561,31 @@ bool server_prompt_cache::destroy_priced_host_entry(
             destruction_obs->host_trade_legacy_fallbacks++;
         }
         return false;
+    }
+
+    // Exact shared-owner aliases are zero-value logical cleanup, not a
+    // positive-byte DF2 alternative. Execute the first lawful alias before
+    // calibrated or learned victim selection; the outer pressure loop then
+    // remeasures and prices the now-exclusive survivor. This preserves pins,
+    // hard leases, and incoming protection while ensuring redundant aliases
+    // cannot mask a more valuable unique entry.
+    const auto alias = std::find_if(
+        candidates.begin(), candidates.end(), [](const auto & candidate) {
+            return candidate.vbr_logical_alias && candidate.lease_known &&
+                   !candidate.hard_leased &&
+                   candidate.victim->recovery_pins == 0;
+        });
+    if (alias != candidates.end()) {
+        if (observe_retention_shadow) {
+            observe_retention_pressure_choice(
+                reason, incoming, alias->victim, competition_wave_valid);
+        }
+        SRV_WRN(
+            " - removing redundant VBR host alias source_id=%d\n",
+            alias->victim->cache_plan_source_id);
+        return destroy_df2_entry(
+            alias->victim, reason, nullptr,
+            &released_bytes, &released_tokens);
     }
 
     const auto stable_key = [](const host_trade_candidate & candidate) {
@@ -4519,6 +4672,9 @@ bool server_prompt_cache::destroy_priced_host_entry(
 
         const auto admission = server_prompt_cache_observe_drop(
             *this, *chosen->victim, reason);
+        const uint64_t victim_bytes = chosen->victim->size();
+        const size_t victim_tokens =
+            size_t(chosen->victim->prompt.n_tokens());
         const std::thread::id scheduler_owner = std::this_thread::get_id();
         if (observe_retention_shadow) {
             observe_retention_pressure_choice(
@@ -4548,6 +4704,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
                 *this, "priced_evicted", chosen->ranking.artifact_id,
                 chosen->ranking.source_id);
         }
+        released_bytes = victim_bytes;
+        released_tokens = victim_tokens;
         return true;
     }
 
@@ -4557,7 +4715,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
     // because D-A evidence is incomplete.
     if (reason == server_cache_destruction_reason::host_capacity) {
         for (auto & candidate : candidates) {
-            if (candidate.attempted || candidate.ranking.price_known) {
+            if (candidate.vbr || candidate.attempted ||
+                candidate.ranking.price_known) {
                 continue;
             }
             candidate.attempted = true;
@@ -4575,6 +4734,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
     }
     for (const auto & candidate : candidates) {
         if (candidate.lease_known && !candidate.hard_leased &&
+            candidate.retirement_ready &&
             candidate.victim->recovery_pins == 0) {
             legacy_floor = candidate.victim;
             break;
@@ -4673,7 +4833,20 @@ bool server_prompt_cache::destroy_priced_host_entry(
                 const int32_t source_id =
                     selected->victim->cache_plan_source_id;
                 const size_t victim_bytes = selected->victim->size();
-                if (destroy_df2_entry(selected->victim, reason)) {
+                vbr_artifact_prepared_retire selected_retire;
+                vbr_artifact_prepared_retire * selected_retire_ptr = nullptr;
+                if (selected->vbr && !selected->vbr_logical_alias) {
+                    if (!acct ||
+                        !selected->victim->payload.prepare_vbr_retire(
+                            acct->serial(), selected_retire)) {
+                        return false;
+                    }
+                    selected_retire_ptr = &selected_retire;
+                }
+                if (destroy_df2_entry(
+                        selected->victim, reason,
+                        selected_retire_ptr,
+                        &released_bytes, &released_tokens)) {
                     if (destruction_obs) {
                         destruction_obs->host_trade_df2_executed++;
                     }
@@ -4695,7 +4868,11 @@ bool server_prompt_cache::evict_front_under_pressure(
         server_cache_destruction_reason reason,
         iterator incoming,
         bool competition_wave_valid,
-        bool observe_retention_shadow) {
+        bool observe_retention_shadow,
+        uint64_t & released_bytes,
+        size_t & released_tokens) {
+    released_bytes = 0;
+    released_tokens = 0;
     GGML_ASSERT(!states.empty());
     iterator legacy_floor = states.end();
     common_cache_plan_destruction_reason floor_reason =
@@ -4704,7 +4881,8 @@ bool server_prompt_cache::evict_front_under_pressure(
     if (destroy_priced_host_entry(
             reason, incoming, legacy_floor, floor_reason,
             recovery_pin_excluded, competition_wave_valid,
-            observe_retention_shadow)) {
+            observe_retention_shadow, released_bytes,
+            released_tokens)) {
         return true;
     }
 
@@ -4713,13 +4891,31 @@ bool server_prompt_cache::evict_front_under_pressure(
     // only entries whose inspected lease is known non-hard.
     if (!publish_authority) {
         for (auto it = states.begin(); it != states.end(); ++it) {
-            // The historical fixed-state FIFO floor is unchanged. H1 VBR
-            // nodes are temporarily non-releasable because their catalog
-            // allocation release is not part of this terminal. The incoming
-            // publication owns a separate refusal terminal below.
-            if (it != incoming && it->payload.restorable()) {
+            if (it != incoming && it->recovery_pins == 0 &&
+                it->payload.vbr_logical_erase_only()) {
                 legacy_floor = it;
                 break;
+            }
+        }
+        if (legacy_floor == states.end()) {
+            for (auto it = states.begin(); it != states.end(); ++it) {
+                // Fixed state retains its historical FIFO order. An owned
+                // VBR node may join that floor only with an exact catalog
+                // retirement capability.
+                if (it == incoming || it->recovery_pins != 0) {
+                    continue;
+                }
+                if (it->payload.restorable()) {
+                    legacy_floor = it;
+                    break;
+                }
+                vbr_artifact_prepared_retire prepared;
+                if (acct && !it->payload.vbr_has_quality_anchor() &&
+                    it->payload.prepare_vbr_retire(
+                        acct->serial(), prepared)) {
+                    legacy_floor = it;
+                    break;
+                }
             }
         }
     }
@@ -4735,12 +4931,37 @@ bool server_prompt_cache::evict_front_under_pressure(
             " - removing fallback host entry source_id=%d (size = %.3f MiB)\n",
             legacy_floor->cache_plan_source_id,
             legacy_floor->size() / (1024.0 * 1024.0));
-        destroy_entry(legacy_floor, reason);
-        if (recovery_pin_excluded) {
-            emit_host_pressure_floor_outcome(
-                *this, "legacy_evicted", floor_artifact, floor_source_id);
+        bool floor_evicted = false;
+        if (legacy_floor->payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact) {
+            vbr_artifact_prepared_retire prepared;
+            const bool alias_only =
+                legacy_floor->payload.vbr_logical_erase_only();
+            floor_evicted = acct &&
+                (alias_only ||
+                 legacy_floor->payload.prepare_vbr_retire(
+                     acct->serial(), prepared)) &&
+                destroy_df2_entry(
+                    legacy_floor, reason,
+                    alias_only ? nullptr : &prepared,
+                    &released_bytes, &released_tokens);
+        } else {
+            released_bytes = legacy_floor->size();
+            released_tokens =
+                size_t(legacy_floor->prompt.n_tokens());
+            destroy_entry(legacy_floor, reason);
+            floor_evicted = true;
         }
-        return true;
+        if (!floor_evicted) {
+            // The VBR quote became unavailable before mutation. Preserve the
+            // incumbent and execute the ordinary incoming-refusal terminal.
+        } else {
+            if (recovery_pin_excluded) {
+                emit_host_pressure_floor_outcome(
+                    *this, "legacy_evicted", floor_artifact, floor_source_id);
+            }
+            return true;
+        }
     }
 
     // Hard leases are proof-backed guarantees. If no unpinned, known-nonhard
@@ -4760,7 +4981,22 @@ bool server_prompt_cache::evict_front_under_pressure(
             observe_retention_pressure_choice(
                 reason, incoming, incoming, competition_wave_valid);
         }
-        destroy_entry(incoming, reason);
+        if (incoming->payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact) {
+            vbr_artifact_prepared_retire prepared;
+            const bool alias_only =
+                incoming->payload.vbr_logical_erase_only();
+            if (!acct ||
+                (!alias_only && !incoming->payload.prepare_vbr_retire(
+                    acct->serial(), prepared)) ||
+                !destroy_df2_entry(
+                    incoming, reason,
+                    alias_only ? nullptr : &prepared)) {
+                destroy_entry(incoming, reason);
+            }
+        } else {
+            destroy_entry(incoming, reason);
+        }
     }
     if (recovery_pin_excluded) {
         emit_host_pressure_floor_outcome(
@@ -4771,8 +5007,72 @@ bool server_prompt_cache::evict_front_under_pressure(
 
 bool server_prompt_cache::destroy_df2_entry(
         iterator it,
-        server_cache_destruction_reason reason) {
-    if (!publish_authority || !acct || it == states.end()) {
+        server_cache_destruction_reason reason,
+        vbr_artifact_prepared_retire * vbr_retire,
+        uint64_t * released_bytes,
+        size_t * released_tokens) {
+    if (released_bytes) {
+        *released_bytes = 0;
+    }
+    if (released_tokens) {
+        *released_tokens = 0;
+    }
+    if (!acct || it == states.end()) {
+        return false;
+    }
+
+    if (it->payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact) {
+        uint64_t bytes = 0;
+        server_prompt_cache_retirement_manifest retirement;
+        const bool alias_only = vbr_retire == nullptr &&
+            it->payload.vbr_logical_erase_only();
+        if ((!alias_only &&
+             (!vbr_retire ||
+              !vbr_release_resident_bytes(*vbr_retire, bytes))) ||
+            bytes > SIZE_MAX ||
+            !server_prompt_cache_capture_retirement(
+                *this, it, retirement)) {
+            return false;
+        }
+        const size_t tokens = size_t(it->prompt.n_tokens());
+        const auto admission =
+            server_prompt_cache_observe_drop(*this, *it, reason);
+        if (!alias_only && acct->serial() !=
+                vbr_retire->preview().accounting_serial) {
+            return false;
+        }
+
+        const std::thread::id scheduler_owner = std::this_thread::get_id();
+        server_prompt_cache_destroy_entry_impl(*this, it);
+        GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+        const auto status = alias_only
+            ? vbr_artifact_prepared_retire_status::retired
+            : vbr_retire->commit();
+        // Once the logical owner is gone, commit owns an unconditional
+        // current-serial cleanup fallback. `unavailable` would therefore be
+        // an internal invariant violation, never a reason to touch a second
+        // cache victim after this iterator was erased.
+        GGML_ASSERT(status !=
+                    vbr_artifact_prepared_retire_status::unavailable);
+        server_prompt_cache_retire_manifest(*this, retirement);
+        if (destruction_obs && !alias_only) {
+            destruction_obs->note_prepared_release(
+                admission.sequence, status !=
+                    vbr_artifact_prepared_retire_status::unavailable);
+        }
+        if (released_bytes) {
+            *released_bytes = alias_only || status !=
+                    vbr_artifact_prepared_retire_status::retired
+                ? UINT64_MAX : bytes;
+        }
+        if (released_tokens) {
+            *released_tokens = tokens;
+        }
+        return true;
+    }
+
+    if (!publish_authority) {
         return false;
     }
 
@@ -4805,6 +5105,8 @@ bool server_prompt_cache::destroy_df2_entry(
         return false;
     }
 
+    const size_t bytes = it->size();
+    const size_t tokens = size_t(it->prompt.n_tokens());
     const std::thread::id scheduler_owner = std::this_thread::get_id();
     server_prompt_cache_destroy_entry_impl(*this, it);
     GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
@@ -4814,6 +5116,12 @@ bool server_prompt_cache::destroy_df2_entry(
     server_prompt_cache_retire_manifest(*this, retirement);
     if (destruction_obs) {
         destruction_obs->note_prepared_release(admission.sequence, true);
+    }
+    if (released_bytes) {
+        *released_bytes = bytes;
+    }
+    if (released_tokens) {
+        *released_tokens = tokens;
     }
     return true;
 }
@@ -4984,11 +5292,11 @@ bool server_prompt_cache::publish(
     const bool is_vbr = staged.payload.kind() ==
         server_prompt_cache_payload_kind::vbr_artifact;
 
-    // This slice publishes an already-sealed VBR capability, so its physical
-    // allocations must belong to the cache's canonical ledger. It never
-    // creates the duplicate fixed-snapshot accounting leaves below. Until
-    // H1's refcount-aware pressure release transaction lands, VBR insertion
-    // is admitted only when it requires no synchronous victim mutation.
+    // A sealed VBR capability is already charged in the cache's canonical
+    // ledger. Borrowed/manual views remain publishable only when they fit
+    // without pressure; cache-owned views may enter the canonical pressure
+    // transaction, whose prepared retirement quote supplies exact marginal
+    // physical bytes.
     if (is_vbr) {
         if (!server_prompt_cache_vbr_frontier_matches(
                 staged.prompt, staged.payload,
@@ -5006,6 +5314,11 @@ bool server_prompt_cache::publish(
             !staged.prompt.checkpoints.empty() ||
             !retention_obs->clone_source_available(
                 server_retention_instance_key::for_slot(source_slot))) {
+            return false;
+        }
+        if ((limit_size > 0 && staged.size() > limit_size) ||
+            (limit_size == 0 && limit_tokens > 0 &&
+             size_t(staged.prompt.n_tokens()) > limit_tokens)) {
             return false;
         }
         size_t total_bytes = staged.size();
@@ -5026,8 +5339,45 @@ bool server_prompt_cache::publish(
             total_bytes += state.size();
             total_tokens += size_t(state.prompt.n_tokens());
         }
-        if ((limit_size > 0 && total_bytes > limit_size) ||
-            (limit_tokens > 0 && total_tokens > limit_tokens)) {
+        if (limit_size > 0 && total_bytes > limit_size && acct) {
+            try {
+                std::vector<const server_prompt_cache_payload *> payloads;
+                payloads.reserve(states.size() + 1);
+                payloads.push_back(&staged.payload);
+                size_t fixed_bytes = 0;
+                for (const auto & state : states) {
+                    if (state.payload.kind() ==
+                            server_prompt_cache_payload_kind::vbr_artifact) {
+                        payloads.push_back(&state.payload);
+                    } else if (state.size() <= SIZE_MAX - fixed_bytes) {
+                        fixed_bytes += state.size();
+                    } else {
+                        return false;
+                    }
+                }
+                llama_cache_acct_release_set_preview preview;
+                uint64_t vbr_bytes = 0;
+                if (server_prompt_cache_payload::preview_vbr_retire_union(
+                        payloads, acct->serial(), preview) &&
+                    vbr_release_resident_bytes(preview, vbr_bytes) &&
+                    vbr_bytes <= SIZE_MAX - fixed_bytes) {
+                    total_bytes = fixed_bytes + size_t(vbr_bytes);
+                }
+            } catch (...) {
+                // Retain the conservative per-entry upper bound.
+            }
+        }
+        const size_t effective_token_limit =
+            server_prompt_cache_effective_token_limit(
+                limit_size, limit_tokens, total_bytes, total_tokens);
+        const bool requires_pressure =
+            (limit_size > 0 && total_bytes > limit_size) ||
+            (limit_tokens > 0 && total_tokens > effective_token_limit);
+        if (requires_pressure &&
+            ((staged.payload.vbr_has_quality_anchor() &&
+              !staged.payload.vbr_logical_erase_only()) ||
+             (!staged.payload.vbr_retirement_exclusive() &&
+              !staged.payload.vbr_logical_erase_only()))) {
             return false;
         }
     }
@@ -5186,7 +5536,7 @@ bool server_prompt_cache::publish(
     // are already committed, so a local make-room loop would prevent no memory spike and, being
     // size-only, would skip the token limit. update() enforces both and evicts oldest-first,
     // preserving the just-added entry.
-    if (!is_vbr && !update_impl(self)) {
+    if (!update_impl(self)) {
         return false;
     }
     if (published) {
@@ -5657,6 +6007,9 @@ void server_prompt_cache::update() {
 }
 
 bool server_prompt_cache::update_impl(iterator incoming) {
+    if (limit_size == 0 && limit_tokens == 0) {
+        return true;
+    }
     bool pressure_wave_started = false;
     bool competition_wave_valid = true;
     bool retention_shadow_observed = false;
@@ -5665,9 +6018,45 @@ bool server_prompt_cache::update_impl(iterator incoming) {
     const auto measure_cache = [&]() noexcept {
         cache_bytes = 0;
         cache_tokens = 0;
+        bool has_vbr = false;
         for (const auto & state : states) {
+            has_vbr |= state.payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact;
             cache_bytes += state.size();
             cache_tokens += state.prompt.n_tokens();
+        }
+
+        // The per-entry sum is an allocation-free upper bound. Exact VBR
+        // union work is needed only close enough to a configured boundary
+        // that shared sealed allocations can change the pressure decision.
+        const bool pressure_plausible =
+            limit_size > 0 && cache_bytes > limit_size;
+        if (!has_vbr || !acct || !pressure_plausible) {
+            return;
+        }
+
+        try {
+            std::vector<const server_prompt_cache_payload *> vbr_payloads;
+            vbr_payloads.reserve(states.size());
+            size_t fixed_bytes = 0;
+            for (const auto & state : states) {
+                if (state.payload.kind() ==
+                        server_prompt_cache_payload_kind::vbr_artifact) {
+                    vbr_payloads.push_back(&state.payload);
+                } else {
+                    fixed_bytes += state.size();
+                }
+            }
+            llama_cache_acct_release_set_preview preview;
+            uint64_t bytes = 0;
+            if (server_prompt_cache_payload::preview_vbr_retire_union(
+                    vbr_payloads, acct->serial(), preview) &&
+                vbr_release_resident_bytes(preview, bytes) &&
+                bytes <= SIZE_MAX - fixed_bytes) {
+                cache_bytes = fixed_bytes + size_t(bytes);
+            }
+        } catch (...) {
+            // Preserve the conservative upper bound on unavailable evidence.
         }
     };
     measure_cache();
@@ -5692,22 +6081,32 @@ bool server_prompt_cache::update_impl(iterator incoming) {
                     cache_bytes / (1024.0 * 1024.0));
 
             const bool observe_shadow = !retention_shadow_observed;
+            uint64_t released_bytes = 0;
+            size_t released_tokens = 0;
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_capacity,
-                    incoming, competition_wave_valid, observe_shadow)) {
+                    incoming, competition_wave_valid, observe_shadow,
+                    released_bytes, released_tokens)) {
                 return false;
             }
             retention_shadow_observed |= observe_shadow;
-            measure_cache();
+            if (released_bytes == UINT64_MAX ||
+                released_bytes > cache_bytes ||
+                released_tokens > cache_tokens) {
+                measure_cache();
+            } else {
+                cache_bytes -= size_t(released_bytes);
+                cache_tokens -= released_tokens;
+            }
         }
     }
 
     // average size per token
-    const float size_per_token = std::max<float>(
-        1.0f, float(cache_bytes) / std::max<size_t>(1, cache_tokens));
-
-    // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+    // Dynamically increase the token limit if the measured physical payload
+    // fits in the byte limit. Publication preflight uses this exact helper.
+    const size_t limit_tokens_cur =
+        server_prompt_cache_effective_token_limit(
+            limit_size, limit_tokens, cache_bytes, cache_tokens);
 
     if (limit_tokens > 0) {
         while (!states.empty() && cache_tokens > limit_tokens_cur) {
@@ -5717,13 +6116,23 @@ bool server_prompt_cache::update_impl(iterator incoming) {
                     cache_bytes / (1024.0 * 1024.0));
 
             const bool observe_shadow = !retention_shadow_observed;
+            uint64_t released_bytes = 0;
+            size_t released_tokens = 0;
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_token_limit,
-                    incoming, competition_wave_valid, observe_shadow)) {
+                    incoming, competition_wave_valid, observe_shadow,
+                    released_bytes, released_tokens)) {
                 return false;
             }
             retention_shadow_observed |= observe_shadow;
-            measure_cache();
+            if (released_bytes == UINT64_MAX ||
+                released_bytes > cache_bytes ||
+                released_tokens > cache_tokens) {
+                measure_cache();
+            } else {
+                cache_bytes -= size_t(released_bytes);
+                cache_tokens -= released_tokens;
+            }
         }
     }
 

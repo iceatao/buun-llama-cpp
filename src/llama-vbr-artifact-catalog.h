@@ -184,6 +184,10 @@ public:
         const std::vector<const vbr_artifact_package_view *> & packages,
         uint64_t expected_serial,
         vbr_artifact_prepared_retire & out) const noexcept;
+    bool preview_owned_retire(
+        const std::vector<const vbr_artifact_package_view *> & packages,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept;
     llama_cache_acct_artifact_id reference_artifact() const noexcept;
     const std::vector<vbr_artifact_portable_topology> & topologies() const noexcept;
     const vbr_artifact_reference_manifest & manifest() const noexcept;
@@ -296,6 +300,10 @@ private:
         const std::vector<llama_cache_acct_artifact_id> & references,
         uint64_t expected_serial,
         vbr_artifact_prepared_retire & out) noexcept;
+    bool preview_owned_retire(
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept;
     vbr_artifact_prepared_retire_status commit_owned_retire(
         uint64_t token,
         const std::vector<llama_cache_acct_artifact_id> & references,

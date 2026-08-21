@@ -828,6 +828,32 @@ bool vbr_artifact_package_view::prepare_owned_retire(
     }
 }
 
+bool vbr_artifact_package_view::preview_owned_retire(
+        const std::vector<const vbr_artifact_package_view *> & packages,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept {
+    out = {};
+    if (owner_ == nullptr || !storage_ || packages.empty()) {
+        return false;
+    }
+    try {
+        std::vector<llama_cache_acct_artifact_id> references;
+        references.reserve(packages.size());
+        for (const auto * package : packages) {
+            if (!package || package->owner_ != owner_ ||
+                !package->storage_ || !package->host_owned_) {
+                return false;
+            }
+            references.push_back(package->storage_->reference);
+        }
+        return owner_->preview_owned_retire(
+            references, expected_serial, out);
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
 const std::vector<vbr_artifact_portable_topology> &
 vbr_artifact_package_view::topologies() const noexcept {
     static const std::vector<vbr_artifact_portable_topology> empty;
@@ -3032,6 +3058,50 @@ bool llama_vbr_artifact_catalog::prepare_owned_retire(
         return true;
     } catch (...) {
         out.reset();
+        return false;
+    }
+}
+
+bool llama_vbr_artifact_catalog::preview_owned_retire(
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept {
+    out = {};
+    try {
+        if (references.empty() || expected_serial == 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        std::vector<llama_cache_acct_artifact_id> canonical = references;
+        std::sort(canonical.begin(), canonical.end(),
+            [](const auto & a, const auto & b) { return a.v < b.v; });
+        if (canonical.front().v == 0 ||
+            std::adjacent_find(
+                canonical.begin(), canonical.end(),
+                [](const auto & a, const auto & b) { return a == b; }) !=
+                    canonical.end()) {
+            return false;
+        }
+
+        std::vector<llama_cache_acct_op_id> operations;
+        for (const auto reference : canonical) {
+            const auto it = impl_->references.find(reference.v);
+            if (it == impl_->references.end() || !it->second.host_owned ||
+                it->second.retire_pending ||
+                it->second.prepared_retire_token != 0 ||
+                it->second.borrow_count != 1 ||
+                it->second.operations.size() >
+                    SIZE_MAX - operations.size()) {
+                return false;
+            }
+            operations.insert(
+                operations.end(), it->second.operations.begin(),
+                it->second.operations.end());
+        }
+        return impl_->ledger.preview_release_set(
+            operations, expected_serial, out);
+    } catch (...) {
+        out = {};
         return false;
     }
 }
