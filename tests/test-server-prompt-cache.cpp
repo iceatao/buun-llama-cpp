@@ -13,8 +13,10 @@
 #include <cstdio>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <list>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -2252,9 +2254,49 @@ void test_declared_family_round_trip_and_price() {
 
     common_prompt_checkpoint copied = checkpoint;
     CHECK(copied.cache_family == declared_main);
+    CHECK(copied.data_tgt.shares_storage_with(checkpoint.data_tgt));
     common_prompt_checkpoint assigned;
     assigned = checkpoint;
     CHECK(assigned.cache_family == declared_main);
+    CHECK(assigned.data_tgt.shares_storage_with(checkpoint.data_tgt));
+    CHECK(checkpoint.data_tgt.storage_use_count() == 3);
+    copied.data_tgt.mutable_at(0) = 9;
+    CHECK(!copied.data_tgt.shares_storage_with(checkpoint.data_tgt));
+    CHECK(copied.data_tgt[0] == 9);
+    CHECK(checkpoint.data_tgt[0] == 7);
+    auto pointer_source = checkpoint.data_tgt;
+    uint8_t * exposed_pointer = pointer_source.mutable_data();
+    auto pointer_copy = pointer_source;
+    exposed_pointer[0] = 11;
+    CHECK(pointer_source[0] == 11);
+    CHECK(pointer_copy[0] == 7);
+    auto reference_source = checkpoint.data_tgt;
+    uint8_t & exposed_reference = reference_source.mutable_at(0);
+    auto reference_copy = reference_source;
+    exposed_reference = 12;
+    CHECK(reference_source[0] == 12);
+    CHECK(reference_copy[0] == 7);
+    auto shared_resize = checkpoint.data_tgt;
+    CHECK(shared_resize.shares_storage_with(checkpoint.data_tgt));
+    bool resize_failed = false;
+    try {
+        shared_resize.resize(std::numeric_limits<size_t>::max());
+    } catch (const std::length_error &) {
+        resize_failed = true;
+    }
+    CHECK(resize_failed);
+    CHECK(shared_resize.shares_storage_with(checkpoint.data_tgt));
+    CHECK(shared_resize == checkpoint.data_tgt);
+    common_shared_byte_buffer empty_resize;
+    resize_failed = false;
+    try {
+        empty_resize.resize(std::numeric_limits<size_t>::max());
+    } catch (const std::length_error &) {
+        resize_failed = true;
+    }
+    CHECK(resize_failed);
+    CHECK(empty_resize.empty());
+    CHECK(empty_resize.storage_use_count() == 0);
     copied.clear();
     CHECK(!copied.cache_family.declared());
 
@@ -2264,12 +2306,16 @@ void test_declared_family_round_trip_and_price() {
     source.sequence_epoch = 9;
     const auto cloned = source.clone();
     CHECK(cloned.checkpoints.front().cache_family == declared_main);
+    CHECK(cloned.checkpoints.front().data_tgt.shares_storage_with(
+        source.checkpoints.front().data_tgt));
 
     server_prompt_cache cache(0, 0);
     auto staged = cache.stage(source, 8, 0, "family-adapter");
     CHECK(staged.size() == 1);
     CHECK(staged.front().prompt.checkpoints.front().cache_family ==
           declared_main);
+    CHECK(staged.front().prompt.checkpoints.front().data_tgt.
+        shares_storage_with(source.checkpoints.front().data_tgt));
     server_prompt_cache_apply_family(
         staged.front(), declared_main, false);
     CHECK(staged.front().cache_family == declared_main);
@@ -3072,8 +3118,16 @@ void test_lifecycle_restore_batch_timing() {
         entry.front().prompt.checkpoints.emplace_back();
         auto & checkpoint = entry.front().prompt.checkpoints.back();
         checkpoint.n_tokens = 4096;
-        checkpoint.data_tgt.assign(64 * 1024, uint8_t(i + 1));
-        checkpoint.accel.ring.assign(4 * 1024, uint8_t(i + 2));
+        const auto fill = [](common_shared_byte_buffer & buffer,
+                             size_t size, uint8_t value) {
+            buffer.overwrite(size, [&](uint8_t * data, size_t count) {
+                std::fill_n(data, count, value);
+            });
+        };
+        fill(checkpoint.data_tgt, 64 * 1024, uint8_t(i + 1));
+        fill(checkpoint.data_dft, 8 * 1024, uint8_t(i + 3));
+        fill(checkpoint.accel.ring, 4 * 1024, uint8_t(i + 2));
+        fill(checkpoint.accel.spec, 1024, uint8_t(i + 4));
     }
     CHECK(cache.publish(std::move(entry)));
     common_chat_msg_spans spans;
@@ -3091,6 +3145,53 @@ void test_lifecycle_restore_batch_timing() {
             common_retention_pool::attention, spans, true, 4096,
             checkpoint.n_tokens, true));
     }
+
+    // Prepare eight non-consuming deliveries concurrently. Every checkpoint
+    // plane shares the immutable host allocation; mutating one delivery
+    // detaches only that plane and cannot alter the host or its seven peers.
+    std::vector<server_prompt_cache_restore_delivery> fanout;
+    fanout.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        fanout.emplace_back();
+        CHECK(cache.prepare_restore_delivery(
+            cache.states.begin(), fanout.back()));
+        CHECK(fanout.back().retains_source);
+    }
+    const auto & host_checkpoint =
+        cache.states.front().prompt.checkpoints.front();
+    CHECK(host_checkpoint.data_tgt.storage_use_count() == 9);
+    CHECK(host_checkpoint.data_dft.storage_use_count() == 9);
+    CHECK(host_checkpoint.accel.ring.storage_use_count() == 9);
+    CHECK(host_checkpoint.accel.spec.storage_use_count() == 9);
+    for (const auto & delivery : fanout) {
+        const auto & checkpoint = delivery.prompt.checkpoints.front();
+        CHECK(checkpoint.data_tgt.shares_storage_with(
+            host_checkpoint.data_tgt));
+        CHECK(checkpoint.data_dft.shares_storage_with(
+            host_checkpoint.data_dft));
+        CHECK(checkpoint.accel.ring.shares_storage_with(
+            host_checkpoint.accel.ring));
+        CHECK(checkpoint.accel.spec.shares_storage_with(
+            host_checkpoint.accel.spec));
+    }
+    auto & detached = fanout.front().prompt.checkpoints.front();
+    detached.data_tgt.mutable_at(0) = 0xff;
+    CHECK(!detached.data_tgt.shares_storage_with(
+        host_checkpoint.data_tgt));
+    CHECK(detached.data_tgt[0] == 0xff);
+    CHECK(host_checkpoint.data_tgt[0] == 1);
+    CHECK(detached.data_dft.shares_storage_with(
+        host_checkpoint.data_dft));
+    detached.accel.ring.clear();
+    CHECK(detached.accel.ring.empty());
+    CHECK(!host_checkpoint.accel.ring.empty());
+    CHECK(host_checkpoint.data_tgt.storage_use_count() == 8);
+    CHECK(host_checkpoint.accel.ring.storage_use_count() == 8);
+    fanout.clear();
+    CHECK(host_checkpoint.data_tgt.storage_use_count() == 1);
+    CHECK(host_checkpoint.data_dft.storage_use_count() == 1);
+    CHECK(host_checkpoint.accel.ring.storage_use_count() == 1);
+    CHECK(host_checkpoint.accel.spec.storage_use_count() == 1);
 
     std::vector<uint64_t> prepare_samples;
     std::vector<uint64_t> commit_samples;
@@ -3691,7 +3792,7 @@ void test_redundancy_payload_mismatch_and_missing_catalog() {
     // planes are still byte-identical.
     CHECK(server_prompt_cache::exactly_redundant(
         victim.front(), survivor.front()));
-    survivor.front().prompt.checkpoints.back().data_tgt[1] = 4;
+    survivor.front().prompt.checkpoints.back().data_tgt.mutable_at(1) = 4;
     CHECK(!server_prompt_cache::exactly_redundant(
         victim.front(), survivor.front()));
 

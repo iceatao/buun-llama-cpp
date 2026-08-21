@@ -17,6 +17,8 @@
 #include <map>
 #include <algorithm>
 #include <fstream>
+#include <memory>
+#include <utility>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -1373,6 +1375,68 @@ struct common_computation_frontier {
     }
 };
 
+// Copy-on-write byte owner for immutable checkpoint planes. Copying a
+// checkpoint into the host cache or a non-consuming restore delivery shares
+// the exact allocation; the first live mutation detaches only that plane.
+// Empty buffers allocate nothing. This keeps common_prompt_checkpoint's
+// existing byte-oriented API while making fixed-cache fan-out zero-copy.
+class common_shared_byte_buffer {
+public:
+    common_shared_byte_buffer() = default;
+    common_shared_byte_buffer(const common_shared_byte_buffer & other);
+    common_shared_byte_buffer & operator=(
+        const common_shared_byte_buffer & other);
+    common_shared_byte_buffer(common_shared_byte_buffer &&) noexcept = default;
+    common_shared_byte_buffer & operator=(
+        common_shared_byte_buffer &&) noexcept = default;
+
+    size_t size() const noexcept;
+    bool empty() const noexcept;
+    const uint8_t * data() const noexcept;
+    uint8_t * mutable_data();
+    void clear() noexcept;
+    void resize(size_t size);
+    void assign(size_t size, uint8_t value);
+
+    // Publishes newly filled storage only after the synchronous writer
+    // returns. The writer must not retain the supplied pointer.
+    template<class Writer>
+    void overwrite(size_t size, Writer && writer) {
+        if (size == 0) {
+            std::forward<Writer>(writer)(nullptr, 0);
+            clear();
+            return;
+        }
+        auto replacement =
+            std::make_shared<std::vector<uint8_t>>(size);
+        std::forward<Writer>(writer)(replacement->data(), size);
+        bytes_ = std::move(replacement);
+        mutable_exposed_ = false;
+    }
+
+    const uint8_t & operator[](size_t index) const noexcept;
+    uint8_t & mutable_at(size_t index);
+
+    const std::vector<uint8_t> & view() const noexcept;
+    bool shares_storage_with(
+        const common_shared_byte_buffer & other) const noexcept;
+    long storage_use_count() const noexcept;
+
+    friend bool operator==(
+        const common_shared_byte_buffer & a,
+        const common_shared_byte_buffer & b) noexcept;
+    friend bool operator!=(
+        const common_shared_byte_buffer & a,
+        const common_shared_byte_buffer & b) noexcept {
+        return !(a == b);
+    }
+
+private:
+    std::vector<uint8_t> & mutable_view();
+    std::shared_ptr<std::vector<uint8_t>> bytes_;
+    bool mutable_exposed_ = false;
+};
+
 inline bool operator==(
         const common_computation_frontier & a,
         const common_computation_frontier & b) noexcept {
@@ -1409,8 +1473,8 @@ struct common_prompt_checkpoint {
     // checkpoint copies/restores but never enters checkpoint payload bytes.
     common_cache_family_binding cache_family;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_shared_byte_buffer data_tgt;
+    common_shared_byte_buffer data_dft;
 
     // Typed accelerator state stashed with the checkpoint (Phase-1 typed
     // accelerators). Exact restore readiness is conjunctive (PROPOSAL §6
@@ -1421,11 +1485,11 @@ struct common_prompt_checkpoint {
         // DFlash drafter ring buffer bytes. Mandatory-on-presence: a non-empty
         // ring that fails to load fails the restore (shipped behavior at the
         // ring-restore site).
-        std::vector<uint8_t> ring;
+        common_shared_byte_buffer ring;
 
         // Speculative-impl state (e.g. eagle3's deferred-boundary g_embd row).
         // Applied unconditionally; absence resets the impl state. Optional.
-        std::vector<uint8_t> spec;
+        common_shared_byte_buffer spec;
 
         size_t size()  const { return ring.size() + spec.size(); }
         bool   empty() const { return ring.empty() && spec.empty(); }

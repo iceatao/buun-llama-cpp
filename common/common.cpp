@@ -2276,6 +2276,124 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+common_shared_byte_buffer::common_shared_byte_buffer(
+        const common_shared_byte_buffer & other) {
+    if (other.mutable_exposed_ && other.bytes_) {
+        bytes_ = std::make_shared<std::vector<uint8_t>>(*other.bytes_);
+    } else {
+        bytes_ = other.bytes_;
+    }
+}
+
+common_shared_byte_buffer & common_shared_byte_buffer::operator=(
+        const common_shared_byte_buffer & other) {
+    if (this == &other) {
+        return *this;
+    }
+    common_shared_byte_buffer replacement(other);
+    bytes_ = std::move(replacement.bytes_);
+    mutable_exposed_ = false;
+    return *this;
+}
+
+size_t common_shared_byte_buffer::size() const noexcept {
+    return bytes_ ? bytes_->size() : 0;
+}
+
+bool common_shared_byte_buffer::empty() const noexcept {
+    return !bytes_ || bytes_->empty();
+}
+
+const uint8_t * common_shared_byte_buffer::data() const noexcept {
+    return bytes_ ? bytes_->data() : nullptr;
+}
+
+std::vector<uint8_t> & common_shared_byte_buffer::mutable_view() {
+    if (!bytes_) {
+        bytes_ = std::make_shared<std::vector<uint8_t>>();
+    } else if (!bytes_.unique()) {
+        bytes_ = std::make_shared<std::vector<uint8_t>>(*bytes_);
+    }
+    return *bytes_;
+}
+
+uint8_t * common_shared_byte_buffer::mutable_data() {
+    if (!bytes_) {
+        return nullptr;
+    }
+    auto & result = mutable_view();
+    mutable_exposed_ = true;
+    return result.data();
+}
+
+void common_shared_byte_buffer::clear() noexcept {
+    bytes_.reset();
+    mutable_exposed_ = false;
+}
+
+void common_shared_byte_buffer::resize(size_t size) {
+    if (size == 0) {
+        clear();
+        return;
+    }
+    if (bytes_ && bytes_->size() == size) {
+        return;
+    }
+    if (!bytes_ || !bytes_.unique() || mutable_exposed_) {
+        auto replacement = bytes_
+            ? std::make_shared<std::vector<uint8_t>>(*bytes_)
+            : std::make_shared<std::vector<uint8_t>>();
+        replacement->resize(size);
+        bytes_ = std::move(replacement);
+        mutable_exposed_ = false;
+        return;
+    }
+    bytes_->resize(size);
+}
+
+void common_shared_byte_buffer::assign(size_t size, uint8_t value) {
+    if (size == 0) {
+        clear();
+        return;
+    }
+    auto replacement =
+        std::make_shared<std::vector<uint8_t>>(size, value);
+    bytes_ = std::move(replacement);
+    mutable_exposed_ = false;
+}
+
+const uint8_t & common_shared_byte_buffer::operator[](
+        size_t index) const noexcept {
+    return (*bytes_)[index];
+}
+
+uint8_t & common_shared_byte_buffer::mutable_at(size_t index) {
+    auto & result = mutable_view();
+    mutable_exposed_ = true;
+    return result[index];
+}
+
+const std::vector<uint8_t> & common_shared_byte_buffer::view()
+        const noexcept {
+    static const std::vector<uint8_t> empty;
+    return bytes_ ? *bytes_ : empty;
+}
+
+bool common_shared_byte_buffer::shares_storage_with(
+        const common_shared_byte_buffer & other) const noexcept {
+    return bytes_ && bytes_ == other.bytes_;
+}
+
+long common_shared_byte_buffer::storage_use_count() const noexcept {
+    return bytes_ ? bytes_.use_count() : 0;
+}
+
+bool operator==(
+        const common_shared_byte_buffer & a,
+        const common_shared_byte_buffer & b) noexcept {
+    return a.view() == b.view();
+}
+
 bool common_prompt_checkpoint::empty() const {
     return data_tgt.empty();
 }
@@ -2321,9 +2439,11 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    size_t n = 0;
+    data_tgt.overwrite(ckpt_size, [&](uint8_t * data, size_t size) {
+        n = llama_state_seq_get_data_ext(
+            ctx, data, size, seq_id, flags);
+    });
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2339,9 +2459,11 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_dft.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    size_t n = 0;
+    data_dft.overwrite(ckpt_size, [&](uint8_t * data, size_t size) {
+        n = llama_state_seq_get_data_ext(
+            ctx, data, size, seq_id, flags);
+    });
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }

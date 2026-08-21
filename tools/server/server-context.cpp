@@ -12273,7 +12273,8 @@ private:
                                         const size_t checkpoint_size = it->data_tgt.size();
                                         const size_t n = do_reset ? 0 :
                                             llama_state_seq_set_data_ext(
-                                                ctx_tgt, it->data_tgt.data(),
+                                                ctx_tgt,
+                                                it->data_tgt.view().data(),
                                                 checkpoint_size, slot.id,
                                                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
@@ -12292,7 +12293,9 @@ private:
                                             it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                             // restore the drafter's speculative state (per-slot spec or shared)
-                                            common_speculative_set_state(slot.get_spec(), slot.id, it->accel.spec);
+                                            common_speculative_set_state(
+                                                slot.get_spec(), slot.id,
+                                                it->accel.spec.view());
 
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -12316,7 +12319,9 @@ private:
                                             bool checkpoint_aux_ok = true;
                                             if (slot.can_speculate() && !it->accel.ring.empty() &&
                                                 !common_speculative_ring_state_load(
-                                                    slot.get_spec(), it->accel.ring.data(), it->accel.ring.size())) {
+                                                    slot.get_spec(),
+                                                    it->accel.ring.view().data(),
+                                                    it->accel.ring.size())) {
                                                 SLT_ERR(slot,
                                                         "failed to restore checkpoint DFlash ring state "
                                                         "(n_tokens = %" PRId64 ", ring size = %zu) -- failing closed\n",
@@ -13022,10 +13027,14 @@ private:
                                 SLT_ERR(slot, "%s", "skipping context checkpoint: target state size is zero\n");
                                 staged.clear();
                             } else {
-                                next.data_tgt.resize(checkpoint_size);
-                                const size_t n = llama_state_seq_get_data_ext(
-                                    ctx_tgt, next.data_tgt.data(), checkpoint_size, slot.id,
-                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                size_t n = 0;
+                                next.data_tgt.overwrite(
+                                    checkpoint_size,
+                                    [&](uint8_t * data, size_t size) {
+                                        n = llama_state_seq_get_data_ext(
+                                            ctx_tgt, data, size, slot.id,
+                                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    });
                                 if (n != checkpoint_size) {
                                     SLT_ERR(slot,
                                             "skipping context checkpoint: target state short write (expected %zu, got %zu)\n",
@@ -13039,9 +13048,12 @@ private:
                             if (!staged.empty() && slot.can_speculate()) {
                                 const size_t ring_size = common_speculative_ring_state_size(slot.get_spec());
                                 if (ring_size > 0) {
-                                    next.accel.ring.resize(ring_size);
-                                    common_speculative_ring_state_save(
-                                        slot.get_spec(), next.accel.ring.data(), ring_size);
+                                    next.accel.ring.overwrite(
+                                        ring_size,
+                                        [&](uint8_t * data, size_t size) {
+                                            common_speculative_ring_state_save(
+                                                slot.get_spec(), data, size);
+                                        });
                                 }
                             }
                         } catch (const std::exception & e) {
