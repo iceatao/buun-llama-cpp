@@ -375,6 +375,60 @@ bool llama_cache_prepared_claim_group::repartition_downward(
     }
 }
 
+bool llama_cache_prepared_claim_group::partition(
+        const std::vector<size_t> & counts,
+        std::vector<llama_cache_prepared_claim_group> & output) noexcept {
+    if (!ready() || counts.empty() || !output.empty() ||
+        impl_->admissions.size() != impl_->leaves.size() ||
+        impl_->reserved_ops.size() != impl_->leaves.size()) {
+        return false;
+    }
+    try {
+        size_t total = 0;
+        std::vector<std::unique_ptr<impl>> states;
+        std::vector<llama_cache_prepared_claim_group> groups;
+        states.reserve(counts.size());
+        groups.reserve(counts.size());
+        for (const auto count : counts) {
+            if (count == 0 || count > impl_->leaves.size() - total) {
+                return false;
+            }
+            total += count;
+            std::unique_ptr<impl> child(new impl);
+            child->ledger = impl_->ledger;
+            child->preparation = impl_->preparation;
+            child->leaves.reserve(count);
+            child->admissions.reserve(count);
+            child->reserved_ops.reserve(count);
+            states.push_back(std::move(child));
+        }
+        if (total != impl_->leaves.size()) {
+            return false;
+        }
+
+        size_t source = 0;
+        for (size_t group = 0; group < counts.size(); ++group) {
+            auto & child = *states[group];
+            for (size_t i = 0; i < counts[group]; ++i, ++source) {
+                child.leaves.push_back(impl_->leaves[source]);
+                child.admissions.push_back(
+                    std::move(impl_->admissions[source]));
+                child.reserved_ops.push_back(impl_->reserved_ops[source]);
+            }
+            groups.push_back(llama_cache_prepared_claim_group(
+                std::move(states[group])));
+        }
+        impl_->consumed = true;
+        impl_->leaves.clear();
+        impl_->admissions.clear();
+        impl_->reserved_ops.clear();
+        output = std::move(groups);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 llama_cache_prepared_claim_group
 llama_cache_prepare_reservation_transaction(
         llama_cache_acct_ledger & ledger,

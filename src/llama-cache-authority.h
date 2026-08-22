@@ -302,6 +302,16 @@ public:
     bool repartition_downward(
         const std::vector<llama_cache_transaction_leaf> & leaves) noexcept;
 
+    // Partition the complete ordered leaf set into independently owned
+    // contiguous groups without touching the ledger. This is used after one
+    // atomic conservative repartition so dependency-scoped publication rows
+    // can reach separate commit/abort terminals without reopening admission.
+    // Counts must be nonzero and sum exactly to this group's leaf count;
+    // output must be empty. Failure leaves both objects unchanged.
+    bool partition(
+        const std::vector<size_t> & counts,
+        std::vector<llama_cache_prepared_claim_group> & output) noexcept;
+
     // Single terminal. The optional hook remains after all claims are admitted
     // and before the first stage. Re-entry or a failed preparation returns a
     // typed invalid/internal result and never exposes success outputs.

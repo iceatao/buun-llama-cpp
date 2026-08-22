@@ -655,6 +655,113 @@ static void test_prepared_transaction_downward_repartition() {
     CHECK(host_reserved(scale_ledger) == 0);
 }
 
+static void test_prepared_transaction_partition_owned_groups() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    llama_cache_budget_config config;
+    llama_cache_acct_op_id initial_op;
+    llama_cache_acct_alloc_id initial_allocation;
+    std::vector<llama_cache_transaction_leaf> initial {
+        transaction_leaf(PAYLOAD, 96, initial_op, initial_allocation),
+    };
+    auto prepared = llama_cache_prepare_reservation_transaction(
+        ledger, config, initial);
+    CHECK(prepared.ready());
+
+    std::vector<llama_cache_acct_op_id> operations(3);
+    std::vector<llama_cache_acct_alloc_id> allocations(3);
+    std::vector<llama_cache_transaction_leaf> leaves {
+        transaction_leaf(PAYLOAD, 40, operations[0], allocations[0]),
+        transaction_leaf(PAYLOAD, 20, operations[1], allocations[1]),
+        transaction_leaf(PAYLOAD, 10, operations[2], allocations[2]),
+    };
+    CHECK(prepared.repartition_downward(leaves));
+    CHECK(ledger.snapshot().live_ops == 3);
+    CHECK(host_reserved(ledger) == 70);
+
+    std::vector<llama_cache_prepared_claim_group> groups;
+    CHECK(!prepared.partition({ 2 }, groups));
+    CHECK(groups.empty());
+    CHECK(prepared.ready());
+    CHECK(ledger.snapshot().live_ops == 3);
+    CHECK(!prepared.partition({ 0, 3 }, groups));
+    CHECK(groups.empty());
+    CHECK(prepared.ready());
+    CHECK(ledger.snapshot().live_ops == 3);
+    CHECK(host_reserved(ledger) == 70);
+
+    llama_cache_acct_op_id seeded_op;
+    llama_cache_acct_alloc_id seeded_allocation;
+    std::vector<llama_cache_transaction_leaf> seeded_leaf {
+        transaction_leaf(PAYLOAD, 24, seeded_op, seeded_allocation),
+    };
+    auto seeded = llama_cache_prepare_reservation_transaction(
+        ledger, config, seeded_leaf);
+    CHECK(seeded.ready());
+    groups.push_back(std::move(seeded));
+    CHECK(!prepared.partition({ 2, 1 }, groups));
+    CHECK(groups.size() == 1 && groups[0].ready());
+    CHECK(prepared.ready());
+    CHECK(ledger.snapshot().live_ops == 4);
+    CHECK(host_reserved(ledger) == 94);
+    groups.clear();
+    CHECK(ledger.snapshot().live_ops == 3);
+    CHECK(host_reserved(ledger) == 70);
+
+    CHECK(prepared.partition({ 2, 1 }, groups));
+    CHECK(groups.size() == 2);
+    CHECK(groups[0].ready());
+    CHECK(groups[1].ready());
+    CHECK(!prepared.ready());
+    const std::vector<llama_cache_transaction_leaf> prefix_leaves {
+        leaves[0], leaves[1],
+    };
+    const auto committed =
+        groups[0].materialize_and_commit(prefix_leaves);
+    CHECK(committed.status == llama_cache_transaction_status::committed);
+    CHECK(!groups[0].ready());
+    CHECK(ledger.snapshot().live_ops == 3);
+    CHECK(host_reserved(ledger) == 10);
+
+    // Dropping the remainder owns exactly its one reservation. The detached
+    // committed prefix remains independently live until ordinary retirement.
+    groups[1] = {};
+    CHECK(ledger.snapshot().live_ops == 2);
+    CHECK(host_reserved(ledger) == 0);
+    CHECK(ledger.release(operations[0]));
+    CHECK(ledger.release(operations[1]));
+    CHECK(ledger.snapshot().live_ops == 0);
+
+    llama_cache_acct_ledger full_ledger;
+    configure_fitting_host(full_ledger);
+    llama_cache_acct_op_id full_op;
+    llama_cache_acct_alloc_id full_allocation;
+    std::vector<llama_cache_transaction_leaf> full_leaves {
+        transaction_leaf(PAYLOAD, 24, full_op, full_allocation),
+    };
+    auto full = llama_cache_prepare_reservation_transaction(
+        full_ledger, config, full_leaves);
+    CHECK(full.ready());
+    std::vector<llama_cache_prepared_claim_group> detached;
+    CHECK(!full.partition({ 2 }, detached));
+    CHECK(detached.empty());
+    CHECK(full.ready());
+    CHECK(full_ledger.snapshot().live_ops == 1);
+    CHECK(host_reserved(full_ledger) == 24);
+
+    CHECK(full.partition({ 1 }, detached));
+    CHECK(detached.size() == 1);
+    CHECK(detached[0].ready());
+    CHECK(!full.ready());
+    const auto empty_terminal = full.materialize_and_commit();
+    CHECK(empty_terminal.status ==
+          llama_cache_transaction_status::internal_fault);
+    CHECK(full_ledger.snapshot().live_ops == 1);
+    detached.clear();
+    CHECK(full_ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(full_ledger) == 0);
+}
+
 static void test_atomic_reservation_sets() {
     llama_cache_acct_ledger ledger;
     configure_fitting_host(ledger);
@@ -800,6 +907,7 @@ int main() {
     test_transaction_after_admit_failure();
     test_prepared_transaction_split_phase();
     test_prepared_transaction_downward_repartition();
+    test_prepared_transaction_partition_owned_groups();
     test_atomic_reservation_sets();
     test_prepared_release_set();
     test_status_names();
