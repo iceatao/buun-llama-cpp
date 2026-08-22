@@ -294,6 +294,32 @@ server_vbr_artifact_import_validation_disposition(
     return server_vbr_artifact_import_status::validation_failed;
 }
 
+bool server_vbr_artifact_import_variant_fallback_safe(
+        const server_vbr_artifact_import_output & output) noexcept {
+    if (output.adopt_attempted || output.h2d_bytes != 0 ||
+        output.h2d_chunks != 0) {
+        return false;
+    }
+    switch (output.status) {
+        case server_vbr_artifact_import_status::validation_failed:
+        case server_vbr_artifact_import_status::report_only:
+        case server_vbr_artifact_import_status::stage_failed:
+            return true;
+        case server_vbr_artifact_import_status::ok:
+        case server_vbr_artifact_import_status::unsupported:
+        case server_vbr_artifact_import_status::not_found:
+        case server_vbr_artifact_import_status::invalid_slot:
+        case server_vbr_artifact_import_status::slot_processing:
+        case server_vbr_artifact_import_status::slot_not_empty:
+        case server_vbr_artifact_import_status::adopt_failed:
+        case server_vbr_artifact_import_status::unavailable:
+        case server_vbr_artifact_import_status::internal_error:
+        case server_vbr_artifact_import_status::_count:
+            return false;
+    }
+    return false;
+}
+
 bool server_vbr_artifact_reference_index::publish(
         std::string reference,
         std::string tenant_key,
@@ -1392,6 +1418,9 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         output.phase = adopted.phase;
         output.downward_subphase = adopted.downward_subphase;
         output.downward_edge = adopted.downward_edge;
+        output.h2d_bytes = adopted.h2d_bytes;
+        output.h2d_chunks = adopted.h2d_chunks;
+        output.rollback_count = adopted.rollback_count;
         output.decision = adopted.decision;
         output.consistency = adopted.consistency;
         output.units = adopted.units;

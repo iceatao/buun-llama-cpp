@@ -2920,6 +2920,37 @@ static void test_server_import_route_classification() {
               vbr_manifest_validation_status::unavailable,
               vbr_import_decision::native_import) ==
           status::validation_failed);
+
+    server_vbr_artifact_import_output fallback;
+    for (const auto retryable : {
+            status::validation_failed,
+            status::report_only,
+            status::stage_failed }) {
+        fallback = {};
+        fallback.status = retryable;
+        fallback.adopt_attempted = false;
+        CHECK(server_vbr_artifact_import_variant_fallback_safe(fallback));
+    }
+    fallback.adopt_attempted = true;
+    CHECK(!server_vbr_artifact_import_variant_fallback_safe(fallback));
+    fallback.adopt_attempted = false;
+    fallback.h2d_bytes = 1;
+    CHECK(!server_vbr_artifact_import_variant_fallback_safe(fallback));
+    fallback.h2d_bytes = 0;
+    fallback.h2d_chunks = 1;
+    CHECK(!server_vbr_artifact_import_variant_fallback_safe(fallback));
+    for (const auto terminal : {
+            status::ok,
+            status::unsupported,
+            status::not_found,
+            status::adopt_failed,
+            status::unavailable,
+            status::internal_error }) {
+        fallback = {};
+        fallback.status = terminal;
+        fallback.adopt_attempted = false;
+        CHECK(!server_vbr_artifact_import_variant_fallback_safe(fallback));
+    }
 }
 
 static void test_fresh_f16_size_generation() {

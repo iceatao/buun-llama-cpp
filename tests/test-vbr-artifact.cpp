@@ -5033,6 +5033,82 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(authority.destruction.host_trade_df2_executed ==
           df2_before_anchor);
 
+    server_prompt_cache_vbr_restore_candidate quality_restore;
+    CHECK(cache.prepare_vbr_restore(
+        server_tokens(llama_tokens { 101, 102, 103 }, false),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        quality_restore));
+    CHECK(quality_restore.payload());
+    CHECK(quality_restore.fallback_payload());
+    CHECK(quality_restore.payload()->reference_artifact() ==
+          anchor_reference.reference_artifact);
+    CHECK(quality_restore.fallback_payload()->reference_artifact() ==
+          compact_reference.reference_artifact);
+
+    server_prompt quality_destination;
+    common_cache_family_binding quality_family;
+    CHECK(cache.prepare_vbr_restore_destination(
+        quality_restore, quality_destination, 17));
+    CHECK(cache.publish_vbr_restore(quality_restore));
+    CHECK(cache.commit_vbr_restore(
+        quality_restore, quality_destination, quality_family, 17));
+    CHECK(!quality_restore.ready());
+    retention.abandon_prepared_launch(
+        server_retention_instance_key::for_slot(17));
+    retention.retire(server_retention_instance_key::for_slot(17));
+
+    server_prompt_cache_vbr_restore_candidate compact_restore;
+    CHECK(cache.prepare_vbr_restore(
+        server_tokens(llama_tokens { 101, 102, 103 }, false),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        compact_restore));
+    CHECK(compact_restore.use_fallback_payload());
+    CHECK(!compact_restore.fallback_payload());
+    CHECK(compact_restore.payload()->reference_artifact() ==
+          compact_reference.reference_artifact);
+    server_prompt compact_destination;
+    common_cache_family_binding compact_family;
+    CHECK(cache.prepare_vbr_restore_destination(
+        compact_restore, compact_destination, 18));
+    CHECK(cache.publish_vbr_restore(compact_restore));
+    CHECK(cache.commit_vbr_restore(
+        compact_restore, compact_destination, compact_family, 18));
+    CHECK(!compact_restore.ready());
+    retention.abandon_prepared_launch(
+        server_retention_instance_key::for_slot(18));
+    retention.retire(server_retention_instance_key::for_slot(18));
+
+    // A newer compact-only alias at the same frontier must not shadow the
+    // older quality-bearing node merely because terminal visitation is
+    // newest-first.
+    auto compact_alias_payload = server_prompt_cache_payload::from_vbr(
+        anchor_state->payload.vbr_compact_owner());
+    auto compact_alias_stage = cache.stage_vbr(
+        prompt, std::move(compact_alias_payload),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(compact_alias_stage.size() == 1);
+    server_prompt_cache::iterator compact_alias;
+    CHECK(cache.publish(
+        std::move(compact_alias_stage), &prompt, source_slot,
+        &compact_alias));
+    CHECK(cache.states.size() == 2);
+    server_prompt_cache_vbr_restore_candidate ranked_restore;
+    CHECK(cache.prepare_vbr_restore(
+        server_tokens(llama_tokens { 101, 102, 103 }, false),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        ranked_restore));
+    CHECK(ranked_restore.payload()->reference_artifact() ==
+          anchor_reference.reference_artifact);
+    ranked_restore = {};
+    cache.destroy_entry(
+        compact_alias, server_cache_destruction_reason::host_capacity);
+    CHECK(cache.states.size() == 1);
+    CHECK(&cache.states.front() == &*anchor_state);
+
     // A protected over-budget incumbent cannot turn publish(false) into a
     // hidden successful insertion. The compact-only incoming node is retired
     // transactionally while the pinned compact+anchor node remains intact.
@@ -5081,6 +5157,36 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(fixture.catalog->snapshot().references == 1);
     CHECK(authority.destruction.host_trade_df2_executed ==
           df2_before_anchor);
+
+    // Equal-quality aliases use immutable catalog identity as their stable
+    // tie-break. A newer terminal must not make family/source selection depend
+    // on radix visitation order.
+    cache.limit_size = 0;
+    const auto tie_reference = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(tie_reference.reference_artifact.v != 0);
+    auto tie_stage = cache.stage_vbr(
+        prompt, owned_payload(tie_reference.reference_artifact),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(tie_stage.size() == 1);
+    server_prompt_cache::iterator tie_state;
+    CHECK(cache.publish(
+        std::move(tie_stage), &prompt, source_slot, &tie_state));
+    server_prompt_cache_vbr_restore_candidate tied_restore;
+    CHECK(cache.prepare_vbr_restore(
+        server_tokens(llama_tokens { 101, 102, 103 }, false),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        tied_restore));
+    CHECK(tied_restore.payload()->reference_artifact().v == std::min(
+        compact_reference.reference_artifact.v,
+        tie_reference.reference_artifact.v));
+    tied_restore = {};
+    cache.destroy_entry(
+        tie_state, server_cache_destruction_reason::host_capacity);
+    CHECK(cache.states.size() == 1);
+    CHECK(fixture.catalog->snapshot().references == 1);
     cache.limit_size = 0;
     cache.quality_anchor_budget_enabled = false;
     cache.clear_accounting();

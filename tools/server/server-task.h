@@ -833,7 +833,9 @@ struct server_prompt_cache_state {
 
 struct server_prompt_cache;
 
-// Move-only, non-consuming citation of one immutable compact VBR host entry.
+// Move-only, non-consuming citation of one immutable VBR host entry. The
+// highest-quality same-frontier owner is preferred; compact current remains
+// available as a bounded fallback when destination negotiation refuses it.
 // The source list node is pinned until commit or destruction; the shared
 // payload owner independently keeps catalog bytes alive. Raw node identity is
 // deliberately private so callers cannot forge or double-release a pin.
@@ -852,6 +854,8 @@ public:
 
     bool ready() const noexcept;
     const server_prompt_cache_vbr_owner & payload() const noexcept;
+    const server_prompt_cache_vbr_owner & fallback_payload() const noexcept;
+    bool use_fallback_payload() noexcept;
     const common_cache_family_binding & cache_family() const noexcept;
     uint64_t prefix_tokens() const noexcept;
     int32_t source_id() const noexcept;
@@ -861,6 +865,7 @@ private:
     server_prompt_cache * cache_ = nullptr;
     server_prompt_cache_state * source_ = nullptr;
     server_prompt_cache_vbr_owner payload_;
+    server_prompt_cache_vbr_owner fallback_payload_;
     common_cache_family_binding cache_family_;
     uint64_t prefix_tokens_ = 0;
     int32_t source_id_ = -1;
@@ -1135,10 +1140,12 @@ struct server_prompt_cache {
         const std::string & execution_identity,
         const std::string & adapter_config_key) const noexcept;
 
-    // Select and pin the longest compact VBR artifact whose complete token
-    // block is an exact prefix of the incoming text-only request and whose
-    // execution and adapter identities match. Media-bearing automatic restore
-    // is deliberately deferred until lookup owns a frontier-media authority.
+    // Select and pin the longest VBR artifact whose complete token block is an
+    // exact prefix of the incoming text-only request and whose execution and
+    // adapter identities match. At an equal frontier, prefer a quality anchor
+    // while retaining compact-current as a bounded pre-adoption fallback.
+    // Media-bearing automatic restore is deliberately deferred until lookup
+    // owns a frontier-media authority.
     // This is deliberately separate
     // from fixed-state load()/contains(): VBR restoration is an adopt
     // transaction, not a serialized state-image restore.

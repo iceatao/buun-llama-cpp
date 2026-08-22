@@ -2242,9 +2242,11 @@ bool server_prompt_cache::prepare_vbr_restore(
             const std::string * execution;
             const std::string * adapter;
             uint64_t prefix;
+            bool quality;
+            uint64_t artifact;
         } selected {
             nullptr, &request_tokens, &execution_identity,
-            &adapter_config_key, 0,
+            &adapter_config_key, 0, false, 0,
         };
         const bool indexed = retention_obs->visit_prefix_instances(
             common_retention_pool::attention, scope,
@@ -2254,7 +2256,7 @@ bool server_prompt_cache::prepare_vbr_restore(
                 auto & current = *static_cast<selection *>(opaque);
                 if (key.kind != common_retention_artifact_kind::host_entry ||
                     key.owner_slot != -1 || key.instance == 0 ||
-                    prefix <= current.prefix) {
+                    prefix < current.prefix) {
                     return true;
                 }
                 auto * state = reinterpret_cast<server_prompt_cache_state *>(
@@ -2274,21 +2276,45 @@ bool server_prompt_cache::prepare_vbr_restore(
                         artifact->package().manifest().identity.next_position) {
                     return true;
                 }
+                const auto * variants = state->payload.vbr_variants();
+                const bool quality = variants && variants->quality_anchor();
+                const auto & preferred = quality
+                    ? variants->quality_anchor()
+                    : variants->compact_current();
+                const uint64_t artifact_id = preferred
+                    ? preferred->reference_artifact().v : 0;
+                if (artifact_id == 0) {
+                    return true;
+                }
+                if (prefix == current.prefix && current.best &&
+                    (quality < current.quality ||
+                     (quality == current.quality &&
+                      artifact_id >= current.artifact))) {
+                    return true;
+                }
                 current.best = state;
                 current.prefix = prefix;
+                current.quality = quality;
+                current.artifact = artifact_id;
                 return true;
             });
         if (!indexed || !selected.best) {
             return false;
         }
-        auto owner = selected.best->payload.vbr_compact_owner();
-        if (!owner) {
+        const auto * variants = selected.best->payload.vbr_variants();
+        if (!variants || !variants->compact_current()) {
             return false;
         }
+        auto compact = variants->compact_current();
+        auto preferred = variants->quality_anchor()
+            ? variants->quality_anchor() : compact;
         ++selected.best->recovery_pins;
         candidate.cache_ = this;
         candidate.source_ = selected.best;
-        candidate.payload_ = std::move(owner);
+        candidate.payload_ = std::move(preferred);
+        if (variants->quality_anchor()) {
+            candidate.fallback_payload_ = std::move(compact);
+        }
         candidate.cache_family_ = selected.best->cache_family;
         candidate.prefix_tokens_ = selected.prefix;
         candidate.source_id_ = selected.best->cache_plan_source_id;
@@ -2346,6 +2372,7 @@ server_prompt_cache_vbr_restore_candidate::operator=(
         cache_ = other.cache_;
         source_ = other.source_;
         payload_ = std::move(other.payload_);
+        fallback_payload_ = std::move(other.fallback_payload_);
         cache_family_ = other.cache_family_;
         prefix_tokens_ = other.prefix_tokens_;
         source_id_ = other.source_id_;
@@ -2367,6 +2394,21 @@ server_prompt_cache_vbr_restore_candidate::payload() const noexcept {
     return payload_;
 }
 
+const server_prompt_cache_vbr_owner &
+server_prompt_cache_vbr_restore_candidate::fallback_payload()
+        const noexcept {
+    return fallback_payload_;
+}
+
+bool server_prompt_cache_vbr_restore_candidate::use_fallback_payload()
+        noexcept {
+    if (!ready() || !fallback_payload_ || adopted_destination_) {
+        return false;
+    }
+    payload_ = std::move(fallback_payload_);
+    return true;
+}
+
 const common_cache_family_binding &
 server_prompt_cache_vbr_restore_candidate::cache_family() const noexcept {
     return cache_family_;
@@ -2386,6 +2428,7 @@ void server_prompt_cache_vbr_restore_candidate::clear() noexcept {
     cache_ = nullptr;
     source_ = nullptr;
     payload_.reset();
+    fallback_payload_.reset();
     cache_family_ = {};
     prefix_tokens_ = 0;
     source_id_ = -1;
@@ -6481,8 +6524,12 @@ bool server_prompt_cache::commit_vbr_restore(
         return false;
     }
     auto * source = candidate.source_;
+    const auto * variants = source ? source->payload.vbr_variants() : nullptr;
+    const bool selected_owner_matches = variants &&
+        (variants->compact_current() == candidate.payload_ ||
+         variants->quality_anchor() == candidate.payload_);
     if (!source || source->recovery_pins == 0 ||
-        source->payload.vbr_artifact() != candidate.payload_.get() ||
+        !selected_owner_matches ||
         !retention_obs->prepared_for_launch(
             server_retention_instance_key::for_slot(id_slot))) {
         release_vbr_restore(candidate);

@@ -2624,6 +2624,7 @@ private:
     std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
     uint64_t vbr_automatic_restore_attempts = 0;
     uint64_t vbr_automatic_restore_succeeded = 0;
+    uint64_t vbr_automatic_restore_quality_fallbacks = 0;
     // E1.1a is lazily constructed by its scheduler-only task. destroy()
     // explicitly closes it before prompt_cache because host proofs point into
     // cache list nodes; this declaration after the F store is the secondary
@@ -9029,14 +9030,15 @@ private:
                 bool published = false;
             } state { prompt_cache.get(), &candidate, false };
 
-            server_vbr_artifact_import_target request;
-            request.memory = memory;
-            request.destination = slot.id;
-            request.execution_identity = frontier_execution_identity;
-            request.adapter_config_identity = adapter_identity;
-            request.previously_observed = false;
-            request.publish_context = &state;
-            request.prepare_publish = [](
+            const auto make_request = [&]() {
+                server_vbr_artifact_import_target request;
+                request.memory = memory;
+                request.destination = slot.id;
+                request.execution_identity = frontier_execution_identity;
+                request.adapter_config_identity = adapter_identity;
+                request.previously_observed = false;
+                request.publish_context = &state;
+                request.prepare_publish = [](
                     void * opaque,
                     const std::vector<llama_token> & tokens,
                     uint64_t sequence_epoch) noexcept {
@@ -9051,19 +9053,32 @@ private:
                            current->candidate->prefix_tokens() &&
                        sequence_epoch ==
                            package.manifest().identity.sequence_epoch;
-            };
-            request.publish = [](void * opaque) noexcept {
-                auto * current = static_cast<publish_state *>(opaque);
-                GGML_ASSERT(current && current->cache && current->candidate);
-                current->published = current->cache->publish_vbr_restore(
-                    *current->candidate);
-                GGML_ASSERT(current->published);
+                };
+                request.publish = [](void * opaque) noexcept {
+                    auto * current = static_cast<publish_state *>(opaque);
+                    GGML_ASSERT(
+                        current && current->cache && current->candidate);
+                    current->published =
+                        current->cache->publish_vbr_restore(
+                            *current->candidate);
+                    GGML_ASSERT(current->published);
+                };
+                return request;
             };
 
             vbr_automatic_restore_attempts++;
             const int64_t started = ggml_time_us();
-            const auto imported = vbr_artifact_store->import_host_payload(
-                std::move(request), candidate.payload());
+            auto imported = vbr_artifact_store->import_host_payload(
+                make_request(), candidate.payload());
+            bool used_compact_fallback = false;
+            if (server_vbr_artifact_import_variant_fallback_safe(imported) &&
+                candidate.use_fallback_payload()) {
+                GGML_ASSERT(!state.published);
+                imported = vbr_artifact_store->import_host_payload(
+                    make_request(), candidate.payload());
+                used_compact_fallback =
+                    imported.status == server_vbr_artifact_import_status::ok;
+            }
             if (imported.status != server_vbr_artifact_import_status::ok) {
                 SLT_DBG(
                     slot,
@@ -9080,17 +9095,23 @@ private:
             if (!committed) {
                 return false;
             }
+            if (used_compact_fallback) {
+                vbr_automatic_restore_quality_fallbacks++;
+            }
             vbr_automatic_restore_succeeded++;
             SLT_INF(
                 slot,
                 "automatic VBR host restore source=%d prefix=%" PRIu64
-                " status=%s duration_ms=%.3f total=%" PRIu64 "/%" PRIu64
+                " status=%s compact_fallback=%d duration_ms=%.3f "
+                "total=%" PRIu64 "/%" PRIu64 " quality_fallbacks=%" PRIu64
                 "\n",
                 source_id, prefix_tokens,
                 server_vbr_artifact_import_status_name(imported.status),
+                int(used_compact_fallback),
                 (ggml_time_us() - started)/1000.0,
                 vbr_automatic_restore_succeeded,
-                vbr_automatic_restore_attempts);
+                vbr_automatic_restore_attempts,
+                vbr_automatic_restore_quality_fallbacks);
             return true;
         } catch (...) {
             // Automatic reuse is a cache optimization. Allocation or identity

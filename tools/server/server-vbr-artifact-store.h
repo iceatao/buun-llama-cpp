@@ -282,6 +282,9 @@ struct server_vbr_artifact_import_output {
     vbr_downward_adopt_subphase downward_subphase =
         vbr_downward_adopt_subphase::none;
     uint32_t downward_edge = UINT32_MAX;
+    uint64_t h2d_bytes = 0;
+    uint64_t h2d_chunks = 0;
+    uint64_t rollback_count = 0;
     vbr_import_decision decision = vbr_import_decision::reject;
     vbr_artifact_consistency_kind consistency =
         vbr_artifact_consistency_kind::live_rebased;
@@ -290,6 +293,11 @@ struct server_vbr_artifact_import_output {
     uint64_t payload_bytes = 0;
     uint64_t companion_bytes = 0;
 };
+
+// A lower-precision variant may be useful only while negotiation is still
+// representation-dependent and before adoption has begun moving payload.
+bool server_vbr_artifact_import_variant_fallback_safe(
+    const server_vbr_artifact_import_output & output) noexcept;
 
 // Server-internal opaque-reference authorization index. It exposes only one
 // indistinguishable miss result; there is no enumeration or tenant-agnostic
