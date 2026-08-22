@@ -396,20 +396,30 @@ class vbr_kv_import_session {
                 });
                 final_unit_indices_[plan->logical_unit_id] =
                     final_units_.size()-1;
-                if (plan->downward) {
+                const size_t ikv = plan->logical_unit_id/2;
+                const bool is_v = (plan->logical_unit_id & 1u) != 0;
+                if (ikv >= cache_->layers.size()) {
+                    return false;
+                }
+                const auto * live_tensor = is_v
+                    ? cache_->layers[ikv].v : cache_->layers[ikv].k;
+                if (!live_tensor || plan->descriptor.current_type < 0 ||
+                    plan->selected_target_type < 0) {
+                    return false;
+                }
+                const auto source_type = static_cast<ggml_type>(
+                    plan->descriptor.current_type);
+                const auto target_type = static_cast<ggml_type>(
+                    plan->selected_target_type);
+                if (source_type != live_tensor->type) {
                     const auto inserted = source_types_.emplace(
-                        plan->logical_unit_id,
-                        plan->transcode_recipe.source_type);
+                        plan->logical_unit_id, source_type);
                     if (!inserted.second &&
-                        inserted.first->second !=
-                            plan->transcode_recipe.source_type) {
+                        inserted.first->second != source_type) {
                         return false;
                     }
                 }
-                const size_t ikv = plan->logical_unit_id/2;
-                const bool is_v = (plan->logical_unit_id & 1u) != 0;
-                if (ikv >= cache_->layers.size() ||
-                    plan->shards.size() !=
+                if (plan->shards.size() !=
                         cache_->vbr_units_of(ikv, is_v).size()) {
                     return false;
                 }
@@ -437,15 +447,12 @@ class vbr_kv_import_session {
                         unit_it->second->t == nullptr || pool->vmm == nullptr ||
                         pool->be == nullptr || pool->backend == nullptr ||
                         uint64_t(ggml_row_size(
-                            plan->downward
-                                ? plan->transcode_recipe.source_type
-                                : unit_it->second->t->type,
+                            source_type,
                             unit_it->second->t->ne[0])) != shard.row_bytes ||
-                        (plan->downward &&
-                         uint64_t(ggml_row_size(
-                            unit_it->second->t->type,
+                        uint64_t(ggml_row_size(
+                            target_type,
                             unit_it->second->t->ne[0])) !=
-                            shard.target_row_bytes)) {
+                            shard.target_row_bytes) {
                         return false;
                     }
                     if (std::none_of(extent_prefixes_.begin(), extent_prefixes_.end(),
@@ -456,8 +463,7 @@ class vbr_kv_import_session {
                         extent_prefixes_.push_back({
                             pool, unit_it->second,
                             shard.row_bytes,
-                            plan->downward ? shard.target_row_bytes
-                                           : shard.row_bytes,
+                            shard.target_row_bytes,
                         });
                     }
                     const size_t pool_index = size_t(

@@ -1,6 +1,7 @@
 #include "llama-vbr-artifact-validate.h"
 
 #include "llama-cache-budget.h"
+#include "llama-vbr-identity-digest.h"
 
 #include <algorithm>
 #include <limits>
@@ -713,8 +714,96 @@ bool vbr_import_schedule_quote_matches(
             target_mapped_bytes = next;
         }
     }
-    return source_payload_bytes == quote.source_payload_bytes_ &&
-           target_mapped_bytes == quote.target_mapped_bytes_;
+    if (source_payload_bytes != quote.source_payload_bytes_ ||
+        target_mapped_bytes != quote.target_mapped_bytes_ ||
+        vbr_classify_import_schedule_units(quote.units_) != quote.status_) {
+        return false;
+    }
+    if (!quote.destination_.feasible()) {
+        return true;
+    }
+    if (quote.destination_.prefix.size() >
+            VBR_IMPORT_DESTINATION_MAX_STEPS ||
+        quote.destination_.initial_types.size() != target.children.size() ||
+        quote.destination_.initial_cursors.size() != target.children.size() ||
+        quote.destination_.final_types.size() != target.children.size() ||
+        quote.destination_.final_cursors.size() != target.children.size() ||
+        quote.destination_.child_type_digests.size() !=
+            target.children.size() ||
+        vbr_type_tree_digest(
+            quote.destination_.child_type_digests,
+            VBR_DOWNWARD_RECIPE_VERSION) != quote.destination_.tree_digest) {
+        return false;
+    }
+    for (size_t child_index = 0; child_index < target.children.size();
+         ++child_index) {
+        const auto & child = target.children[child_index];
+        if (child.child_id != child_index ||
+            child.controller_policy.cursor !=
+                quote.destination_.final_cursors[child_index] ||
+            child.controller_policy.current_type_vector_digest !=
+                quote.destination_.child_type_digests[child_index] ||
+            child.units.size() !=
+                quote.destination_.final_types[child_index].size()) {
+            return false;
+        }
+        for (const auto & unit : child.units) {
+            if (unit.logical_unit_id >=
+                    quote.destination_.final_types[child_index].size() ||
+                unit.current_type != int32_t(
+                    quote.destination_.final_types[child_index]
+                        [unit.logical_unit_id])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool vbr_rebind_import_schedule_quote(
+        const vbr_target_validation_snapshot & target,
+        const vbr_artifact_package_view & package,
+        const vbr_import_destination_projection & destination,
+        vbr_import_schedule_quote & output) noexcept {
+    if (!package || !destination.feasible() ||
+        output.manifest_digest_ != package.manifest().manifest_digest ||
+        output.units_.size() != package.units().size()) {
+        return false;
+    }
+    output.target_mapped_bytes_ = 0;
+    for (size_t i = 0; i < output.units_.size(); ++i) {
+        auto & quoted = output.units_[i];
+        const auto & source = package.units()[i].descriptor;
+        if (quoted.child_id != source.child_id ||
+            quoted.logical_unit_id != source.logical_unit_id ||
+            quoted.source_type != source.current_type ||
+            source.child_id >= target.children.size() ||
+            source.logical_unit_id >=
+                target.children[source.child_id].units.size()) {
+            return false;
+        }
+        const auto & selected = target.children[source.child_id].units[
+            source.logical_unit_id];
+        quoted.target_type = selected.current_type;
+        quoted.target_domain = selected.current_domain;
+        for (const auto & shard : selected.shards) {
+            if (shard.mapped_bytes > UINT64_MAX -
+                    output.target_mapped_bytes_) {
+                return false;
+            }
+            output.target_mapped_bytes_ += shard.mapped_bytes;
+        }
+    }
+    output.status_ = vbr_classify_import_schedule_units(output.units_);
+    if (output.status_ == vbr_import_schedule_status::unavailable) {
+        return false;
+    }
+    output.destination_ = destination;
+    // The caller immediately hands this private, friend-minted capability to
+    // the manifest validator, which performs the one authoritative full
+    // source/target shard match. Repeating it here doubles max-shape restore
+    // work without adding an intervening mutation boundary.
+    return true;
 }
 
 vbr_validated_manifest::vbr_validated_manifest(
@@ -882,16 +971,39 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             }
             const auto & controller_policy =
                 manifest.controller_policy[controller.child_id];
-            const bool projected_policy = policy.allow_downward &&
+            const auto * selected_destination = policy.schedule_quote &&
+                    policy.schedule_quote->destination().feasible()
+                ? &policy.schedule_quote->destination() : nullptr;
+            const bool negotiated_projected_policy =
+                selected_destination != nullptr &&
+                controller_index <
+                    selected_destination->child_type_digests.size() &&
+                controller_index <
+                    selected_destination->final_types.size() &&
+                controller_index <
+                    selected_destination->final_cursors.size() &&
+                target_child->controller_policy.current_type_vector_digest ==
+                    selected_destination->child_type_digests[controller_index] &&
+                target_child->controller_policy.cursor ==
+                    selected_destination->final_cursors[controller_index];
+            // Compatibility for direct validator callers that predate
+            // negotiated destinations. Production imports authenticate the
+            // generic selected tuple through schedule_quote; this fallback is
+            // deliberately restricted to an explicitly authorized downward
+            // projection.
+            const bool legacy_downward_projected_policy =
+                selected_destination == nullptr &&
+                policy.allow_downward &&
                 policy.downward_projection != nullptr &&
                 policy.downward_projection->status ==
                     vbr_downward_policy_status::coherent &&
                 controller_index <
                     policy.downward_projection->child_type_digests.size() &&
-                controller_index <
-                    policy.downward_projection->final_types.size() &&
                 target_child->controller_policy.current_type_vector_digest ==
-                    policy.downward_projection->child_type_digests[controller_index];
+                    policy.downward_projection->child_type_digests[
+                        controller_index];
+            const bool projected_policy = negotiated_projected_policy ||
+                legacy_downward_projected_policy;
             if (controller_policy.child_id != controller.child_id ||
                 controller_policy.dependency_mode !=
                     controller.dependency_mode ||

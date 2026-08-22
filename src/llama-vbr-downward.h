@@ -13,6 +13,9 @@
 #include <vector>
 
 constexpr uint32_t VBR_DOWNWARD_RECIPE_VERSION = 1;
+// H1 bounds a package at 16,384 projected units. Each unit has at most the
+// five adjacent downward edges represented by vbr_downward_recipe::edges.
+constexpr size_t VBR_IMPORT_DESTINATION_MAX_STEPS = 16384u*5u;
 // Recipe FAMILY id ("PQ2=A adjacent-chain recipe-v1"); distinct from the
 // serialization version above. Proofs carry both.
 constexpr uint32_t VBR_DOWNWARD_RECIPE_ID = 1;
@@ -147,6 +150,8 @@ struct vbr_import_destination_projection {
     vbr_import_destination_status status =
         vbr_import_destination_status::invalid;
     std::vector<llama_vbr_policy::selection> prefix;
+    std::vector<std::vector<ggml_type>> initial_types;
+    std::vector<uint64_t> initial_cursors;
     std::vector<std::vector<ggml_type>> final_types;
     std::vector<uint64_t> final_cursors;
     std::vector<std::array<uint8_t, 32>> child_type_digests;
@@ -187,6 +192,13 @@ vbr_import_destination_projection vbr_select_import_destination(
     const std::vector<vbr_import_destination_child> & children,
     void * context,
     vbr_import_destination_measure_fn measure) noexcept;
+
+// Replays a bounded controller-minted prefix from the supplied live inputs
+// and authenticates its final types, cursors, and digests. This performs no
+// resource pricing and is shared by import binding and barrier rechecks.
+bool vbr_import_destination_projection_coherent(
+    const std::vector<vbr_import_destination_child> & children,
+    const vbr_import_destination_projection & projection) noexcept;
 
 struct vbr_downward_policy_projection {
     vbr_downward_policy_status status = vbr_downward_policy_status::invalid;

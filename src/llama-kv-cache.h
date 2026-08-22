@@ -590,8 +590,8 @@ private:
         int demanded_device, uint32_t watermark, bool fixed_watermark,
         bool fail_closed, llama_vbr_policy::child & output,
         vbr_hard_seal_consult_session * seal_session = nullptr) const;
-    bool vbr_downward_bind_target_unit(
-        ggml_type source_type,
+    bool vbr_import_bind_target_unit(
+        ggml_type source_type, ggml_type target_type,
         const vbr_downward_policy_projection & projection,
         uint32_t projection_child,
         vbr_target_unit_snapshot & output) const noexcept;

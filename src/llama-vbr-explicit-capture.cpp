@@ -702,8 +702,7 @@ public:
             const std::vector<llama_vbr_artifact_domain_binding> & bindings,
             bool previously_observed,
             uint64_t policy_epoch,
-            vbr_target_child_snapshot & output,
-            bool & type_mismatch) noexcept {
+            vbr_target_child_snapshot & output) noexcept {
         auto * cache = tree_child.attention;
         if (!cache || !cache->vbr_operation_armed()) {
             return false;
@@ -761,8 +760,6 @@ public:
                 extents.size() != descriptor.shards.size()) {
                 return false;
             }
-            type_mismatch = type_mismatch ||
-                int32_t(tensor->type) != descriptor.current_type;
             const auto live_generation = tracker->unit_generation(
                 descriptor.logical_unit_id);
             vbr_target_unit_snapshot target;
@@ -847,9 +844,10 @@ public:
             plans, ledger, budget, output);
     }
 
-    static bool bind_import_downward(
+    static bool apply_import_destination(
             const std::vector<llama_memory_tree_child> & tree,
             const vbr_artifact_package_view & package,
+            const vbr_import_destination_projection & destination,
             vbr_target_validation_snapshot & output,
             vbr_downward_policy_projection & projection) noexcept {
         struct indexed_child {
@@ -857,6 +855,22 @@ public:
             vbr_target_child_snapshot * target = nullptr;
             std::vector<const vbr_artifact_unit_view *> units;
         };
+        try {
+        if (!destination.feasible() ||
+            destination.prefix.size() >
+                VBR_IMPORT_DESTINATION_MAX_STEPS ||
+            destination.final_types.size() != output.children.size() ||
+            destination.final_cursors.size() != output.children.size() ||
+            destination.child_type_digests.size() != output.children.size() ||
+            !vbr_digest_nonzero(destination.tree_digest)) {
+            return false;
+        }
+        projection.status = vbr_downward_policy_status::coherent;
+        projection.final_types = destination.final_types;
+        projection.final_cursors = destination.final_cursors;
+        projection.child_type_digests = destination.child_type_digests;
+        projection.tree_digest = destination.tree_digest;
+
         const size_t n_controller =
             package.manifest().controller_policy.size();
         std::vector<const llama_memory_tree_child *> tree_index(
@@ -904,52 +918,42 @@ public:
             units[unit_id] = &unit;
         }
 
-        std::vector<vbr_downward_policy_child> policy_children;
-        policy_children.reserve(indexed.size());
-        for (auto & child : indexed) {
-            std::vector<ggml_type> source_types;
-            source_types.reserve(child.units.size());
-            for (const auto * unit : child.units) {
-                if (!unit) {
-                    return false;
-                }
-                source_types.push_back(static_cast<ggml_type>(
-                    unit->descriptor.current_type));
-            }
-            const auto & source_policy = package.manifest().
-                controller_policy[child.target->child_id];
-            if (source_policy.wm_cells > UINT32_MAX ||
-                !child.cache->vbr_downward_policy_input(
-                    source_types, source_policy.cursor,
-                    uint32_t(source_policy.wm_cells),
-                    child.cache->vbr_pools_.front().device,
-                    policy_children.emplace_back())) {
-                return false;
-            }
-        }
-        projection = vbr_downward_project_policy_prefix(policy_children);
-        if (projection.status != vbr_downward_policy_status::coherent) {
-            return false;
-        }
         for (size_t child_index = 0; child_index < indexed.size();
              ++child_index) {
             auto & child = indexed[child_index];
+            if (child.target->child_id != child_index ||
+                projection.final_types[child_index].size() !=
+                    child.units.size() ||
+                vbr_type_vector_digest(projection.final_types[child_index]) !=
+                    projection.child_type_digests[child_index]) {
+                return false;
+            }
             for (auto & unit : child.target->units) {
                 if (unit.logical_unit_id >= child.units.size() ||
                     !child.units[unit.logical_unit_id]) {
                     return false;
                 }
+                const auto & descriptor = child.units[
+                    unit.logical_unit_id]->descriptor;
                 const auto source_type = static_cast<ggml_type>(
-                    child.units[unit.logical_unit_id]->descriptor.current_type);
-                // The projected prefix is tree-wide, but only units whose
-                // representation changes need a transcode recipe. Unchanged
-                // units retain their native geometry and are validated by the
-                // ordinary representation path.
-                if (source_type != unit.current_type &&
-                    !child.cache->vbr_downward_bind_target_unit(
-                        source_type, projection,
+                    descriptor.current_type);
+                const auto target_type = projection.final_types[child_index]
+                    [unit.logical_unit_id];
+                const auto live_type = static_cast<ggml_type>(
+                    unit.current_type);
+                if ((source_type != target_type || target_type != live_type) &&
+                    !child.cache->vbr_import_bind_target_unit(
+                        source_type, target_type, projection,
                         uint32_t(child_index), unit)) {
                     return false;
+                }
+                if (source_type == target_type) {
+                    // This copied snapshot is the post-adoption image. Exact
+                    // selected units inherit their authenticated source
+                    // generation rather than the empty target's old history.
+                    unit.last_source_type = descriptor.last_source_type;
+                    unit.promote_hops = descriptor.promote_hops;
+                    unit.last_transition = descriptor.last_transition;
                 }
             }
             child.target->controller_policy.current_type_vector_digest =
@@ -957,7 +961,54 @@ public:
             child.target->controller_policy.cursor =
                 projection.final_cursors[child_index];
         }
-        return true;
+        return vbr_type_tree_digest(
+                   projection.child_type_digests,
+                   VBR_DOWNWARD_RECIPE_VERSION) == projection.tree_digest;
+        } catch (...) {
+            projection = {};
+            return false;
+        }
+    }
+
+    static bool recheck_import_destination(
+            const std::vector<llama_memory_tree_child> & tree,
+            const vbr_target_validation_snapshot & live,
+            const vbr_import_destination_projection & destination) noexcept {
+        if (!destination.feasible() ||
+            destination.initial_types.size() != live.children.size() ||
+            destination.initial_cursors.size() != live.children.size()) {
+            return false;
+        }
+        size_t attention_index = 0;
+        for (const auto & child : tree) {
+            if (!child.attention) {
+                continue;
+            }
+            if (attention_index >= live.children.size() ||
+                child.child_id != attention_index ||
+                live.children[attention_index].child_id != child.child_id ||
+                destination.initial_types[attention_index].size() !=
+                    live.children[attention_index].units.size()) {
+                return false;
+            }
+            llama_kv_cache::vbr_capture_stability_token policy;
+            if (!child.attention->vbr_capture_policy_snapshot(policy) ||
+                policy.degrade_cursor !=
+                    destination.initial_cursors[attention_index]) {
+                return false;
+            }
+            for (const auto & unit : live.children[attention_index].units) {
+                if (unit.logical_unit_id >=
+                        destination.initial_types[attention_index].size() ||
+                    unit.current_type != int32_t(
+                        destination.initial_types[attention_index]
+                            [unit.logical_unit_id])) {
+                    return false;
+                }
+            }
+            attention_index++;
+        }
+        return attention_index == live.children.size();
     }
 
     static bool negotiate_import_destination(
@@ -1081,7 +1132,9 @@ public:
             }
             quote.destination_ = vbr_select_import_destination(
                 inputs, &context, measure);
-            return quote.destination_.feasible() ||
+            return (quote.destination_.feasible() &&
+                    vbr_import_destination_projection_coherent(
+                        inputs, quote.destination_)) ||
                 quote.destination_.status ==
                     vbr_import_destination_status::exhausted;
         } catch (...) {
@@ -2683,7 +2736,6 @@ static bool import_target_snapshot_core(
         output.target_state_serial = 1;
         size_t n_attention = 0;
         size_t n_recurrent = 0;
-        bool type_mismatch = false;
         for (const auto & child : tree) {
             if (child.recurrent) {
                 if (n_recurrent != 0 || !recurrent_target_empty(child)) {
@@ -2706,7 +2758,7 @@ static bool import_target_snapshot_core(
             vbr_target_child_snapshot snapshot;
             if (!vbr_live_capture_adapter::fill_import_child(
                     child, package, bindings, previously_observed,
-                    policy_epoch, snapshot, type_mismatch)) {
+                    policy_epoch, snapshot)) {
                 output = {};
                 return false;
             }
@@ -2734,8 +2786,16 @@ static bool import_target_snapshot_core(
         }
         vbr_import_schedule_quote local_schedule;
         const vbr_import_schedule_quote * negotiated = nullptr;
+        vbr_downward_policy_projection selected_projection;
         if (authenticated_schedule != nullptr) {
-            if (!vbr_import_schedule_quote_matches(
+            if (!authenticated_schedule->destination().feasible() ||
+                !vbr_live_capture_adapter::recheck_import_destination(
+                    tree, output,
+                    authenticated_schedule->destination()) ||
+                !vbr_live_capture_adapter::apply_import_destination(
+                    tree, package, authenticated_schedule->destination(),
+                    output, selected_projection) ||
+                !vbr_import_schedule_quote_matches(
                     *authenticated_schedule, output, package)) {
                 output = {};
                 return false;
@@ -2754,6 +2814,25 @@ static bool import_target_snapshot_core(
                 *destination = {};
                 return false;
             }
+            if (!destination->destination().feasible()) {
+                // Exhausted negotiation is useful report evidence, but it is
+                // never an actionable import target.
+                return schedule_quote != nullptr;
+            }
+            const auto & selected = destination->destination();
+            if (!vbr_live_capture_adapter::apply_import_destination(
+                    tree, package, selected, output,
+                    selected_projection)) {
+                output = {};
+                *destination = {};
+                return false;
+            }
+            if (!vbr_rebind_import_schedule_quote(
+                    output, package, selected, *destination)) {
+                output = {};
+                *destination = {};
+                return false;
+            }
             negotiated = destination;
         }
         const auto schedule_status = negotiated->status();
@@ -2763,29 +2842,15 @@ static bool import_target_snapshot_core(
             // schedule without pretending it was a downward-bind failure.
             return schedule_quote != nullptr;
         }
-        if (type_mismatch !=
-                (schedule_status == vbr_import_schedule_status::downward)) {
-            output = {};
-            if (schedule_quote) {
-                *schedule_quote = {};
-            }
-            return false;
-        }
-        // The binder rewrites projected policy digests/cursors only for the
-        // already-classified downward schedule. Exact imports stay native.
         if (schedule_status == vbr_import_schedule_status::downward) {
-            if (downward_projection == nullptr ||
-                !vbr_live_capture_adapter::bind_import_downward(
-                    tree, package, output, *downward_projection)) {
+            if (downward_projection == nullptr) {
                 output = {};
-                if (downward_projection) {
-                    *downward_projection = {};
-                }
                 if (schedule_quote) {
                     *schedule_quote = {};
                 }
                 return false;
             }
+            *downward_projection = std::move(selected_projection);
             if (downward_required) {
                 *downward_required = true;
             }
@@ -2835,6 +2900,9 @@ vbr_explicit_import_target_schedule_snapshot(
             memory, destination, package, bindings, previously_observed,
             accounting_serial, output, &downward_projection,
             &downward_required, &schedule_quote, nullptr)) {
+        return vbr_import_target_snapshot_status::unavailable;
+    }
+    if (!schedule_quote.destination().feasible()) {
         return vbr_import_target_snapshot_status::unavailable;
     }
     switch (schedule_quote.status()) {

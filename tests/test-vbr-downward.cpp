@@ -307,6 +307,26 @@ struct destination_measure_fixture {
     bool fail = false;
 };
 
+struct destination_last_step_fixture {
+    uint64_t calls = 0;
+};
+
+static bool measure_destination_last_step(
+        void * opaque,
+        const std::vector<std::vector<ggml_type>> &,
+        const llama_vbr_policy::selection *,
+        vbr_import_destination_evidence & evidence) noexcept {
+    auto * fixture = static_cast<destination_last_step_fixture *>(opaque);
+    if (!fixture) {
+        return false;
+    }
+    fixture->calls++;
+    evidence.active = true;
+    evidence.fits = fixture->calls ==
+        uint64_t(VBR_IMPORT_DESTINATION_MAX_STEPS) + 1;
+    return true;
+}
+
 static bool measure_destination_schedule(
         void * opaque,
         const std::vector<std::vector<ggml_type>> & types,
@@ -379,6 +399,37 @@ static void test_import_destination_selects_shortest_controller_prefix() {
     assert(std::any_of(
         selected.tree_digest.begin(), selected.tree_digest.end(),
         [](uint8_t value) { return value != 0; }));
+    assert(vbr_import_destination_projection_coherent(children, selected));
+    {
+        auto bad = selected;
+        bad.initial_types[0][0] = GGML_TYPE_TURBO8_0;
+        assert(!vbr_import_destination_projection_coherent(children, bad));
+    }
+    {
+        auto bad = selected;
+        bad.initial_cursors[0]++;
+        assert(!vbr_import_destination_projection_coherent(children, bad));
+    }
+    {
+        auto bad = selected;
+        bad.prefix[0].value.type_a = GGML_TYPE_TURBO8_0;
+        assert(!vbr_import_destination_projection_coherent(children, bad));
+    }
+    {
+        auto bad = selected;
+        bad.final_cursors[0]++;
+        assert(!vbr_import_destination_projection_coherent(children, bad));
+    }
+    {
+        auto bad = selected;
+        bad.child_type_digests[0][0] ^= 1;
+        assert(!vbr_import_destination_projection_coherent(children, bad));
+    }
+    {
+        auto bad = selected;
+        bad.tree_digest[0] ^= 1;
+        assert(!vbr_import_destination_projection_coherent(children, bad));
+    }
 
     destination_measure_fixture both { 2 };
     const auto pair = vbr_select_import_destination(
@@ -389,6 +440,7 @@ static void test_import_destination_selects_shortest_controller_prefix() {
     assert(pair.final_types[0][0] == GGML_TYPE_TURBO8_0);
     assert(pair.final_types[1][0] == GGML_TYPE_TURBO8_0);
     assert(both.calls == 3);
+    assert(vbr_import_destination_projection_coherent(children, pair));
 
     destination_measure_fixture impossible { 3 };
     const auto exhausted = vbr_select_import_destination(
@@ -407,6 +459,19 @@ static void test_import_destination_selects_shortest_controller_prefix() {
         children, &failed, measure_destination_schedule);
     assert(invalid.status == vbr_import_destination_status::invalid);
     assert(invalid.prefix.empty());
+
+    std::vector<vbr_import_destination_child> over_limit(1);
+    over_limit[0].initial_types = { GGML_TYPE_F16 };
+    over_limit[0].watermark_cells = 1;
+    over_limit[0].policy.terminal_progress = 1;
+    over_limit[0].policy.steps.resize(
+        VBR_IMPORT_DESTINATION_MAX_STEPS + 1);
+    destination_measure_fixture never_measured;
+    const auto overflow = vbr_select_import_destination(
+        over_limit, &never_measured, measure_destination_schedule);
+    assert(overflow.status == vbr_import_destination_status::overflow);
+    assert(overflow.prefix.empty());
+    assert(never_measured.calls == 0);
 }
 
 static void test_policy_stream_max_shape_is_heap_bounded() {
@@ -432,6 +497,38 @@ static void test_policy_stream_max_shape_is_heap_bounded() {
     // A scan selector needs ~67M comparisons here. The indexed heap stays
     // comfortably within the O((C+S) log C) envelope.
     assert(stream.comparison_count() < 1000000);
+}
+
+static void test_import_destination_exact_step_cap() {
+    constexpr size_t units = 16384;
+    static constexpr std::array<ggml_type, 6> ladder = {
+        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_TURBO8_0,
+        GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_TCQ,
+        GGML_TYPE_TURBO2_TCQ,
+    };
+    std::vector<vbr_import_destination_child> children(1);
+    auto & child = children[0];
+    child.initial_types.assign(units, ladder[0]);
+    child.watermark_cells = 1;
+    child.policy.terminal_progress = VBR_IMPORT_DESTINATION_MAX_STEPS;
+    child.policy.steps.reserve(VBR_IMPORT_DESTINATION_MAX_STEPS);
+    for (size_t unit = 0; unit < units; ++unit) {
+        for (size_t edge = 0; edge + 1 < ladder.size(); ++edge) {
+            child.policy.steps.push_back({
+                unit*5 + edge, unit, int32_t(ladder[edge]),
+                int32_t(ladder[edge + 1]), 1,
+            });
+        }
+    }
+    destination_last_step_fixture fixture;
+    const auto selected = vbr_select_import_destination(
+        children, &fixture, measure_destination_last_step);
+    assert(selected.status ==
+        vbr_import_destination_status::feasible_degraded);
+    assert(selected.prefix.size() == VBR_IMPORT_DESTINATION_MAX_STEPS);
+    assert(fixture.calls ==
+        uint64_t(VBR_IMPORT_DESTINATION_MAX_STEPS) + 1);
+    assert(vbr_import_destination_projection_coherent(children, selected));
 }
 
 static llama_vbr_policy::child policy_child(
@@ -733,6 +830,7 @@ int main() {
     test_all_recipes_and_rejections();
     test_import_destination_selects_shortest_controller_prefix();
     test_policy_stream_max_shape_is_heap_bounded();
+    test_import_destination_exact_step_cap();
     test_policy_projection_tree_and_ordinary();
     test_edge_oracles_and_stash_boundaries();
     test_straddled_kv_independent_chains();

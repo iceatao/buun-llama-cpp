@@ -5440,8 +5440,8 @@ bool llama_kv_cache::vbr_import_destination_input(
     }
 }
 
-bool llama_kv_cache::vbr_downward_bind_target_unit(
-        ggml_type source_type,
+bool llama_kv_cache::vbr_import_bind_target_unit(
+        ggml_type source_type, ggml_type target_type,
         const vbr_downward_policy_projection & projection,
         uint32_t projection_child,
         vbr_target_unit_snapshot & output) const noexcept {
@@ -5457,22 +5457,27 @@ bool llama_kv_cache::vbr_downward_bind_target_unit(
             return false;
         }
         const ggml_tensor * canonical = is_v ? layers[ikv].v : layers[ikv].k;
-        if (!canonical || projection.final_types[projection_child]
-                [output.logical_unit_id] != canonical->type) {
+        if (!canonical || target_type == GGML_TYPE_COUNT ||
+            projection.final_types[projection_child]
+                [output.logical_unit_id] != target_type) {
             return false;
         }
         vbr_capture_stability_token policy;
         if (!vbr_capture_policy_snapshot(policy)) {
             return false;
         }
-        vbr_downward_recipe recipe;
         const bool movable = vbr_unit_movable(source_type, is_v);
-        if (vbr_downward_resolve_recipe(
-                source_type, canonical->type,
-                static_cast<ggml_type>(policy.floor_type),
-                movable, recipe) != vbr_downward_recipe_status::resolved) {
+        vbr_downward_recipe recipe;
+        const auto relation = vbr_downward_resolve_recipe(
+            source_type, target_type,
+            static_cast<ggml_type>(policy.floor_type), movable, recipe);
+        if (relation != vbr_downward_recipe_status::resolved &&
+            relation != vbr_downward_recipe_status::equal_tier &&
+            relation != vbr_downward_recipe_status::upward_forbidden) {
             return false;
         }
+        const bool downward =
+            relation == vbr_downward_recipe_status::resolved;
         const auto & units = vbr_units_of(ikv, is_v);
         if (units.empty() || units.size() != output.shards.size()) {
             return false;
@@ -5487,11 +5492,11 @@ bool llama_kv_cache::vbr_downward_bind_target_unit(
             const auto * pool = units[i].first;
             const auto * extent = units[i].second;
             if (!pool || !extent || !extent->t || !pool->be ||
-                !pool->be->kv_transcode_workspace_memory) {
+                (downward && !pool->be->kv_transcode_workspace_memory)) {
                 return false;
             }
             const uint64_t target_row = ggml_row_size(
-                canonical->type, extent->t->ne[0]);
+                target_type, extent->t->ne[0]);
             const uint64_t source_row = ggml_row_size(
                 source_type, extent->t->ne[0]);
             if (target_row == 0 || source_row == 0 ||
@@ -5508,24 +5513,31 @@ bool llama_kv_cache::vbr_downward_bind_target_unit(
             }
             mapped += target_bytes;
             transfer += source_bytes;
-            size_t now = 0;
-            size_t endpoint = 0;
-            if (!pool->be->kv_transcode_workspace_memory(
-                    pool->backend, pool->device,
-                    int64_t(output.wm_cells), extent->t->ne[0],
-                    stash_rows, &now, &endpoint) ||
-                endpoint > UINT64_MAX-workspace) {
-                return false;
+            if (downward) {
+                size_t now = 0;
+                size_t endpoint = 0;
+                if (!pool->be->kv_transcode_workspace_memory(
+                        pool->backend, pool->device,
+                        int64_t(output.wm_cells), extent->t->ne[0],
+                        stash_rows, &now, &endpoint) ||
+                    endpoint > UINT64_MAX-workspace) {
+                    return false;
+                }
+                workspace += endpoint;
             }
-            workspace += endpoint;
             output.shards[i].row_bytes = target_row;
             output.shards[i].mapped_bytes = target_bytes;
+        }
+        output.current_type = target_type;
+        output.current_domain = vbr_downward_tier_domain(target_type);
+        if (!downward) {
+            return true;
         }
         output.downward_supported = true;
         output.downward_movable = movable;
         output.controller_floor_type = policy.floor_type;
-        output.downward_type = canonical->type;
-        output.downward_domain = vbr_downward_tier_domain(canonical->type);
+        output.downward_type = target_type;
+        output.downward_domain = vbr_downward_tier_domain(target_type);
         output.downward_recipe_id = VBR_DOWNWARD_RECIPE_ID;
         output.downward_recipe_version = VBR_DOWNWARD_RECIPE_VERSION;
         output.downward_recipe = recipe;

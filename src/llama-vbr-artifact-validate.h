@@ -150,6 +150,11 @@ private:
         const vbr_import_schedule_quote &,
         const vbr_target_validation_snapshot &,
         const vbr_artifact_package_view &) noexcept;
+    friend bool vbr_rebind_import_schedule_quote(
+        const vbr_target_validation_snapshot &,
+        const vbr_artifact_package_view &,
+        const vbr_import_destination_projection &,
+        vbr_import_schedule_quote &) noexcept;
     friend class vbr_live_capture_adapter;
 };
 
@@ -289,12 +294,17 @@ struct vbr_target_validation_snapshot {
     std::vector<vbr_target_companion_snapshot> companions;
 };
 
-// Quotes the already-selected current target schedule. It does not choose a
-// higher tier; the controller-owned highest-feasible selector is a separate
-// step that will consume this immutable evidence.
+// Quotes an authenticated target image. Destination selection is controller-
+// owned; the rebind overload attaches its already-normalized projected image
+// without revalidating or rematerializing the package.
 bool vbr_quote_import_schedule(
     const vbr_target_validation_snapshot & target,
     const vbr_artifact_package_view & package,
+    vbr_import_schedule_quote & output) noexcept;
+bool vbr_rebind_import_schedule_quote(
+    const vbr_target_validation_snapshot & target,
+    const vbr_artifact_package_view & package,
+    const vbr_import_destination_projection & destination,
     vbr_import_schedule_quote & output) noexcept;
 bool vbr_import_schedule_quote_matches(
     const vbr_import_schedule_quote & quote,

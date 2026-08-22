@@ -2471,8 +2471,12 @@ static bool f42a_model_backed_adoption(
         ggml_type target_type = GGML_TYPE_F16,
         uint64_t live_budget_mib = 0,
         size_t live_token_count = 0,
-        bool require_straddled = false) {
+        bool require_straddled = false,
+        uint64_t destination_budget_mib = 0,
+        ggml_type expected_destination_type = GGML_TYPE_COUNT) {
     const bool live_matrix = live_token_count != 0;
+    const bool require_destination_degraded =
+        expected_destination_type != GGML_TYPE_COUNT;
     ggml_backend_load_all();
     if (live_matrix) {
         // F5 validates the shipped, model-matched order. The older homogeneous
@@ -2512,10 +2516,13 @@ static bool f42a_model_backed_adoption(
         context_params.vbr_min_bits_explicit = true;
     }
 
-    auto make_context = [&](ggml_type entry_type) {
+    auto make_context = [&](ggml_type entry_type, uint64_t budget_mib = 0) {
         auto params = context_params;
         params.type_k = entry_type;
         params.type_v = entry_type;
+        if (budget_mib != 0) {
+            params.vbr_vram_budget_bytes = budget_mib*1024*1024;
+        }
         return llama_context_ptr(llama_init_from_model(model.get(), params));
     };
     auto source = make_context(source_type);
@@ -2834,6 +2841,8 @@ static bool f42a_model_backed_adoption(
     llama_context_ptr live_degrade_reference;
     const llama_kv_cache * live_degrade_cache = nullptr;
     if (downward_mode) {
+        const auto final_oracle_type = require_destination_degraded
+            ? expected_destination_type : target_type;
         live_degrade_reference = make_context(source_type);
         CHECK(live_degrade_reference != nullptr);
         std::vector<llama_memory_tree_child> degrade_tree;
@@ -2847,12 +2856,12 @@ static bool f42a_model_backed_adoption(
                 degrade_tree) ||
             degrade_tree.size() != 1 || !degrade_tree[0].attention ||
             !llama_kv_cache_vbr_epoch_test::degrade_to(
-                degrade_tree[0].attention, target_type)) {
+                degrade_tree[0].attention, final_oracle_type)) {
             return false;
         }
         live_degrade_cache = degrade_tree[0].attention;
 
-        auto same_tier = make_context(target_type);
+        auto same_tier = make_context(final_oracle_type);
         CHECK(same_tier != nullptr);
         if (!same_tier || !f42a_decode(same_tier.get(), tokens, 0) ||
             !f42a_decode(same_tier.get(), { continuation },
@@ -2884,7 +2893,10 @@ static bool f42a_model_backed_adoption(
         const uint64_t baseline_live_ops = ledger.snapshot().live_ops;
         llama_context_ptr target_context = live_matrix
             ? std::move(source)
-            : make_context(downward_mode ? target_type : GGML_TYPE_F16);
+            : make_context(
+                require_destination_degraded || downward_mode
+                    ? target_type : GGML_TYPE_F16,
+                destination_budget_mib);
         CHECK(target_context != nullptr);
         if (!target_context) {
             return false;
@@ -2963,11 +2975,26 @@ static bool f42a_model_backed_adoption(
         CHECK(schedule_quote.status() == (downward_mode
             ? vbr_import_schedule_status::downward
             : vbr_import_schedule_status::exact));
+        if (require_destination_degraded) {
+            CHECK(schedule_quote.destination().status ==
+                vbr_import_destination_status::feasible_degraded);
+            CHECK(!schedule_quote.destination().prefix.empty());
+            CHECK(std::all_of(
+                schedule_quote.destination().final_types.begin(),
+                schedule_quote.destination().final_types.end(),
+                [&](const auto & types) {
+                    return std::all_of(
+                        types.begin(), types.end(), [&](ggml_type type) {
+                            return type == expected_destination_type;
+                        });
+                }));
+        }
         CHECK(vbr_import_schedule_quote_matches(
             schedule_quote, target_snapshot, package));
-        if (!detected_downward) {
-            CHECK(downward_projection.final_types.empty());
-        }
+        CHECK(downward_mode
+            ? downward_projection.status ==
+                vbr_downward_policy_status::coherent
+            : downward_projection.final_types.empty());
         target_snapshot.scheduler_idle = true;
         if (target_snapshot.children.empty()) {
             return false;
@@ -3193,6 +3220,11 @@ static bool f42a_model_backed_adoption(
                 return false;
             }
         }
+        if (require_destination_degraded) {
+            CHECK(llama_kv_cache_vbr_epoch_test::representation_types(
+                adopted_cache,
+                schedule_quote.destination().final_types[0]));
+        }
 
         CHECK(f42a_decode(target_context.get(),
                           { continuation }, llama_pos(tokens.size())));
@@ -3251,8 +3283,16 @@ static bool f42a_model_backed_adoption(
         }
         CHECK(run_import(false, vbr_import_decision::native_import));
         CHECK(run_import(true, vbr_import_decision::live_rebased));
-    } else {
+    } else if (!require_destination_degraded) {
         CHECK(run_import(false, vbr_import_decision::downward_rebase));
+    } else {
+        CHECK(run_import(false,
+            downward_mode ? vbr_import_decision::downward_rebase
+                          : vbr_import_decision::native_import,
+            vbr_adopt_phase::composite_publish));
+        CHECK(run_import(false,
+            downward_mode ? vbr_import_decision::downward_rebase
+                          : vbr_import_decision::native_import));
     }
     package.reset();
     CHECK(catalog.retire(reference) == vbr_artifact_retire_status::retired);
@@ -3328,25 +3368,31 @@ int main(int argc, char ** argv) {
     if (argc >= 2 &&
         (std::string(argv[1]) == "--f42a-cuda" ||
          std::string(argv[1]) == "--f42b-cuda" ||
-         std::string(argv[1]) == "--f5-cuda")) {
+         std::string(argv[1]) == "--f5-cuda" ||
+         std::string(argv[1]) == "--h2-destination-cuda")) {
         const bool downward = std::string(argv[1]) == "--f42b-cuda";
         const bool f5 = std::string(argv[1]) == "--f5-cuda";
-        if ((!downward && !f5 && argc != 3) ||
+        const bool h2_destination =
+            std::string(argv[1]) == "--h2-destination-cuda";
+        if ((!downward && !f5 && !h2_destination && argc != 3) ||
             (f5 && argc != 6) ||
-            (downward && argc != 3 && argc != 5)) {
+            (downward && argc != 3 && argc != 5) ||
+            (h2_destination && argc != 7)) {
             std::fprintf(stderr,
                 "usage: %s --f42a-cuda MODEL\n"
                 "       %s --f42b-cuda MODEL [SOURCE TARGET]\n"
+                "       %s --h2-destination-cuda MODEL SOURCE ENTRY "
+                "EXPECTED BUDGET_MIB\n"
                 "       %s --f5-cuda MODEL BUDGET_MIB TOKENS "
                 "mixed|straddled\n"
                 "tiers: f16 t8 t4 t3 t2 t1\n",
-                argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
         ggml_type source_type = GGML_TYPE_F16;
         ggml_type target_type = downward ?
             GGML_TYPE_TURBO3_TCQ : GGML_TYPE_F16;
-        if (argc == 5 &&
+        if (downward && argc == 5 &&
             (!f42b_parse_type(argv[3], source_type) ||
              !f42b_parse_type(argv[4], target_type))) {
             std::fprintf(stderr, "invalid F4.2b tier pair: %s -> %s\n",
@@ -3354,6 +3400,34 @@ int main(int argc, char ** argv) {
             return 2;
         }
         vbr_downward_recipe requested_recipe;
+        ggml_type expected_destination_type = GGML_TYPE_COUNT;
+        uint64_t destination_budget_mib = 0;
+        bool destination_downward = downward;
+        if (h2_destination) {
+            char * budget_end = nullptr;
+            if (!f42b_parse_type(argv[3], source_type) ||
+                !f42b_parse_type(argv[4], target_type) ||
+                !f42b_parse_type(argv[5], expected_destination_type)) {
+                std::fprintf(stderr, "invalid H2 destination tier\n");
+                return 2;
+            }
+            destination_budget_mib = std::strtoull(
+                argv[6], &budget_end, 10);
+            vbr_downward_recipe destination_recipe;
+            const auto relation = vbr_downward_resolve_recipe(
+                source_type, expected_destination_type,
+                GGML_TYPE_TURBO1_TCQ, true, destination_recipe);
+            destination_downward =
+                relation == vbr_downward_recipe_status::resolved;
+            if (!destination_budget_mib ||
+                destination_budget_mib > UINT64_MAX/(1024*1024) ||
+                *budget_end ||
+                (relation != vbr_downward_recipe_status::resolved &&
+                 relation != vbr_downward_recipe_status::equal_tier)) {
+                std::fprintf(stderr, "invalid H2 destination schedule\n");
+                return 2;
+            }
+        }
         if (downward && vbr_downward_resolve_recipe(
                 source_type, target_type, GGML_TYPE_TURBO1_TCQ, true,
                 requested_recipe) != vbr_downward_recipe_status::resolved) {
@@ -3364,7 +3438,12 @@ int main(int argc, char ** argv) {
         }
         test_cuda_h2d_adapter();
         if (failures == 0) {
-            if (f5) {
+            if (h2_destination) {
+                f42a_model_backed_adoption(
+                    argv[2], destination_downward,
+                    source_type, target_type, 0, 0, false,
+                    destination_budget_mib, expected_destination_type);
+            } else if (f5) {
                 char * budget_end = nullptr;
                 char * tokens_end = nullptr;
                 const uint64_t budget = std::strtoull(

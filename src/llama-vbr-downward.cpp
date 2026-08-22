@@ -156,17 +156,29 @@ vbr_import_destination_projection vbr_select_import_destination(
         }
         result.final_types.reserve(children.size());
         result.final_cursors.reserve(children.size());
+        result.initial_types.reserve(children.size());
+        result.initial_cursors.reserve(children.size());
         std::vector<llama_vbr_policy::child> policies;
         policies.reserve(children.size());
+        size_t total_steps = 0;
         for (const auto & child : children) {
             if (child.initial_types.empty() ||
                 child.watermark_cells == 0) {
                 return result;
             }
+            if (child.policy.steps.size() >
+                    VBR_IMPORT_DESTINATION_MAX_STEPS - total_steps) {
+                result.status = vbr_import_destination_status::overflow;
+                return result;
+            }
+            total_steps += child.policy.steps.size();
             result.final_types.push_back(child.initial_types);
             result.final_cursors.push_back(child.initial_cursor);
+            result.initial_types.push_back(child.initial_types);
+            result.initial_cursors.push_back(child.initial_cursor);
             policies.push_back(child.policy);
         }
+        result.prefix.reserve(total_steps);
         bool measure_ok = true;
         const auto fits = [&](const llama_vbr_policy::selection * selected) {
             vbr_import_destination_evidence evidence;
@@ -193,8 +205,10 @@ vbr_import_destination_projection vbr_select_import_destination(
             result.status =
                 vbr_import_destination_status::feasible_current;
         } else {
+            // The destination result is the sole prefix owner. Avoid retaining
+            // a duplicate history inside the policy stream.
             llama_vbr_policy::shortest_prefix_stream stream(
-                std::move(policies));
+                std::move(policies), false);
             llama_vbr_policy::selection selected;
             for (;;) {
                 const auto status = stream.next(selected);
@@ -246,6 +260,80 @@ vbr_import_destination_projection vbr_select_import_destination(
         return result;
     } catch (...) {
         return {};
+    }
+}
+
+bool vbr_import_destination_projection_coherent(
+        const std::vector<vbr_import_destination_child> & children,
+        const vbr_import_destination_projection & projection) noexcept {
+    try {
+        if (!projection.feasible() || children.empty() ||
+            projection.prefix.size() > VBR_IMPORT_DESTINATION_MAX_STEPS ||
+            projection.final_types.size() != children.size() ||
+            projection.final_cursors.size() != children.size() ||
+            projection.initial_types.size() != children.size() ||
+            projection.initial_cursors.size() != children.size() ||
+            projection.child_type_digests.size() != children.size() ||
+            (projection.status ==
+                 vbr_import_destination_status::feasible_current) !=
+                projection.prefix.empty()) {
+            return false;
+        }
+        std::vector<std::vector<ggml_type>> types;
+        std::vector<uint64_t> cursors;
+        std::vector<size_t> next_steps(children.size(), 0);
+        types.reserve(children.size());
+        cursors.reserve(children.size());
+        for (const auto & child : children) {
+            const size_t index = types.size();
+            if (projection.initial_types[index] != child.initial_types ||
+                projection.initial_cursors[index] != child.initial_cursor) {
+                return false;
+            }
+            types.push_back(child.initial_types);
+            cursors.push_back(child.initial_cursor);
+        }
+        for (const auto & selected : projection.prefix) {
+            if (selected.child_index >= children.size() ||
+                selected.child_step_index !=
+                    next_steps[selected.child_index] ||
+                selected.child_step_index >= children[
+                    selected.child_index].policy.steps.size()) {
+                return false;
+            }
+            const auto & expected = children[selected.child_index].
+                policy.steps[selected.child_step_index];
+            if (selected.value.order_index != expected.order_index ||
+                selected.value.slot != expected.slot ||
+                selected.value.type_a != expected.type_a ||
+                selected.value.type_b != expected.type_b ||
+                selected.value.logical_gain != expected.logical_gain ||
+                expected.slot >= types[selected.child_index].size() ||
+                types[selected.child_index][expected.slot] !=
+                    static_cast<ggml_type>(expected.type_a)) {
+                return false;
+            }
+            types[selected.child_index][expected.slot] =
+                static_cast<ggml_type>(expected.type_b);
+            cursors[selected.child_index] = std::max<uint64_t>(
+                cursors[selected.child_index], expected.order_index + 1);
+            next_steps[selected.child_index]++;
+        }
+        if (types != projection.final_types ||
+            cursors != projection.final_cursors) {
+            return false;
+        }
+        std::vector<std::array<uint8_t, 32>> digests;
+        digests.reserve(types.size());
+        for (const auto & child_types : types) {
+            digests.push_back(vbr_type_vector_digest(child_types));
+        }
+        return digests == projection.child_type_digests &&
+               vbr_type_tree_digest(
+                   digests, VBR_DOWNWARD_RECIPE_VERSION) ==
+                   projection.tree_digest;
+    } catch (...) {
+        return false;
     }
 }
 

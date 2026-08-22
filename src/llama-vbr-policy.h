@@ -120,7 +120,10 @@ inline bool fraction_less(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
 // successor's SWA-root topology, that means an active SWA root wins an exact initial tie.
 class shortest_prefix_stream {
 public:
-    explicit shortest_prefix_stream(std::vector<child> children) : children_(std::move(children)) {
+    explicit shortest_prefix_stream(
+            std::vector<child> children,
+            bool retain_history = true) :
+        children_(std::move(children)), retain_history_(retain_history) {
         states_.reserve(children_.size());
         for (const child & c : children_) {
             state s;
@@ -176,7 +179,9 @@ public:
                 [this](size_t lhs, size_t rhs) { return better(rhs, lhs); });
         }
         out = { pick, child_step_index, st };
-        selected_.push_back(out);
+        if (retain_history_) {
+            selected_.push_back(out);
+        }
         return result::selected;
     }
 
@@ -243,6 +248,7 @@ private:
     std::vector<size_t> heap_;
     mutable uint64_t comparisons_ = 0;
     bool valid_ = true;
+    bool retain_history_ = true;
 };
 
 } // namespace llama_vbr_policy
