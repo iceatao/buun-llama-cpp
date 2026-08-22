@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -194,33 +195,109 @@ std::array<uint8_t, 32> tagged_digest(
     return writer.finish();
 }
 
-class vector_io_writer final : public llama_io_write_i {
+class chain_io_writer final : public llama_io_write_i {
 public:
-    void write(const void * source, size_t size) override {
-        if (size > std::numeric_limits<size_t>::max() - bytes.size()) {
-            throw std::bad_alloc();
+    static constexpr size_t CHUNK_BYTES = 1024*1024;
+
+    chain_io_writer(
+            artifact_segment_chain & chain,
+            uint64_t expected_bytes)
+        : chain_(chain), expected_bytes_(expected_bytes),
+          scratch_(size_t(std::max<uint64_t>(
+              1, std::min<uint64_t>(CHUNK_BYTES, expected_bytes)))) {
+        if (expected_bytes > SIZE_MAX) {
+            throw std::length_error("companion payload exceeds size_t");
         }
-        const auto * begin = static_cast<const uint8_t *>(source);
-        bytes.insert(bytes.end(), begin, begin + size);
+    }
+
+    void write(const void * source, size_t size) override {
+        const auto * cursor = static_cast<const uint8_t *>(source);
+        if (cursor == nullptr && size != 0) {
+            throw std::invalid_argument("null companion source");
+        }
+        account(size);
+        while (size != 0) {
+            ensure_scratch();
+            const size_t take = std::min(size, scratch_.size() - used_);
+            std::memcpy(scratch_.data() + used_, cursor, take);
+            used_ += take;
+            cursor += take;
+            size -= take;
+            if (used_ == scratch_.size()) {
+                flush();
+            }
+        }
     }
 
     void write_tensor(
             ggml_tensor * tensor,
             size_t offset,
             size_t size) override {
-        const size_t old = bytes.size();
-        if (size > std::numeric_limits<size_t>::max() - old) {
-            throw std::bad_alloc();
+        if (tensor == nullptr) {
+            throw std::invalid_argument("null companion tensor");
         }
-        bytes.resize(old + size);
-        ggml_backend_tensor_get(tensor, bytes.data() + old, offset, size);
+        account(size);
+        while (size != 0) {
+            ensure_scratch();
+            const size_t take = std::min(size, scratch_.size() - used_);
+            ggml_backend_tensor_get(
+                tensor, scratch_.data() + used_, offset, take);
+            used_ += take;
+            offset += take;
+            size -= take;
+            if (used_ == scratch_.size()) {
+                flush();
+            }
+        }
     }
 
     size_t n_bytes() override {
-        return bytes.size();
+        return size_t(written_);
     }
 
-    std::vector<uint8_t> bytes;
+    bool finish() {
+        flush();
+        return written_ == expected_bytes_ &&
+               chain_.size() == expected_bytes_;
+    }
+
+private:
+    void account(size_t size) {
+        if (written_ > expected_bytes_ ||
+            size > expected_bytes_ - written_ ||
+            written_ > SIZE_MAX || size > SIZE_MAX - size_t(written_)) {
+            throw std::overflow_error("companion payload size mismatch");
+        }
+        written_ += size;
+    }
+
+    void flush() {
+        if (used_ != 0) {
+            scratch_.resize(used_);
+            if (!chain_.append_owned(std::move(scratch_))) {
+                throw std::bad_alloc();
+            }
+            used_ = 0;
+        }
+    }
+
+    void ensure_scratch() {
+        if (!scratch_.empty()) {
+            return;
+        }
+        const uint64_t remaining = expected_bytes_ - chain_.size();
+        if (remaining == 0) {
+            throw std::overflow_error("companion payload overrun");
+        }
+        scratch_.resize(size_t(std::min<uint64_t>(
+            CHUNK_BYTES, remaining)));
+    }
+
+    artifact_segment_chain & chain_;
+    uint64_t expected_bytes_ = 0;
+    uint64_t written_ = 0;
+    std::vector<uint8_t> scratch_;
+    size_t used_ = 0;
 };
 
 class counting_io_writer final : public llama_io_write_i {
@@ -242,6 +319,119 @@ public:
     }
     size_t bytes = 0;
 };
+
+struct recurrent_companion_plan {
+    llama_memory_recurrent * source = nullptr;
+    llama_pos expected_terminal = -1;
+    vbr_artifact_companion_payload descriptor;
+};
+
+bool recurrent_companion_current(
+        const recurrent_companion_plan & plan,
+        llama_seq_id sequence) noexcept {
+    return plan.source != nullptr && sequence >= 0 &&
+        plan.source->seq_pos_min(sequence) == plan.expected_terminal &&
+        plan.source->seq_pos_max(sequence) == plan.expected_terminal;
+}
+
+bool recurrent_companion_prepare(
+        llama_memory_recurrent * source,
+        llama_seq_id sequence,
+        llama_pos next_position,
+        recurrent_companion_plan & output,
+        vbr_explicit_capture_status & status) noexcept {
+    output = {};
+    try {
+        if (source == nullptr || sequence < 0 || next_position < 0) {
+            status = vbr_explicit_capture_status::
+                required_companion_unavailable;
+            return false;
+        }
+        const llama_pos expected_terminal = next_position - 1;
+        if (source->seq_pos_min(sequence) != expected_terminal ||
+            source->seq_pos_max(sequence) != expected_terminal) {
+            status = vbr_explicit_capture_status::source_changed;
+            return false;
+        }
+        counting_io_writer writer;
+        source->state_write(writer, sequence, 0);
+        if (writer.n_bytes() == 0 ||
+            source->seq_pos_min(sequence) != expected_terminal ||
+            source->seq_pos_max(sequence) != expected_terminal) {
+            status = vbr_explicit_capture_status::
+                required_companion_unavailable;
+            return false;
+        }
+        output.source = source;
+        output.expected_terminal = expected_terminal;
+        output.descriptor.kind = vbr_artifact_companion_kind::recurrent;
+        output.descriptor.format_version = 1;
+        output.descriptor.build_identity_digest = tagged_digest(
+            VBR_RECURRENT_CODEC_DOMAIN, 1);
+        output.descriptor.domain = {
+            llama_cache_acct_residency::pageable_host,
+            llama_cache_acct_domain_kind::not_applicable,
+            UINT32_MAX, UINT16_MAX,
+        };
+        output.descriptor.payload_bytes = writer.n_bytes();
+        return true;
+    } catch (...) {
+        output = {};
+        status = vbr_explicit_capture_status::
+            required_companion_unavailable;
+        return false;
+    }
+}
+
+bool recurrent_companion_capture(
+        const recurrent_companion_plan & plan,
+        llama_seq_id sequence,
+        std::unique_ptr<artifact_segment_chain> & output,
+        std::array<uint8_t, 32> & digest,
+        vbr_explicit_capture_status & status) noexcept {
+    output.reset();
+    digest = {};
+    try {
+        if (plan.source == nullptr ||
+            plan.descriptor.payload_bytes == 0 || sequence < 0) {
+            status = vbr_explicit_capture_status::
+                required_companion_unavailable;
+            return false;
+        }
+        if (!recurrent_companion_current(plan, sequence)) {
+            status = vbr_explicit_capture_status::source_changed;
+            return false;
+        }
+        auto chain = std::make_unique<artifact_segment_chain>(
+            plan.descriptor.payload_bytes);
+        chain_io_writer writer(*chain, plan.descriptor.payload_bytes);
+        plan.source->state_write(writer, sequence, 0);
+        if (!writer.finish() ||
+            writer.n_bytes() != plan.descriptor.payload_bytes ||
+            !recurrent_companion_current(plan, sequence)) {
+            status = vbr_explicit_capture_status::source_changed;
+            return false;
+        }
+        digest = vbr_capture_stream_digest(*chain);
+        if (!digest_nonzero(digest)) {
+            status = vbr_explicit_capture_status::
+                required_companion_unavailable;
+            return false;
+        }
+        if (!recurrent_companion_current(plan, sequence)) {
+            status = vbr_explicit_capture_status::source_changed;
+            return false;
+        }
+        output = std::move(chain);
+        return true;
+    } catch (...) {
+        output.reset();
+        digest = {};
+        status = vbr_explicit_capture_status::
+            required_companion_unavailable;
+        return false;
+    }
+}
 
 void add_accounting(
         std::vector<vbr_artifact_portable_accounting_row> & rows,
@@ -759,6 +949,405 @@ public:
         return true;
     }
 
+    static bool capture_size(
+            child & output,
+            const std::vector<vbr_explicit_capture_pool_binding> & bindings,
+            vbr_explicit_generation_failure & failure,
+            vbr_explicit_size_failure & size_failure) {
+        failure = vbr_explicit_generation_failure::none;
+        size_failure = vbr_explicit_size_failure::none;
+        if (output.cache == nullptr) {
+            failure = vbr_explicit_generation_failure::internal_error;
+            return false;
+        }
+        llama_kv_cache::vbr_capture_unit_request request;
+        request.child_id = output.child_id;
+        request.bindings = &bindings;
+        if (!output.cache->vbr_capture_size_pass(
+                request, output.units, output.stability, &size_failure)) {
+            failure = vbr_explicit_generation_failure::size_pass;
+            return false;
+        }
+        return true;
+    }
+
+    static bool capture_generation(
+            const child & value,
+            llama_seq_id sequence,
+            llama_pos frontier,
+            vbr_checkpoint_generation_controller & generation,
+            vbr_artifact_stream_placement & placement,
+            vbr_explicit_generation_failure & failure) {
+        failure = vbr_explicit_generation_failure::none;
+        if (value.cache == nullptr ||
+            !value.cache->vbr_capture_generation_record(
+                value.child_id, value.dependency_mode,
+                sequence, frontier, generation, &placement, &failure)) {
+            if (failure == vbr_explicit_generation_failure::none) {
+                failure = vbr_explicit_generation_failure::internal_error;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    static vbr_controller_instance_id instance(const child & value) noexcept {
+        return value.cache ? value.cache->vbr_instance_id() :
+            vbr_controller_instance_id {};
+    }
+
+    static vbr_capture_stream_status transfer_projected_unit(
+            const child & value,
+            const llama_kv_cache::vbr_capture_unit_plan & plan,
+            const vbr_capture_projection & projection,
+            uint64_t source_namespace,
+            vbr_pinned_chunk_ring & ring,
+            vbr_capture_projected_unit & output) noexcept {
+        if (!value.cache) {
+            return vbr_capture_stream_status::snapshot_unavailable;
+        }
+        std::vector<vbr_capture_projected_shard_source> sources;
+        if (!value.cache->vbr_capture_projected_sources(plan, sources)) {
+            return vbr_capture_stream_status::snapshot_unavailable;
+        }
+        llama_kv_cache::vbr_capture_snapshot_session session;
+        if (!value.cache->vbr_capture_snapshot_bind(
+                plan, sources, source_namespace, session)) {
+            return vbr_capture_stream_status::snapshot_unavailable;
+        }
+        return vbr_capture_projected_unit_transfer(
+            projection, value.child_id, 0, plan.logical_unit,
+            sources, {}, session.provider(), ring, output);
+    }
+
+    struct representation_cache_entry {
+        int32_t current_type = -1;
+        bool value_side = false;
+        vbr_explicit_representation_identity identity;
+    };
+
+    static bool capture_schema(
+            const child & value,
+            const void * representation_context,
+            vbr_explicit_capture_request::representation_identity_fn
+                representation_identity,
+            bool allow_clean_stash,
+            std::vector<representation_cache_entry> & representation_cache,
+            vbr_artifact_controller_policy & policy,
+            std::vector<vbr_artifact_unit_descriptor> & descriptors,
+            vbr_explicit_capture_status & status) {
+        descriptors.clear();
+        if (value.units.empty() || !representation_identity) {
+            status = vbr_explicit_capture_status::identity_unavailable;
+            return false;
+        }
+        const auto & first = value.units.front();
+        if (first.n_stream == 0 || first.wm_cells == 0) {
+            status = vbr_explicit_capture_status::unsupported_layout;
+            return false;
+        }
+
+        policy = {};
+        policy.child_id = value.child_id;
+        policy.dependency_mode = value.dependency_mode;
+        policy.degrade_order_digest =
+            value.stability.degrade_order_digest;
+        policy.policy_digest = value.stability.policy_digest;
+        policy.cursor = value.stability.degrade_cursor;
+        policy.floor_type = value.stability.floor_type;
+        policy.pressure_independent_settings =
+            value.stability.pressure_independent_settings;
+        policy.n_stream = first.n_stream;
+        policy.unified = first.unified;
+        policy.wm_cells = first.wm_cells;
+        policy.completed_wave = value.stability.completed_wave;
+
+        std::vector<ggml_type> current_types;
+        current_types.reserve(value.units.size());
+        descriptors.reserve(value.units.size());
+        for (const auto & plan : value.units) {
+            if (plan.child_id != value.child_id ||
+                plan.logical_unit != descriptors.size() ||
+                plan.n_stream != policy.n_stream ||
+                plan.unified != policy.unified ||
+                plan.wm_cells != policy.wm_cells ||
+                plan.shards.empty()) {
+                status = vbr_explicit_capture_status::unsupported_layout;
+                return false;
+            }
+            vbr_artifact_unit_descriptor descriptor;
+            descriptor.child_id = value.child_id;
+            descriptor.logical_unit_id = plan.logical_unit;
+            descriptor.lineage_uuid = value.stability.lineage_uuid;
+            descriptor.repr_gen = plan.generation.repr_gen;
+            descriptor.current_type = plan.generation.current_type;
+            descriptor.last_source_type =
+                plan.generation.last_source_type;
+            descriptor.promote_hops = plan.generation.promote_hops;
+            descriptor.last_transition = plan.generation.last_transition;
+            descriptor.representation.kind =
+                plan.generation.current_type == GGML_TYPE_F16
+                    ? vbr_artifact_representation_kind::raw
+                    : vbr_artifact_representation_kind::approximate;
+            auto representation = std::find_if(
+                representation_cache.begin(), representation_cache.end(),
+                [&](const auto & cached) {
+                    return cached.current_type ==
+                            plan.generation.current_type &&
+                        cached.value_side == plan.is_v;
+                });
+            if (representation == representation_cache.end()) {
+                vbr_explicit_representation_identity identity;
+                if (!representation_identity(
+                        representation_context,
+                        plan.generation.current_type,
+                        plan.is_v, identity)) {
+                    status =
+                        vbr_explicit_capture_status::identity_unavailable;
+                    return false;
+                }
+                representation_cache.push_back({
+                    plan.generation.current_type, plan.is_v,
+                    std::move(identity),
+                });
+                representation = std::prev(representation_cache.end());
+            }
+            const auto & identity = representation->identity;
+            if (
+                identity.codec_id == 0 ||
+                identity.codec_version == 0 ||
+                !digest_nonzero(identity.codebook_digest) ||
+                !digest_nonzero(identity.rotation_digest) ||
+                !digest_nonzero(identity.meansub_digest)) {
+                status = vbr_explicit_capture_status::identity_unavailable;
+                return false;
+            }
+            descriptor.representation.codec_id = identity.codec_id;
+            descriptor.representation.codec_version =
+                identity.codec_version;
+            llama_sha256_writer representation_hash;
+            static constexpr char REPRESENTATION_DOMAIN[] =
+                "buun.vbr.capture/representation";
+            representation_hash.string(
+                REPRESENTATION_DOMAIN,
+                sizeof(REPRESENTATION_DOMAIN) - 1);
+            representation_hash.u32(
+                uint32_t(plan.generation.current_type));
+            representation_hash.u32(
+                uint32_t(plan.generation.last_source_type));
+            representation_hash.u32(identity.codec_id);
+            representation_hash.u32(identity.codec_version);
+            representation_hash.bytes(
+                identity.codebook_digest.data(),
+                identity.codebook_digest.size());
+            representation_hash.bytes(
+                identity.rotation_digest.data(),
+                identity.rotation_digest.size());
+            representation_hash.bytes(
+                identity.meansub_digest.data(),
+                identity.meansub_digest.size());
+            descriptor.representation.reference_digest =
+                representation_hash.finish();
+            descriptor.representation.source_loss_history =
+                plan.generation.promote_hops;
+            descriptor.side = plan.is_v
+                ? vbr_artifact_side::value : vbr_artifact_side::key;
+            descriptor.n_stream = plan.n_stream;
+            descriptor.unified = plan.unified;
+            descriptor.wm_cells = plan.wm_cells;
+            descriptor.rank = 2;
+            uint64_t total_columns = 0;
+            uint64_t logical_offset = 0;
+            bool has_stash = false;
+            uint32_t stash_rows = 0;
+            for (const auto & shard : plan.shards) {
+                if (shard.columns == 0 ||
+                    shard.columns > UINT64_MAX - total_columns) {
+                    status = vbr_explicit_capture_status::size_overflow;
+                    return false;
+                }
+                if (shard.stash_bytes != 0 && !allow_clean_stash) {
+                    status = vbr_explicit_capture_status::unsupported_layout;
+                    return false;
+                }
+                total_columns += shard.columns;
+                vbr_artifact_shard_descriptor wire;
+                wire.shard_index = shard.shard_index;
+                wire.topology_index = shard.topology_index;
+                wire.device_ordinal = shard.device_ordinal;
+                wire.logical_offset = logical_offset;
+                wire.row_count = plan.wm_cells;
+                wire.column_count = shard.columns;
+                wire.row_bytes = shard.row_bytes;
+                wire.payload_bytes = shard.payload_bytes;
+                descriptor.shards.push_back(wire);
+                logical_offset += shard.columns;
+                if (shard.stash_bytes != 0) {
+                    if (shard.columns > UINT64_MAX/sizeof(uint16_t) ||
+                        shard.stash_bytes %
+                            (shard.columns*sizeof(uint16_t)) != 0 ||
+                        shard.stash_bytes /
+                            (shard.columns*sizeof(uint16_t)) > UINT32_MAX) {
+                        status =
+                            vbr_explicit_capture_status::stash_inconsistent;
+                        return false;
+                    }
+                    const uint32_t rows = uint32_t(
+                        shard.stash_bytes /
+                            (shard.columns*sizeof(uint16_t)));
+                    if (has_stash && rows != stash_rows) {
+                        status =
+                            vbr_explicit_capture_status::stash_inconsistent;
+                        return false;
+                    }
+                    has_stash = true;
+                    stash_rows = rows;
+                }
+            }
+            descriptor.dimensions = { plan.wm_cells, total_columns, 0, 0 };
+            descriptor.row_alignment = 1;
+            descriptor.row_codec_version = 1;
+            descriptor.codebook_digest = identity.codebook_digest;
+            descriptor.rotation_digest = identity.rotation_digest;
+            descriptor.meansub_digest = identity.meansub_digest;
+            descriptor.clean_stash_state = has_stash
+                ? vbr_artifact_clean_stash_state::present
+                : vbr_artifact_clean_stash_state::absent_at_source;
+            if (has_stash) {
+                if (total_columns > UINT64_MAX/sizeof(uint16_t)) {
+                    status = vbr_explicit_capture_status::size_overflow;
+                    return false;
+                }
+                descriptor.clean_stash.valid_rows = stash_rows;
+                descriptor.clean_stash.domain = vbr_repr_domain::tapped;
+                descriptor.clean_stash.row_count = stash_rows;
+                descriptor.clean_stash.column_count = total_columns;
+                descriptor.clean_stash.row_bytes =
+                    total_columns*sizeof(uint16_t);
+                logical_offset = 0;
+                for (const auto & shard : plan.shards) {
+                    if (shard.stash_bytes == 0) {
+                        status =
+                            vbr_explicit_capture_status::stash_inconsistent;
+                        return false;
+                    }
+                    vbr_artifact_shard_descriptor wire;
+                    wire.shard_index = shard.shard_index;
+                    wire.topology_index = shard.topology_index;
+                    wire.device_ordinal = shard.device_ordinal;
+                    wire.logical_offset = logical_offset;
+                    wire.row_count = stash_rows;
+                    wire.column_count = shard.columns;
+                    wire.row_bytes = shard.columns*sizeof(uint16_t);
+                    wire.payload_bytes = shard.stash_bytes;
+                    descriptor.clean_stash.shards.push_back(wire);
+                    logical_offset += shard.columns;
+                }
+            }
+            current_types.push_back(
+                static_cast<ggml_type>(plan.generation.current_type));
+            descriptors.push_back(std::move(descriptor));
+        }
+        policy.current_type_vector_digest =
+            vbr_type_vector_digest(current_types);
+        status = vbr_explicit_capture_status::ok;
+        return true;
+    }
+
+    struct projected_target_expectation {
+        uint64_t manifest_id = 0;
+        llama_seq_id sequence = -1;
+        llama_pos frontier = -1;
+        const child * source = nullptr;
+        vbr_checkpoint_generation_controller generation;
+        vbr_artifact_stream_placement placement;
+        vbr_capture_controller_target target;
+    };
+
+    struct projected_target_recheck_context {
+        const std::vector<projected_target_expectation> * expectations =
+            nullptr;
+    };
+
+    static bool projected_targets_recheck(
+            void * opaque,
+            uint64_t manifest_id,
+            const vbr_capture_controller_target * targets,
+            size_t target_count) noexcept {
+        try {
+            const auto * context =
+                static_cast<const projected_target_recheck_context *>(opaque);
+            if (!context || !context->expectations || !targets ||
+                target_count == 0) {
+                return false;
+            }
+            if (size_t(std::count_if(
+                    context->expectations->begin(),
+                    context->expectations->end(),
+                    [&](const auto & value) {
+                        return value.manifest_id == manifest_id;
+                    })) != target_count) {
+                return false;
+            }
+            for (size_t i = 0; i < target_count; ++i) {
+                const auto & target = targets[i];
+                for (size_t prior = 0; prior < i; ++prior) {
+                    if (targets[prior].child_id == target.child_id) {
+                        return false;
+                    }
+                }
+                const auto expected = std::find_if(
+                    context->expectations->begin(),
+                    context->expectations->end(),
+                    [&](const auto & value) {
+                        return value.manifest_id == manifest_id &&
+                               value.target.child_id == target.child_id;
+                    });
+                if (expected == context->expectations->end() ||
+                    expected->source == nullptr ||
+                    target.manifest_id != expected->target.manifest_id ||
+                    target.source_namespace !=
+                        expected->target.source_namespace ||
+                    !vbr_capture_controller_representation_equal(
+                        target, expected->target) ||
+                    !stable(*expected->source)) {
+                    return false;
+                }
+                vbr_checkpoint_generation_controller current;
+                vbr_artifact_stream_placement placement;
+                vbr_explicit_generation_failure failure;
+                if (!capture_generation(
+                        *expected->source, expected->sequence,
+                        expected->frontier, current, placement, failure) ||
+                    !(current == expected->generation) ||
+                    placement.child_id != expected->placement.child_id ||
+                    placement.stream_index !=
+                        expected->placement.stream_index ||
+                    placement.source_sequence !=
+                        expected->placement.source_sequence ||
+                    placement.computation_frontier !=
+                        expected->placement.computation_frontier ||
+                    placement.cells.size() !=
+                        expected->placement.cells.size()) {
+                    return false;
+                }
+                for (size_t cell = 0;
+                     cell < placement.cells.size(); ++cell) {
+                    const auto & lhs = placement.cells[cell];
+                    const auto & rhs = expected->placement.cells[cell];
+                    if (lhs.physical_cell != rhs.physical_cell ||
+                        lhs.logical_position != rhs.logical_position ||
+                        lhs.ext_x != rhs.ext_x || lhs.ext_y != rhs.ext_y) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     static bool stable(const child & value) {
         return value.cache != nullptr &&
                value.cache->vbr_capture_stability_matches(value.stability);
@@ -865,6 +1454,721 @@ bool vbr_explicit_capture_runtime_pools(
         pools.clear();
         attention_children = 0;
         return false;
+    }
+}
+
+vbr_projected_capture_batch_result vbr_capture_projected_batch(
+        llama_memory_i & memory,
+        const vbr_projected_capture_batch_request & request) noexcept {
+    vbr_projected_capture_batch_result result;
+    if (!request.idle_decode_thread || request.manifests.empty() ||
+        request.manifests.size() > VBR_PROJECTED_CAPTURE_MAX_MANIFESTS ||
+        request.ring == nullptr || request.topologies.empty() ||
+        request.pool_bindings.empty() ||
+        request.max_packed_bytes == 0 ||
+        request.representation_identity == nullptr) {
+        result.status = request.idle_decode_thread
+            ? vbr_explicit_capture_status::identity_unavailable
+            : vbr_explicit_capture_status::slot_not_idle;
+        return result;
+    }
+
+    try {
+        result.phase = vbr_explicit_capture_phase::memory_tree;
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            result.status = vbr_explicit_capture_status::unsupported_layout;
+            return result;
+        }
+        std::vector<vbr_live_capture_adapter::child> children;
+        std::vector<llama_memory_recurrent *> recurrent_children;
+        for (const auto & node : tree) {
+            if (node.recurrent != nullptr) {
+                recurrent_children.push_back(node.recurrent);
+                continue;
+            }
+            if (node.attention == nullptr ||
+                !node.attention->vbr_operation_armed() ||
+                node.dependency_mode !=
+                    checkpoint_child_dependency_mode::live_guarded) {
+                result.status = vbr_explicit_capture_status::unsupported_layout;
+                return result;
+            }
+            vbr_live_capture_adapter::child child;
+            child.child_id = node.child_id;
+            child.dependency_mode = node.dependency_mode;
+            child.cache = node.attention;
+            children.push_back(std::move(child));
+        }
+        if (children.empty()) {
+            result.status = vbr_explicit_capture_status::not_armed;
+            return result;
+        }
+
+        result.phase = vbr_explicit_capture_phase::settlement;
+        std::vector<vbr_controller_instance_id> instances;
+        instances.reserve(children.size());
+        for (auto & child : children) {
+            if (!vbr_live_capture_adapter::settle(*child.cache)) {
+                result.status =
+                    vbr_explicit_capture_status::generation_unavailable;
+                return result;
+            }
+            const auto instance =
+                vbr_live_capture_adapter::instance(child);
+            if (!vbr_controller_instance_id_is_set(instance) ||
+                std::find(instances.begin(), instances.end(), instance) !=
+                    instances.end() ||
+                vbr_recovery_pending_for(instance)) {
+                result.status =
+                    vbr_explicit_capture_status::generation_unavailable;
+                return result;
+            }
+            instances.push_back(instance);
+        }
+        if (!vbr_operation_registry_quiescent_for(
+                instances.data(), instances.size())) {
+            result.status = vbr_explicit_capture_status::registry_busy;
+            return result;
+        }
+
+        result.phase = vbr_explicit_capture_phase::metadata_and_manifest;
+        struct child_schema {
+            vbr_artifact_controller_policy policy;
+            std::vector<vbr_artifact_unit_descriptor> descriptors;
+        };
+        std::vector<child_schema> schemas(children.size());
+        std::vector<vbr_live_capture_adapter::representation_cache_entry>
+            representation_cache;
+        for (size_t i = 0; i < children.size(); ++i) {
+            ++result.size_pass_calls;
+            if (!vbr_live_capture_adapter::capture_size(
+                    children[i], request.pool_bindings,
+                    result.generation_failure, result.size_failure)) {
+                result.status =
+                    vbr_explicit_capture_status::generation_unavailable;
+                return result;
+            }
+            if (children[i].dependency_mode !=
+                    checkpoint_child_dependency_mode::live_guarded ||
+                children[i].units.empty() ||
+                children[i].units.front().n_stream != 1 ||
+                !children[i].units.front().unified) {
+                result.status =
+                    vbr_explicit_capture_status::unsupported_layout;
+                return result;
+            }
+            if (!vbr_live_capture_adapter::capture_schema(
+                    children[i], request.representation_context,
+                    request.representation_identity,
+                    false,
+                    representation_cache,
+                    schemas[i].policy, schemas[i].descriptors,
+                    result.status)) {
+                if (result.status ==
+                        vbr_explicit_capture_status::internal_error) {
+                    result.status =
+                        vbr_explicit_capture_status::generation_unavailable;
+                }
+                return result;
+            }
+        }
+
+        llama_sha256_writer namespace_hash;
+        static constexpr char NAMESPACE_DOMAIN[] =
+            "buun.vbr.projected-capture/tree-namespace/v1";
+        namespace_hash.string(
+            NAMESPACE_DOMAIN, sizeof(NAMESPACE_DOMAIN) - 1);
+        namespace_hash.u64(
+            uint64_t(reinterpret_cast<uintptr_t>(&memory)));
+        static std::atomic<uint64_t> next_capture_namespace { 1 };
+        namespace_hash.u64(next_capture_namespace.fetch_add(
+            1, std::memory_order_relaxed));
+        for (size_t i = 0; i < children.size(); ++i) {
+            namespace_hash.u32(children[i].child_id);
+            namespace_hash.u64(instances[i].hi);
+            namespace_hash.u64(instances[i].lo);
+        }
+        result.source_namespace = digest_head_u64(namespace_hash);
+        if (result.source_namespace == 0) {
+            result.status =
+                vbr_explicit_capture_status::generation_unavailable;
+            return result;
+        }
+
+        std::vector<vbr_capture_projection_manifest> projection_manifests;
+        std::vector<vbr_capture_controller_target> targets;
+        std::vector<vbr_live_capture_adapter::projected_target_expectation>
+            expectations;
+        projection_manifests.reserve(request.manifests.size());
+        targets.reserve(request.manifests.size()*children.size());
+        expectations.reserve(request.manifests.size()*children.size());
+        std::vector<uint64_t> manifest_ids;
+        std::vector<std::vector<recurrent_companion_plan>> recurrent_plans;
+        std::vector<bool> manifest_dependency_available;
+        manifest_ids.reserve(request.manifests.size());
+        recurrent_plans.reserve(request.manifests.size());
+        manifest_dependency_available.reserve(request.manifests.size());
+        for (const auto & manifest_request : request.manifests) {
+            const auto & identity = manifest_request.identity;
+            if (manifest_request.manifest_id == 0 ||
+                manifest_request.sequence < 0 ||
+                identity.execution_identity.empty() ||
+                identity.adapter_config_identity.empty() ||
+                identity.media_content_identity.empty() ||
+                identity.sequence_epoch == 0 || identity.token_count <= 0 ||
+                identity.next_position <= 0 ||
+                manifest_request.token_block.size() !=
+                    size_t(identity.token_count) ||
+                std::find(
+                    manifest_ids.begin(), manifest_ids.end(),
+                    manifest_request.manifest_id) != manifest_ids.end()) {
+                result.status =
+                    vbr_explicit_capture_status::identity_unavailable;
+                return result;
+            }
+            manifest_ids.push_back(manifest_request.manifest_id);
+            vbr_capture_projection_manifest projected;
+            projected.manifest_id = manifest_request.manifest_id;
+            projected.identity = identity;
+            projected.token_block.tokens = manifest_request.token_block;
+            projected.generation.version = 1;
+            projected.generation.status =
+                vbr_checkpoint_generation_status::complete;
+            bool dependencies_available = true;
+            std::vector<recurrent_companion_plan> manifest_recurrent_plans;
+            manifest_recurrent_plans.reserve(recurrent_children.size());
+            for (auto * recurrent : recurrent_children) {
+                recurrent_companion_plan companion;
+                vbr_explicit_capture_status companion_status;
+                if (!recurrent_companion_prepare(
+                        recurrent, manifest_request.sequence,
+                        identity.next_position,
+                        companion, companion_status)) {
+                    dependencies_available = false;
+                    projected.companions.clear();
+                    manifest_recurrent_plans.clear();
+                    break;
+                }
+                projected.companions.push_back(companion.descriptor);
+                manifest_recurrent_plans.push_back(std::move(companion));
+            }
+            std::vector<vbr_identity_policy_digest_row> identity_policy;
+            identity_policy.reserve(children.size());
+            for (size_t child_index = 0;
+                 child_index < children.size(); ++child_index) {
+                auto & child = children[child_index];
+                vbr_checkpoint_generation_controller generation;
+                vbr_artifact_stream_placement placement;
+                if (!vbr_live_capture_adapter::capture_generation(
+                        child, manifest_request.sequence,
+                        identity.next_position, generation, placement,
+                        result.generation_failure)) {
+                    result.status =
+                        vbr_explicit_capture_status::generation_unavailable;
+                    return result;
+                }
+                const llama_pos terminal_position =
+                    identity.next_position - 1;
+                const auto terminal_cell = std::max_element(
+                    placement.cells.begin(), placement.cells.end(),
+                    [](const auto & lhs, const auto & rhs) {
+                        return lhs.logical_position < rhs.logical_position;
+                    });
+                if (terminal_cell == placement.cells.end() ||
+                    terminal_cell->logical_position != terminal_position) {
+                    dependencies_available = false;
+                }
+                projected.generation.controllers.push_back(generation);
+                projected.placements.push_back(placement);
+                identity_policy.push_back({
+                    child.child_id, child.dependency_mode,
+                    child.stability.lineage_uuid,
+                });
+
+                if (!dependencies_available) {
+                    continue;
+                }
+                vbr_capture_controller_target target;
+                target.manifest_id = manifest_request.manifest_id;
+                target.source_namespace = result.source_namespace;
+                target.child_id = child.child_id;
+                target.lineage_uuid = child.stability.lineage_uuid;
+                target.controller_generation =
+                    child.stability.controller_generation;
+                target.policy = schemas[child_index].policy;
+                target.unit_descriptors = schemas[child_index].descriptors;
+                target.units.reserve(child.units.size());
+                for (const auto & unit : child.units) {
+                    target.units.push_back(unit.generation);
+                }
+                vbr_live_capture_adapter::projected_target_expectation
+                    expectation;
+                expectation.manifest_id = manifest_request.manifest_id;
+                expectation.sequence = manifest_request.sequence;
+                expectation.frontier = identity.next_position;
+                expectation.source = &child;
+                expectation.generation = std::move(generation);
+                expectation.placement = std::move(placement);
+                expectation.target = target;
+                expectations.push_back(std::move(expectation));
+                targets.push_back(std::move(target));
+            }
+            vbr_checkpoint_frontier_fields frontier;
+            frontier.execution_identity = identity.execution_identity.data();
+            frontier.execution_identity_len =
+                identity.execution_identity.size();
+            frontier.adapter_config_identity =
+                identity.adapter_config_identity.data();
+            frontier.adapter_config_identity_len =
+                identity.adapter_config_identity.size();
+            frontier.media_content_identity =
+                identity.media_content_identity.data();
+            frontier.media_content_identity_len =
+                identity.media_content_identity.size();
+            frontier.sequence_epoch = identity.sequence_epoch;
+            frontier.token_count = identity.token_count;
+            frontier.next_position = identity.next_position;
+            const auto identity_digest =
+                vbr_identity_policy_digest(frontier, identity_policy);
+            if (digest_nonzero(
+                    manifest_request.identity_policy_order_digest) &&
+                identity_digest !=
+                    manifest_request.identity_policy_order_digest) {
+                result.status =
+                    vbr_explicit_capture_status::identity_unavailable;
+                return result;
+            }
+            projected.identity_policy_order_digest = identity_digest;
+            projected.generation.identity_policy_order_digest =
+                identity_digest;
+            recurrent_plans.push_back(
+                std::move(manifest_recurrent_plans));
+            manifest_dependency_available.push_back(
+                dependencies_available);
+            projection_manifests.push_back(std::move(projected));
+        }
+
+        const auto manifest_available = [&](uint64_t manifest_id) {
+            const auto manifest = std::find(
+                manifest_ids.begin(), manifest_ids.end(), manifest_id);
+            return manifest != manifest_ids.end() &&
+                manifest_dependency_available[size_t(
+                    manifest - manifest_ids.begin())];
+        };
+        const auto apply_dependency_availability =
+                [&](std::vector<vbr_capture_projection_manifest> & manifests) {
+            for (auto & projected : manifests) {
+                const auto manifest = std::find(
+                    manifest_ids.begin(), manifest_ids.end(),
+                    projected.manifest_id);
+                if (manifest == manifest_ids.end()) {
+                    continue;
+                }
+                const size_t manifest_index = size_t(
+                    manifest - manifest_ids.begin());
+                if (manifest_dependency_available[manifest_index]) {
+                    continue;
+                }
+                projected.dependencies_available = false;
+                projected.placements.clear();
+                projected.companions.clear();
+                recurrent_plans[manifest_index].clear();
+            }
+            targets.erase(
+                std::remove_if(
+                    targets.begin(), targets.end(),
+                    [&](const auto & target) {
+                        return !manifest_available(target.manifest_id);
+                    }),
+                targets.end());
+            expectations.erase(
+                std::remove_if(
+                    expectations.begin(), expectations.end(),
+                    [&](const auto & expectation) {
+                        return !manifest_available(expectation.manifest_id);
+                    }),
+                expectations.end());
+        };
+        apply_dependency_availability(projection_manifests);
+
+        vbr_capture_projection projection;
+        vbr_capture_projection_limits projection_limits;
+        projection_limits.max_manifests =
+            VBR_PROJECTED_CAPTURE_MAX_MANIFESTS;
+        ++result.projection_calls;
+        if (!vbr_artifact_project_capture_union(
+                { result.source_namespace,
+                  std::move(projection_manifests) },
+                projection_limits, projection)) {
+            result.status = vbr_explicit_capture_status::generation_unavailable;
+            return result;
+        }
+        result.union_cells = projection->union_cell_count;
+
+        const auto preflight_projection_bytes = [&]() {
+            result.planned_packed_bytes = 0;
+            const auto add_planned_bytes = [&](uint64_t bytes) {
+                if (bytes > UINT64_MAX - result.planned_packed_bytes) {
+                    result.status =
+                        vbr_explicit_capture_status::size_overflow;
+                    return false;
+                }
+                result.planned_packed_bytes += bytes;
+                if (result.planned_packed_bytes > request.max_packed_bytes) {
+                    result.status =
+                        vbr_explicit_capture_status::accounting_failed;
+                    return false;
+                }
+                return true;
+            };
+            for (const auto & child : children) {
+                const auto stream = std::find_if(
+                    projection->streams.begin(), projection->streams.end(),
+                    [&](const auto & value) {
+                        return value.child_id == child.child_id &&
+                            value.stream_index == 0;
+                    });
+                if (stream == projection->streams.end()) {
+                    continue;
+                }
+                uint64_t projected_rows = 0;
+                for (const auto & segment : stream->segments) {
+                    if (segment.cell_count > UINT64_MAX - projected_rows) {
+                        result.status =
+                            vbr_explicit_capture_status::size_overflow;
+                        return false;
+                    }
+                    projected_rows += segment.cell_count;
+                }
+                for (const auto & unit : child.units) {
+                    for (const auto & shard : unit.shards) {
+                        if (shard.row_bytes != 0 &&
+                            projected_rows > UINT64_MAX/shard.row_bytes) {
+                            result.status =
+                                vbr_explicit_capture_status::size_overflow;
+                            return false;
+                        }
+                        if (!add_planned_bytes(
+                                projected_rows*shard.row_bytes)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            for (size_t manifest_index = 0;
+                 manifest_index < recurrent_plans.size(); ++manifest_index) {
+                if (!manifest_dependency_available[manifest_index]) {
+                    continue;
+                }
+                for (const auto & companion :
+                     recurrent_plans[manifest_index]) {
+                    if (!add_planned_bytes(
+                            companion.descriptor.payload_bytes)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        if (!preflight_projection_bytes()) {
+            return result;
+        }
+
+        // Payload runway is proven before the first companion D2H byte. A
+        // locally stale/failed companion removes only its manifest; rebuild
+        // the physical union and re-cap it before attention transfer.
+        result.phase = vbr_explicit_capture_phase::companion_capture;
+        std::vector<std::vector<vbr_capture_sealed_companion>>
+            sealed_companions(request.manifests.size());
+        bool rebuild_projection = false;
+        for (size_t manifest_index = 0;
+             manifest_index < request.manifests.size(); ++manifest_index) {
+            auto & sealed = sealed_companions[manifest_index];
+            if (!manifest_dependency_available[manifest_index]) {
+                continue;
+            }
+            sealed.reserve(recurrent_plans[manifest_index].size());
+            for (size_t companion_index = 0;
+                 companion_index < recurrent_plans[manifest_index].size();
+                 ++companion_index) {
+                std::unique_ptr<artifact_segment_chain> chain;
+                std::array<uint8_t, 32> companion_digest;
+                vbr_explicit_capture_status companion_status;
+                vbr_capture_sealed_companion capability;
+                if (!recurrent_companion_capture(
+                        recurrent_plans[manifest_index][companion_index],
+                        request.manifests[manifest_index].sequence,
+                        chain, companion_digest, companion_status) ||
+                    !vbr_capture_seal_companion(
+                        uint32_t(companion_index), std::move(chain),
+                        capability) ||
+                    capability.streaming_digest() != companion_digest ||
+                    !recurrent_companion_current(
+                        recurrent_plans[manifest_index][companion_index],
+                        request.manifests[manifest_index].sequence)) {
+                    manifest_dependency_available[manifest_index] = false;
+                    sealed.clear();
+                    rebuild_projection = true;
+                    break;
+                }
+                sealed.push_back(std::move(capability));
+            }
+        }
+        if (rebuild_projection) {
+            auto revised_manifests = projection->manifests;
+            apply_dependency_availability(revised_manifests);
+            projection = {};
+            ++result.projection_calls;
+            if (!vbr_artifact_project_capture_union(
+                    { result.source_namespace,
+                      std::move(revised_manifests) },
+                    projection_limits, projection)) {
+                result.status =
+                    vbr_explicit_capture_status::generation_unavailable;
+                return result;
+            }
+            result.union_cells = projection->union_cell_count;
+            if (!preflight_projection_bytes()) {
+                return result;
+            }
+        }
+
+        result.phase = vbr_explicit_capture_phase::pre_transfer_stability;
+        for (const auto & child : children) {
+            if (!vbr_live_capture_adapter::stable(child)) {
+                result.status = vbr_explicit_capture_status::source_changed;
+                return result;
+            }
+        }
+        if (!vbr_operation_registry_quiescent_for(
+                instances.data(), instances.size())) {
+            result.status = vbr_explicit_capture_status::registry_busy;
+            return result;
+        }
+
+        result.phase = vbr_explicit_capture_phase::unit_transfer;
+        std::vector<vbr_capture_projected_unit> projected_units;
+        for (const auto & child : children) {
+            const bool projected_child = std::any_of(
+                projection->streams.begin(), projection->streams.end(),
+                [&](const auto & stream) {
+                    return stream.child_id == child.child_id &&
+                        stream.stream_index == 0;
+                });
+            if (!projected_child) {
+                continue;
+            }
+            for (const auto & plan : child.units) {
+                vbr_capture_projected_unit captured;
+                ++result.unit_transfer_calls;
+                const auto transferred =
+                    vbr_live_capture_adapter::transfer_projected_unit(
+                        child, plan, projection, result.source_namespace,
+                        *request.ring, captured);
+                if (transferred != vbr_capture_stream_status::ok) {
+                    if (result.inner_stream_status ==
+                            vbr_capture_stream_status::_count) {
+                        result.inner_stream_status = transferred;
+                    }
+                    if (transferred ==
+                            vbr_capture_stream_status::snapshot_unavailable ||
+                        transferred ==
+                            vbr_capture_stream_status::snapshot_changed ||
+                        transferred ==
+                            vbr_capture_stream_status::transfer_failed ||
+                        transferred == vbr_capture_stream_status::short_read ||
+                        transferred ==
+                            vbr_capture_stream_status::hash_mismatch) {
+                        continue;
+                    }
+                    result.status = stream_status(transferred);
+                    return result;
+                }
+                const auto & stats = captured.transfer();
+                if (stats.bytes > UINT64_MAX - result.transfer.bytes ||
+                    stats.chunks > UINT64_MAX - result.transfer.chunks ||
+                    stats.backpressure_waits >
+                        UINT64_MAX - result.transfer.backpressure_waits ||
+                    stats.event_completions >
+                        UINT64_MAX - result.transfer.event_completions ||
+                    stats.synchronous_fallbacks >
+                        UINT64_MAX - result.transfer.synchronous_fallbacks) {
+                    result.status = vbr_explicit_capture_status::size_overflow;
+                    return result;
+                }
+                result.transfer.bytes += stats.bytes;
+                result.transfer.chunks += stats.chunks;
+                result.transfer.backpressure_waits +=
+                    stats.backpressure_waits;
+                result.transfer.event_completions +=
+                    stats.event_completions;
+                result.transfer.synchronous_fallbacks +=
+                    stats.synchronous_fallbacks;
+                result.transfer.max_segment_size = std::max(
+                    result.transfer.max_segment_size,
+                    stats.max_segment_size);
+                ++result.transferred_units;
+                projected_units.push_back(std::move(captured));
+            }
+        }
+
+        // Successful preflight companions remain immutable while attention
+        // bytes transfer. A changed recurrent frontier is a violated idle
+        // snapshot, so fail the whole batch instead of publishing stale rows.
+        for (size_t manifest_index = 0;
+             manifest_index < request.manifests.size(); ++manifest_index) {
+            if (!manifest_dependency_available[manifest_index]) {
+                continue;
+            }
+            for (const auto & companion : recurrent_plans[manifest_index]) {
+                if (!recurrent_companion_current(
+                        companion,
+                        request.manifests[manifest_index].sequence)) {
+                    result.status =
+                        vbr_explicit_capture_status::source_changed;
+                    return result;
+                }
+            }
+        }
+
+        result.phase = vbr_explicit_capture_phase::post_transfer_stability;
+        for (const auto instance : instances) {
+            if (vbr_recovery_pending_for(instance)) {
+                result.status =
+                    vbr_explicit_capture_status::recovery_pending;
+                return result;
+            }
+        }
+        if (!vbr_operation_registry_quiescent_for(
+                instances.data(), instances.size())) {
+            result.status = vbr_explicit_capture_status::registry_busy;
+            return result;
+        }
+        vbr_live_capture_adapter::projected_target_recheck_context
+            recheck_context { &expectations };
+        vbr_capture_controller_target_provider provider;
+        provider.context = &recheck_context;
+        provider.recheck =
+            vbr_live_capture_adapter::projected_targets_recheck;
+        vbr_capture_manifest_assembly_limits assembly_limits;
+        assembly_limits.max_manifests =
+            VBR_PROJECTED_CAPTURE_MAX_MANIFESTS;
+        if (!vbr_capture_assemble_manifests(
+                projection, std::move(targets),
+                std::move(projected_units), provider,
+                assembly_limits, result.assembly)) {
+            result.status = vbr_explicit_capture_status::internal_error;
+            return result;
+        }
+
+        result.publications.reserve(result.assembly.manifests().size());
+        const auto host_domain = vbr_artifact_portable_domain {
+            llama_cache_acct_residency::pageable_host,
+            llama_cache_acct_domain_kind::not_applicable,
+            UINT32_MAX, UINT16_MAX,
+        };
+        for (const auto & manifest : result.assembly.manifests()) {
+            vbr_projected_manifest_publication publication;
+            publication.manifest_id = manifest.manifest_id;
+            publication.topologies = request.topologies;
+            const auto requested = std::find(
+                manifest_ids.begin(), manifest_ids.end(),
+                manifest.manifest_id);
+            if (requested == manifest_ids.end()) {
+                result.status = vbr_explicit_capture_status::internal_error;
+                result.assembly = {};
+                result.publications.clear();
+                return result;
+            }
+            const size_t manifest_index = size_t(
+                requested - manifest_ids.begin());
+            if (manifest.state == vbr_capture_manifest_state::ready) {
+                std::map<uint32_t,
+                    const vbr_capture_controller_target *> target_by_child;
+                for (uint32_t i = 0; i < manifest.controller_count; ++i) {
+                    const uint32_t target_index =
+                        result.assembly.controller_references()[
+                            manifest.first_controller + i];
+                    const auto & target =
+                        result.assembly.controller_targets()[target_index];
+                    target_by_child.emplace(target.child_id, &target);
+                }
+                for (uint32_t i = 0; i < manifest.unit_count; ++i) {
+                    const uint32_t unit_index =
+                        result.assembly.unit_references()[
+                            manifest.first_unit + i];
+                    const auto & captured =
+                        result.assembly.projected_units()[unit_index];
+                    const auto target = target_by_child.find(
+                        captured.child_id());
+                    if (target == target_by_child.end() ||
+                        captured.logical_unit_id() >=
+                            target->second->unit_descriptors.size()) {
+                        result.status =
+                            vbr_explicit_capture_status::internal_error;
+                        result.assembly = {};
+                        result.publications.clear();
+                        return result;
+                    }
+                    const auto & descriptor =
+                        target->second->unit_descriptors[
+                            captured.logical_unit_id()];
+                    if (descriptor.shards.size() !=
+                            captured.shards().size()) {
+                        result.status =
+                            vbr_explicit_capture_status::internal_error;
+                        result.assembly = {};
+                        result.publications.clear();
+                        return result;
+                    }
+                    for (size_t shard = 0;
+                         shard < captured.shards().size(); ++shard) {
+                        add_accounting(
+                            publication.accounting,
+                            vbr_artifact_accounting_role::unit_payload,
+                            portable_domain(
+                                descriptor.shards[shard].topology_index,
+                                descriptor.shards[shard].device_ordinal),
+                            captured.shards()[shard].bytes->size());
+                    }
+                }
+                add_accounting(
+                    publication.accounting,
+                    vbr_artifact_accounting_role::descriptor_metadata,
+                    host_domain,
+                    std::max<uint64_t>(
+                        1, uint64_t(manifest.unit_count)*256));
+                add_accounting(
+                    publication.accounting,
+                    vbr_artifact_accounting_role::reference_metadata,
+                    host_domain,
+                    std::max<uint64_t>(
+                        1, uint64_t(manifest.unit_count)*128));
+                for (size_t companion_index = 0;
+                     companion_index <
+                        recurrent_plans[manifest_index].size();
+                     ++companion_index) {
+                    add_accounting(
+                        publication.accounting,
+                        vbr_artifact_accounting_role::recurrent_payload,
+                        host_domain,
+                        recurrent_plans[manifest_index][companion_index].
+                            descriptor.payload_bytes);
+                }
+                publication.companions = std::move(
+                    sealed_companions[manifest_index]);
+            }
+            result.publications.push_back(std::move(publication));
+        }
+        result.status = vbr_explicit_capture_status::ok;
+        result.phase = vbr_explicit_capture_phase::complete;
+        return result;
+    } catch (...) {
+        result.status = vbr_explicit_capture_status::internal_error;
+        result.assembly = {};
+        result.publications.clear();
+        return result;
     }
 }
 
@@ -1247,6 +2551,8 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             identity_policy_order_digest;
 
         uint32_t global_unit = 0;
+        std::vector<vbr_live_capture_adapter::representation_cache_entry>
+            representation_cache;
         for (auto & child : children) {
             package.manifest.generation.controllers.push_back(
                 child.generation);
@@ -1254,137 +2560,29 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 package.manifest.stream_placements.end(),
                 child.placements.begin(), child.placements.end());
             vbr_artifact_controller_policy policy;
-            policy.child_id = child.child_id;
-            policy.dependency_mode = child.dependency_mode;
-            policy.degrade_order_digest =
-                child.stability.degrade_order_digest;
-            policy.policy_digest = child.stability.policy_digest;
-            policy.cursor = child.stability.degrade_cursor;
-            policy.floor_type = child.stability.floor_type;
-            policy.pressure_independent_settings =
-                child.stability.pressure_independent_settings;
-            policy.n_stream = child.units.front().n_stream;
-            policy.unified = child.units.front().unified;
-            policy.wm_cells = child.units.front().wm_cells;
-            std::vector<ggml_type> current_types;
-            current_types.reserve(child.units.size());
-            for (const auto & unit : child.units) {
-                current_types.push_back(
-                    static_cast<ggml_type>(unit.generation.current_type));
+            std::vector<vbr_artifact_unit_descriptor> descriptors;
+            if (!vbr_live_capture_adapter::capture_schema(
+                    child, request.representation_context,
+                    request.representation_identity, true,
+                    representation_cache,
+                    policy, descriptors, result.status)) {
+                return result;
             }
-            policy.current_type_vector_digest =
-                vbr_type_vector_digest(current_types);
-            policy.completed_wave = child.stability.completed_wave;
-            package.manifest.controller_policy.push_back(policy);
+            package.manifest.controller_policy.push_back(std::move(policy));
 
-            for (auto & plan : child.units) {
+            for (size_t plan_index = 0;
+                 plan_index < child.units.size(); ++plan_index) {
+                auto & plan = child.units[plan_index];
                 plan.capture_index = global_unit;
                 vbr_artifact_unit_blob blob;
-                auto & descriptor = blob.descriptor;
-                descriptor.child_id = child.child_id;
-                descriptor.logical_unit_id = plan.logical_unit;
-                descriptor.lineage_uuid = child.stability.lineage_uuid;
-                descriptor.repr_gen = plan.generation.repr_gen;
-                descriptor.current_type = plan.generation.current_type;
-                descriptor.last_source_type =
-                    plan.generation.last_source_type;
-                descriptor.promote_hops = plan.generation.promote_hops;
-                descriptor.last_transition =
-                    plan.generation.last_transition;
-                descriptor.representation.kind =
-                    plan.generation.current_type == GGML_TYPE_F16
-                        ? vbr_artifact_representation_kind::raw
-                        : vbr_artifact_representation_kind::approximate;
-                vbr_explicit_representation_identity representation;
-                if (!request.representation_identity(
-                        request.representation_context,
-                        plan.generation.current_type,
-                        plan.is_v, representation) ||
-                    representation.codec_id == 0 ||
-                    representation.codec_version == 0 ||
-                    !digest_nonzero(representation.codebook_digest) ||
-                    !digest_nonzero(representation.rotation_digest) ||
-                    !digest_nonzero(representation.meansub_digest)) {
-                    result.status =
-                        vbr_explicit_capture_status::
-                            identity_unavailable;
-                    return result;
-                }
-                descriptor.representation.codec_id =
-                    representation.codec_id;
-                descriptor.representation.codec_version =
-                    representation.codec_version;
-                llama_sha256_writer representation_hash;
-                static constexpr char REPRESENTATION_DOMAIN[] =
-                    "buun.vbr.capture/representation";
-                representation_hash.string(
-                    REPRESENTATION_DOMAIN,
-                    sizeof(REPRESENTATION_DOMAIN) - 1);
-                representation_hash.u32(
-                    uint32_t(plan.generation.current_type));
-                representation_hash.u32(
-                    uint32_t(plan.generation.last_source_type));
-                representation_hash.u32(representation.codec_id);
-                representation_hash.u32(
-                    representation.codec_version);
-                representation_hash.bytes(
-                    representation.codebook_digest.data(),
-                    representation.codebook_digest.size());
-                representation_hash.bytes(
-                    representation.rotation_digest.data(),
-                    representation.rotation_digest.size());
-                representation_hash.bytes(
-                    representation.meansub_digest.data(),
-                    representation.meansub_digest.size());
-                descriptor.representation.reference_digest =
-                    representation_hash.finish();
-                descriptor.representation.source_loss_history =
-                    plan.generation.promote_hops;
-                descriptor.side = plan.is_v
-                    ? vbr_artifact_side::value
-                    : vbr_artifact_side::key;
-                descriptor.n_stream = plan.n_stream;
-                descriptor.unified = plan.unified;
-                descriptor.wm_cells = plan.wm_cells;
-                descriptor.rank = 2;
-                uint64_t total_columns = 0;
+                blob.descriptor = std::move(descriptors[plan_index]);
+                const bool has_stash = blob.descriptor.clean_stash_state ==
+                    vbr_artifact_clean_stash_state::present;
+                const uint32_t stash_rows = uint32_t(
+                    blob.descriptor.clean_stash.valid_rows);
+                const uint64_t total_columns =
+                    blob.descriptor.dimensions[1];
                 for (const auto & shard : plan.shards) {
-                    if (shard.columns >
-                        std::numeric_limits<uint64_t>::max() -
-                            total_columns) {
-                        result.status =
-                            vbr_explicit_capture_status::size_overflow;
-                        return result;
-                    }
-                    total_columns += shard.columns;
-                }
-                descriptor.dimensions =
-                    std::array<uint64_t, 4> {
-                        plan.wm_cells, total_columns, 0, 0,
-                    };
-                descriptor.row_alignment = 1;
-                descriptor.row_codec_version = 1;
-                descriptor.codebook_digest =
-                    representation.codebook_digest;
-                descriptor.rotation_digest =
-                    representation.rotation_digest;
-                descriptor.meansub_digest =
-                    representation.meansub_digest;
-                bool has_stash = false;
-                uint32_t stash_rows = 0;
-                uint64_t logical_offset = 0;
-                for (const auto & shard : plan.shards) {
-                    vbr_artifact_shard_descriptor wire;
-                    wire.shard_index = shard.shard_index;
-                    wire.topology_index = shard.topology_index;
-                    wire.device_ordinal = shard.device_ordinal;
-                    wire.logical_offset = logical_offset;
-                    wire.row_count = plan.wm_cells;
-                    wire.column_count = shard.columns;
-                    wire.row_bytes = shard.row_bytes;
-                    wire.payload_bytes = shard.payload_bytes;
-                    descriptor.shards.push_back(wire);
-                    logical_offset += shard.columns;
                     add_accounting(
                         package.manifest.accounting,
                         vbr_artifact_accounting_role::unit_payload,
@@ -1392,50 +2590,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                             shard.topology_index,
                             shard.device_ordinal),
                         shard.payload_bytes);
-                    if (shard.stash_bytes != 0) {
-                        has_stash = true;
-                        stash_rows =
-                            uint32_t(shard.stash_bytes /
-                                     (shard.columns*sizeof(uint16_t)));
-                    }
-                }
-                descriptor.clean_stash_state = has_stash
-                    ? vbr_artifact_clean_stash_state::present
-                    : vbr_artifact_clean_stash_state::absent_at_source;
-                if (has_stash) {
-                    if (total_columns >
-                        std::numeric_limits<uint64_t>::max() /
-                            sizeof(uint16_t)) {
-                        result.status =
-                            vbr_explicit_capture_status::size_overflow;
-                        return result;
-                    }
-                    descriptor.clean_stash.valid_rows = stash_rows;
-                    descriptor.clean_stash.domain =
-                        vbr_repr_domain::tapped;
-                    descriptor.clean_stash.row_count = stash_rows;
-                    descriptor.clean_stash.column_count =
-                        total_columns;
-                    descriptor.clean_stash.row_bytes =
-                        total_columns*sizeof(uint16_t);
-                    logical_offset = 0;
-                    for (const auto & shard : plan.shards) {
-                        if (shard.stash_bytes == 0) {
-                            result.status =
-                                vbr_explicit_capture_status::stash_inconsistent;
-                            return result;
-                        }
-                        vbr_artifact_shard_descriptor wire;
-                        wire.shard_index = shard.shard_index;
-                        wire.topology_index = shard.topology_index;
-                        wire.device_ordinal = shard.device_ordinal;
-                        wire.logical_offset = logical_offset;
-                        wire.row_count = stash_rows;
-                        wire.column_count = shard.columns;
-                        wire.row_bytes = shard.columns*sizeof(uint16_t);
-                        wire.payload_bytes = shard.stash_bytes;
-                        descriptor.clean_stash.shards.push_back(wire);
-                        logical_offset += shard.columns;
+                    if (has_stash) {
                         add_accounting(
                             package.manifest.accounting,
                             vbr_artifact_accounting_role::
@@ -1482,36 +2637,24 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         }
 
         struct pending_companion {
-            llama_memory_recurrent * recurrent = nullptr;
+            recurrent_companion_plan recurrent;
             const vbr_explicit_companion_provider * provider = nullptr;
             uint64_t bytes = 0;
         };
         std::vector<pending_companion> pending_companions;
         for (auto * memory_recurrent : recurrent) {
-            counting_io_writer writer;
-            memory_recurrent->state_write(
-                writer, request.sequence, 0);
-            if (writer.n_bytes() == 0) {
-                result.status =
-                    vbr_explicit_capture_status::
-                        required_companion_unavailable;
+            recurrent_companion_plan recurrent_plan;
+            if (!recurrent_companion_prepare(
+                    memory_recurrent, request.sequence,
+                    request.frontier.next_position,
+                    recurrent_plan, result.status)) {
                 return result;
             }
             pending_companions.push_back({
-                memory_recurrent, nullptr, writer.n_bytes(),
+                recurrent_plan, nullptr,
+                recurrent_plan.descriptor.payload_bytes,
             });
-            vbr_artifact_companion_payload companion;
-            companion.kind = vbr_artifact_companion_kind::recurrent;
-            companion.format_version = 1;
-            companion.build_identity_digest = tagged_digest(
-                VBR_RECURRENT_CODEC_DOMAIN, 1);
-            companion.domain = {
-                llama_cache_acct_residency::pageable_host,
-                llama_cache_acct_domain_kind::not_applicable,
-                UINT32_MAX, UINT16_MAX,
-            };
-            companion.payload_bytes = writer.n_bytes();
-            package.companions.push_back(companion);
+            package.companions.push_back(recurrent_plan.descriptor);
         }
         for (const auto & provider : request.companions) {
             if (provider.size == nullptr ||
@@ -1542,7 +2685,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 continue;
             }
             pending_companions.push_back({
-                nullptr, &provider, companion_size,
+                {}, &provider, companion_size,
             });
             vbr_artifact_companion_payload companion;
             companion.kind = provider.kind;
@@ -1626,11 +2769,15 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         for (size_t i = 0; i < pending_companions.size(); ++i) {
             std::vector<uint8_t> bytes;
             const auto & pending = pending_companions[i];
-            if (pending.recurrent != nullptr) {
-                vector_io_writer writer;
-                pending.recurrent->state_write(
-                    writer, request.sequence, 0);
-                bytes = std::move(writer.bytes);
+            std::unique_ptr<artifact_segment_chain> recurrent_chain;
+            std::array<uint8_t, 32> recurrent_digest;
+            if (pending.recurrent.source != nullptr) {
+                if (!recurrent_companion_capture(
+                        pending.recurrent, request.sequence,
+                        recurrent_chain, recurrent_digest,
+                        result.status)) {
+                    return result;
+                }
             } else if (pending.provider == nullptr ||
                        !pending.provider->capture(
                            pending.provider->context,
@@ -1644,29 +2791,40 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             // no-decode route invariant. F3.3 must enforce that invariant;
             // size equality is intentionally the F3.2 guard, not a second
             // content-hash pass over the existing companion codecs.
-            if (bytes.size() != pending.bytes) {
+            if (pending.recurrent.source == nullptr &&
+                bytes.size() != pending.bytes) {
                 result.status =
                     vbr_explicit_capture_status::source_changed;
                 return result;
             }
-            auto chain = std::make_shared<artifact_segment_chain>();
-            static constexpr size_t CHUNK = 1024*1024;
-            for (size_t offset = 0; offset < bytes.size();) {
-                const size_t size = std::min(
-                    CHUNK, bytes.size() - offset);
-                if (!chain->append(
-                        bytes.data() + offset, size)) {
-                    result.status =
-                        vbr_explicit_capture_status::accounting_failed;
-                    return result;
+            std::shared_ptr<const artifact_segment_chain> chain;
+            std::array<uint8_t, 32> digest;
+            if (recurrent_chain) {
+                chain = std::shared_ptr<const artifact_segment_chain>(
+                    std::move(recurrent_chain));
+                digest = recurrent_digest;
+            } else {
+                auto provider_chain =
+                    std::make_shared<artifact_segment_chain>();
+                static constexpr size_t CHUNK = 1024*1024;
+                for (size_t offset = 0; offset < bytes.size();) {
+                    const size_t size = std::min(
+                        CHUNK, bytes.size() - offset);
+                    if (!provider_chain->append(
+                            bytes.data() + offset, size)) {
+                        result.status =
+                            vbr_explicit_capture_status::accounting_failed;
+                        return result;
+                    }
+                    offset += size;
                 }
-                offset += size;
+                digest = vbr_capture_stream_digest(*provider_chain);
+                chain = std::move(provider_chain);
             }
             vbr_verified_companion verified;
             verified.companion_index = uint32_t(i);
             verified.bytes = chain;
-            verified.streaming_digest =
-                vbr_capture_stream_digest(*chain);
+            verified.streaming_digest = digest;
             const auto accepted =
                 build->accept_verified_companion(verified);
             if (accepted != vbr_capture_stream_status::ok) {

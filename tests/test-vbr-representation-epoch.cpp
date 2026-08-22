@@ -2,6 +2,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-io.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid.h"
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-explicit-capture.h"
 #include "llama.h"
@@ -970,6 +971,176 @@ static bool decode_one(llama_context * ctx, llama_pos pos = 0) {
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
+}
+
+struct h2_representation_identity_counts {
+    std::array<std::array<uint32_t, 2>, GGML_TYPE_COUNT> calls = {};
+};
+
+static bool h2_test_representation_identity(
+        const void * opaque, int32_t current_type, bool value_side,
+        vbr_explicit_representation_identity & output) noexcept {
+    auto * counts = const_cast<h2_representation_identity_counts *>(
+        static_cast<const h2_representation_identity_counts *>(opaque));
+    if (!counts || current_type < 0 || current_type >= GGML_TYPE_COUNT) {
+        return false;
+    }
+    ++counts->calls[size_t(current_type)][value_side ? 1 : 0];
+    output = {};
+    output.codec_id = uint32_t(current_type) + 1;
+    output.codec_version = 1;
+    output.codebook_digest.fill(value_side ? 0x31 : 0x32);
+    output.rotation_digest.fill(value_side ? 0x41 : 0x42);
+    output.meansub_digest.fill(value_side ? 0x51 : 0x52);
+    return true;
+}
+
+static bool h2_projected_capture_batch_exact(
+        llama_memory_i & memory, uint32_t manifest_count,
+        uint32_t & expected_transfers) {
+    std::vector<vbr_explicit_capture_runtime_pool> pools;
+    uint32_t attention_children = 0;
+    if (!vbr_explicit_capture_runtime_pools(
+            memory, pools, attention_children) ||
+        pools.empty() || attention_children == 0) {
+        return false;
+    }
+    std::vector<vbr_capture_lane> lanes;
+    std::vector<ggml_backend_dev_t> devices;
+    std::vector<vbr_explicit_capture_pool_binding> bindings;
+    for (const auto & pool : pools) {
+        auto found = std::find(devices.begin(), devices.end(),
+                               pool.backend_device);
+        uint32_t lane = 0;
+        if (found == devices.end()) {
+            lane = uint32_t(devices.size());
+            devices.push_back(pool.backend_device);
+            lanes.push_back({ pool.backend_device, pool.backend, false });
+        } else {
+            lane = uint32_t(found - devices.begin());
+        }
+        bindings.push_back({
+            pool.instance_id, pool.device, 0, uint16_t(lane), lane,
+        });
+    }
+    if (devices.size() != 1 || lanes.front().backend == nullptr) {
+        return false;
+    }
+    llama_cache_acct_shard_topology topology;
+    const std::string device_identity =
+        std::string(ggml_backend_dev_name(devices.front())) + "\n" +
+        ggml_backend_dev_description(devices.front());
+    if (!llama_cache_acct_build_shard_topology(
+            { device_identity }, LLAMA_SPLIT_MODE_NONE, 0,
+            nullptr, topology)) {
+        return false;
+    }
+    vbr_capture_stream_status ring_status;
+    constexpr size_t chunk_bytes = 64*1024;
+    auto ring = vbr_pinned_chunk_ring::create(
+        lanes, uint64_t(lanes.size())*4*chunk_bytes,
+        chunk_bytes, ring_status);
+    if (!ring || ring_status != vbr_capture_stream_status::ok) {
+        return false;
+    }
+    vbr_projected_capture_batch_request request;
+    request.idle_decode_thread = true;
+    request.max_packed_bytes = uint64_t(16)*1024*1024*1024;
+    request.ring = ring.get();
+    request.topologies = { std::move(topology) };
+    request.pool_bindings = std::move(bindings);
+    h2_representation_identity_counts identity_counts;
+    request.representation_context = &identity_counts;
+    request.representation_identity = h2_test_representation_identity;
+    for (uint32_t i = 0; i < manifest_count; ++i) {
+        vbr_projected_capture_manifest_request manifest;
+        manifest.manifest_id = 100 + i;
+        manifest.sequence = llama_seq_id(i);
+        manifest.identity.execution_identity = "h2-live-model";
+        manifest.identity.adapter_config_identity = "none";
+        manifest.identity.media_content_identity = "none";
+        manifest.identity.sequence_epoch = i + 1;
+        manifest.identity.token_count = 1;
+        manifest.identity.next_position = 1;
+        manifest.token_block = { 1 };
+        request.manifests.push_back(std::move(manifest));
+    }
+    auto captured = vbr_capture_projected_batch(memory, request);
+    if (captured.status != vbr_explicit_capture_status::ok ||
+        captured.phase != vbr_explicit_capture_phase::complete ||
+        !captured.assembly ||
+        captured.assembly.manifests().size() != manifest_count ||
+        captured.publications.size() != manifest_count ||
+        captured.size_pass_calls != attention_children ||
+        captured.projection_calls != 1 || captured.union_cells != 1 ||
+        captured.planned_packed_bytes == 0 ||
+        captured.planned_packed_bytes > request.max_packed_bytes ||
+        captured.unit_transfer_calls == 0 ||
+        captured.transferred_units != captured.unit_transfer_calls) {
+        return false;
+    }
+    uint32_t identity_keys = 0;
+    for (const auto & type : identity_counts.calls) {
+        for (const uint32_t calls : type) {
+            if (calls > 1) {
+                return false;
+            }
+            identity_keys += calls != 0;
+        }
+    }
+    if (identity_keys == 0) {
+        return false;
+    }
+    if (expected_transfers == 0) {
+        expected_transfers = captured.unit_transfer_calls;
+    } else if (captured.unit_transfer_calls != expected_transfers) {
+        return false;
+    }
+    for (const auto & manifest : captured.assembly.manifests()) {
+        if (manifest.state != vbr_capture_manifest_state::ready) {
+            return false;
+        }
+    }
+    for (const auto & publication : captured.publications) {
+        if (publication.companions.size() != 1 ||
+            publication.accounting.empty()) {
+            return false;
+        }
+    }
+    if (manifest_count == 1) {
+        auto refused_request = request;
+        refused_request.max_packed_bytes =
+            captured.planned_packed_bytes - 1;
+        const auto refused = vbr_capture_projected_batch(
+            memory, refused_request);
+        if (refused.status !=
+                vbr_explicit_capture_status::accounting_failed ||
+            refused.unit_transfer_calls != 0 || refused.assembly ||
+            !refused.publications.empty()) {
+            return false;
+        }
+        auto inflated_request = request;
+        inflated_request.manifests.front().identity.token_count = 2;
+        inflated_request.manifests.front().identity.next_position = 2;
+        inflated_request.manifests.front().token_block = { 1, 2 };
+        auto inflated = vbr_capture_projected_batch(
+            memory, inflated_request);
+        if (inflated.status != vbr_explicit_capture_status::ok ||
+            inflated.phase != vbr_explicit_capture_phase::complete ||
+            !inflated.assembly || inflated.assembly.manifests().size() != 1 ||
+            inflated.assembly.manifests().front().state !=
+                vbr_capture_manifest_state::dependency_unavailable ||
+            inflated.union_cells != 0 ||
+            inflated.planned_packed_bytes != 0 ||
+            inflated.unit_transfer_calls != 0 ||
+            inflated.transferred_units != 0 ||
+            inflated.publications.size() != 1 ||
+            !inflated.publications.front().companions.empty() ||
+            !inflated.publications.front().accounting.empty()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool epochs_equal(
@@ -2217,6 +2388,42 @@ int main(int argc, char ** argv) {
     llama_memory_t mem = llama_get_memory(ctx.get());
     llama_kv_cache * base = nullptr;
     llama_kv_cache * swa  = nullptr;
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        auto * attention = hybrid->get_mem_attn();
+        if (!llama_kv_cache_vbr_epoch_test::active(attention)) {
+            fprintf(stderr, "SKIP: loaded GPU backend does not provide VBR VMM for the hybrid attention child\n");
+            return 0;
+        }
+        if (!llama_kv_cache_vbr_epoch_test::map_seed_watermark(attention) ||
+            !decode_one(ctx.get())) {
+            fprintf(stderr, "H2 projected capture hybrid seed failed\n");
+            return 1;
+        }
+        uint32_t expected_transfers = 0;
+        if (!h2_projected_capture_batch_exact(
+                *mem, 1, expected_transfers)) {
+            fprintf(stderr, "H2 one-manifest projected capture failed\n");
+            return 1;
+        }
+        for (llama_seq_id sequence = 1; sequence < 4; ++sequence) {
+            llama_memory_seq_cp(mem, 0, sequence, -1, -1);
+        }
+        if (!h2_projected_capture_batch_exact(
+                *mem, 4, expected_transfers)) {
+            fprintf(stderr, "H2 four-manifest projected capture failed\n");
+            return 1;
+        }
+        for (llama_seq_id sequence = 4; sequence < 8; ++sequence) {
+            llama_memory_seq_cp(mem, 0, sequence, -1, -1);
+        }
+        if (!h2_projected_capture_batch_exact(
+                *mem, 8, expected_transfers)) {
+            fprintf(stderr, "H2 eight-manifest projected capture failed\n");
+            return 1;
+        }
+        printf("H2 automatic projected capture 1/4/8 union PASS\n");
+        return 0;
+    }
     if (!get_iswa_children(mem, base, swa)) {
         fprintf(stderr, "fixture did not create an iSWA attention cache\n");
         return 1;

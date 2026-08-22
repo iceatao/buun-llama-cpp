@@ -83,6 +83,20 @@ bool capture_policy_equal(
            lhs.completed_wave == rhs.completed_wave;
 }
 
+bool capture_shard_schema_equal(
+        const vbr_artifact_shard_descriptor & lhs,
+        const vbr_artifact_shard_descriptor & rhs) noexcept {
+    return lhs.shard_index == rhs.shard_index &&
+           lhs.topology_index == rhs.topology_index &&
+           lhs.device_ordinal == rhs.device_ordinal &&
+           lhs.logical_offset == rhs.logical_offset &&
+           lhs.row_count == rhs.row_count &&
+           lhs.column_count == rhs.column_count &&
+           lhs.row_bytes == rhs.row_bytes &&
+           lhs.payload_bytes == rhs.payload_bytes &&
+           lhs.section_checksum == rhs.section_checksum;
+}
+
 bool capture_descriptor_schema_equal(
         const vbr_artifact_unit_descriptor & lhs,
         const vbr_artifact_unit_descriptor & rhs) {
@@ -110,19 +124,26 @@ bool capture_descriptor_schema_equal(
         lhs.rotation_digest != rhs.rotation_digest ||
         lhs.meansub_digest != rhs.meansub_digest ||
         lhs.clean_stash_state != rhs.clean_stash_state ||
-        lhs.shards.size() != rhs.shards.size()) {
+        lhs.clean_stash.valid_rows != rhs.clean_stash.valid_rows ||
+        lhs.clean_stash.domain != rhs.clean_stash.domain ||
+        lhs.clean_stash.layout != rhs.clean_stash.layout ||
+        lhs.clean_stash.row_count != rhs.clean_stash.row_count ||
+        lhs.clean_stash.column_count != rhs.clean_stash.column_count ||
+        lhs.clean_stash.row_bytes != rhs.clean_stash.row_bytes ||
+        lhs.clean_stash.payload_id != rhs.clean_stash.payload_id ||
+        lhs.shards.size() != rhs.shards.size() ||
+        lhs.clean_stash.shards.size() != rhs.clean_stash.shards.size()) {
         return false;
     }
     for (size_t i = 0; i < lhs.shards.size(); ++i) {
-        const auto & a = lhs.shards[i];
-        const auto & b = rhs.shards[i];
-        if (a.shard_index != b.shard_index ||
-            a.topology_index != b.topology_index ||
-            a.device_ordinal != b.device_ordinal ||
-            a.logical_offset != b.logical_offset ||
-            a.row_count != b.row_count ||
-            a.column_count != b.column_count ||
-            a.row_bytes != b.row_bytes) {
+        if (!capture_shard_schema_equal(lhs.shards[i], rhs.shards[i])) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < lhs.clean_stash.shards.size(); ++i) {
+        if (!capture_shard_schema_equal(
+                lhs.clean_stash.shards[i],
+                rhs.clean_stash.shards[i])) {
             return false;
         }
     }
@@ -139,6 +160,28 @@ bool capture_cursor_after(
 }
 
 } // namespace
+
+bool vbr_capture_controller_representation_equal(
+        const vbr_capture_controller_target & lhs,
+        const vbr_capture_controller_target & rhs) noexcept {
+    if (lhs.child_id != rhs.child_id ||
+        lhs.lineage_uuid != rhs.lineage_uuid ||
+        lhs.controller_generation != rhs.controller_generation ||
+        !capture_policy_equal(lhs.policy, rhs.policy) ||
+        lhs.units.size() != rhs.units.size() ||
+        lhs.unit_descriptors.size() != rhs.unit_descriptors.size() ||
+        lhs.units.size() != lhs.unit_descriptors.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.units.size(); ++i) {
+        if (!capture_generation_equal(lhs.units[i], rhs.units[i]) ||
+            !capture_descriptor_schema_equal(
+                lhs.unit_descriptors[i], rhs.unit_descriptors[i])) {
+            return false;
+        }
+    }
+    return true;
+}
 
 vbr_capture_projection::vbr_capture_projection(
         std::shared_ptr<const vbr_capture_projection_plan> plan) noexcept
@@ -211,7 +254,9 @@ bool vbr_artifact_project_capture_union(
         manifest_ids.reserve(manifests.size());
         std::vector<capture_projection_placement> placements;
         for (const auto & manifest : manifests) {
-            if (manifest.manifest_id == 0 || manifest.placements.empty() ||
+            if (manifest.manifest_id == 0 ||
+                (manifest.dependencies_available !=
+                    !manifest.placements.empty()) ||
                 !capture_checked_add(
                     placement_count, manifest.placements.size(),
                     placement_count) ||
@@ -489,7 +534,11 @@ bool vbr_artifact_project_capture_union(
             }
             group_begin = group_end;
         }
-        if (plan.streams.empty()) {
+        if (plan.streams.empty() && std::any_of(
+                plan.manifests.begin(), plan.manifests.end(),
+                [](const auto & manifest) {
+                    return manifest.dependencies_available;
+                })) {
             return false;
         }
         output = vbr_capture_projection(
@@ -592,6 +641,17 @@ std::array<uint8_t, 32> capture_range_leaf_digest(
     uint32_t size,
     const std::array<uint8_t, 32> & payload) noexcept;
 
+constexpr char CAPTURE_STREAM_DIGEST_DOMAIN[] =
+    "buun.vbr.capture.segment-stream";
+
+void capture_stream_digest_begin(
+        llama_sha256_writer & hash, uint64_t expected_bytes) {
+    hash.string(
+        CAPTURE_STREAM_DIGEST_DOMAIN,
+        sizeof(CAPTURE_STREAM_DIGEST_DOMAIN) - 1);
+    hash.u64(expected_bytes);
+}
+
 } // namespace
 
 struct artifact_segment_chain::impl {
@@ -605,10 +665,26 @@ struct artifact_segment_chain::impl {
     bool authenticated_closed = false;
     llama_sha256_writer authenticated_current_hash;
     std::vector<std::array<uint8_t, 32>> authenticated_leaves;
+    bool stream_digest_enabled = false;
+    bool stream_digest_complete = false;
+    uint64_t stream_digest_expected = 0;
+    llama_sha256_writer stream_digest_hash;
+    std::array<uint8_t, 32> stream_digest = {};
 };
 
 artifact_segment_chain::artifact_segment_chain()
     : impl_(new impl) {}
+artifact_segment_chain::artifact_segment_chain(uint64_t expected_stream_bytes)
+    : impl_(new impl) {
+    impl_->stream_digest_enabled = true;
+    impl_->stream_digest_expected = expected_stream_bytes;
+    capture_stream_digest_begin(
+        impl_->stream_digest_hash, expected_stream_bytes);
+    if (expected_stream_bytes == 0) {
+        impl_->stream_digest = impl_->stream_digest_hash.finish();
+        impl_->stream_digest_complete = true;
+    }
+}
 artifact_segment_chain::artifact_segment_chain(
         uint32_t authenticated_chunk_bytes,
         uint32_t max_authenticated_chunks)
@@ -627,13 +703,46 @@ artifact_segment_chain & artifact_segment_chain::operator=(
 
 bool artifact_segment_chain::append(
         const uint8_t * data, size_t size) noexcept {
+    if ((!data && size != 0) || impl_->authenticated_closed ||
+        size > std::numeric_limits<uint64_t>::max() - impl_->total ||
+        (impl_->stream_digest_enabled &&
+         size > impl_->stream_digest_expected - impl_->total)) {
+        return false;
+    }
     try {
-        if ((!data && size != 0) ||
-            impl_->authenticated_closed ||
-            size > std::numeric_limits<uint64_t>::max() -
-                impl_->total) {
+        std::vector<uint8_t> bytes;
+        if (size != 0) {
+            bytes.assign(data, data + size);
+        }
+        return append_owned(std::move(bytes));
+    } catch (...) {
+        return false;
+    }
+}
+
+bool artifact_segment_chain::append_owned(
+        std::vector<uint8_t> data) noexcept {
+    try {
+        return append_storage(
+            std::make_shared<std::vector<uint8_t>>(std::move(data)));
+    } catch (...) {
+        return false;
+    }
+}
+
+bool artifact_segment_chain::append_storage(
+        std::shared_ptr<std::vector<uint8_t>> bytes) noexcept {
+    try {
+        if (!bytes || impl_->authenticated_closed ||
+            bytes->size() > std::numeric_limits<uint64_t>::max() -
+                impl_->total ||
+            (impl_->stream_digest_enabled &&
+             bytes->size() >
+                impl_->stream_digest_expected - impl_->total)) {
             return false;
         }
+        const size_t size = bytes->size();
+        const uint8_t * data = bytes->data();
         if (impl_->authenticated_chunk_bytes != 0) {
             const uint64_t new_total = impl_->total + size;
             const uint64_t chunks = new_total == 0 ? 0 :
@@ -671,11 +780,6 @@ bool artifact_segment_chain::append(
             }
             impl_->segment_ends.reserve(next);
         }
-        auto bytes =
-            std::make_shared<std::vector<uint8_t>>();
-        if (size != 0) {
-            bytes->assign(data, data + size);
-        }
         impl_->segments.push_back({
             std::move(bytes), 0, uint64_t(size),
         });
@@ -706,6 +810,15 @@ bool artifact_segment_chain::append(
                     impl_->authenticated_current_hash = {};
                     impl_->authenticated_current_bytes = 0;
                 }
+            }
+        }
+        if (impl_->stream_digest_enabled &&
+            !impl_->stream_digest_complete) {
+            impl_->stream_digest_hash.bytes(data, size);
+            if (impl_->total == impl_->stream_digest_expected) {
+                impl_->stream_digest =
+                    impl_->stream_digest_hash.finish();
+                impl_->stream_digest_complete = true;
             }
         }
         return true;
@@ -798,11 +911,14 @@ vbr_artifact_byte_source artifact_segment_chain::source() const noexcept {
 
 std::array<uint8_t, 32> vbr_capture_stream_digest(
         const artifact_segment_chain & chain) noexcept {
-    static constexpr char domain_label[] =
-        "buun.vbr.capture.segment-stream";
+    if (chain.impl_->stream_digest_enabled) {
+        return chain.impl_->stream_digest_complete &&
+               chain.impl_->total == chain.impl_->stream_digest_expected
+            ? chain.impl_->stream_digest
+            : std::array<uint8_t, 32> {};
+    }
     llama_sha256_writer hash;
-    hash.string(domain_label, sizeof(domain_label) - 1);
-    hash.u64(chain.size());
+    capture_stream_digest_begin(hash, chain.size());
     std::array<uint8_t, 64*1024> scratch;
     for (uint64_t offset = 0; offset < chain.size();) {
         const size_t count = size_t(std::min<uint64_t>(
@@ -2329,29 +2445,27 @@ bool vbr_capture_assemble_manifests(
             if (!representation.second) {
                 const auto & prior =
                     controller_targets[representation.first->second];
-                if (prior.lineage_uuid != target.lineage_uuid ||
-                    prior.units.size() != target.units.size()) {
-                    return false;
-                }
-                for (uint32_t unit = 0; unit < target.units.size(); ++unit) {
-                    if (!capture_generation_equal(
-                            prior.units[unit], target.units[unit]) ||
-                        !capture_descriptor_schema_equal(
-                            prior.unit_descriptors[unit],
-                            target.unit_descriptors[unit])) {
-                        return false;
-                    }
-                }
-                if (!capture_policy_equal(prior.policy, target.policy)) {
+                if (!vbr_capture_controller_representation_equal(
+                        prior, target)) {
                     return false;
                 }
             }
         }
 
         std::map<uint64_t, std::set<stream_key>> manifest_streams;
+        std::map<uint64_t, bool> manifest_preflight_available;
         std::map<manifest_stream_key,
                  std::vector<vbr_capture_authenticated_range>>
             manifest_packed_ranges;
+        for (const auto & manifest : projection->manifests) {
+            if (!manifest_preflight_available.emplace(
+                    manifest.manifest_id,
+                    manifest.dependencies_available).second) {
+                return false;
+            }
+            manifest_streams.emplace(
+                manifest.manifest_id, std::set<stream_key> {});
+        }
         for (const auto & stream : projection->streams) {
             for (const auto & segment : stream.segments) {
                 if (segment.dependency_count == 0 ||
@@ -2400,7 +2514,12 @@ bool vbr_capture_assemble_manifests(
         uint64_t referenced_targets = 0;
         for (const auto & entry : manifest_streams) {
             auto & refs = manifest_targets[entry.first];
-            bool complete = true;
+            const auto preflight =
+                manifest_preflight_available.find(entry.first);
+            if (preflight == manifest_preflight_available.end()) {
+                return false;
+            }
+            bool complete = preflight->second;
             std::map<uint32_t, std::set<uint32_t>> streams_by_child;
             for (const auto & stream : entry.second) {
                 streams_by_child[stream.first].insert(stream.second);
@@ -2435,10 +2554,10 @@ bool vbr_capture_assemble_manifests(
                     }
                 }
             }
-            manifest_reachable.push_back(complete && targets.recheck(
-                targets.context, entry.first,
-                complete ? controller_targets.data() + refs.front() : nullptr,
-                complete ? refs.size() : 0));
+            manifest_reachable.push_back(
+                complete && targets.recheck(
+                    targets.context, entry.first,
+                    controller_targets.data() + refs.front(), refs.size()));
         }
         if (referenced_targets != controller_targets.size()) {
             return false;

@@ -6289,30 +6289,38 @@ uint64_t vbr_capture_shard_source_identity(
 bool llama_kv_cache::vbr_capture_projected_sources(
         const vbr_capture_unit_plan & plan,
         std::vector<vbr_capture_projected_shard_source> & output) const noexcept {
-    return vbr_capture_projected_sources_impl(plan, output, false);
+    return vbr_capture_projected_sources_impl(plan, &output, nullptr, false);
 }
 
 bool llama_kv_cache::vbr_capture_projected_sources_leased(
         const vbr_capture_unit_plan & plan,
-        std::vector<vbr_capture_projected_shard_source> & output,
+        const std::vector<vbr_capture_projected_shard_source> & expected,
         const vbr_capture_snapshot_session & session) const noexcept {
     uint64_t mutation_serial = 0;
     if (!session.active || session.cache != this || session.plan != &plan ||
+        expected.empty() ||
         !vbr_capture_unit_read_serial(plan.logical_unit, mutation_serial)) {
-        output.clear();
         return false;
     }
-    return vbr_capture_projected_sources_impl(plan, output, true);
+    return vbr_capture_projected_sources_impl(
+        plan, nullptr, &expected, true);
 }
 
 bool llama_kv_cache::vbr_capture_projected_sources_impl(
         const vbr_capture_unit_plan & plan,
-        std::vector<vbr_capture_projected_shard_source> & output,
+        std::vector<vbr_capture_projected_shard_source> * output,
+        const std::vector<vbr_capture_projected_shard_source> * expected,
         bool unit_leased) const noexcept {
-    output.clear();
+    if ((output == nullptr) == (expected == nullptr) ||
+        unit_leased != (expected != nullptr)) {
+        return false;
+    }
+    if (output != nullptr) {
+        output->clear();
+    }
     if (other != nullptr) {
         return other->vbr_capture_projected_sources_impl(
-            plan, output, unit_leased);
+            plan, output, expected, unit_leased);
     }
     try {
         const auto * tracker = vbr_generation_tracker_get();
@@ -6326,6 +6334,7 @@ bool llama_kv_cache::vbr_capture_projected_sources_impl(
             plan.is_v != ((plan.logical_unit & 1u) != 0) ||
             plan.n_stream != n_stream || plan.unified != (n_stream == 1) ||
             plan.shards.empty() || plan.wm_cells == 0 ||
+            (expected != nullptr && expected->size() != plan.shards.size()) ||
             !vbr_capture_generation_equal(
                 tracker->unit_generation(plan.logical_unit),
                 plan.generation)) {
@@ -6337,7 +6346,9 @@ bool llama_kv_cache::vbr_capture_projected_sources_impl(
             return false;
         }
         std::vector<vbr_capture_projected_shard_source> prepared;
-        prepared.reserve(plan.shards.size());
+        if (output != nullptr) {
+            prepared.reserve(plan.shards.size());
+        }
         for (size_t i = 0; i < plan.shards.size(); ++i) {
             const auto & shard = plan.shards[i];
             auto * pool = static_cast<vbr_pool *>(shard.pool);
@@ -6380,23 +6391,50 @@ bool llama_kv_cache::vbr_capture_projected_sources_impl(
             if (source.source_identity == 0) {
                 return false;
             }
-            prepared.push_back(source);
+            if (expected != nullptr) {
+                const auto & canonical = (*expected)[i];
+                if (canonical.shard_index != source.shard_index ||
+                    canonical.row_count != source.row_count ||
+                    canonical.row_bytes != source.row_bytes ||
+                    canonical.source_identity != source.source_identity ||
+                    canonical.source.lane != source.source.lane ||
+                    canonical.source.size != source.source.size ||
+                    canonical.source.backend != source.source.backend ||
+                    canonical.source.device != source.source.device ||
+                    canonical.source.tensor != source.source.tensor ||
+                    canonical.source.tensor_offset !=
+                        source.source.tensor_offset ||
+                    canonical.source.context != source.source.context ||
+                    canonical.source.read != source.source.read) {
+                    return false;
+                }
+            } else {
+                prepared.push_back(source);
+            }
         }
-        uint32_t shard_count = 0;
-        std::array<uint8_t, 32> topology = {};
-        if (!vbr_capture_projected_shard_topology(
-                prepared, shard_count, topology) ||
-            shard_count != prepared.size() ||
-            (!unit_leased && !tracker->stable()) ||
+        if (output != nullptr) {
+            uint32_t shard_count = 0;
+            std::array<uint8_t, 32> topology = {};
+            if (!vbr_capture_projected_shard_topology(
+                    prepared, shard_count, topology) ||
+                shard_count != prepared.size()) {
+                return false;
+            }
+        }
+        if ((!unit_leased && !tracker->stable()) ||
             !vbr_capture_generation_equal(
                 tracker->unit_generation(plan.logical_unit),
                 plan.generation)) {
             return false;
         }
-        output = std::move(prepared);
+        if (output != nullptr) {
+            *output = std::move(prepared);
+        }
         return true;
     } catch (...) {
-        output.clear();
+        if (output != nullptr) {
+            output->clear();
+        }
         return false;
     }
 }
@@ -6426,34 +6464,25 @@ bool llama_kv_cache::vbr_capture_snapshot_bind(
         plan.child_id == UINT32_MAX || sources.empty()) {
         return false;
     }
-    uint32_t shard_count = 0;
-    std::array<uint8_t, 32> topology = {};
-    std::vector<vbr_capture_projected_shard_source> current;
-    if (!vbr_capture_projected_shard_topology(
-            sources, shard_count, topology) ||
-        !vbr_capture_projected_sources(plan, current) ||
-        current.size() != sources.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < sources.size(); ++i) {
-        if (current[i].shard_index != sources[i].shard_index ||
-            current[i].row_count != sources[i].row_count ||
-            current[i].row_bytes != sources[i].row_bytes ||
-            current[i].source_identity != sources[i].source_identity ||
-            current[i].source.backend != sources[i].source.backend ||
-            current[i].source.device != sources[i].source.device ||
-            current[i].source.tensor != sources[i].source.tensor ||
-            current[i].source.size != sources[i].source.size ||
-            current[i].source.lane != sources[i].source.lane) {
+    try {
+        uint32_t shard_count = 0;
+        std::array<uint8_t, 32> topology = {};
+        if (!vbr_capture_projected_shard_topology(
+                sources, shard_count, topology) ||
+            shard_count != sources.size()) {
             return false;
         }
+        output.sources = sources;
+        output.cache = this;
+        output.plan = &plan;
+        output.source_namespace = source_namespace;
+        output.shard_count = shard_count;
+        output.shard_topology_digest = topology;
+        return true;
+    } catch (...) {
+        output.sources.clear();
+        return false;
     }
-    output.cache = this;
-    output.plan = &plan;
-    output.source_namespace = source_namespace;
-    output.shard_count = shard_count;
-    output.shard_topology_digest = topology;
-    return true;
 }
 
 bool llama_kv_cache::vbr_capture_snapshot_acquire(
@@ -6478,21 +6507,15 @@ bool llama_kv_cache::vbr_capture_snapshot_acquire(
     };
     try {
         const auto * tracker = session->cache->vbr_generation_tracker_get();
-        std::vector<vbr_capture_projected_shard_source> current;
-        uint32_t shard_count = 0;
         uint64_t unit_mutation_serial = 0;
-        std::array<uint8_t, 32> topology = {};
         if (tracker == nullptr || !tracker->active() ||
             tracker->runtime_instance() != session->cache->vbr_instance_id() ||
             logical_unit_id >= tracker->unit_count() ||
             !session->cache->vbr_capture_projected_sources_leased(
-                *session->plan, current, *session) ||
-            !vbr_capture_projected_shard_topology(
-                current, shard_count, topology) ||
+                *session->plan, session->sources, *session) ||
             !session->cache->vbr_capture_unit_read_serial(
                 logical_unit_id, unit_mutation_serial) ||
-            shard_count != session->shard_count ||
-            topology != session->shard_topology_digest) {
+            session->sources.size() != session->shard_count) {
             return fail();
         }
         output.source_namespace = source_namespace;
@@ -6502,8 +6525,8 @@ bool llama_kv_cache::vbr_capture_snapshot_acquire(
         output.controller_generation = tracker->controller_generation();
         output.mutation_serial = unit_mutation_serial;
         output.generation = tracker->unit_generation(logical_unit_id);
-        output.shard_count = shard_count;
-        output.shard_topology_digest = topology;
+        output.shard_count = session->shard_count;
+        output.shard_topology_digest = session->shard_topology_digest;
         if (!vbr_capture_generation_equal(
                 output.generation,
                 tracker->unit_generation(logical_unit_id))) {
@@ -6530,10 +6553,7 @@ bool llama_kv_cache::vbr_capture_snapshot_recheck(
     }
     try {
         const auto * tracker = session->cache->vbr_generation_tracker_get();
-        std::vector<vbr_capture_projected_shard_source> current;
-        uint32_t shard_count = 0;
         uint64_t unit_mutation_serial = 0;
-        std::array<uint8_t, 32> topology = {};
         return tracker != nullptr && tracker->active() &&
             tracker->lineage_identity() == expected.lineage_uuid &&
             tracker->controller_generation() == expected.controller_generation &&
@@ -6544,11 +6564,7 @@ bool llama_kv_cache::vbr_capture_snapshot_recheck(
                 expected.generation,
                 tracker->unit_generation(expected.logical_unit_id)) &&
             session->cache->vbr_capture_projected_sources_leased(
-                *session->plan, current, *session) &&
-            vbr_capture_projected_shard_topology(
-                current, shard_count, topology) &&
-            shard_count == expected.shard_count &&
-            topology == expected.shard_topology_digest;
+                *session->plan, session->sources, *session);
     } catch (...) {
         return false;
     }

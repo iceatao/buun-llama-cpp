@@ -455,12 +455,14 @@ private:
     };
 
     // One synchronous projected transfer owns this stack-scoped callback
-    // context. The session borrows its immutable size-pass plan; acquire()
-    // rebinds the live sources under the unit reader lease before exposing a
-    // snapshot, and release() is idempotent as a defensive terminal.
+    // context. The session borrows its immutable size-pass plan and owns the
+    // canonical sources prepared before the unit reader lease. acquire() and
+    // recheck() validate those sources in place without allocating while the
+    // lease is held; release() is idempotent as a defensive terminal.
     struct vbr_capture_snapshot_session {
         const llama_kv_cache * cache = nullptr;
         const vbr_capture_unit_plan * plan = nullptr;
+        std::vector<vbr_capture_projected_shard_source> sources;
         uint64_t source_namespace = 0;
         uint32_t shard_count = 0;
         std::array<uint8_t, 32> shard_topology_digest = {};
@@ -493,11 +495,12 @@ private:
         std::vector<vbr_capture_projected_shard_source> & output) const noexcept;
     bool vbr_capture_projected_sources_leased(
         const vbr_capture_unit_plan & plan,
-        std::vector<vbr_capture_projected_shard_source> & output,
+        const std::vector<vbr_capture_projected_shard_source> & expected,
         const vbr_capture_snapshot_session & session) const noexcept;
     bool vbr_capture_projected_sources_impl(
         const vbr_capture_unit_plan & plan,
-        std::vector<vbr_capture_projected_shard_source> & output,
+        std::vector<vbr_capture_projected_shard_source> * output,
+        const std::vector<vbr_capture_projected_shard_source> * expected,
         bool unit_leased) const noexcept;
     bool vbr_capture_snapshot_bind(
         const vbr_capture_unit_plan & plan,

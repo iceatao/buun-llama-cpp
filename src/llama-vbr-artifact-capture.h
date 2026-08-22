@@ -96,6 +96,11 @@ struct artifact_segment {
 class artifact_segment_chain {
 public:
     artifact_segment_chain();
+    // Known-size construction incrementally authenticates the canonical
+    // segment-stream digest during append(). A complete chain can therefore
+    // be sealed without rereading its payload; incomplete/overlong chains
+    // fail closed. Legacy construction retains scan-on-demand behavior.
+    explicit artifact_segment_chain(uint64_t expected_stream_bytes);
     artifact_segment_chain(
         uint32_t authenticated_chunk_bytes,
         uint32_t max_authenticated_chunks);
@@ -107,6 +112,9 @@ public:
     artifact_segment_chain & operator=(artifact_segment_chain &&) noexcept;
 
     bool append(const uint8_t * data, size_t size) noexcept;
+    // Transfers one already-filled bounded chunk without copying its payload.
+    // The chain still computes every enabled authentication digest itself.
+    bool append_owned(std::vector<uint8_t> data) noexcept;
     uint64_t size() const noexcept;
     size_t segment_count() const noexcept;
     size_t max_segment_size() const noexcept;
@@ -117,10 +125,14 @@ public:
 private:
     struct impl;
     std::unique_ptr<impl> impl_;
+    bool append_storage(
+        std::shared_ptr<std::vector<uint8_t>> bytes) noexcept;
     friend bool vbr_capture_range_seal(
         artifact_segment_chain &,
         uint64_t,
         class vbr_capture_range_tree &) noexcept;
+    friend std::array<uint8_t, 32> vbr_capture_stream_digest(
+        const artifact_segment_chain &) noexcept;
 };
 
 struct vbr_capture_authenticated_range {
@@ -275,6 +287,10 @@ struct vbr_capture_stream_stats {
 // process-local capture plan, not wire metadata.
 struct vbr_capture_projection_manifest {
     uint64_t manifest_id = 0;
+    // False records a preflight dependency refusal without inventing physical
+    // placement. The planner retains the semantic result row but excludes it
+    // from the transfer union; false therefore cannot broaden publication.
+    bool dependencies_available = true;
     // Exact semantic frontier captured with the placement evidence. These
     // fields are retained by the sealed projection and later become the
     // catalog manifest authority; publication callers cannot substitute a
@@ -546,6 +562,14 @@ struct vbr_capture_controller_target {
     // layout, representation, or device geometry.
     std::vector<vbr_artifact_unit_descriptor> unit_descriptors;
 };
+
+// Exact payload-pointer-independent representation equality. Manifest ID and
+// source namespace are reference-local and deliberately excluded; callers
+// authenticate those separately before sharing or rechecking a controller
+// tuple.
+bool vbr_capture_controller_representation_equal(
+    const vbr_capture_controller_target & lhs,
+    const vbr_capture_controller_target & rhs) noexcept;
 
 struct vbr_capture_controller_target_provider {
     using recheck_fn = bool (*)(

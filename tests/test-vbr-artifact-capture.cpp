@@ -91,6 +91,24 @@ static void test_segment_chain_offsets() {
     CHECK(source.read(source.context, 7, &one, 1));
     CHECK(one == 7);
     CHECK(!chain.read(8, &one, 1));
+
+    artifact_segment_chain known_size(8);
+    CHECK(known_size.append(a, sizeof(a)));
+    const auto incomplete_digest =
+        vbr_capture_stream_digest(known_size);
+    CHECK(!std::any_of(
+        incomplete_digest.begin(), incomplete_digest.end(),
+        [](uint8_t value) { return value != 0; }));
+    CHECK(known_size.append(b, sizeof(b)));
+    CHECK(vbr_capture_stream_digest(known_size) ==
+          vbr_capture_stream_digest(chain));
+    CHECK(!known_size.append(&one, 1));
+
+    auto incomplete = std::make_unique<artifact_segment_chain>(8);
+    CHECK(incomplete->append(a, sizeof(a)));
+    vbr_capture_sealed_companion refused;
+    CHECK(!vbr_capture_seal_companion(
+        0, std::move(incomplete), refused));
 }
 
 struct range_verify_source {
@@ -1048,6 +1066,70 @@ static bool assemble_projected_test_batch(
         provider, limits, output);
 }
 
+static void test_preflight_unavailable_projection_rows() {
+    auto target = projected_target(
+        1, 0, 101, projected_generation(5));
+    vbr_capture_projection_manifest available;
+    available.manifest_id = 1;
+    available.placements.push_back(
+        projected_placement(1, 1, { 1, 2 }));
+    bind_projected_manifest_metadata(available, target);
+    auto unavailable = available;
+    unavailable.manifest_id = 2;
+    unavailable.dependencies_available = false;
+    unavailable.placements.clear();
+
+    vbr_capture_projection mixed;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, { unavailable, available } }, {}, mixed));
+    CHECK(mixed);
+    CHECK(mixed->manifest_count == 2);
+    CHECK(mixed->union_cell_count == 2);
+    CHECK(mixed->streams.size() == 1);
+    auto unit = capture_projected_unit_for_target(mixed, target);
+    projected_controller_fixture provider;
+    vbr_capture_manifest_assembly assembled;
+    CHECK(assemble_projected_test_batch(
+        mixed, { target }, { unit }, provider.provider(), {}, assembled));
+    CHECK(provider.rechecked == std::vector<uint64_t>({ 1 }));
+    CHECK(projected_manifest(assembled, 1)->state ==
+          vbr_capture_manifest_state::ready);
+    CHECK(projected_manifest(assembled, 2)->state ==
+          vbr_capture_manifest_state::dependency_unavailable);
+
+    auto unavailable_three = unavailable;
+    unavailable_three.manifest_id = 3;
+    vbr_capture_projection all_unavailable;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, { unavailable, unavailable_three } }, {}, all_unavailable));
+    CHECK(all_unavailable);
+    CHECK(all_unavailable->union_cell_count == 0);
+    CHECK(all_unavailable->streams.empty());
+    provider = {};
+    CHECK(assemble_projected_test_batch(
+        all_unavailable, {}, {}, provider.provider(), {}, assembled));
+    CHECK(provider.rechecked.empty());
+    CHECK(assembled.manifests().size() == 2);
+    CHECK(std::all_of(
+        assembled.manifests().begin(), assembled.manifests().end(),
+        [](const auto & manifest) {
+            return manifest.state ==
+                vbr_capture_manifest_state::dependency_unavailable;
+        }));
+
+    auto invalid = unavailable;
+    invalid.placements.push_back(projected_placement(2, 2, { 3 }));
+    vbr_capture_projection refused = mixed;
+    CHECK(!vbr_artifact_project_capture_union(
+        { 707, { invalid } }, {}, refused));
+    CHECK(!refused);
+    invalid = unavailable;
+    invalid.dependencies_available = true;
+    CHECK(!vbr_artifact_project_capture_union(
+        { 707, { invalid } }, {}, refused));
+    CHECK(!refused);
+}
+
 static vbr_artifact_portable_topology capture_test_topology();
 
 static vbr_projected_manifest_publication projected_publication(
@@ -1387,6 +1469,58 @@ static void test_manifest_coherent_assembly() {
     auto target_second = projected_target(20, 1, 202, generation_b);
     auto target_shared_a = projected_target(30, 0, 101, generation_a);
     auto target_shared_b = projected_target(30, 1, 303, generation_c);
+
+    // Representation equality deliberately ignores reference-local identity,
+    // but authenticates policy and the complete pointer-free unit schema.
+    CHECK(vbr_capture_controller_representation_equal(
+        target_first, target_shared_a));
+    auto schema_mutant = target_shared_a;
+    schema_mutant.policy.cursor++;
+    CHECK(!vbr_capture_controller_representation_equal(
+        target_first, schema_mutant));
+    schema_mutant = target_shared_a;
+    schema_mutant.unit_descriptors[0].shards[0].payload_bytes++;
+    CHECK(!vbr_capture_controller_representation_equal(
+        target_first, schema_mutant));
+    schema_mutant = target_shared_a;
+    schema_mutant.unit_descriptors[0].shards[0].section_checksum[0] ^= 1;
+    CHECK(!vbr_capture_controller_representation_equal(
+        target_first, schema_mutant));
+
+    auto stash_target = target_first;
+    auto stash_peer = target_shared_a;
+    for (auto * value : { &stash_target, &stash_peer }) {
+        auto & descriptor = value->unit_descriptors[0];
+        descriptor.clean_stash_state =
+            vbr_artifact_clean_stash_state::present;
+        descriptor.clean_stash.valid_rows = 4;
+        descriptor.clean_stash.domain = vbr_repr_domain::full;
+        descriptor.clean_stash.layout = vbr_artifact_layout::row_major;
+        descriptor.clean_stash.row_count = 4;
+        descriptor.clean_stash.column_count = 1;
+        descriptor.clean_stash.row_bytes = 2;
+        std::array<uint8_t, 32> stash_id = {};
+        stash_id.fill(0x5a);
+        descriptor.clean_stash.payload_id =
+            vbr_stash_payload_id::from_sha256(stash_id);
+        auto stash_shard = descriptor.shards[0];
+        stash_shard.row_count = 4;
+        stash_shard.row_bytes = 2;
+        stash_shard.payload_bytes = 8;
+        stash_shard.section_checksum.fill(0x6b);
+        descriptor.clean_stash.shards = { stash_shard };
+    }
+    CHECK(vbr_capture_controller_representation_equal(
+        stash_target, stash_peer));
+    stash_peer.unit_descriptors[0].clean_stash.row_bytes++;
+    CHECK(!vbr_capture_controller_representation_equal(
+        stash_target, stash_peer));
+    stash_peer = stash_target;
+    stash_peer.unit_descriptors[0].clean_stash.shards[0]
+        .section_checksum[0] ^= 1;
+    CHECK(!vbr_capture_controller_representation_equal(
+        stash_target, stash_peer));
+
     std::vector<vbr_capture_controller_target> targets {
         target_shared_b, target_first, target_shared_a, target_second,
     };
@@ -2946,6 +3080,7 @@ int main(int argc, char ** argv) {
     test_registry_quiescence_query();
     test_cpu_ring_boundaries();
     test_projected_unit_transfer();
+    test_preflight_unavailable_projection_rows();
     test_manifest_coherent_assembly();
     test_dependency_scoped_projected_catalog_publication();
     test_h2d_bounded_streaming();

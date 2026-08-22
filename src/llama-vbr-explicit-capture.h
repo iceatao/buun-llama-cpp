@@ -307,3 +307,66 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
     const vbr_explicit_capture_request & request,
     vbr_unit_version_sink & sink,
     const vbr_explicit_capture_accounting & accounting) noexcept;
+
+// H2's first automatic-capture boundary. One scheduler batch is capped well
+// below the generic H1 arenas and is bound to one live memory tree. Semantic
+// identity and token storage are owned values; no caller-owned string pointer
+// is retained by the sealed projection.
+constexpr uint32_t VBR_PROJECTED_CAPTURE_MAX_MANIFESTS = 8;
+
+struct vbr_projected_capture_manifest_request {
+    uint64_t manifest_id = 0;
+    llama_seq_id sequence = -1;
+    vbr_artifact_identity_block identity;
+    std::vector<llama_token> token_block;
+    // Zero derives the canonical frontier/policy digest. A nonzero value must
+    // match, exactly as in explicit capture.
+    std::array<uint8_t, 32> identity_policy_order_digest = {};
+};
+
+struct vbr_projected_capture_batch_request {
+    using representation_identity_fn =
+        vbr_explicit_capture_request::representation_identity_fn;
+
+    bool idle_decode_thread = false;
+    // Scheduler-admitted aggregate pageable payload runway for this batch.
+    // Required and checked before the first D2H byte.
+    uint64_t max_packed_bytes = 0;
+    std::vector<vbr_projected_capture_manifest_request> manifests;
+    vbr_pinned_chunk_ring * ring = nullptr;
+    std::vector<vbr_artifact_portable_topology> topologies;
+    std::vector<vbr_explicit_capture_pool_binding> pool_bindings;
+    const void * representation_context = nullptr;
+    representation_identity_fn representation_identity = nullptr;
+};
+
+struct vbr_projected_capture_batch_result {
+    vbr_explicit_capture_status status =
+        vbr_explicit_capture_status::internal_error;
+    vbr_explicit_capture_phase phase =
+        vbr_explicit_capture_phase::validation;
+    vbr_capture_stream_status inner_stream_status =
+        vbr_capture_stream_status::_count;
+    vbr_explicit_generation_failure generation_failure =
+        vbr_explicit_generation_failure::none;
+    vbr_explicit_size_failure size_failure =
+        vbr_explicit_size_failure::none;
+    vbr_capture_manifest_assembly assembly;
+    std::vector<vbr_projected_manifest_publication> publications;
+    uint64_t source_namespace = 0;
+    uint64_t union_cells = 0;
+    uint64_t planned_packed_bytes = 0;
+    uint32_t size_pass_calls = 0;
+    uint32_t projection_calls = 0;
+    uint32_t unit_transfer_calls = 0;
+    uint32_t transferred_units = 0;
+    vbr_capture_stream_stats transfer;
+};
+
+// Produces immutable H1 capabilities and the narrow publication envelopes
+// consumed by the server-owned catalog adapter. Required recurrent state is
+// sealed per manifest; clean stash payloads, payload-complete dependencies,
+// and non-unified controllers fail closed in this first slice.
+vbr_projected_capture_batch_result vbr_capture_projected_batch(
+    llama_memory_i & memory,
+    const vbr_projected_capture_batch_request & request) noexcept;
