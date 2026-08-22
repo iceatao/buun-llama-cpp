@@ -4957,7 +4957,8 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         &fixture.package.manifest.identity.execution_identity;
     cache.retention_df2_authority = true;
     CHECK(cache.enable_retention_shadow());
-    const auto publish_owned = [&](llama_cache_acct_artifact_id reference) {
+    const auto publish_owned_for =
+            [&](llama_cache_acct_artifact_id reference, int32_t owner_slot) {
         auto payload = owned_payload(reference);
         auto staged = cache.stage_vbr(
             prompt, std::move(payload),
@@ -4966,8 +4967,11 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         CHECK(staged.size() == 1);
         server_prompt_cache::iterator result;
         CHECK(cache.publish(
-            std::move(staged), &prompt, source_slot, &result));
+            std::move(staged), &prompt, owner_slot, &result));
         return result;
+    };
+    const auto publish_owned = [&](llama_cache_acct_artifact_id reference) {
+        return publish_owned_for(reference, source_slot);
     };
 
     auto first_state = publish_owned(first.reference_artifact);
@@ -5002,8 +5006,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(first_marginal > 0 && first_marginal < union_bytes);
     first_retire.reset();
 
-    // Multi-incumbent pressure refuses before D2H; canonical victim
-    // selection remains solely in the ordinary publication terminal.
+    // One incoming row may cite the canonical first victim across a
+    // multi-incumbent cache. The citation remains non-mutating until the
+    // matching publication terminal consumes it.
     cache.limit_size = size_t(union_bytes);
     {
         server_prompt_cache_vbr_publication_metadata incoming;
@@ -5016,9 +5021,11 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
             &incoming,
         };
         server_prompt_cache_vbr_capacity_claim capacity;
-        CHECK(!cache.prepare_vbr_publication_capacity(
+        CHECK(cache.prepare_vbr_publication_capacity(
             batch, 1, first_marginal, capacity));
-        CHECK(!capacity.ready());
+        CHECK(capacity.requires_publication_revalidation());
+        CHECK(!cache.consume_vbr_publication_capacity(capacity));
+        CHECK(capacity.requires_publication_revalidation());
     }
     {
         server_prompt_cache_vbr_publication_metadata incoming_a;
@@ -5095,9 +5102,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
             batch, 1, remaining_bytes, capacity));
         CHECK(capacity.ready());
         // Production publishes the captured catalog row between prepare and
-        // consume. Exact dedup shrinks both incoming growth and incumbent
-        // marginal by the same bytes; identity/lease revalidation must not
-        // subtract the new marginal from the old conservative total.
+        // the matching cache publication. Exact dedup shrinks both incoming
+        // growth and incumbent marginal by the same bytes; the terminal must
+        // not subtract a new marginal from the old conservative total.
         const auto shared_incoming = publish_fixture(
             *fixture.catalog, fixture.package,
             fixture.completions(), fixture.budget);
@@ -5106,7 +5113,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         auto shared_payload =
             owned_payload(shared_incoming.reference_artifact);
         CHECK(shared_payload.vbr_artifact() != nullptr);
-        CHECK(cache.consume_vbr_publication_capacity(capacity));
+        CHECK(cache.publish_vbr(
+            incoming, std::move(shared_payload), {}, false, nullptr,
+            &capacity));
         CHECK(!capacity.ready());
     }
     CHECK(fixture.catalog->snapshot().references == 1);
@@ -5124,7 +5133,10 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         CHECK(cache.prepare_vbr_publication_capacity(
             batch, 1, remaining_bytes, capacity));
         cache.states.front().recovery_pins++;
-        CHECK(!cache.consume_vbr_publication_capacity(capacity));
+        auto alias_payload = cache.states.front().payload;
+        CHECK(!cache.publish_vbr(
+            incoming, std::move(alias_payload), {}, false, nullptr,
+            &capacity));
         CHECK(!capacity.ready());
         cache.states.front().recovery_pins--;
     }
@@ -5133,7 +5145,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(cache.states.empty());
     CHECK(retention.artifact_id(second_key).v == 0);
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 2);
+    CHECK(authority.destruction.host_trade_df2_executed == 3);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
 
     // Carry the singleton pressure citation through the real publication
@@ -5185,21 +5197,238 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     server_prompt_cache_vbr_capacity_claim pressure_capacity;
     CHECK(cache.prepare_vbr_publication_capacity(
         pressure_batch, 1, pressure_bytes, pressure_capacity));
-    CHECK(cache.consume_vbr_publication_capacity(pressure_capacity));
     server_prompt_cache::iterator pressure_published;
     CHECK(cache.publish_vbr(
         pressure_metadata, std::move(pressure_payload), {}, false,
-        &pressure_published));
+        &pressure_published, &pressure_capacity));
     CHECK(pressure_published != cache.states.end());
     CHECK(cache.states.size() == 1);
     CHECK(pressure_published->payload.vbr_artifact() == pressure_owner);
     CHECK(retention.artifact_id(pressure_incumbent_key).v == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 3);
+    CHECK(authority.destruction.host_trade_df2_executed == 4);
     cache.limit_size = size_t(pressure_bytes - 1);
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 4);
+    CHECK(authority.destruction.host_trade_df2_executed == 5);
+
+    // Multi-incumbent admission cites the canonical first DF2 victim, not
+    // list/FIFO order. Keep the economic evidence tied, then reverse the list
+    // so the lower stable artifact identity and the physical front differ.
+    fixture_storage multi_storage_a;
+    fixture_storage multi_storage_b;
+    fixture_storage multi_storage_incoming;
+    multi_storage_a.payload0.bytes[0] ^= 0x11;
+    multi_storage_a.payload1.bytes[0] ^= 0x11;
+    multi_storage_a.stash0.bytes[0] ^= 0x11;
+    multi_storage_a.stash1.bytes[0] ^= 0x11;
+    multi_storage_b.payload0.bytes[0] ^= 0x22;
+    multi_storage_b.payload1.bytes[0] ^= 0x22;
+    multi_storage_b.stash0.bytes[0] ^= 0x22;
+    multi_storage_b.stash1.bytes[0] ^= 0x22;
+    multi_storage_incoming.payload0.bytes[0] ^= 0x33;
+    multi_storage_incoming.payload1.bytes[0] ^= 0x33;
+    multi_storage_incoming.stash0.bytes[0] ^= 0x33;
+    multi_storage_incoming.stash1.bytes[0] ^= 0x33;
+    auto multi_package_a = make_package(multi_storage_a);
+    auto multi_package_b = make_package(multi_storage_b);
+    auto multi_package_incoming = make_package(multi_storage_incoming);
+    multi_package_a.manifest.identity = fixture.package.manifest.identity;
+    multi_package_b.manifest.identity = fixture.package.manifest.identity;
+    multi_package_incoming.manifest.identity =
+        fixture.package.manifest.identity;
+    const auto multi_reference_a = publish_fixture(
+        *fixture.catalog, multi_package_a, {
+            { 0, 1, true,  true, multi_storage_a.stash1.bytes },
+            { 0, 0, false, true, multi_storage_a.payload0.bytes },
+            { 0, 0, true,  true, multi_storage_a.stash0.bytes },
+            { 0, 1, false, true, multi_storage_a.payload1.bytes },
+        }, fixture.budget);
+    const auto multi_reference_b = publish_fixture(
+        *fixture.catalog, multi_package_b, {
+            { 0, 1, true,  true, multi_storage_b.stash1.bytes },
+            { 0, 0, false, true, multi_storage_b.payload0.bytes },
+            { 0, 0, true,  true, multi_storage_b.stash0.bytes },
+            { 0, 1, false, true, multi_storage_b.payload1.bytes },
+        }, fixture.budget);
+    const auto multi_reference_incoming = publish_fixture(
+        *fixture.catalog, multi_package_incoming, {
+            { 0, 1, true,  true, multi_storage_incoming.stash1.bytes },
+            { 0, 0, false, true, multi_storage_incoming.payload0.bytes },
+            { 0, 0, true,  true, multi_storage_incoming.stash0.bytes },
+            { 0, 1, false, true, multi_storage_incoming.payload1.bytes },
+        }, fixture.budget);
+    CHECK(multi_reference_a.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(multi_reference_b.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(multi_reference_incoming.status ==
+          llama_vbr_artifact_publish_status::published);
+    cache.limit_size = 0;
+    auto multi_a = publish_owned(multi_reference_a.reference_artifact);
+    auto multi_b = publish_owned(multi_reference_b.reference_artifact);
+    CHECK(cache.states.size() == 2);
+    CHECK(!multi_a->payload.vbr_logical_erase_only());
+    CHECK(!multi_b->payload.vbr_logical_erase_only());
+    const auto multi_key_a =
+        server_retention_instance_key::for_host_entry(&*multi_a);
+    const auto multi_key_b =
+        server_retention_instance_key::for_host_entry(&*multi_b);
+    const auto multi_artifact_a = retention.artifact_id(multi_key_a);
+    const auto multi_artifact_b = retention.artifact_id(multi_key_b);
+    CHECK(multi_artifact_a.v != 0 && multi_artifact_b.v != 0);
+    CHECK(multi_artifact_a.v < multi_artifact_b.v);
+    cache.states.splice(cache.states.begin(), cache.states, multi_b);
+    CHECK(&cache.states.front() == &*multi_b);
+
+    auto multi_incoming_payload =
+        owned_payload(multi_reference_incoming.reference_artifact);
+    std::vector<const server_prompt_cache_payload *> multi_union {
+        &multi_a->payload, &multi_b->payload, &multi_incoming_payload,
+    };
+    std::vector<const server_prompt_cache_payload *> multi_incumbents {
+        &multi_a->payload, &multi_b->payload,
+    };
+    std::vector<vbr_artifact_retire_resident_preview> multi_marginals;
+    CHECK(server_prompt_cache_payload::preview_vbr_retire_resident_batch(
+        multi_incumbents, fixture.ledger.serial(), multi_marginals));
+    CHECK(multi_marginals.size() == 2);
+    CHECK(multi_marginals[0].known && multi_marginals[0].resident > 0);
+    CHECK(multi_marginals[1].known && multi_marginals[1].resident > 0);
+    server_prompt_cache_vbr_budget_summary multi_budget;
+    CHECK(server_prompt_cache_payload::summarize_vbr_budgets(
+        multi_union, multi_budget));
+    CHECK(multi_budget.compact_resident_bytes > 1 &&
+          multi_budget.compact_resident_bytes <= SIZE_MAX);
+    const uint64_t multi_largest_marginal = std::max(
+        multi_marginals[0].resident, multi_marginals[1].resident);
+    CHECK(multi_largest_marginal <
+          multi_budget.compact_resident_bytes);
+    cache.limit_size = size_t(
+        multi_budget.compact_resident_bytes -
+        multi_largest_marginal - 1);
+    {
+        server_prompt_cache_vbr_publication_metadata metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, metadata));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &metadata,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(!cache.prepare_vbr_publication_capacity(
+            batch, 1, multi_incoming_payload.size(), capacity));
+        CHECK(!capacity.ready());
+    }
+    cache.limit_size = size_t(multi_budget.compact_resident_bytes - 1);
+
+    // A pressure citation is bound to the exact provisional destination and
+    // conservative payload quote that were admitted before D2H.
+    {
+        server_prompt_cache_vbr_publication_metadata admitted;
+        server_prompt_cache_vbr_publication_metadata other;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, admitted));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &admitted,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 1, multi_incoming_payload.size(), capacity));
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, other));
+        CHECK(!cache.publish_vbr(
+            other, multi_incoming_payload, {}, false, nullptr, &capacity));
+        CHECK(!capacity.ready());
+        CHECK(cache.states.size() == 2);
+    }
+    {
+        CHECK(multi_incoming_payload.size() > 1);
+        cache.limit_size = size_t(multi_budget.compact_resident_bytes - 2);
+        server_prompt_cache_vbr_publication_metadata metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, metadata));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &metadata,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 1, multi_incoming_payload.size() - 1, capacity));
+        CHECK(!cache.publish_vbr(
+            metadata, multi_incoming_payload, {}, false, nullptr, &capacity));
+        CHECK(!capacity.ready());
+        CHECK(cache.states.size() == 2);
+        cache.limit_size = size_t(multi_budget.compact_resident_bytes - 1);
+    }
+
+    // Pin drift between pre-D2H admission and publication refuses the whole
+    // incoming operation without falling through to a different victim.
+    {
+        server_prompt_cache_vbr_publication_metadata metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, metadata));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &metadata,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 1, multi_incoming_payload.size(), capacity));
+        CHECK(capacity.requires_publication_revalidation());
+        multi_a->recovery_pins++;
+        CHECK(!cache.publish_vbr(
+            metadata, multi_incoming_payload, {}, false, nullptr,
+            &capacity));
+        CHECK(!capacity.ready());
+        multi_a->recovery_pins--;
+        CHECK(cache.states.size() == 2);
+        CHECK(retention.artifact_id(multi_key_a) == multi_artifact_a);
+        CHECK(retention.artifact_id(multi_key_b) == multi_artifact_b);
+    }
+
+    server_prompt_cache_vbr_publication_metadata multi_metadata;
+    CHECK(cache.prepare_vbr_publication_metadata(
+        prompt,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        source_slot, multi_metadata));
+    server_prompt_cache_vbr_publication_metadata * multi_batch[] = {
+        &multi_metadata,
+    };
+    server_prompt_cache_vbr_capacity_claim multi_capacity;
+    CHECK(cache.prepare_vbr_publication_capacity(
+        multi_batch, 1, multi_incoming_payload.size(), multi_capacity));
+    CHECK(multi_capacity.requires_publication_revalidation());
+    server_prompt_cache::iterator multi_published;
+    CHECK(cache.publish_vbr(
+        multi_metadata, std::move(multi_incoming_payload), {}, false,
+        &multi_published, &multi_capacity));
+    CHECK(!multi_capacity.ready());
+    CHECK(cache.states.size() == 2);
+    CHECK(multi_published != cache.states.end());
+    CHECK(retention.artifact_id(multi_key_a).v == 0);
+    CHECK(retention.artifact_id(multi_key_b) == multi_artifact_b);
+    CHECK(&cache.states.front() == &*multi_b);
+    CHECK(cache.retention_shadow_snapshot().last.proposed_artifact ==
+          multi_artifact_a);
+    cache.limit_size = 1;
+    cache.update();
+    cache.limit_size = 0;
+    CHECK(cache.states.empty());
+    CHECK(fixture.catalog->snapshot().references == 0);
 
     // Token-pressure feasibility uses the exact logical frontier denominator
     // under the same singleton bound; physical publication is covered by the
@@ -5226,13 +5455,16 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         server_prompt_cache_vbr_capacity_claim capacity;
         CHECK(cache.prepare_vbr_publication_capacity(
             batch, 1, token_state->size(), capacity));
-        CHECK(cache.consume_vbr_publication_capacity(capacity));
+        auto token_payload = token_state->payload;
+        CHECK(cache.publish_vbr(
+            incoming, std::move(token_payload), {}, false, nullptr,
+            &capacity));
     }
     cache.limit_tokens = size_t(prompt.n_tokens() - 1);
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 5);
+    CHECK(authority.destruction.host_trade_df2_executed == 9);
     CHECK(cache.retention_shadow_snapshot().last.reason ==
           server_cache_destruction_reason::host_token_limit);
     CHECK(cache.retention_shadow_snapshot().last.proposed_resource ==
@@ -5284,14 +5516,14 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(cache.states.size() == 1);
     CHECK(fixture.catalog->snapshot().references == 1);
     CHECK(cache.states.front().payload.vbr_retirement_exclusive());
-    CHECK(authority.destruction.host_trade_df2_executed == 5);
+    CHECK(authority.destruction.host_trade_df2_executed == 9);
 
     cache.limit_tokens = 0;
     cache.limit_size = cache.states.front().size() - 1;
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 6);
+    CHECK(authority.destruction.host_trade_df2_executed == 10);
 
     // A zero-byte alias is also lawful capacity cleanup: erasing it makes
     // the survivor exclusive, after which the next bounded iteration can
@@ -5346,7 +5578,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 8);
+    CHECK(authority.destruction.host_trade_df2_executed == 12);
 
     // The publication transaction itself—not only later maintenance—may
     // reclaim a lawful incumbent. The incoming node is protected until the
@@ -5952,6 +6184,178 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     cache.limit_size = 0;
     cache.clear_accounting();
     cache.states.clear();
+    CHECK(fixture.catalog->snapshot().references == 0);
+
+    // A pressure citation also binds the canonical ranking decision. Distinct
+    // frontiers keep both incumbent values physical; reversing their priors
+    // after admission must make publication refuse without evicting either.
+    {
+        server_prompt drift_prompt_a;
+        server_prompt drift_prompt_b;
+        server_prompt drift_prompt_incoming;
+        drift_prompt_a.tokens = server_tokens(
+            llama_tokens { 301, 302 }, false);
+        drift_prompt_b.tokens = server_tokens(
+            llama_tokens { 401, 402 }, false);
+        drift_prompt_incoming.tokens = server_tokens(
+            llama_tokens { 501, 502 }, false);
+        drift_prompt_a.sequence_epoch = 11;
+        drift_prompt_b.sequence_epoch = 12;
+        drift_prompt_incoming.sequence_epoch = 13;
+        auto drift_package_a = multi_package_a;
+        auto drift_package_b = multi_package_b;
+        auto drift_package_incoming = multi_package_incoming;
+        const auto bind_prompt = [](vbr_artifact_package & package,
+                                    const server_prompt & value) {
+            package.manifest.token_block.tokens =
+                value.tokens.retention_token_ids();
+            package.manifest.token_block.digest = {};
+            package.manifest.identity.sequence_epoch = value.sequence_epoch;
+            package.manifest.manifest_digest = {};
+            package.manifest.capture_generation_id = {};
+            package.manifest.consistency = {};
+            return value.tokens.media_content_identity(
+                       value.n_tokens(),
+                       package.manifest.identity.media_content_identity) &&
+                   ((package.manifest.identity.next_position =
+                         value.tokens.pos_next()) >= 0);
+        };
+        CHECK(bind_prompt(drift_package_a, drift_prompt_a));
+        CHECK(bind_prompt(drift_package_b, drift_prompt_b));
+        CHECK(bind_prompt(drift_package_incoming, drift_prompt_incoming));
+
+        server_cache_authority drift_authority;
+        server_retention_sidecar_store drift_retention;
+        drift_retention.configure(
+            &fixture.ledger, fixture.host, &drift_authority.leases);
+        CHECK(drift_retention.enable_prefix_tracking());
+        constexpr int32_t drift_slot_a = 31;
+        constexpr int32_t drift_slot_b = 32;
+        constexpr int32_t drift_slot_incoming = 33;
+        const server_prompt * drift_prompts[] = {
+            &drift_prompt_a, &drift_prompt_b, &drift_prompt_incoming,
+        };
+        const int32_t drift_slots[] = {
+            drift_slot_a, drift_slot_b, drift_slot_incoming,
+        };
+        for (size_t i = 0; i < 3; ++i) {
+            common_chat_msg_spans drift_spans;
+            drift_spans.add(
+                COMMON_CHAT_ROLE_USER, 0, drift_prompts[i]->n_tokens());
+            const auto source =
+                server_retention_instance_key::for_slot(drift_slots[i]);
+            CHECK(drift_retention.publish(
+                source, common_retention_pool::attention,
+                drift_spans, true, drift_prompts[i]->n_tokens(),
+                drift_prompts[i]->n_tokens(), true));
+            CHECK(server_prompt_retention_publish_exact_prefix(
+                drift_retention, source, *drift_prompts[i],
+                fixture.package.manifest.identity.adapter_config_identity,
+                drift_prompts[i]->n_tokens()));
+        }
+
+        const auto republish = [&](const vbr_artifact_package & package,
+                                   const fixture_storage & storage) {
+            return publish_fixture(*fixture.catalog, package, {
+                { 0, 1, true,  true, storage.stash1.bytes },
+                { 0, 0, false, true, storage.payload0.bytes },
+                { 0, 0, true,  true, storage.stash0.bytes },
+                { 0, 1, false, true, storage.payload1.bytes },
+            }, fixture.budget);
+        };
+        const auto drift_reference_a =
+            republish(drift_package_a, multi_storage_a);
+        const auto drift_reference_b =
+            republish(drift_package_b, multi_storage_b);
+        const auto drift_reference_incoming =
+            republish(drift_package_incoming, multi_storage_incoming);
+        CHECK(drift_reference_a.reference_artifact.v != 0);
+        CHECK(drift_reference_b.reference_artifact.v != 0);
+        CHECK(drift_reference_incoming.reference_artifact.v != 0);
+
+        server_prompt_cache drift_cache(0, 0);
+        drift_cache.acct = &fixture.ledger;
+        drift_cache.publish_authority = &drift_authority;
+        drift_cache.destruction_obs = &drift_authority.destruction;
+        drift_cache.retention_obs = &drift_retention;
+        drift_cache.lease_obs = &drift_authority.leases;
+        drift_cache.lease_execution_identity =
+            &fixture.package.manifest.identity.execution_identity;
+        drift_cache.retention_df2_authority = true;
+        CHECK(drift_cache.enable_retention_shadow());
+        const auto drift_publish = [&](llama_cache_acct_artifact_id reference,
+                                       const server_prompt & value,
+                                       int32_t slot) {
+            auto payload = owned_payload(reference);
+            auto staged = drift_cache.stage_vbr(
+                value, std::move(payload),
+                fixture.package.manifest.identity.execution_identity,
+                fixture.package.manifest.identity.adapter_config_identity);
+            CHECK(staged.size() == 1);
+            server_prompt_cache::iterator result;
+            CHECK(drift_cache.publish(
+                std::move(staged), &value, slot, &result));
+            return result;
+        };
+        auto drift_a = drift_publish(
+            drift_reference_a.reference_artifact,
+            drift_prompt_a, drift_slot_a);
+        auto drift_b = drift_publish(
+            drift_reference_b.reference_artifact,
+            drift_prompt_b, drift_slot_b);
+        drift_retention.retire(
+            server_retention_instance_key::for_slot(drift_slot_a));
+        drift_retention.retire(
+            server_retention_instance_key::for_slot(drift_slot_b));
+        const auto drift_key_a =
+            server_retention_instance_key::for_host_entry(&*drift_a);
+        const auto drift_key_b =
+            server_retention_instance_key::for_host_entry(&*drift_b);
+        const auto drift_artifact_a =
+            drift_retention.artifact_id(drift_key_a);
+        const auto drift_artifact_b =
+            drift_retention.artifact_id(drift_key_b);
+        CHECK(drift_artifact_a.v != 0 && drift_artifact_b.v != 0);
+        auto drift_incoming = owned_payload(
+            drift_reference_incoming.reference_artifact);
+        std::vector<const server_prompt_cache_payload *> drift_union {
+            &drift_a->payload, &drift_b->payload, &drift_incoming,
+        };
+        server_prompt_cache_vbr_budget_summary drift_budget;
+        CHECK(server_prompt_cache_payload::summarize_vbr_budgets(
+            drift_union, drift_budget));
+        CHECK(drift_budget.compact_resident_bytes > 1 &&
+              drift_budget.compact_resident_bytes <= SIZE_MAX);
+        drift_cache.limit_size =
+            size_t(drift_budget.compact_resident_bytes - 1);
+        CHECK(drift_retention.set_lineage_prior(drift_key_a, 1));
+        CHECK(drift_retention.set_lineage_prior(drift_key_b, 2000));
+
+        server_prompt_cache_vbr_publication_metadata drift_metadata;
+        CHECK(drift_cache.prepare_vbr_publication_metadata(
+            drift_prompt_incoming,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            drift_slot_incoming, drift_metadata));
+        server_prompt_cache_vbr_publication_metadata * drift_batch[] = {
+            &drift_metadata,
+        };
+        server_prompt_cache_vbr_capacity_claim drift_capacity;
+        CHECK(drift_cache.prepare_vbr_publication_capacity(
+            drift_batch, 1, drift_incoming.size(), drift_capacity));
+        CHECK(drift_capacity.requires_publication_revalidation());
+        CHECK(drift_retention.set_lineage_prior(drift_key_a, 2000));
+        CHECK(drift_retention.set_lineage_prior(drift_key_b, 1));
+        CHECK(!drift_cache.publish_vbr(
+            drift_metadata, std::move(drift_incoming), {}, false, nullptr,
+            &drift_capacity));
+        CHECK(!drift_capacity.ready());
+        CHECK(drift_cache.states.size() == 2);
+        CHECK(drift_retention.artifact_id(drift_key_a) == drift_artifact_a);
+        CHECK(drift_retention.artifact_id(drift_key_b) == drift_artifact_b);
+        CHECK(drift_cache.retention_shadow_snapshot().last.proposed_artifact ==
+              drift_artifact_b);
+    }
     CHECK(fixture.catalog->snapshot().references == 0);
 
     // Whole-cache destruction is also an ownership terminal: a live owned

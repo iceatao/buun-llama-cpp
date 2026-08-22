@@ -10931,6 +10931,7 @@ private:
         }
 
         if (has_fresh_candidate &&
+            !capacity_claim.requires_publication_revalidation() &&
             !prompt_cache->consume_vbr_publication_capacity(
                 capacity_claim)) {
             const int64_t retry_after_ms = ggml_time_ms() + 5000;
@@ -11042,7 +11043,9 @@ private:
                     server_prompt_cache_payload::from_vbr(
                         std::move(row.payload)),
                     source.cache_family,
-                    !source.task || !source.task->is_child())) {
+                    !source.task || !source.task->is_child(), nullptr,
+                    capacity_claim.requires_publication_revalidation()
+                        ? &capacity_claim : nullptr)) {
                 source.vbr_idle_capture_attempt_identity =
                     found->attempt_identity;
                 source.vbr_idle_capture_terminal = false;

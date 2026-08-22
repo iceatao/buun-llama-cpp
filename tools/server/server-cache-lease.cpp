@@ -939,6 +939,107 @@ server_cache_lease_evaluation server_cache_lease_table::inspect(
     return result;
 }
 
+bool server_cache_lease_table::inspect_batch(
+        const std::vector<server_cache_lease_inspection_request> & requests,
+        std::vector<server_cache_lease_evaluation> & out) const noexcept {
+    out.clear();
+    try {
+        out.resize(requests.size());
+        if (!available) {
+            return true;
+        }
+
+        std::vector<size_t> request_order(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            request_order[i] = i;
+        }
+        std::sort(request_order.begin(), request_order.end(),
+            [&](size_t a, size_t b) {
+                return requests[a].artifact.v < requests[b].artifact.v;
+            });
+        for (size_t i = 0; i < request_order.size(); ++i) {
+            const auto & request = requests[request_order[i]];
+            if (request.artifact.v == 0 || !request.expected_identity ||
+                !request.expected_identity->valid() ||
+                (i != 0 && requests[request_order[i - 1]].artifact.v ==
+                    request.artifact.v)) {
+                out.clear();
+                return false;
+            }
+            out[request_order[i]].state =
+                server_cache_lease_eval_state::known;
+        }
+
+        std::vector<size_t> identity_order(identities.size());
+        for (size_t i = 0; i < identities.size(); ++i) {
+            identity_order[i] = i;
+        }
+        std::sort(identity_order.begin(), identity_order.end(),
+            [&](size_t a, size_t b) {
+                return identities[a].id.v < identities[b].id.v;
+            });
+
+        const auto find_request = [&](uint64_t artifact) {
+            return std::lower_bound(
+                request_order.begin(), request_order.end(), artifact,
+                [&](size_t index, uint64_t value) {
+                    return requests[index].artifact.v < value;
+                });
+        };
+        for (const auto & unavailable : identity_unavailable) {
+            const auto it = find_request(unavailable.artifact.v);
+            if (it != request_order.end() &&
+                requests[*it].artifact == unavailable.artifact) {
+                out[*it] = {};
+            }
+        }
+
+        const uint64_t now = clock->now_ns();
+        for (const auto & lease : leases) {
+            if (lease.subject_lost ||
+                (!lease.explicit_hard && lease.expires_at_ns <= now)) {
+                continue;
+            }
+            const auto request_it = find_request(lease.subject.artifact.v);
+            if (request_it == request_order.end() ||
+                requests[*request_it].artifact != lease.subject.artifact) {
+                continue;
+            }
+            auto & result = out[*request_it];
+            if (result.state != server_cache_lease_eval_state::known) {
+                continue;
+            }
+            const auto identity_it = std::lower_bound(
+                identity_order.begin(), identity_order.end(),
+                lease.identity_id.v,
+                [&](size_t index, uint64_t value) {
+                    return identities[index].id.v < value;
+                });
+            if (identity_it == identity_order.end() ||
+                identities[*identity_it].id != lease.identity_id ||
+                identities[*identity_it].value !=
+                    *requests[*request_it].expected_identity) {
+                result = {};
+                continue;
+            }
+            if (lease.cls > result.cls) {
+                result.cls = lease.cls;
+            }
+        }
+        for (auto & result : out) {
+            if (result.state == server_cache_lease_eval_state::known &&
+                result.cls == server_cache_lease_class::hard) {
+                result.eligibility =
+                    server_cache_lease_eligibility::hard_blocked;
+            }
+        }
+        return true;
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
 server_cache_lease_evaluation server_cache_lease_table::inspect_range(
         llama_cache_acct_artifact_id artifact,
         const server_cache_lease_identity & expected_identity,

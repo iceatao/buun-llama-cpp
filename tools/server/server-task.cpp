@@ -1910,7 +1910,7 @@ static size_t server_prompt_cache_effective_token_limit(
     size_t cache_bytes,
     size_t cache_tokens) noexcept;
 
-static bool server_prompt_cache_single_incumbent_pressure(
+static bool server_prompt_cache_single_victim_pressure(
     server_prompt_cache & cache,
     size_t projected_bytes,
     size_t projected_tokens,
@@ -1918,14 +1918,21 @@ static bool server_prompt_cache_single_incumbent_pressure(
     llama_cache_acct_artifact_id expected_artifact,
     bool prove_capacity,
     server_prompt_cache_state *& incumbent,
-    llama_cache_acct_artifact_id & artifact) noexcept;
+    llama_cache_acct_artifact_id & artifact,
+    server_prompt_cache_shadow_row * shadow_rows = nullptr,
+    server_prompt_cache_shadow_artifact_slot * shadow_artifacts = nullptr,
+    server_prompt_cache_shadow_lineage_slot * shadow_lineages = nullptr,
+    llama_cache_acct_artifact_id ignored_artifact = {}) noexcept;
 
 server_prompt_cache_vbr_capacity_claim::
 server_prompt_cache_vbr_capacity_claim(
         server_prompt_cache_vbr_capacity_claim && other) noexcept
     : cache_(other.cache_),
-      incumbent_(other.incumbent_),
-      incumbent_artifact_(other.incumbent_artifact_),
+      victim_(other.victim_),
+      victim_artifact_(other.victim_artifact_),
+      destination_artifact_(other.destination_artifact_),
+      incoming_compact_bytes_(other.incoming_compact_bytes_),
+      incoming_tokens_(other.incoming_tokens_),
       scheduler_owner_(other.scheduler_owner_) {
     other.clear();
 }
@@ -1935,8 +1942,11 @@ server_prompt_cache_vbr_capacity_claim::operator=(
         server_prompt_cache_vbr_capacity_claim && other) noexcept {
     if (this != &other) {
         cache_ = other.cache_;
-        incumbent_ = other.incumbent_;
-        incumbent_artifact_ = other.incumbent_artifact_;
+        victim_ = other.victim_;
+        victim_artifact_ = other.victim_artifact_;
+        destination_artifact_ = other.destination_artifact_;
+        incoming_compact_bytes_ = other.incoming_compact_bytes_;
+        incoming_tokens_ = other.incoming_tokens_;
         scheduler_owner_ = other.scheduler_owner_;
         other.clear();
     }
@@ -1945,8 +1955,11 @@ server_prompt_cache_vbr_capacity_claim::operator=(
 
 void server_prompt_cache_vbr_capacity_claim::clear() noexcept {
     cache_ = nullptr;
-    incumbent_ = nullptr;
-    incumbent_artifact_ = {};
+    victim_ = nullptr;
+    victim_artifact_ = {};
+    destination_artifact_ = {};
+    incoming_compact_bytes_ = 0;
+    incoming_tokens_ = 0;
     scheduler_owner_ = {};
 }
 
@@ -2035,16 +2048,25 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
         }
     }
     if (!fits(projected_bytes, projected_tokens)) {
-        if (prepared_count != 1 || states.size() != 1 ||
+        if (prepared_count != 1 ||
             !publish_authority || !acct || !retention_obs || !lease_obs ||
             !lease_execution_identity ||
-            !server_prompt_cache_single_incumbent_pressure(
+            !server_prompt_cache_single_victim_pressure(
                 *this, projected_bytes, projected_tokens, nullptr, {},
                 true,
-                claim.incumbent_, claim.incumbent_artifact_)) {
+                claim.victim_, claim.victim_artifact_,
+                retention_shadow_rows.get(),
+                retention_shadow_artifacts.get(),
+                retention_shadow_lineages.get(),
+                prepared[0]->destination_artifact_)) {
             claim.clear();
             return false;
         }
+    }
+    if (claim.victim_) {
+        claim.destination_artifact_ = prepared[0]->destination_artifact_;
+        claim.incoming_compact_bytes_ = incoming_compact_bytes;
+        claim.incoming_tokens_ = incoming_tokens;
     }
     claim.cache_ = this;
     claim.scheduler_owner_ = std::this_thread::get_id();
@@ -2054,20 +2076,9 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
 bool server_prompt_cache::consume_vbr_publication_capacity(
         server_prompt_cache_vbr_capacity_claim & claim) noexcept {
     if (!claim.ready() || claim.cache_ != this ||
-        claim.scheduler_owner_ != std::this_thread::get_id()) {
+        claim.scheduler_owner_ != std::this_thread::get_id() ||
+        claim.victim_) {
         return false;
-    }
-    if (claim.incumbent_) {
-        server_prompt_cache_state * current = nullptr;
-        llama_cache_acct_artifact_id artifact;
-        if (!server_prompt_cache_single_incumbent_pressure(
-                *this, 0, 0,
-                claim.incumbent_, claim.incumbent_artifact_,
-                false,
-                current, artifact)) {
-            claim.clear();
-            return false;
-        }
     }
     claim.clear();
     return true;
@@ -3357,7 +3368,8 @@ bool server_prompt_cache::publish_vbr(
         server_prompt_cache_payload payload,
         common_cache_family_binding family,
         bool automatic_main_family,
-        iterator * published) noexcept {
+        iterator * published,
+        server_prompt_cache_vbr_capacity_claim * capacity) noexcept {
     if (published) {
         *published = states.end();
     }
@@ -3365,6 +3377,37 @@ bool server_prompt_cache::publish_vbr(
         payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
         !payload.publishable()) {
         return false;
+    }
+    llama_cache_acct_artifact_id required_first_victim;
+    if (capacity) {
+        if (!capacity->ready() || capacity->cache_ != this ||
+            capacity->scheduler_owner_ != std::this_thread::get_id()) {
+            return false;
+        }
+        if (capacity->victim_) {
+            const auto compact = payload.vbr_compact_owner();
+            if (prepared.destination_artifact_ !=
+                    capacity->destination_artifact_ ||
+                prepared.entry_.front().prompt.n_tokens() < 0 ||
+                size_t(prepared.entry_.front().prompt.n_tokens()) !=
+                    capacity->incoming_tokens_ ||
+                !compact || compact->resident_bytes() >
+                    capacity->incoming_compact_bytes_) {
+                capacity->clear();
+                return false;
+            }
+            server_prompt_cache_state * current = nullptr;
+            llama_cache_acct_artifact_id artifact;
+            if (!server_prompt_cache_single_victim_pressure(
+                    *this, 0, 0,
+                    capacity->victim_, capacity->victim_artifact_,
+                    false, current, artifact)) {
+                capacity->clear();
+                return false;
+            }
+            required_first_victim = capacity->victim_artifact_;
+        }
+        capacity->clear();
     }
     auto & staged = prepared.entry_.front();
     const auto source_key =
@@ -3388,7 +3431,8 @@ bool server_prompt_cache::publish_vbr(
     prepared.clear();
     try {
         if (publish_impl(
-                std::move(entry), source, source_slot, published, true)) {
+                std::move(entry), source, source_slot, published, true,
+                required_first_victim)) {
             return true;
         }
     } catch (...) {
@@ -4101,11 +4145,13 @@ bool checkpoint_payload_equal(
            a.accel.spec == b.accel.spec;
 }
 
-bool build_host_retention_artifact(
+bool build_host_retention_artifact_uninspected(
         server_prompt_cache & cache,
         server_prompt_cache_state & state,
-        server_cache_destruction_artifact & out) noexcept {
+        server_cache_destruction_artifact & out,
+        server_cache_lease_identity & identity) noexcept {
     out = {};
+    identity = {};
     try {
         if (!cache.retention_obs || !cache.lease_obs ||
             !cache.lease_execution_identity) {
@@ -4118,7 +4164,6 @@ bool build_host_retention_artifact(
             catalog.record.kind != common_retention_artifact_kind::host_entry) {
             return false;
         }
-        server_cache_lease_identity identity;
         if (!server_cache_lease_build_identity(
                 *cache.lease_execution_identity,
                 state.adapter_config_key,
@@ -4131,8 +4176,6 @@ bool build_host_retention_artifact(
         out.candidate.record = catalog.record;
         out.candidate.lineage = catalog.lineage;
         out.candidate.availability = catalog.avail;
-        out.candidate.lease = cache.lease_obs->inspect(
-            catalog.artifact_id, identity);
         out.candidate.identity_known = true;
         out.kind = common_retention_artifact_kind::host_entry;
         out.host_source_id = state.cache_plan_source_id;
@@ -4143,6 +4186,20 @@ bool build_host_retention_artifact(
         out = {};
         return false;
     }
+}
+
+bool build_host_retention_artifact(
+        server_prompt_cache & cache,
+        server_prompt_cache_state & state,
+        server_cache_destruction_artifact & out) noexcept {
+    server_cache_lease_identity identity;
+    if (!build_host_retention_artifact_uninspected(
+            cache, state, out, identity)) {
+        return false;
+    }
+    out.candidate.lease = cache.lease_obs->inspect(
+        out.candidate.artifact_id, identity);
+    return true;
 }
 
 bool build_host_destruction_artifact(
@@ -4663,7 +4720,9 @@ bool host_trade_price(
         uint32_t ordinal,
         server_cache_destruction_reason reason,
         const common_cache_plan_calib * calib,
-        host_trade_candidate & out) noexcept {
+        host_trade_candidate & out,
+        bool preview_vbr = true,
+        const server_cache_destruction_artifact * prepared_artifact = nullptr) noexcept {
     out = {};
     out.victim = victim;
     out.ranking.ordinal = ordinal;
@@ -4673,14 +4732,16 @@ bool host_trade_price(
     out.main_family = victim->main_family;
     try {
         auto & authority = *cache.publish_authority;
-        server_cache_destruction_artifact artifact;
+        server_cache_destruction_artifact local_artifact;
         out.vbr = victim->payload.kind() ==
             server_prompt_cache_payload_kind::vbr_artifact;
-        if (!(out.vbr
-                ? build_host_retention_artifact(cache, *victim, artifact)
-                : build_host_destruction_artifact(cache, *victim, artifact))) {
+        if (!prepared_artifact && !(out.vbr
+                ? build_host_retention_artifact(cache, *victim, local_artifact)
+                : build_host_destruction_artifact(cache, *victim, local_artifact))) {
             return false;
         }
+        const auto & artifact = prepared_artifact
+            ? *prepared_artifact : local_artifact;
         out.ranking.artifact_id = artifact.candidate.artifact_id;
         out.mandatory_anchor = artifact.mandatory_anchor;
         if (artifact.candidate.lease.state !=
@@ -4709,7 +4770,7 @@ bool host_trade_price(
             if (!victim->payload.vbr_retirement_exclusive()) {
                 return false;
             }
-            if (reason ==
+            if (preview_vbr && reason ==
                     server_cache_destruction_reason::host_capacity) {
                 llama_cache_acct_release_set_preview preview;
                 if (!victim->payload.preview_vbr_retire(
@@ -4784,6 +4845,48 @@ bool host_trade_price(
     }
 }
 
+bool populate_vbr_host_trade_marginals(
+        server_prompt_cache & cache,
+        std::vector<host_trade_candidate> & candidates) noexcept {
+    try {
+        std::vector<const server_prompt_cache_payload *> payloads;
+        std::vector<size_t> indices;
+        payloads.reserve(candidates.size());
+        indices.reserve(candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            auto & candidate = candidates[i];
+            if (!candidate.vbr || !candidate.retirement_ready ||
+                candidate.vbr_logical_alias || candidate.hard_leased ||
+                candidate.mandatory_anchor) {
+                continue;
+            }
+            payloads.push_back(&candidate.victim->payload);
+            indices.push_back(i);
+        }
+        if (payloads.empty()) {
+            return true;
+        }
+        std::vector<vbr_artifact_retire_resident_preview> marginals;
+        if (!cache.acct ||
+            !server_prompt_cache_payload::preview_vbr_retire_resident_batch(
+                payloads, cache.acct->serial(), marginals) ||
+            marginals.size() != indices.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < indices.size(); ++i) {
+            auto & candidate = candidates[indices[i]];
+            candidate.marginal_resident_bytes = marginals[i].resident;
+            candidate.marginal_resident_known = marginals[i].known;
+            if (!marginals[i].known) {
+                candidate.retirement_ready = false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 struct host_trade_df2_projection {
     bool complete = false;
     bool release_evidence_complete = true;
@@ -4808,7 +4911,8 @@ host_trade_df2_projection project_host_trade_df2(
         const std::vector<host_trade_candidate> & candidates,
         server_prompt_cache_shadow_row * rows,
         server_prompt_cache_shadow_artifact_slot * artifacts,
-        server_prompt_cache_shadow_lineage_slot * lineages) noexcept {
+        server_prompt_cache_shadow_lineage_slot * lineages,
+        llama_cache_acct_artifact_id ignored_artifact = {}) noexcept {
     host_trade_df2_projection result;
     if (!rows || !artifacts || !lineages || !cache.retention_obs || !cache.acct ||
         candidates.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
@@ -4982,6 +5086,15 @@ host_trade_df2_projection project_host_trade_df2(
         }
         row->backing_known = true;
     }
+    if (ignored_artifact.v) {
+        auto * row = find_artifact(ignored_artifact);
+        if (row == end ||
+            row->kind != common_retention_artifact_kind::host_entry ||
+            row->backing_known) {
+            return {};
+        }
+        row->backing_known = true;
+    }
     for (const auto * row = begin; row != end; ++row) {
         if (row->kind == common_retention_artifact_kind::host_entry &&
             !row->backing_known) {
@@ -5068,7 +5181,7 @@ void observe_host_trade_refusal(
 
 } // namespace
 
-static bool server_prompt_cache_single_incumbent_pressure(
+static bool server_prompt_cache_single_victim_pressure(
         server_prompt_cache & cache,
         size_t projected_bytes,
         size_t projected_tokens,
@@ -5076,25 +5189,33 @@ static bool server_prompt_cache_single_incumbent_pressure(
         llama_cache_acct_artifact_id expected_artifact,
         bool prove_capacity,
         server_prompt_cache_state *& incumbent,
-        llama_cache_acct_artifact_id & artifact) noexcept {
+        llama_cache_acct_artifact_id & artifact,
+        server_prompt_cache_shadow_row * shadow_rows,
+        server_prompt_cache_shadow_artifact_slot * shadow_artifacts,
+        server_prompt_cache_shadow_lineage_slot * shadow_lineages,
+        llama_cache_acct_artifact_id ignored_artifact) noexcept {
     incumbent = nullptr;
     artifact = {};
-    if (cache.states.size() != 1 || !cache.acct || !cache.retention_obs ||
+    if (cache.states.empty() || !cache.acct || !cache.retention_obs ||
         !cache.lease_obs) {
-        return false;
-    }
-    auto current = cache.states.begin();
-    if (current->recovery_pins != 0 ||
-        (expected_incumbent && &*current != expected_incumbent)) {
         return false;
     }
     cache.lease_obs->lifecycle_point();
     if (!prove_capacity) {
+        if (!expected_incumbent || !expected_artifact.v ||
+            cache.retention_obs->artifact_id(
+                server_retention_instance_key::for_host_entry(
+                    expected_incumbent)) != expected_artifact ||
+            expected_incumbent->recovery_pins != 0) {
+            return false;
+        }
         server_cache_destruction_artifact evidence;
-        const bool built = current->payload.kind() ==
+        const bool built = expected_incumbent->payload.kind() ==
                 server_prompt_cache_payload_kind::vbr_artifact
-            ? build_host_retention_artifact(cache, *current, evidence)
-            : build_host_destruction_artifact(cache, *current, evidence);
+            ? build_host_retention_artifact(
+                cache, *expected_incumbent, evidence)
+            : build_host_destruction_artifact(
+                cache, *expected_incumbent, evidence);
         if (!built || evidence.mandatory_anchor ||
             evidence.candidate.lease.state !=
                 server_cache_lease_eval_state::known ||
@@ -5104,9 +5225,124 @@ static bool server_prompt_cache_single_incumbent_pressure(
              evidence.candidate.artifact_id != expected_artifact)) {
             return false;
         }
-        incumbent = &*current;
+        incumbent = expected_incumbent;
         artifact = evidence.candidate.artifact_id;
         return true;
+    }
+
+    if (cache.states.size() > 1) {
+        const bool byte_pressure = cache.limit_size > 0 &&
+            projected_bytes > cache.limit_size;
+        const auto reason = byte_pressure
+            ? server_cache_destruction_reason::host_capacity
+            : server_cache_destruction_reason::host_token_limit;
+        if (!shadow_rows || !shadow_artifacts || !shadow_lineages ||
+            cache.states.size() >
+                SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES ||
+            !cache.retention_obs->begin_competition_wave()) {
+            return false;
+        }
+        std::vector<host_trade_candidate> candidates;
+        try {
+            std::vector<server_prompt_cache::iterator> victims;
+            std::vector<uint32_t> ordinals;
+            std::vector<server_cache_destruction_artifact> evidence;
+            std::vector<server_cache_lease_identity> identities;
+            std::vector<server_cache_lease_inspection_request> requests;
+            victims.reserve(cache.states.size());
+            ordinals.reserve(cache.states.size());
+            evidence.reserve(cache.states.size());
+            identities.reserve(cache.states.size());
+            requests.reserve(cache.states.size());
+            candidates.reserve(cache.states.size());
+            uint32_t ordinal = 0;
+            for (auto it = cache.states.begin(); it != cache.states.end();
+                    ++it, ++ordinal) {
+                if (it->payload.kind() !=
+                        server_prompt_cache_payload_kind::vbr_artifact ||
+                    it->payload.vbr_has_quality_anchor() ||
+                    it->payload.vbr_logical_erase_only()) {
+                    return false;
+                }
+                if (it->recovery_pins != 0) {
+                    continue;
+                }
+                victims.push_back(it);
+                ordinals.push_back(ordinal);
+                evidence.emplace_back();
+                identities.emplace_back();
+                if (!build_host_retention_artifact_uninspected(
+                        cache, *it, evidence.back(), identities.back())) {
+                    return false;
+                }
+                requests.push_back({
+                    evidence.back().candidate.artifact_id,
+                    &identities.back(),
+                });
+            }
+            std::vector<server_cache_lease_evaluation> leases;
+            if (!cache.lease_obs->inspect_batch(requests, leases) ||
+                leases.size() != evidence.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < evidence.size(); ++i) {
+                evidence[i].candidate.lease = leases[i];
+                host_trade_candidate candidate;
+                (void) host_trade_price(
+                    cache, victims[i], ordinals[i], reason,
+                    nullptr, candidate, false, &evidence[i]);
+                candidates.push_back(std::move(candidate));
+            }
+            if (candidates.empty() || (byte_pressure &&
+                !populate_vbr_host_trade_marginals(cache, candidates))) {
+                return false;
+            }
+        } catch (...) {
+            return false;
+        }
+        const auto projection = project_host_trade_df2(
+            cache, reason,
+            cache.states.end(), candidates,
+            shadow_rows, shadow_artifacts, shadow_lineages,
+            ignored_artifact);
+        if (!projection.complete || !projection.release_evidence_complete ||
+            !projection.artifact.v) {
+            return false;
+        }
+        const auto selected = std::find_if(
+            candidates.begin(), candidates.end(), [&](const auto & value) {
+                return value.ranking.artifact_id == projection.artifact &&
+                    (!byte_pressure || value.marginal_resident_known) &&
+                    value.retirement_ready && value.lease_known &&
+                    !value.hard_leased && !value.mandatory_anchor &&
+                    value.victim->recovery_pins == 0;
+            });
+        if (selected == candidates.end()) {
+            return false;
+        }
+        const size_t released_tokens = size_t(std::max(
+            0, selected->victim->prompt.n_tokens()));
+        const size_t after_bytes = selected->marginal_resident_bytes >
+                projected_bytes
+            ? 0 : projected_bytes -
+                size_t(selected->marginal_resident_bytes);
+        const size_t after_tokens = released_tokens > projected_tokens
+            ? 0 : projected_tokens - released_tokens;
+        if ((cache.limit_size > 0 && after_bytes > cache.limit_size) ||
+            (cache.limit_tokens != 0 &&
+             after_tokens > server_prompt_cache_effective_token_limit(
+                cache.limit_size, cache.limit_tokens,
+                after_bytes, after_tokens))) {
+            return false;
+        }
+        incumbent = &*selected->victim;
+        artifact = selected->ranking.artifact_id;
+        return true;
+    }
+
+    auto current = cache.states.begin();
+    if (current->recovery_pins != 0) {
+        return false;
     }
     host_trade_candidate candidate;
     (void) host_trade_price(
@@ -5686,7 +5922,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
         bool competition_wave_valid,
         bool & observe_retention_shadow,
         uint64_t & released_bytes,
-        size_t & released_tokens) {
+        size_t & released_tokens,
+        llama_cache_acct_artifact_id required_victim) {
     released_bytes = 0;
     released_tokens = 0;
     legacy_floor = states.end();
@@ -5762,7 +5999,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
             }
             host_trade_candidate candidate;
             (void) host_trade_price(
-                *this, it, ordinal, reason, calib, candidate);
+                *this, it, ordinal, reason, calib, candidate, false);
             if (candidate.hard_leased) {
                 candidate.attempted = true;
                 const uint64_t quote_sequence =
@@ -5777,6 +6014,13 @@ bool server_prompt_cache::destroy_priced_host_entry(
                 }
             }
             candidates.push_back(std::move(candidate));
+        }
+        if (reason == server_cache_destruction_reason::host_capacity &&
+            !populate_vbr_host_trade_marginals(*this, candidates)) {
+            if (destruction_obs) {
+                destruction_obs->host_trade_legacy_fallbacks++;
+            }
+            return false;
         }
         if (reason == server_cache_destruction_reason::host_capacity) {
             std::vector<llama_cache_acct_release_set_view> fixed_sets;
@@ -5826,6 +6070,10 @@ bool server_prompt_cache::destroy_priced_host_entry(
                    candidate.victim->recovery_pins == 0;
         });
     if (alias != candidates.end()) {
+        if (required_victim.v &&
+            alias->ranking.artifact_id != required_victim) {
+            return false;
+        }
         if (observe_retention_shadow) {
             observe_retention_pressure_choice(
                 reason, incoming, alias->victim, competition_wave_valid);
@@ -5883,6 +6131,10 @@ bool server_prompt_cache::destroy_priced_host_entry(
         chosen->attempted = true;
         chosen->ranking.zero_destruction_tie_break =
             mixed_destruction_tie && chosen->ranking.zero_destruction;
+        if (required_victim.v &&
+            chosen->ranking.artifact_id != required_victim) {
+            return false;
+        }
 
         const uint64_t quote_sequence =
             ++publish_authority->destruction_quote_sequence;
@@ -6082,6 +6334,10 @@ bool server_prompt_cache::destroy_priced_host_entry(
                         value.victim->recovery_pins == 0;
             });
             if (selected != candidates.end()) {
+                if (required_victim.v &&
+                    selected->ranking.artifact_id != required_victim) {
+                    return false;
+                }
                 const int32_t source_id =
                     selected->victim->cache_plan_source_id;
                 const size_t victim_bytes = selected->victim->size();
@@ -6146,7 +6402,8 @@ bool server_prompt_cache::evict_front_under_pressure(
         bool competition_wave_valid,
         bool observe_retention_shadow,
         uint64_t & released_bytes,
-        size_t & released_tokens) {
+        size_t & released_tokens,
+        llama_cache_acct_artifact_id required_victim) {
     released_bytes = 0;
     released_tokens = 0;
     GGML_ASSERT(!states.empty());
@@ -6158,8 +6415,14 @@ bool server_prompt_cache::evict_front_under_pressure(
             reason, incoming, legacy_floor, floor_reason,
             recovery_pin_excluded, competition_wave_valid,
             observe_retention_shadow, released_bytes,
-            released_tokens)) {
+            released_tokens, required_victim)) {
         return true;
+    }
+
+    if (required_victim.v) {
+        floor_reason =
+            common_cache_plan_destruction_reason::capacity_refused;
+        legacy_floor = states.end();
     }
 
     // Lifecycle-off is the byte-identical historical FIFO floor. Once
@@ -6557,7 +6820,7 @@ bool server_prompt_cache::publish(
         int32_t source_slot,
         iterator * published) {
     return publish_impl(
-        std::move(entry), source_prompt, source_slot, published, false);
+        std::move(entry), source_prompt, source_slot, published, false, {});
 }
 
 bool server_prompt_cache::publish_impl(
@@ -6565,7 +6828,8 @@ bool server_prompt_cache::publish_impl(
         const server_prompt * source_prompt,
         int32_t source_slot,
         iterator * published,
-        bool vbr_retention_prepared) {
+        bool vbr_retention_prepared,
+        llama_cache_acct_artifact_id required_first_victim) {
     if (published) {
         *published = states.end();
     }
@@ -6982,7 +7246,7 @@ bool server_prompt_cache::publish_impl(
     // are already committed, so a local make-room loop would prevent no memory spike and, being
     // size-only, would skip the token limit. update() enforces both and evicts oldest-first,
     // preserving the just-added entry.
-    if (!update_impl(self)) {
+    if (!update_impl(self, required_first_victim)) {
         return false;
     }
     if (published) {
@@ -7864,7 +8128,9 @@ bool server_prompt_cache::enforce_quality_anchor_budget(
     }
 }
 
-bool server_prompt_cache::update_impl(iterator incoming) {
+bool server_prompt_cache::update_impl(
+        iterator incoming,
+        llama_cache_acct_artifact_id required_first_victim) {
     if (limit_size == 0 && limit_tokens == 0 &&
         !quality_anchor_budget_enabled) {
         return true;
@@ -7994,9 +8260,11 @@ bool server_prompt_cache::update_impl(iterator incoming) {
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_capacity,
                     incoming, competition_wave_valid, observe_shadow,
-                    released_bytes, released_tokens)) {
+                    released_bytes, released_tokens,
+                    required_first_victim)) {
                 return false;
             }
+            required_first_victim = {};
             retention_shadow_observed |= observe_shadow;
             if (released_bytes == UINT64_MAX ||
                 released_bytes > cache_bytes ||
@@ -8029,9 +8297,11 @@ bool server_prompt_cache::update_impl(iterator incoming) {
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_token_limit,
                     incoming, competition_wave_valid, observe_shadow,
-                    released_bytes, released_tokens)) {
+                    released_bytes, released_tokens,
+                    required_first_victim)) {
                 return false;
             }
+            required_first_victim = {};
             retention_shadow_observed |= observe_shadow;
             if (released_bytes == UINT64_MAX ||
                 released_bytes > cache_bytes ||

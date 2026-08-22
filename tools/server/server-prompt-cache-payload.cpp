@@ -564,6 +564,45 @@ bool server_prompt_cache_vbr_variant_set::preview_retire_union(
     }
 }
 
+bool server_prompt_cache_vbr_variant_set::preview_retire_resident_batch(
+        const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) noexcept {
+    out.clear();
+    if (variants.empty()) {
+        return false;
+    }
+    try {
+        if (variants.size() > SIZE_MAX/2) {
+            return false;
+        }
+        std::vector<const vbr_artifact_package_view *> package_arena;
+        std::vector<vbr_artifact_package_set_view> groups;
+        package_arena.reserve(variants.size()*2);
+        groups.reserve(variants.size());
+        for (const auto * variant : variants) {
+            if (!variant || !variant->retirement_exclusive() ||
+                !variant->impl_ || !variant->impl_->compact) {
+                return false;
+            }
+            const size_t first = package_arena.size();
+            package_arena.push_back(&variant->impl_->compact->package());
+            if (variant->impl_->anchor) {
+                package_arena.push_back(&variant->impl_->anchor->package());
+            }
+            groups.push_back({
+                package_arena.data() + first,
+                package_arena.size() - first,
+            });
+        }
+        return package_arena.front()->preview_owned_retire_resident_batch(
+            groups, expected_serial, out);
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
 server_prompt_cache_payload server_prompt_cache_payload::from_vbr(
         vbr_owner owner) noexcept {
     return from_vbr_variants(
@@ -875,6 +914,34 @@ bool server_prompt_cache_payload::preview_vbr_retire_union(
             variants, expected_serial, out);
     } catch (...) {
         out = {};
+        return false;
+    }
+}
+
+bool server_prompt_cache_payload::preview_vbr_retire_resident_batch(
+        const std::vector<const server_prompt_cache_payload *> & payloads,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) noexcept {
+    out.clear();
+    if (payloads.empty()) {
+        return false;
+    }
+    try {
+        std::vector<const server_prompt_cache_vbr_variant_set *> variants;
+        variants.reserve(payloads.size());
+        for (const auto * payload : payloads) {
+            const auto * owner = payload
+                ? std::get_if<vbr_variant_owner>(&payload->storage_)
+                : nullptr;
+            if (!owner || !*owner) {
+                return false;
+            }
+            variants.push_back(owner->get());
+        }
+        return server_prompt_cache_vbr_variant_set::
+            preview_retire_resident_batch(variants, expected_serial, out);
+    } catch (...) {
+        out.clear();
         return false;
     }
 }

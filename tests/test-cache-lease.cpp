@@ -517,6 +517,39 @@ static void test_lifecycle_without_debug_consults_lease() {
     CHECK(lifecycle.n_events == 1);
 }
 
+static void test_batch_inspection_max_cardinality() {
+    fake_clock clock;
+    server_cache_lease_table table(&clock);
+    const auto expected = identity();
+    const auto wrong = identity("different-adapter");
+    constexpr size_t count = 8192;
+    std::vector<server_cache_lease_inspection_request> requests;
+    requests.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto value = subject(1000 + i);
+        CHECK(table.grant_soft(value, context_scope(), expected, 1000));
+        requests.push_back({ value.artifact, &expected });
+    }
+    requests[count / 2].expected_identity = &wrong;
+    table.artifact_identity_unavailable(subject(1000 + count - 1));
+
+    clock.calls = 0;
+    std::vector<server_cache_lease_evaluation> inspected;
+    CHECK(table.inspect_batch(requests, inspected));
+    CHECK(clock.calls == 1);
+    CHECK(inspected.size() == count);
+    CHECK(inspected.front().state == server_cache_lease_eval_state::known);
+    CHECK(inspected.front().cls == server_cache_lease_class::soft);
+    CHECK(inspected[count / 2].state ==
+          server_cache_lease_eval_state::unavailable);
+    CHECK(inspected.back().state ==
+          server_cache_lease_eval_state::unavailable);
+
+    requests.back().artifact = requests.front().artifact;
+    CHECK(!table.inspect_batch(requests, inspected));
+    CHECK(inspected.empty());
+}
+
 int main() {
     test_closed_scope_types();
     test_declared_family_replaces_automatic_weight();
@@ -529,6 +562,7 @@ int main() {
     test_observer_off_zero_work();
     test_lifecycle_without_debug_consults_lease();
     test_hard_proof_lifetime_across_clone();
+    test_batch_inspection_max_cardinality();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d cache-lease test(s) failed\n", failures);

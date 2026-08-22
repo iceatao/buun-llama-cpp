@@ -11,6 +11,7 @@
 class vbr_artifact_package_view;
 class vbr_artifact_prepared_retire;
 struct vbr_artifact_allocation_view;
+struct vbr_artifact_retire_resident_preview;
 struct server_prompt_cache;
 
 struct server_prompt_cache_vbr_accounting_summary {
@@ -120,6 +121,10 @@ public:
         const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
         uint64_t expected_serial,
         llama_cache_acct_release_set_preview & out) noexcept;
+    static bool preview_retire_resident_batch(
+        const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) noexcept;
 
 private:
     bool prepare_anchor_retire_owned(
@@ -191,6 +196,10 @@ public:
         const std::vector<const server_prompt_cache_payload *> & payloads,
         uint64_t expected_serial,
         llama_cache_acct_release_set_preview & out) noexcept;
+    static bool preview_vbr_retire_resident_batch(
+        const std::vector<const server_prompt_cache_payload *> & payloads,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) noexcept;
     static bool summarize_vbr_budgets(
         const std::vector<const server_prompt_cache_payload *> & payloads,
         server_prompt_cache_vbr_budget_summary & out) noexcept;

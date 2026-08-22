@@ -258,6 +258,18 @@ private:
     friend class llama_vbr_artifact_catalog;
 };
 
+class vbr_artifact_package_view;
+
+struct vbr_artifact_package_set_view {
+    const vbr_artifact_package_view * const * data = nullptr;
+    size_t size = 0;
+};
+
+struct vbr_artifact_retire_resident_preview {
+    uint64_t resident = 0;
+    bool known = false;
+};
+
 // A catalog lease exposes only immutable restore inputs that passed the
 // catalog's sealed publication transaction. Resolving or retaining a view is
 // therefore an O(metadata) capability operation, not a request to re-read and
@@ -295,6 +307,10 @@ public:
         const std::vector<const vbr_artifact_package_view *> & packages,
         uint64_t expected_serial,
         llama_cache_acct_release_set_preview & out) const noexcept;
+    bool preview_owned_retire_resident_batch(
+        const std::vector<vbr_artifact_package_set_view> & package_sets,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) const noexcept;
     llama_cache_acct_artifact_id reference_artifact() const noexcept;
     const std::vector<vbr_artifact_portable_topology> & topologies() const noexcept;
     const vbr_artifact_reference_manifest & manifest() const noexcept;
@@ -515,6 +531,10 @@ private:
         const std::vector<llama_cache_acct_artifact_id> & references,
         uint64_t expected_serial,
         llama_cache_acct_release_set_preview & out) const noexcept;
+    bool preview_owned_retire_resident_batch(
+        const std::vector<vbr_artifact_package_set_view> & package_sets,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) const noexcept;
     vbr_artifact_prepared_retire_status commit_owned_retire(
         uint64_t token,
         const std::vector<llama_cache_acct_artifact_id> & references,

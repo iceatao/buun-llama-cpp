@@ -894,8 +894,8 @@ private:
 
 // Scheduler-thread citation that the complete conservative fresh-capture
 // batch fits the ordinary prompt-cache limits. Pressure support is limited to
-// one incoming row and one incumbent, where no victim-choice policy exists;
-// the ordinary publication terminal remains the sole eviction authority.
+// one incoming row and one canonically selected victim; the ordinary
+// publication terminal remains the sole eviction authority.
 class server_prompt_cache_vbr_capacity_claim {
 public:
     server_prompt_cache_vbr_capacity_claim() = default;
@@ -910,12 +910,18 @@ public:
         server_prompt_cache_vbr_capacity_claim && other) noexcept;
 
     bool ready() const noexcept { return cache_ != nullptr; }
+    bool requires_publication_revalidation() const noexcept {
+        return ready() && victim_ != nullptr;
+    }
 
 private:
     void clear() noexcept;
     server_prompt_cache * cache_ = nullptr;
-    server_prompt_cache_state * incumbent_ = nullptr;
-    llama_cache_acct_artifact_id incumbent_artifact_;
+    server_prompt_cache_state * victim_ = nullptr;
+    llama_cache_acct_artifact_id victim_artifact_;
+    llama_cache_acct_artifact_id destination_artifact_;
+    uint64_t incoming_compact_bytes_ = 0;
+    size_t incoming_tokens_ = 0;
     std::thread::id scheduler_owner_;
     friend struct server_prompt_cache;
 };
@@ -1262,11 +1268,13 @@ struct server_prompt_cache {
         server_prompt_cache_payload payload,
         common_cache_family_binding family,
         bool automatic_main_family,
-        iterator * published = nullptr) noexcept;
+        iterator * published = nullptr,
+        server_prompt_cache_vbr_capacity_claim * capacity = nullptr) noexcept;
     // Cite one complete conservative fresh-capture batch at the exact
-    // pre-D2H scheduler checkpoint. Multi-row and multi-incumbent pressure
-    // are refused. A singleton/single-incumbent pressure citation is
-    // revalidated at consume; ordinary publication still owns the eviction.
+    // pre-D2H scheduler checkpoint. Pressure is limited to one incoming row
+    // and one canonical victim. A pressure citation is consumed only by the
+    // matching publication terminal; ordinary publication still owns the
+    // eviction and refuses if its first victim no longer matches.
     bool prepare_vbr_publication_capacity(
         server_prompt_cache_vbr_publication_metadata * const * prepared,
         size_t prepared_count,
@@ -1405,7 +1413,8 @@ private:
         const server_prompt * source_prompt,
         int32_t source_slot,
         iterator * published,
-        bool vbr_retention_prepared);
+        bool vbr_retention_prepared,
+        llama_cache_acct_artifact_id required_first_victim = {});
     void release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
     friend class server_prompt_cache_vbr_publication_metadata;
@@ -1483,14 +1492,16 @@ private:
             bool competition_wave_valid,
             bool & observe_retention_shadow,
             uint64_t & released_bytes,
-            size_t & released_tokens);
+            size_t & released_tokens,
+            llama_cache_acct_artifact_id required_victim = {});
     bool evict_front_under_pressure(
         server_cache_destruction_reason reason,
         iterator incoming,
         bool competition_wave_valid,
-        bool observe_retention_shadow,
-        uint64_t & released_bytes,
-        size_t & released_tokens);
+            bool observe_retention_shadow,
+            uint64_t & released_bytes,
+            size_t & released_tokens,
+            llama_cache_acct_artifact_id required_victim = {});
     void refuse_incoming_under_pressure(
         iterator incoming,
         server_cache_destruction_reason reason);
@@ -1500,7 +1511,9 @@ private:
         vbr_artifact_prepared_retire * vbr_retire = nullptr,
         uint64_t * released_bytes = nullptr,
         size_t * released_tokens = nullptr);
-    bool update_impl(iterator incoming);
+    bool update_impl(
+        iterator incoming,
+        llama_cache_acct_artifact_id required_first_victim = {});
     bool enforce_quality_anchor_budget(
         iterator incoming,
         uint64_t competition_epoch,

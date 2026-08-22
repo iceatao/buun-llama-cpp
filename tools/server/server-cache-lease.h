@@ -148,6 +148,11 @@ struct server_cache_lease_evaluation {
         server_cache_lease_eligibility::eligible;
 };
 
+struct server_cache_lease_inspection_request {
+    llama_cache_acct_artifact_id artifact;
+    const server_cache_lease_identity * expected_identity = nullptr;
+};
+
 struct server_cache_lease_frontier {
     uint64_t sequence_epoch = 0;
     uint64_t token_count = 0;
@@ -370,6 +375,11 @@ public:
     server_cache_lease_evaluation inspect(
         llama_cache_acct_artifact_id artifact,
         const server_cache_lease_identity & expected_identity) const noexcept;
+    // Batch planner seam. It samples the clock once and indexes the immutable
+    // lease/identity vectors once, avoiding a full lease scan per candidate.
+    bool inspect_batch(
+        const std::vector<server_cache_lease_inspection_request> & requests,
+        std::vector<server_cache_lease_evaluation> & out) const noexcept;
     server_cache_lease_evaluation inspect_range(
         llama_cache_acct_artifact_id artifact,
         const server_cache_lease_identity & expected_identity,
