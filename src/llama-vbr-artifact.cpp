@@ -581,7 +581,8 @@ bool shard_metadata_valid(
 bool descriptor_metadata_valid(
         const vbr_artifact_unit_descriptor & descriptor,
         const std::vector<vbr_artifact_portable_topology> & topologies,
-        bool require_source) {
+        bool require_source,
+        bool allow_sparse_rows = false) {
     const bool current_type_supported =
         descriptor.current_type == GGML_TYPE_F16 ||
         descriptor.current_type == GGML_TYPE_TURBO8_0 ||
@@ -637,7 +638,10 @@ bool descriptor_metadata_valid(
     for (uint32_t i = 0; i < descriptor.shards.size(); ++i) {
         if (!shard_metadata_valid(
                 descriptor.shards[i], i, topologies, require_source) ||
-            descriptor.shards[i].row_count != descriptor.wm_cells ||
+            (allow_sparse_rows
+                ? (descriptor.shards[i].row_count == 0 ||
+                   descriptor.shards[i].row_count > descriptor.wm_cells)
+                : descriptor.shards[i].row_count != descriptor.wm_cells) ||
             (i > 0 &&
              (descriptor.shards[i].topology_index != topology_index ||
               descriptor.shards[i].device_ordinal <= prior_ordinal))) {
@@ -1201,17 +1205,6 @@ bool stash_reference_valid(
     return cardinality == reference.captured_sink_count;
 }
 
-const vbr_artifact_unit_blob * find_blob(
-        const std::vector<vbr_artifact_unit_blob> & blobs,
-        const vbr_artifact_unit_reference & reference) {
-    for (const auto & blob : blobs) {
-        if (blob.unit_version_id == reference.unit_version_id) {
-            return &blob;
-        }
-    }
-    return nullptr;
-}
-
 bool accounting_payloads_match(const vbr_artifact_package & package) {
     struct expected_row {
         vbr_artifact_accounting_role role;
@@ -1349,17 +1342,32 @@ bool manifest_valid(
             return false;
         }
     }
-    std::set<std::array<uint8_t, 32>> seen_unit_ids;
+    std::map<std::array<uint8_t, 32>,
+             const vbr_artifact_unit_blob *> blob_by_id;
+    for (const auto & blob : package.unit_blobs) {
+        if (!blob_by_id.emplace(
+                blob.unit_version_id.bytes(), &blob).second) {
+            return false;
+        }
+    }
+    using reference_key =
+        std::tuple<uint64_t, uint64_t, uint32_t, uint64_t>;
+    std::set<reference_key> reference_generations;
     for (const auto & reference : manifest.unit_references) {
         if (!vbr_lineage_uuid_is_set(reference.lineage_uuid) ||
             reference.repr_gen == 0 ||
             !reference.unit_version_id.valid() ||
             !reference.payload_digest.valid() ||
             reference.authorized_stream_refs.empty() ||
-            !seen_unit_ids.insert(reference.unit_version_id.bytes()).second) {
+            !reference_generations.emplace(
+                reference.lineage_uuid.hi, reference.lineage_uuid.lo,
+                reference.logical_unit_id, reference.repr_gen).second) {
             return false;
         }
-        const auto * blob = find_blob(package.unit_blobs, reference);
+        const auto found_blob =
+            blob_by_id.find(reference.unit_version_id.bytes());
+        const auto * blob = found_blob == blob_by_id.end()
+            ? nullptr : found_blob->second;
         if (!blob ||
             blob->payload_digest != reference.payload_digest ||
             blob->descriptor.lineage_uuid != reference.lineage_uuid ||
@@ -1373,41 +1381,43 @@ bool manifest_valid(
                 vbr_artifact_consistency_kind::live_rebased) {
             return false;
         }
-        const auto child = std::find_if(
-            manifest.generation.controllers.begin(),
-            manifest.generation.controllers.end(),
-            [&](const vbr_checkpoint_generation_controller & controller) {
-                return controller.child_id == blob->descriptor.child_id;
-            });
-        if (child == manifest.generation.controllers.end() ||
-            reference.logical_unit_id >= child->units.size() ||
+        if (blob->descriptor.child_id >=
+                manifest.generation.controllers.size() ||
             blob->descriptor.child_id >=
                 manifest.controller_policy.size() ||
+            manifest.generation.controllers[
+                blob->descriptor.child_id].child_id !=
+                    blob->descriptor.child_id) {
+            return false;
+        }
+        const auto & child = manifest.generation.controllers[
+            blob->descriptor.child_id];
+        if (reference.logical_unit_id >= child.units.size() ||
             manifest.controller_policy[blob->descriptor.child_id].n_stream !=
                 blob->descriptor.n_stream ||
             manifest.controller_policy[blob->descriptor.child_id].unified !=
                 blob->descriptor.unified ||
             manifest.controller_policy[blob->descriptor.child_id].wm_cells !=
                 blob->descriptor.wm_cells ||
-            child->units[reference.logical_unit_id].repr_gen !=
+            child.units[reference.logical_unit_id].repr_gen !=
                 reference.repr_gen ||
-            child->units[reference.logical_unit_id].current_type !=
+            child.units[reference.logical_unit_id].current_type !=
                 blob->descriptor.current_type ||
-            child->units[reference.logical_unit_id].last_source_type !=
+            child.units[reference.logical_unit_id].last_source_type !=
                 blob->descriptor.last_source_type ||
-            child->units[reference.logical_unit_id].domain !=
+            child.units[reference.logical_unit_id].domain !=
                 (blob->descriptor.current_type == GGML_TYPE_F16 ||
                  blob->descriptor.current_type == GGML_TYPE_TURBO8_0 ?
                      vbr_repr_domain::full : vbr_repr_domain::tapped) ||
-            child->units[reference.logical_unit_id].promote_hops !=
+            child.units[reference.logical_unit_id].promote_hops !=
                 blob->descriptor.promote_hops ||
-            child->units[reference.logical_unit_id].last_transition !=
+            child.units[reference.logical_unit_id].last_transition !=
                 blob->descriptor.last_transition) {
             return false;
         }
         std::set<uint32_t> streams;
         for (uint32_t stream : reference.authorized_stream_refs) {
-            if (stream >= child->streams.size() ||
+            if (stream >= child.streams.size() ||
                 !streams.insert(stream).second) {
                 return false;
             }
@@ -1435,7 +1445,7 @@ bool manifest_valid(
                 bool authorized = false;
                 for (uint32_t stream_index :
                      reference.authorized_stream_refs) {
-                    const auto & stream = child->streams[stream_index];
+                    const auto & stream = child.streams[stream_index];
                     const auto page = std::find_if(
                         stream.pages.begin(), stream.pages.end(),
                         [&](const vbr_generation_page_ref & candidate) {
@@ -1475,16 +1485,11 @@ bool manifest_valid(
             continue;
         }
         for (uint32_t unit = 0; unit < controller.units.size(); ++unit) {
-            const auto found = std::find_if(
-                manifest.unit_references.begin(),
-                manifest.unit_references.end(),
-                [&](const vbr_artifact_unit_reference & reference) {
-                    return reference.lineage_uuid == controller.lineage_uuid &&
-                           reference.logical_unit_id == unit &&
-                           reference.repr_gen ==
-                               controller.units[unit].repr_gen;
-                });
-            if (found == manifest.unit_references.end()) {
+            if (reference_generations.find(reference_key {
+                    controller.lineage_uuid.hi,
+                    controller.lineage_uuid.lo,
+                    unit, controller.units[unit].repr_gen,
+                }) == reference_generations.end()) {
                 return false;
             }
         }
@@ -1516,7 +1521,8 @@ bool manifest_valid(
 bool package_metadata_valid(
         const vbr_artifact_package & package,
         const vbr_artifact_decode_limits * limits,
-        bool require_sources) {
+        bool require_sources,
+        bool allow_sparse_rows = false) {
     if (!artifact_version_supported(package.version) ||
         package.flags != ARTIFACT_FLAGS_V1 ||
         package.topologies.empty() ||
@@ -1539,7 +1545,8 @@ bool package_metadata_valid(
             !blob.payload_digest.valid() ||
             !ids.insert(blob.unit_version_id.bytes()).second ||
             !descriptor_metadata_valid(
-                blob.descriptor, package.topologies, require_sources) ||
+                blob.descriptor, package.topologies, require_sources,
+                allow_sparse_rows) ||
             (limits &&
              (blob.descriptor.shards.size() >
                   limits->max_shards_per_unit ||
@@ -3256,6 +3263,96 @@ vbr_artifact_status vbr_artifact_prepare(
         }
         if (!prepare_manifest_digest(package.manifest) ||
             !package_metadata_valid(package, nullptr, true)) {
+            return vbr_artifact_status::malformed;
+        }
+        return vbr_artifact_status::ok;
+    } catch (...) {
+        return vbr_artifact_status::internal_error;
+    }
+}
+
+vbr_artifact_status vbr_artifact_prepare_projected_metadata(
+        vbr_artifact_package & package) noexcept {
+    try {
+        if (!artifact_version_supported(package.version) ||
+            package.flags != ARTIFACT_FLAGS_V1 ||
+            package.topologies.empty() || package.unit_blobs.empty()) {
+            return vbr_artifact_status::invalid_argument;
+        }
+        for (auto & topology : package.topologies) {
+            topology.digest =
+                llama_cache_acct_compute_topology_digest(topology);
+            if (topology.version != LLAMA_CACHE_ACCT_TOPOLOGY_VERSION ||
+                topology.device_identities.empty() ||
+                topology.device_identities.size() !=
+                    topology.shard_weights.size() ||
+                !topology.digest.valid() || !topology_valid(topology)) {
+                return vbr_artifact_status::topology_mismatch;
+            }
+        }
+        for (auto & blob : package.unit_blobs) {
+            if (!blob.unit_version_id.valid() ||
+                !blob.payload_digest.valid() ||
+                blob.descriptor.shards.empty() ||
+                !canonicalize_shards(blob.descriptor.shards) ||
+                blob.descriptor.clean_stash_state !=
+                    vbr_artifact_clean_stash_state::absent_at_source ||
+                !descriptor_metadata_valid(
+                    blob.descriptor, package.topologies, false, true)) {
+                return vbr_artifact_status::content_id_mismatch;
+            }
+        }
+        for (uint32_t i = 0; i < package.companions.size(); ++i) {
+            if (!prepare_companion(
+                    i, package.topologies, package.companions[i])) {
+                return vbr_artifact_status::content_id_mismatch;
+            }
+        }
+
+        vbr_capture_generation_id capture;
+        if (!hash_generation(package.manifest.generation, capture)) {
+            return vbr_artifact_status::generation_mismatch;
+        }
+        package.manifest.capture_generation_id = capture;
+        package.manifest.consistency.kind =
+            vbr_artifact_consistency_kind::capture_exact;
+        package.manifest.consistency.source_capture_generation_id = capture;
+        package.manifest.consistency.target_capture_generation_id = {};
+        package.manifest.consistency.transition_lineage_id = {};
+        package.manifest.version = package.version;
+        if (!prepare_token_block(
+                package.manifest.identity,
+                package.manifest.identity_policy_order_digest,
+                package.manifest.token_block)) {
+            return vbr_artifact_status::malformed;
+        }
+        if (package.manifest.unit_references.size() !=
+                package.unit_blobs.size()) {
+            return vbr_artifact_status::generation_mismatch;
+        }
+        for (size_t i = 0;
+             i < package.manifest.unit_references.size(); ++i) {
+            auto & reference = package.manifest.unit_references[i];
+            const auto & found = package.unit_blobs[i];
+            if (found.descriptor.lineage_uuid != reference.lineage_uuid ||
+                found.descriptor.logical_unit_id !=
+                    reference.logical_unit_id ||
+                found.descriptor.repr_gen != reference.repr_gen) {
+                return vbr_artifact_status::generation_mismatch;
+            }
+            reference.unit_version_id = found.unit_version_id;
+            reference.payload_digest = found.payload_digest;
+            reference.has_stash_reference = false;
+            reference.stash_reference = {};
+        }
+        package.manifest.companions = package.companions;
+        if (!vbr_artifact_validate_portable_accounting(
+                package.topologies, package.manifest.accounting) ||
+            !accounting_payloads_match(package)) {
+            return vbr_artifact_status::accounting_unavailable;
+        }
+        if (!prepare_manifest_digest(package.manifest) ||
+            !package_metadata_valid(package, nullptr, false, true)) {
             return vbr_artifact_status::malformed;
         }
         return vbr_artifact_status::ok;

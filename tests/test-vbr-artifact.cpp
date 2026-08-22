@@ -5258,6 +5258,24 @@ static void test_sequence_projected_capture_union() {
     too_few_dependencies.max_dependency_references = 5;
     expect_refused(batch, too_few_dependencies);
 
+    auto semantic_batch = batch;
+    semantic_batch.manifests[0].token_block.tokens = { 1, 2 };
+    semantic_batch.manifests[0].identity.execution_identity = "abc";
+    auto semantic_exact = limits;
+    semantic_exact.max_token_ids = 2;
+    semantic_exact.max_string_bytes = 3;
+    CHECK(vbr_artifact_project_capture_union(
+        semantic_batch, semantic_exact, exact));
+    auto too_many_tokens = semantic_exact;
+    too_many_tokens.max_token_ids = 1;
+    expect_refused(semantic_batch, too_many_tokens);
+    auto too_many_strings = semantic_exact;
+    too_many_strings.max_string_bytes = 2;
+    expect_refused(semantic_batch, too_many_strings);
+    auto too_many_semantic_bytes = semantic_exact;
+    too_many_semantic_bytes.max_semantic_metadata_bytes = 10;
+    expect_refused(semantic_batch, too_many_semantic_bytes);
+
     auto no_namespace = batch;
     no_namespace.source_namespace = 0;
     expect_refused(no_namespace, limits);

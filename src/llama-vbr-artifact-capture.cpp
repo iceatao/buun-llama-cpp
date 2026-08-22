@@ -84,6 +84,52 @@ bool capture_policy_equal(
            lhs.completed_wave == rhs.completed_wave;
 }
 
+bool capture_descriptor_schema_equal(
+        const vbr_artifact_unit_descriptor & lhs,
+        const vbr_artifact_unit_descriptor & rhs) {
+    if (lhs.child_id != rhs.child_id ||
+        lhs.logical_unit_id != rhs.logical_unit_id ||
+        lhs.lineage_uuid != rhs.lineage_uuid ||
+        lhs.repr_gen != rhs.repr_gen ||
+        lhs.current_type != rhs.current_type ||
+        lhs.last_source_type != rhs.last_source_type ||
+        lhs.promote_hops != rhs.promote_hops ||
+        lhs.last_transition != rhs.last_transition ||
+        lhs.representation.kind != rhs.representation.kind ||
+        lhs.representation.codec_id != rhs.representation.codec_id ||
+        lhs.representation.codec_version != rhs.representation.codec_version ||
+        lhs.representation.reference_digest != rhs.representation.reference_digest ||
+        lhs.representation.source_loss_history != rhs.representation.source_loss_history ||
+        lhs.representation.checkpoint_codec_hops != rhs.representation.checkpoint_codec_hops ||
+        lhs.recoverability != rhs.recoverability || lhs.side != rhs.side ||
+        lhs.layout != rhs.layout || lhs.n_stream != rhs.n_stream ||
+        lhs.unified != rhs.unified || lhs.wm_cells != rhs.wm_cells ||
+        lhs.rank != rhs.rank || lhs.dimensions != rhs.dimensions ||
+        lhs.row_alignment != rhs.row_alignment ||
+        lhs.row_codec_version != rhs.row_codec_version ||
+        lhs.codebook_digest != rhs.codebook_digest ||
+        lhs.rotation_digest != rhs.rotation_digest ||
+        lhs.meansub_digest != rhs.meansub_digest ||
+        lhs.clean_stash_state != rhs.clean_stash_state ||
+        lhs.shards.size() != rhs.shards.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.shards.size(); ++i) {
+        const auto & a = lhs.shards[i];
+        const auto & b = rhs.shards[i];
+        if (a.shard_index != b.shard_index ||
+            a.topology_index != b.topology_index ||
+            a.device_ordinal != b.device_ordinal ||
+            a.logical_offset != b.logical_offset ||
+            a.row_count != b.row_count ||
+            a.column_count != b.column_count ||
+            a.row_bytes != b.row_bytes) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool capture_cursor_after(
         const capture_projection_cursor & lhs,
         const capture_projection_cursor & rhs) {
@@ -130,12 +176,38 @@ bool vbr_artifact_project_capture_union(
             limits.max_manifests == 0 || limits.max_placements == 0 ||
             limits.max_input_cells == 0 || limits.max_union_cells == 0 ||
             limits.max_segments == 0 ||
-            limits.max_dependency_references == 0) {
+            limits.max_dependency_references == 0 ||
+            limits.max_token_ids == 0 || limits.max_string_bytes == 0 ||
+            limits.max_generation_controllers == 0 ||
+            limits.max_generation_units == 0 ||
+            limits.max_generation_streams == 0 ||
+            limits.max_generation_pages == 0 ||
+            limits.max_companions == 0 ||
+            limits.max_companion_payload_bytes == 0 ||
+            limits.max_semantic_metadata_bytes == 0) {
             return false;
         }
 
         uint64_t placement_count = 0;
         uint64_t input_cells = 0;
+        uint64_t token_ids = 0;
+        uint64_t string_bytes = 0;
+        uint64_t generation_controllers = 0;
+        uint64_t generation_units = 0;
+        uint64_t generation_streams = 0;
+        uint64_t generation_pages = 0;
+        uint64_t companions = 0;
+        uint64_t companion_payload_bytes = 0;
+        uint64_t semantic_metadata_bytes = 0;
+        const auto add_semantic = [&](uint64_t count, uint64_t element) {
+            return element == 0 || count <= UINT64_MAX/element
+                ? capture_checked_add(
+                      semantic_metadata_bytes, count*element,
+                      semantic_metadata_bytes) &&
+                      semantic_metadata_bytes <=
+                          limits.max_semantic_metadata_bytes
+                : false;
+        };
         std::vector<uint64_t> manifest_ids;
         manifest_ids.reserve(manifests.size());
         std::vector<capture_projection_placement> placements;
@@ -146,6 +218,90 @@ bool vbr_artifact_project_capture_union(
                     placement_count) ||
                 placement_count > limits.max_placements) {
                 return false;
+            }
+            uint64_t manifest_strings = 0;
+            if (!capture_checked_add(
+                    manifest_strings,
+                    manifest.identity.execution_identity.size(),
+                    manifest_strings) ||
+                !capture_checked_add(
+                    manifest_strings,
+                    manifest.identity.adapter_config_identity.size(),
+                    manifest_strings) ||
+                !capture_checked_add(
+                    manifest_strings,
+                    manifest.identity.media_content_identity.size(),
+                    manifest_strings)) {
+                return false;
+            }
+            if (!capture_checked_add(
+                    token_ids, manifest.token_block.tokens.size(), token_ids) ||
+                token_ids > limits.max_token_ids ||
+                !capture_checked_add(
+                    string_bytes, manifest_strings, string_bytes) ||
+                string_bytes > limits.max_string_bytes ||
+                !capture_checked_add(
+                    generation_controllers,
+                    manifest.generation.controllers.size(),
+                    generation_controllers) ||
+                generation_controllers >
+                    limits.max_generation_controllers ||
+                !capture_checked_add(
+                    companions, manifest.companions.size(), companions) ||
+                companions > limits.max_companions ||
+                !add_semantic(
+                    manifest.token_block.tokens.size(),
+                    sizeof(llama_token)) ||
+                !add_semantic(manifest_strings, 1) ||
+                !add_semantic(
+                    manifest.generation.controllers.size(),
+                    sizeof(vbr_checkpoint_generation_controller)) ||
+                !add_semantic(
+                    manifest.companions.size(),
+                    sizeof(vbr_artifact_companion_payload)) ||
+                !add_semantic(
+                    manifest.placements.size(),
+                    sizeof(vbr_artifact_stream_placement))) {
+                return false;
+            }
+            for (const auto & companion : manifest.companions) {
+                if (!capture_checked_add(
+                        companion_payload_bytes, companion.payload_bytes,
+                        companion_payload_bytes) ||
+                    companion_payload_bytes >
+                        limits.max_companion_payload_bytes) {
+                    return false;
+                }
+            }
+            for (const auto & controller :
+                 manifest.generation.controllers) {
+                if (!capture_checked_add(
+                        generation_units, controller.units.size(),
+                        generation_units) ||
+                    generation_units > limits.max_generation_units ||
+                    !capture_checked_add(
+                        generation_streams, controller.streams.size(),
+                        generation_streams) ||
+                    generation_streams > limits.max_generation_streams ||
+                    !add_semantic(
+                        controller.units.size(),
+                        sizeof(vbr_checkpoint_unit_generation)) ||
+                    !add_semantic(
+                        controller.streams.size(),
+                        sizeof(vbr_checkpoint_generation_stream))) {
+                    return false;
+                }
+                for (const auto & stream : controller.streams) {
+                    if (!capture_checked_add(
+                            generation_pages, stream.pages.size(),
+                            generation_pages) ||
+                        generation_pages > limits.max_generation_pages ||
+                        !add_semantic(
+                            stream.pages.size(),
+                            sizeof(vbr_generation_page_ref))) {
+                        return false;
+                    }
+                }
             }
             manifest_ids.push_back(manifest.manifest_id);
             std::vector<std::pair<llama_seq_id, llama_pos>> logical_positions;
@@ -161,6 +317,11 @@ bool vbr_artifact_project_capture_union(
                     return false;
                 }
                 placements.push_back({ manifest.manifest_id, &placement });
+                if (!add_semantic(
+                        placement.cells.size(),
+                        sizeof(vbr_artifact_cell_placement))) {
+                    return false;
+                }
                 for (size_t i = 0; i < placement.cells.size(); ++i) {
                     const auto & cell = placement.cells[i];
                     if (cell.physical_cell == UINT32_MAX ||
@@ -216,6 +377,11 @@ bool vbr_artifact_project_capture_union(
         plan.manifest_count = uint32_t(manifests.size());
         plan.placement_count = uint32_t(placement_count);
         plan.input_cell_references = input_cells;
+        plan.manifests = batch.manifests;
+        std::sort(plan.manifests.begin(), plan.manifests.end(),
+            [](const auto & lhs, const auto & rhs) {
+                return lhs.manifest_id < rhs.manifest_id;
+            });
         uint64_t segment_count = 0;
         std::vector<capture_projection_cursor> heap;
         std::vector<uint64_t> dependencies;
@@ -1903,6 +2069,9 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
                 stats.streaming_digest.size());
             result.shards.push_back({
                 shard->shard_index,
+                shard->row_count,
+                shard->row_bytes,
+                shard->source_identity,
                 std::move(chain),
                 stats.streaming_digest,
                 std::move(authenticated_ranges),
@@ -1921,6 +2090,48 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
     } catch (...) {
         output = {};
         return vbr_capture_stream_status::internal_error;
+    }
+}
+
+vbr_capture_sealed_companion::operator bool() const noexcept {
+    return companion_index_ != UINT32_MAX && bytes_ != nullptr &&
+           capture_digest_nonzero(streaming_digest_);
+}
+
+uint32_t vbr_capture_sealed_companion::companion_index() const noexcept {
+    return companion_index_;
+}
+
+uint64_t vbr_capture_sealed_companion::size() const noexcept {
+    return bytes_ ? bytes_->size() : 0;
+}
+
+const std::array<uint8_t, 32> &
+vbr_capture_sealed_companion::streaming_digest() const noexcept {
+    return streaming_digest_;
+}
+
+bool vbr_capture_seal_companion(
+        uint32_t companion_index,
+        std::unique_ptr<artifact_segment_chain> bytes,
+        vbr_capture_sealed_companion & output) noexcept {
+    output = {};
+    try {
+        if (companion_index == UINT32_MAX || !bytes || bytes->size() == 0) {
+            return false;
+        }
+        const auto digest = vbr_capture_stream_digest(*bytes);
+        if (!capture_digest_nonzero(digest)) {
+            return false;
+        }
+        output.companion_index_ = companion_index;
+        output.streaming_digest_ = digest;
+        output.bytes_ = std::shared_ptr<const artifact_segment_chain>(
+            std::move(bytes));
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
     }
 }
 
@@ -1995,7 +2206,10 @@ bool vbr_capture_assemble_manifests(
     try {
         if (!projection || !targets.recheck ||
             limits.max_controller_targets == 0 ||
-            limits.max_projected_units == 0 || limits.max_manifests == 0 ||
+            limits.max_projected_units == 0 ||
+            limits.max_unit_descriptor_shards == 0 ||
+            limits.max_unit_descriptor_metadata_bytes == 0 ||
+            limits.max_manifests == 0 ||
             limits.max_controller_references == 0 ||
             limits.max_unit_references == 0 ||
             limits.max_range_proofs == 0 ||
@@ -2057,9 +2271,12 @@ bool vbr_capture_assemble_manifests(
         std::map<std::pair<uint32_t, uint64_t>, uint32_t>
             target_by_representation;
         uint64_t target_unit_references = 0;
+        uint64_t descriptor_shards = 0;
+        uint64_t descriptor_metadata_bytes = 0;
         for (uint32_t i = 0; i < controller_targets.size(); ++i) {
             const auto & target = controller_targets[i];
             if (target.units.empty() ||
+                target.unit_descriptors.size() != target.units.size() ||
                 target.units.size() > limits.max_projected_units ||
                 target.units.size() >
                     limits.max_unit_references - target_unit_references) {
@@ -2069,9 +2286,39 @@ bool vbr_capture_assemble_manifests(
             std::vector<ggml_type> types;
             types.reserve(target.units.size());
             bool generations_valid = !target.units.empty();
-            for (const auto & generation : target.units) {
+            for (uint32_t unit = 0; unit < target.units.size(); ++unit) {
+                const auto & generation = target.units[unit];
+                const auto & descriptor = target.unit_descriptors[unit];
+                if (!capture_checked_add(
+                        descriptor_shards, descriptor.shards.size(),
+                        descriptor_shards) ||
+                    descriptor_shards >
+                        limits.max_unit_descriptor_shards ||
+                    !capture_range_metadata_add(
+                        1, sizeof(vbr_artifact_unit_descriptor),
+                        descriptor_metadata_bytes) ||
+                    !capture_range_metadata_add(
+                        descriptor.shards.size(),
+                        sizeof(vbr_artifact_shard_descriptor),
+                        descriptor_metadata_bytes) ||
+                    descriptor_metadata_bytes >
+                        limits.max_unit_descriptor_metadata_bytes) {
+                    return false;
+                }
                 generations_valid = generations_valid &&
-                    capture_generation_valid(generation);
+                    capture_generation_valid(generation) &&
+                    descriptor.child_id == target.child_id &&
+                    descriptor.logical_unit_id == unit &&
+                    descriptor.lineage_uuid == target.lineage_uuid &&
+                    descriptor.repr_gen == generation.repr_gen &&
+                    descriptor.current_type == generation.current_type &&
+                    descriptor.last_source_type == generation.last_source_type &&
+                    descriptor.promote_hops == generation.promote_hops &&
+                    descriptor.last_transition == generation.last_transition &&
+                    descriptor.n_stream == target.policy.n_stream &&
+                    descriptor.unified == target.policy.unified &&
+                    descriptor.wm_cells == target.policy.wm_cells &&
+                    !descriptor.shards.empty();
                 types.push_back(static_cast<ggml_type>(
                     generation.current_type));
             }
@@ -2110,7 +2357,10 @@ bool vbr_capture_assemble_manifests(
                 }
                 for (uint32_t unit = 0; unit < target.units.size(); ++unit) {
                     if (!capture_generation_equal(
-                            prior.units[unit], target.units[unit])) {
+                            prior.units[unit], target.units[unit]) ||
+                        !capture_descriptor_schema_equal(
+                            prior.unit_descriptors[unit],
+                            target.unit_descriptors[unit])) {
                         return false;
                     }
                 }
@@ -2280,6 +2530,23 @@ bool vbr_capture_assemble_manifests(
                 snapshot.lineage_uuid == controller_targets[
                     representation->second].lineage_uuid &&
                 capture_generation_equal(snapshot.generation, *expected);
+            if (unit_valid[i]) {
+                const auto & descriptor = controller_targets[
+                    representation->second].unit_descriptors[
+                        unit.logical_unit_id()];
+                if (descriptor.shards.size() != unit.shards().size()) {
+                    unit_valid[i] = false;
+                }
+                for (uint32_t shard = 0;
+                     unit_valid[i] && shard < unit.shards().size(); ++shard) {
+                    unit_valid[i] =
+                        descriptor.shards[shard].shard_index == shard &&
+                        descriptor.shards[shard].row_bytes ==
+                            unit.shards()[shard].row_bytes &&
+                        descriptor.shards[shard].row_count ==
+                            unit.shards()[shard].source_row_count;
+                }
+            }
         }
 
         auto result = std::make_shared<vbr_capture_manifest_assembly::data>();

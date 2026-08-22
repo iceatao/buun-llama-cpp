@@ -115,6 +115,53 @@ struct vbr_artifact_companion_view {
     std::shared_ptr<const artifact_segment_chain> payload;
 };
 
+// Reference-local authenticated projection retained with a catalog package.
+// The projected unit owns the complete packed shard while this proof names
+// the exact byte ranges authorized by one logical manifest.
+struct vbr_artifact_projected_range_view {
+    uint32_t unit_index = UINT32_MAX;
+    uint32_t shard_index = UINT32_MAX;
+    vbr_capture_range_proof proof;
+};
+
+enum class vbr_projected_manifest_publish_status : uint8_t {
+    published = 0,
+    adopted,
+    dependency_unavailable,
+    companion_unavailable,
+    metadata_invalid,
+    accounting_unavailable,
+    admission_refused,
+    publication_failed,
+    internal_error,
+    _count,
+};
+
+// Metadata and companion evidence for one logical row of an immutable
+// projected assembly. `package` supplies reference-local identity, placement,
+// topology and unit geometry; the catalog replaces every payload source and
+// content ID from the assembly's sealed capabilities before publication.
+struct vbr_projected_manifest_publication {
+    uint64_t manifest_id = 0;
+    vbr_artifact_package package;
+    std::vector<vbr_capture_sealed_companion> companions;
+};
+
+struct vbr_projected_manifest_publish_result {
+    uint64_t manifest_id = 0;
+    vbr_projected_manifest_publish_status status =
+        vbr_projected_manifest_publish_status::internal_error;
+    llama_vbr_artifact_publish_result publication;
+};
+
+struct vbr_projected_batch_publish_diagnostics {
+    uint64_t ready_manifests = 0;
+    uint64_t published_manifests = 0;
+    uint64_t dependency_unavailable = 0;
+    uint64_t main_payload_bytes_rehashed = 0;
+    uint64_t companion_payload_hash_bytes = 0;
+};
+
 class llama_vbr_artifact_catalog;
 
 enum class vbr_artifact_prepared_retire_status : uint8_t {
@@ -193,6 +240,8 @@ public:
     const vbr_artifact_reference_manifest & manifest() const noexcept;
     const std::vector<vbr_artifact_unit_view> & units() const noexcept;
     const std::vector<vbr_artifact_companion_view> & companions() const noexcept;
+    const std::vector<vbr_artifact_projected_range_view> &
+        projected_ranges() const noexcept;
     const std::vector<vbr_artifact_allocation_view> &
         reference_allocations() const noexcept;
     vbr_artifact_status validate() const noexcept;
@@ -251,6 +300,19 @@ public:
         vbr_capture_begin_diagnostics * diagnostics =
             nullptr) noexcept override;
 
+    // H1 dependency-scoped publication. Structural assembly corruption or a
+    // malformed publication inventory clears all output and returns false.
+    // Missing/stale unit or companion evidence is reported per manifest;
+    // unaffected rows publish independently. Main payload bytes are never
+    // reread: authority comes exclusively from the opaque sealed assembly.
+    bool publish_projected_batch(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        const llama_cache_budget_config & budget,
+        std::vector<vbr_projected_manifest_publish_result> & output,
+        vbr_projected_batch_publish_diagnostics * diagnostics = nullptr,
+        const llama_cache_transaction_fault & fault = {}) noexcept;
+
     // Release every ledger reference owned by this checkpoint reference.
     // Physical payload/stash bytes discharge only when C observes the last op.
     vbr_artifact_resolve_status resolve_reference(
@@ -276,11 +338,15 @@ private:
         void * prepared_stream_state) noexcept;
 
     llama_vbr_artifact_publish_result publish_stream_complete(
-        const vbr_artifact_package & package,
+        vbr_artifact_package package,
         const std::vector<vbr_verified_segment> & segments,
         const llama_cache_budget_config & budget,
         const llama_cache_transaction_fault & fault,
-        void * prepared_stream_state) noexcept;
+        void * prepared_stream_state,
+        bool sealed_projected = false,
+        const std::vector<vbr_artifact_projected_range_view> *
+            projected_ranges = nullptr,
+        uint64_t * payload_bytes_rehashed = nullptr) noexcept;
 
     std::unique_ptr<vbr_capture_build> begin_capture_impl(
         const vbr_artifact_package & package,

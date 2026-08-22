@@ -133,6 +133,7 @@ public:
 
     bool available() const noexcept;
     size_t size() const noexcept;
+    size_t node_count() const noexcept;
     uint64_t token_bytes() const noexcept;
 
 private:

@@ -249,6 +249,75 @@ static void test_prefix_index_matches_exhaustive_oracle() {
     CHECK(index.token_bytes() == 0);
 }
 
+static void test_prefix_index_large_node_oracle() {
+    const auto run = [](size_t artifacts, size_t minimum_nodes) {
+        struct row {
+            llama_tokens tokens;
+            uint64_t lineage = 0;
+        };
+        CHECK(artifacts%2 == 0);
+        std::vector<row> rows;
+        rows.reserve(artifacts);
+        server_retention_prefix_index index;
+        for (size_t i = 0; i < artifacts/2; ++i) {
+            row lhs;
+            lhs.tokens = {
+                llama_token(100000 + i), llama_token(7), llama_token(0),
+            };
+            lhs.lineage = 1 + (2*i)%31;
+            rows.push_back(lhs);
+            CHECK(index.publish(
+                llama_cache_acct_artifact_id { rows.size() },
+                lhs.lineage, lhs.tokens));
+            row rhs;
+            rhs.tokens = {
+                llama_token(100000 + i), llama_token(7), llama_token(1),
+            };
+            rhs.lineage = 1 + (2*i + 1)%31;
+            rows.push_back(rhs);
+            CHECK(index.publish(
+                llama_cache_acct_artifact_id { rows.size() },
+                rhs.lineage, rhs.tokens));
+        }
+        CHECK(index.available());
+        CHECK(index.size() == artifacts);
+        CHECK(index.node_count() >= minimum_nodes);
+
+        // Deterministic sampled indexed lookups are compared with the exact
+        // exhaustive definition at both the ~1K and >10K radix-node shapes.
+        const size_t samples = std::min<size_t>(128, rows.size());
+        for (size_t sample = 0; sample < samples; ++sample) {
+            const size_t i = (sample*2654435761ull)%rows.size();
+            uint64_t expected = 0;
+            for (size_t j = 0; j < rows.size(); ++j) {
+                if (i == j || rows[i].lineage == rows[j].lineage) {
+                    continue;
+                }
+                size_t shared = 0;
+                while (shared < rows[i].tokens.size() &&
+                       shared < rows[j].tokens.size() &&
+                       rows[i].tokens[shared] == rows[j].tokens[shared]) {
+                    shared++;
+                }
+                expected = std::max(expected, uint64_t(shared));
+            }
+            uint64_t actual = UINT64_MAX;
+            CHECK(index.external_shared_coverage(
+                llama_cache_acct_artifact_id { i + 1 }, actual));
+            CHECK(actual == expected);
+        }
+        for (size_t i = 0; i < rows.size(); ++i) {
+            index.retire(llama_cache_acct_artifact_id { i + 1 });
+        }
+        CHECK(index.available());
+        CHECK(index.size() == 0);
+        CHECK(index.node_count() == 1);
+    };
+
+    run(700, 1000);
+    run(7000, 10000);
+}
+
 static void test_prefix_index_branch_churn_recompresses() {
     server_retention_prefix_index index;
     constexpr size_t main_size = 16400;
@@ -1160,6 +1229,7 @@ int main() {
     test_prefix_index_cap_fail_closed();
     test_prefix_index_oversized_input_fail_closed();
     test_prefix_index_matches_exhaustive_oracle();
+    test_prefix_index_large_node_oracle();
     test_prefix_index_branch_churn_recompresses();
     test_pinned_replacement_retires_prefix_evidence();
     test_turn_table_and_geometry();

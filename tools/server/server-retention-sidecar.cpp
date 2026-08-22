@@ -454,6 +454,10 @@ size_t server_retention_prefix_index::size() const noexcept {
     return available() ? pimpl->artifacts.size() : 0;
 }
 
+size_t server_retention_prefix_index::node_count() const noexcept {
+    return available() ? pimpl->nodes : 0;
+}
+
 uint64_t server_retention_prefix_index::token_bytes() const noexcept {
     return available() ? pimpl->artifact_token_bytes + pimpl->edge_token_bytes : 0;
 }

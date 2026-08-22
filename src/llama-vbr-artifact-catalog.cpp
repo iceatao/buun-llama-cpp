@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -97,6 +98,8 @@ struct llama_vbr_artifact_catalog::impl {
         vbr_artifact_reference_manifest manifest;
         std::vector<std::shared_ptr<const artifact_segment_chain>>
             companion_payloads;
+        std::vector<vbr_artifact_projected_range_view> projected_ranges;
+        bool projected_sealed = false;
         std::vector<llama_cache_acct_op_id> operations;
         std::vector<allocation> allocations;
         uint64_t borrow_count = 0;
@@ -109,6 +112,8 @@ struct llama_vbr_artifact_catalog::impl {
         allocation binding;
         uint64_t reserve_resident = 0;
         bool existing = false;
+        size_t owner_index = SIZE_MAX;
+        bool owner_stash = false;
     };
 
     explicit impl(llama_cache_acct_ledger & ledger_) : ledger(ledger_) {}
@@ -278,6 +283,8 @@ struct vbr_artifact_package_view::storage {
     vbr_artifact_reference_manifest manifest;
     std::vector<vbr_artifact_unit_view> units;
     std::vector<vbr_artifact_companion_view> companions;
+    std::vector<vbr_artifact_projected_range_view> projected_ranges;
+    bool projected_sealed = false;
     std::vector<vbr_artifact_allocation_view> reference_allocations;
 };
 
@@ -296,6 +303,288 @@ bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
     return std::any_of(
         digest.begin(), digest.end(),
         [](uint8_t byte) { return byte != 0; });
+}
+
+template <typename Digest>
+Digest projected_digest(
+        const char * domain,
+        const vbr_capture_projected_unit & unit,
+        const vbr_artifact_unit_descriptor & descriptor) {
+    llama_sha256_writer hash;
+    hash.string(domain, std::strlen(domain));
+    hash.u32(unit.child_id());
+    hash.u32(unit.stream_index());
+    hash.u32(unit.logical_unit_id());
+    hash.u64(unit.snapshot().controller_generation);
+    hash.u64(unit.snapshot().generation.repr_gen);
+    hash.u32(uint32_t(unit.snapshot().generation.current_type));
+    hash.u32(uint32_t(unit.snapshot().generation.last_source_type));
+    hash.u32(uint32_t(descriptor.side));
+    hash.u32(uint32_t(descriptor.layout));
+    hash.u64(descriptor.lineage_uuid.hi);
+    hash.u64(descriptor.lineage_uuid.lo);
+    hash.u32(uint32_t(descriptor.representation.kind));
+    hash.u32(descriptor.representation.codec_id);
+    hash.u32(descriptor.representation.codec_version);
+    hash.string(
+        descriptor.representation.reference_digest.data(),
+        descriptor.representation.reference_digest.size());
+    hash.u32(descriptor.representation.source_loss_history);
+    hash.u32(descriptor.representation.checkpoint_codec_hops);
+    hash.u32(descriptor.n_stream);
+    hash.u32(descriptor.unified ? 1 : 0);
+    hash.u32(descriptor.rank);
+    for (const uint64_t dimension : descriptor.dimensions) {
+        hash.u64(dimension);
+    }
+    hash.u64(descriptor.row_alignment);
+    hash.u32(descriptor.row_codec_version);
+    hash.string(
+        descriptor.codebook_digest.data(),
+        descriptor.codebook_digest.size());
+    hash.string(
+        descriptor.rotation_digest.data(),
+        descriptor.rotation_digest.size());
+    hash.string(
+        descriptor.meansub_digest.data(),
+        descriptor.meansub_digest.size());
+    hash.u32(uint32_t(unit.shards().size()));
+    for (uint32_t i = 0; i < unit.shards().size(); ++i) {
+        const auto & shard = unit.shards()[i];
+        const auto & metadata = descriptor.shards[i];
+        hash.u32(shard.shard_index);
+        hash.u32(metadata.topology_index);
+        hash.u32(metadata.device_ordinal);
+        hash.u64(metadata.logical_offset);
+        hash.u64(metadata.row_count);
+        hash.u64(metadata.column_count);
+        hash.u64(metadata.row_bytes);
+        hash.u64(shard.bytes ? shard.bytes->size() : 0);
+        hash.string(
+            shard.authenticated_ranges.root().data(),
+            shard.authenticated_ranges.root().size());
+    }
+    return Digest::from_sha256(hash.finish());
+}
+
+bool normalize_projected_package(
+        const vbr_capture_manifest_assembly & assembly,
+        const vbr_capture_manifest_result & manifest_row,
+        vbr_artifact_package & package,
+        std::vector<vbr_verified_segment> & segments,
+        std::vector<vbr_artifact_projected_range_view> & ranges) {
+    if (!assembly ||
+        manifest_row.state != vbr_capture_manifest_state::ready ||
+        package.topologies.empty() ||
+        manifest_row.unit_count == 0 ||
+        package.unit_blobs.size() != manifest_row.unit_count ||
+        package.manifest.unit_references.size() != manifest_row.unit_count ||
+        manifest_row.first_unit > assembly.unit_references().size() ||
+        manifest_row.unit_count >
+            assembly.unit_references().size() - manifest_row.first_unit ||
+        manifest_row.first_controller >
+            assembly.controller_references().size() ||
+        manifest_row.controller_count >
+            assembly.controller_references().size() -
+                manifest_row.first_controller ||
+        manifest_row.first_range_proof > assembly.range_proofs().size() ||
+        manifest_row.range_proof_count >
+            assembly.range_proofs().size() -
+                manifest_row.first_range_proof) {
+        return false;
+    }
+
+    const auto & projection_manifests =
+        assembly.projection()->manifests;
+    const auto declared_manifest = std::lower_bound(
+        projection_manifests.begin(), projection_manifests.end(),
+        manifest_row.manifest_id,
+        [](const auto & value, uint64_t id) {
+            return value.manifest_id < id;
+        });
+    if (declared_manifest == projection_manifests.end() ||
+        declared_manifest->manifest_id != manifest_row.manifest_id) {
+        return false;
+    }
+
+    package.version = VBR_UNIT_ARTIFACT_FORMAT_VERSION;
+    package.flags = 0;
+    package.manifest.version = package.version;
+    package.manifest.identity_policy_order_digest =
+        declared_manifest->identity_policy_order_digest;
+    package.manifest.identity = declared_manifest->identity;
+    package.manifest.token_block = declared_manifest->token_block;
+    package.manifest.generation = declared_manifest->generation;
+    package.manifest.stream_placements = declared_manifest->placements;
+    package.companions = declared_manifest->companions;
+    package.manifest.controller_policy.clear();
+    for (uint32_t i = 0; i < manifest_row.controller_count; ++i) {
+        const uint32_t index = assembly.controller_references()[
+            manifest_row.first_controller + i];
+        if (index >= assembly.controller_targets().size()) {
+            return false;
+        }
+        const auto & target = assembly.controller_targets()[index];
+        if (target.child_id >=
+                package.manifest.generation.controllers.size()) {
+            return false;
+        }
+        const auto & controller =
+            package.manifest.generation.controllers[target.child_id];
+        if (controller.child_id != target.child_id ||
+            controller.lineage_uuid != target.lineage_uuid ||
+            controller.global_generation !=
+                target.controller_generation ||
+            controller.units.size() != target.units.size() ||
+            controller.dependency_mode !=
+                target.policy.dependency_mode) {
+            return false;
+        }
+        for (size_t u = 0; u < target.units.size(); ++u) {
+            const auto & live = target.units[u];
+            const auto & sealed = controller.units[u];
+            if (sealed.repr_gen != live.repr_gen ||
+                sealed.current_type != live.current_type ||
+                sealed.last_source_type != live.last_source_type ||
+                sealed.domain != live.domain ||
+                sealed.promote_hops != live.promote_hops ||
+                sealed.last_transition != live.last_transition) {
+                return false;
+            }
+        }
+        package.manifest.controller_policy.push_back(target.policy);
+    }
+    if (package.manifest.controller_policy.size() !=
+            package.manifest.generation.controllers.size()) {
+        return false;
+    }
+
+    segments.clear();
+    ranges.clear();
+    std::vector<uint32_t> local_unit_by_captured(
+        assembly.projected_units().size(), UINT32_MAX);
+    for (uint32_t i = 0; i < manifest_row.unit_count; ++i) {
+        const uint32_t captured_index = assembly.unit_references()[
+            manifest_row.first_unit + i];
+        if (captured_index >= assembly.projected_units().size() ||
+            local_unit_by_captured[captured_index] != UINT32_MAX) {
+            return false;
+        }
+        local_unit_by_captured[captured_index] = i;
+        const auto & captured = assembly.projected_units()[captured_index];
+        auto & blob = package.unit_blobs[i];
+        auto & descriptor = blob.descriptor;
+        const vbr_artifact_unit_descriptor * certified = nullptr;
+        for (uint32_t c = 0; c < manifest_row.controller_count; ++c) {
+            const uint32_t target_index = assembly.controller_references()[
+                manifest_row.first_controller + c];
+            if (target_index >= assembly.controller_targets().size()) {
+                return false;
+            }
+            const auto & target = assembly.controller_targets()[target_index];
+            if (target.child_id == captured.child_id() &&
+                captured.logical_unit_id() < target.unit_descriptors.size()) {
+                if (certified != nullptr) {
+                    return false;
+                }
+                certified = &target.unit_descriptors[
+                    captured.logical_unit_id()];
+            }
+        }
+        if (certified == nullptr) {
+            return false;
+        }
+        descriptor = *certified;
+        if (!captured || captured.shards().empty() ||
+            descriptor.shards.size() != captured.shards().size() ||
+            descriptor.clean_stash_state !=
+                vbr_artifact_clean_stash_state::absent_at_source ||
+            descriptor.child_id != captured.child_id() ||
+            descriptor.logical_unit_id != captured.logical_unit_id() ||
+            descriptor.side >= vbr_artifact_side::_count ||
+            descriptor.layout >= vbr_artifact_layout::_count) {
+            return false;
+        }
+        if (descriptor.child_id >=
+                package.manifest.controller_policy.size()) {
+            return false;
+        }
+        const auto & policy =
+            package.manifest.controller_policy[descriptor.child_id];
+        if (descriptor.n_stream != policy.n_stream ||
+            descriptor.unified != policy.unified ||
+            descriptor.wm_cells != policy.wm_cells) {
+            return false;
+        }
+        descriptor.clean_stash = {};
+        uint64_t packed_rows = 0;
+        for (uint32_t s = 0; s < captured.shards().size(); ++s) {
+            const auto & source = captured.shards()[s];
+            auto & shard = descriptor.shards[s];
+            if (source.shard_index != s || !source.bytes ||
+                !source.authenticated_ranges || shard.row_bytes == 0 ||
+                source.row_bytes == 0 ||
+                shard.row_bytes != source.row_bytes ||
+                source.bytes->size()%source.row_bytes != 0) {
+                return false;
+            }
+            const uint64_t rows = source.bytes->size()/source.row_bytes;
+            if (rows == 0 || (s != 0 && rows != packed_rows)) {
+                return false;
+            }
+            packed_rows = rows;
+            shard.shard_index = s;
+            shard.row_count = rows;
+            shard.row_bytes = source.row_bytes;
+            shard.payload_bytes = source.bytes->size();
+            shard.section_checksum = source.authenticated_ranges.root();
+            shard.payload = {};
+            segments.push_back({
+                i, s, false, source.bytes,
+                source.authenticated_ranges.root(),
+            });
+        }
+        blob.payload_digest = projected_digest<vbr_payload_digest>(
+            "buun.vbr.projected-payload.v1", captured, descriptor);
+        blob.unit_version_id = projected_digest<vbr_unit_version_id>(
+            "buun.vbr.projected-unit.v1", captured, descriptor);
+        if (!blob.payload_digest.valid() || !blob.unit_version_id.valid()) {
+            return false;
+        }
+        auto & reference = package.manifest.unit_references[i];
+        reference.lineage_uuid = descriptor.lineage_uuid;
+        reference.logical_unit_id = descriptor.logical_unit_id;
+        reference.repr_gen = descriptor.repr_gen;
+        reference.unit_version_id = blob.unit_version_id;
+        reference.payload_digest = blob.payload_digest;
+        reference.authorized_stream_refs = { captured.stream_index() };
+        reference.has_stash_reference = false;
+        reference.stash_reference = {};
+    }
+
+    for (uint32_t i = 0; i < manifest_row.range_proof_count; ++i) {
+        const auto & source = assembly.range_proofs()[
+            manifest_row.first_range_proof + i];
+        if (source.unit_index >= assembly.projected_units().size() ||
+            !source.proof) {
+            return false;
+        }
+        const uint32_t local_unit =
+            local_unit_by_captured[source.unit_index];
+        if (local_unit == UINT32_MAX) {
+            return false;
+        }
+        ranges.push_back({
+            local_unit,
+            source.shard_index,
+            source.proof,
+        });
+    }
+    if (ranges.empty()) {
+        return false;
+    }
+
+    return true;
 }
 
 struct catalog_stream_state {
@@ -878,6 +1167,12 @@ vbr_artifact_package_view::companions() const noexcept {
     return storage_ ? storage_->companions : empty;
 }
 
+const std::vector<vbr_artifact_projected_range_view> &
+vbr_artifact_package_view::projected_ranges() const noexcept {
+    static const std::vector<vbr_artifact_projected_range_view> empty;
+    return storage_ ? storage_->projected_ranges : empty;
+}
+
 const std::vector<vbr_artifact_allocation_view> &
 vbr_artifact_package_view::reference_allocations() const noexcept {
     static const std::vector<vbr_artifact_allocation_view> empty;
@@ -889,6 +1184,70 @@ vbr_artifact_status vbr_artifact_package_view::validate() const noexcept {
         return vbr_artifact_status::invalid_argument;
     }
     try {
+        if (storage_->projected_sealed) {
+            if (storage_->units.empty() ||
+                storage_->projected_ranges.empty()) {
+                return vbr_artifact_status::malformed;
+            }
+            for (const auto & range : storage_->projected_ranges) {
+                if (range.unit_index >= storage_->units.size() ||
+                    !range.proof ||
+                    range.proof.root() == std::array<uint8_t, 32> {}) {
+                    return vbr_artifact_status::malformed;
+                }
+                const auto & unit = storage_->units[range.unit_index];
+                const auto shard = std::find_if(
+                    unit.descriptor.shards.begin(),
+                    unit.descriptor.shards.end(),
+                    [&](const auto & value) {
+                        return value.shard_index == range.shard_index;
+                    });
+                if (shard == unit.descriptor.shards.end() ||
+                    shard->section_checksum != range.proof.root()) {
+                    return vbr_artifact_status::checksum_mismatch;
+                }
+            }
+            vbr_artifact_package package;
+            package.version = storage_->manifest.version;
+            package.topologies = storage_->topologies;
+            package.manifest = storage_->manifest;
+            package.unit_blobs.reserve(storage_->units.size());
+            for (const auto & view : storage_->units) {
+                vbr_artifact_unit_blob blob;
+                blob.unit_version_id = view.unit_version_id;
+                blob.payload_digest = view.payload_digest;
+                blob.descriptor = view.descriptor;
+                for (auto & shard : blob.descriptor.shards) {
+                    shard.payload = {};
+                }
+                package.unit_blobs.push_back(std::move(blob));
+            }
+            package.companions.reserve(storage_->companions.size());
+            for (const auto & view : storage_->companions) {
+                if (!view.payload) {
+                    return vbr_artifact_status::malformed;
+                }
+                auto companion = view.descriptor;
+                companion.payload = view.payload->source();
+                package.companions.push_back(std::move(companion));
+            }
+            const auto expected_manifest =
+                package.manifest.manifest_digest;
+            const auto expected_capture =
+                package.manifest.capture_generation_id;
+            const auto expected_token = package.manifest.token_block.digest;
+            const auto status =
+                vbr_artifact_prepare_projected_metadata(package);
+            if (status != vbr_artifact_status::ok) {
+                return status;
+            }
+            if (package.manifest.manifest_digest != expected_manifest ||
+                package.manifest.capture_generation_id != expected_capture ||
+                package.manifest.token_block.digest != expected_token) {
+                return vbr_artifact_status::content_id_mismatch;
+            }
+            return vbr_artifact_status::ok;
+        }
         vbr_artifact_package package;
         package.version = storage_->manifest.version;
         package.topologies = storage_->topologies;
@@ -1046,6 +1405,14 @@ bool llama_vbr_artifact_catalog::configure_accounting(
                     llama_cache_acct_category::pinned_preimage_ring, domain,
                 });
             }
+        }
+
+        if (std::all_of(
+                needed.begin(), needed.end(),
+                [&](const configured_cell & cell) {
+                    return impl_->configured.count(cell) != 0;
+                })) {
+            return true;
         }
 
         const auto before = impl_->ledger.snapshot();
@@ -2205,30 +2572,45 @@ llama_vbr_artifact_catalog::publish_stream(
 
 llama_vbr_artifact_publish_result
 llama_vbr_artifact_catalog::publish_stream_complete(
-        const vbr_artifact_package & package,
+        vbr_artifact_package package,
         const std::vector<vbr_verified_segment> & segments,
         const llama_cache_budget_config & budget,
         const llama_cache_transaction_fault & fault,
-        void * prepared_stream_state) noexcept {
+        void * prepared_stream_state,
+        bool sealed_projected,
+        const std::vector<vbr_artifact_projected_range_view> *
+            projected_ranges,
+        uint64_t * payload_bytes_rehashed) noexcept {
     llama_vbr_artifact_publish_result result;
     try {
+        // Copying a legacy lvalue happens at the call boundary. Projected
+        // publication transfers its already-preflighted package here. Either
+        // way, no nested placement arena is allocated while the catalog lock
+        // is held.
+        vbr_artifact_package working = std::move(package);
         auto * stream_state =
             static_cast<catalog_stream_state *>(prepared_stream_state);
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->topologies != package.topologies ||
-            package.unit_blobs.empty() ||
-            package.manifest.unit_references.size() !=
-                package.unit_blobs.size()) {
+        if (impl_->topologies != working.topologies ||
+            working.unit_blobs.empty() ||
+            working.manifest.unit_references.size() !=
+                working.unit_blobs.size()) {
             result.status =
                 llama_vbr_artifact_publish_status::invalid_argument;
             impl_->n_refusals++;
             return result;
         }
 
-        vbr_artifact_package working = package;
         size_t expected_segments = 0;
-        for (const auto & blob : working.unit_blobs) {
+        std::vector<size_t> payload_offsets(
+            working.unit_blobs.size(), 0);
+        std::vector<size_t> stash_offsets(
+            working.unit_blobs.size(), 0);
+        for (size_t u = 0; u < working.unit_blobs.size(); ++u) {
+            const auto & blob = working.unit_blobs[u];
+            payload_offsets[u] = expected_segments;
             expected_segments += blob.descriptor.shards.size();
+            stash_offsets[u] = expected_segments;
             if (blob.descriptor.clean_stash_state ==
                     vbr_artifact_clean_stash_state::present) {
                 expected_segments +=
@@ -2243,16 +2625,24 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             return result;
         }
 
-        std::set<std::tuple<uint32_t, bool, uint32_t>> seen;
+        std::vector<const vbr_verified_segment *> segment_lookup(
+            expected_segments, nullptr);
         for (const auto & segment : segments) {
+            if (!sealed_projected && payload_bytes_rehashed) {
+                if (!segment.bytes || segment.bytes->size() >
+                        UINT64_MAX - *payload_bytes_rehashed) {
+                    result.status =
+                        llama_vbr_artifact_publish_status::format_rejected;
+                    impl_->n_refusals++;
+                    return result;
+                }
+                *payload_bytes_rehashed += segment.bytes->size();
+            }
             if (segment.unit_index >= working.unit_blobs.size() ||
                 !segment.bytes ||
-                vbr_capture_stream_digest(*segment.bytes) !=
-                    segment.streaming_digest ||
-                !seen.emplace(
-                    segment.unit_index,
-                    segment.clean_stash,
-                    segment.shard_index).second) {
+                (!sealed_projected &&
+                 vbr_capture_stream_digest(*segment.bytes) !=
+                    segment.streaming_digest)) {
                 result.status =
                     llama_vbr_artifact_publish_status::format_rejected;
                 impl_->n_refusals++;
@@ -2263,20 +2653,35 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             auto & shards = segment.clean_stash
                 ? descriptor.clean_stash.shards
                 : descriptor.shards;
-            const auto shard = std::find_if(
-                shards.begin(), shards.end(),
-                [&](const auto & candidate) {
-                    return candidate.shard_index ==
-                           segment.shard_index;
-                });
-            if (shard == shards.end() ||
-                shard->payload_bytes != segment.bytes->size()) {
+            if (segment.shard_index >= shards.size() ||
+                shards[segment.shard_index].shard_index !=
+                    segment.shard_index ||
+                shards[segment.shard_index].payload_bytes !=
+                    segment.bytes->size()) {
                 result.status =
                     llama_vbr_artifact_publish_status::format_rejected;
                 impl_->n_refusals++;
                 return result;
             }
-            shard->payload = segment.bytes->source();
+            const size_t slot = (segment.clean_stash
+                ? stash_offsets[segment.unit_index]
+                : payload_offsets[segment.unit_index]) +
+                segment.shard_index;
+            if (slot >= segment_lookup.size() || segment_lookup[slot]) {
+                result.status =
+                    llama_vbr_artifact_publish_status::format_rejected;
+                impl_->n_refusals++;
+                return result;
+            }
+            segment_lookup[slot] = &segment;
+            shards[segment.shard_index].payload = segment.bytes->source();
+        }
+        if (std::find(segment_lookup.begin(), segment_lookup.end(), nullptr) !=
+                segment_lookup.end()) {
+            result.status =
+                llama_vbr_artifact_publish_status::missing_completion;
+            impl_->n_refusals++;
+            return result;
         }
         if (stream_state == nullptr ||
             stream_state->companions.size() !=
@@ -2300,7 +2705,8 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 companion.companion_index].payload =
                     companion.bytes->source();
         }
-        if (vbr_artifact_prepare(working) !=
+        if (!sealed_projected &&
+            vbr_artifact_prepare(working) !=
                 vbr_artifact_status::ok) {
             result.status =
                 llama_vbr_artifact_publish_status::format_rejected;
@@ -2335,13 +2741,22 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             impl_->n_refusals++;
             return result;
         }
-        pending_reference.manifest = working.manifest;
+        if (sealed_projected) {
+            if (!projected_ranges || projected_ranges->empty()) {
+                result.status =
+                    llama_vbr_artifact_publish_status::invalid_argument;
+                impl_->n_refusals++;
+                return result;
+            }
+            pending_reference.projected_ranges = *projected_ranges;
+            pending_reference.projected_sealed = true;
+        }
         pending_reference.companion_payloads.reserve(
             stream_state->companions.size());
         for (const auto & companion : stream_state->companions) {
             pending_reference.companion_payloads.push_back(
                 companion.bytes);
-            pending_reference.manifest.companions[
+            working.manifest.companions[
                 companion.companion_index].payload =
                     companion.bytes->source();
         }
@@ -2458,9 +2873,13 @@ llama_vbr_artifact_catalog::publish_stream_complete(
         // allocation identity across references.
         std::vector<impl::txn_leaf> leaves;
         auto append_leaf = [&](impl::allocation binding,
-                               const std::vector<impl::allocation> * existing) {
+                               const std::vector<impl::allocation> * existing,
+                               size_t owner_index = SIZE_MAX,
+                               bool owner_stash = false) {
             impl::txn_leaf leaf;
             leaf.binding = binding;
+            leaf.owner_index = owner_index;
+            leaf.owner_stash = owner_stash;
             if (existing) {
                 const auto * allocation = impl_->find_allocation(
                     *existing, binding.category, binding.domain,
@@ -2514,7 +2933,8 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                                 working.unit_blobs[u]
                                     .unit_version_id.bytes())
                                   ->second.allocations
-                            : nullptr)) {
+                            : nullptr,
+                        u, false)) {
                     result.status =
                         llama_vbr_artifact_publish_status::
                             publication_failed;
@@ -2565,7 +2985,8 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                                     working.unit_blobs[u].descriptor
                                         .clean_stash.payload_id.bytes())
                                       ->second.allocations
-                                : nullptr)) {
+                                : nullptr,
+                            u, true)) {
                         result.status =
                             llama_vbr_artifact_publish_status::
                                 publication_failed;
@@ -2622,6 +3043,10 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 return result;
             }
         }
+        // All validation/accounting reads of the manifest are complete. Move
+        // its potentially million-cell placement arena into the pending
+        // reference instead of duplicating it under the catalog mutex.
+        pending_reference.manifest = std::move(working.manifest);
 
         std::vector<llama_cache_acct_op_id> committed(
             leaves.size());
@@ -2671,10 +3096,13 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             const std::vector<bool> * blob_exists;
             const std::vector<bool> * stash_exists;
             const std::vector<size_t> * stash_alias;
-            const std::vector<vbr_verified_segment> * segments;
+            const std::vector<const vbr_verified_segment *> * segments;
+            const std::vector<size_t> * payload_offsets;
+            const std::vector<size_t> * stash_offsets;
         } materialize {
             &pending_blobs, &pending_stashes,
-            &blob_exists, &stash_exists, &stash_alias, &segments,
+            &blob_exists, &stash_exists, &stash_alias, &segment_lookup,
+            &payload_offsets, &stash_offsets,
         };
         const auto materialize_storage = [](void * opaque) -> bool {
             auto * context =
@@ -2683,16 +3111,10 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 auto & blob = (*context->blobs)[u];
                 if (!(*context->blob_exists)[u]) {
                     for (const auto & shard : blob.descriptor.shards) {
-                        const auto segment = std::find_if(
-                            context->segments->begin(),
-                            context->segments->end(),
-                            [&](const auto & candidate) {
-                                return candidate.unit_index == u &&
-                                       !candidate.clean_stash &&
-                                       candidate.shard_index ==
-                                           shard.shard_index;
-                            });
-                        if (segment == context->segments->end()) {
+                        const auto * segment = (*context->segments)[
+                            (*context->payload_offsets)[u] +
+                            shard.shard_index];
+                        if (!segment) {
                             return false;
                         }
                         blob.payload_shards.push_back(segment->bytes);
@@ -2704,16 +3126,10 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                     auto & stash = (*context->stashes)[u];
                     for (const auto & shard :
                          stash.descriptor.shards) {
-                        const auto segment = std::find_if(
-                            context->segments->begin(),
-                            context->segments->end(),
-                            [&](const auto & candidate) {
-                                return candidate.unit_index == u &&
-                                       candidate.clean_stash &&
-                                       candidate.shard_index ==
-                                           shard.shard_index;
-                            });
-                        if (segment == context->segments->end()) {
+                        const auto * segment = (*context->segments)[
+                            (*context->stash_offsets)[u] +
+                            shard.shard_index];
+                        if (!segment) {
                             return false;
                         }
                         stash.shards.push_back(segment->bytes);
@@ -2764,25 +3180,12 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             if (leaves[i].existing) {
                 continue;
             }
-            bool assigned = false;
-            for (size_t u = 0; u < pending_blobs.size(); ++u) {
-                if (leaves[i].binding.artifact ==
-                        pending_blobs[u].artifact) {
-                    pending_blobs[u].allocations.push_back(
-                        leaves[i].binding);
-                    assigned = true;
-                    break;
-                }
-                if (pending_stashes[u].artifact.v != 0 &&
-                    leaves[i].binding.artifact ==
-                        pending_stashes[u].artifact) {
-                    pending_stashes[u].allocations.push_back(
-                        leaves[i].binding);
-                    assigned = true;
-                    break;
-                }
+            if (leaves[i].owner_index != SIZE_MAX) {
+                auto & owner = leaves[i].owner_stash
+                    ? pending_stashes[leaves[i].owner_index].allocations
+                    : pending_blobs[leaves[i].owner_index].allocations;
+                owner.push_back(leaves[i].binding);
             }
-            (void) assigned;
         }
         pending_reference.operations = committed;
         std::vector<digest_key> inserted_blobs;
@@ -2854,6 +3257,226 @@ llama_vbr_artifact_catalog::publish_stream_complete(
     }
 }
 
+bool llama_vbr_artifact_catalog::publish_projected_batch(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        const llama_cache_budget_config & budget,
+        std::vector<vbr_projected_manifest_publish_result> & output,
+        vbr_projected_batch_publish_diagnostics * diagnostics,
+        const llama_cache_transaction_fault & fault) noexcept {
+    output.clear();
+    if (diagnostics) {
+        *diagnostics = {};
+    }
+
+    struct prepared_row {
+        vbr_projected_manifest_publish_result result;
+        vbr_artifact_package package;
+        std::vector<vbr_verified_segment> segments;
+        std::vector<vbr_artifact_projected_range_view> ranges;
+        std::vector<vbr_verified_companion> companions;
+        bool runnable = false;
+    };
+    std::vector<prepared_row> prepared;
+    vbr_projected_batch_publish_diagnostics measured;
+    try {
+        if (!assembly || assembly.manifests().empty() ||
+            publications.size() != assembly.manifests().size()) {
+            return false;
+        }
+        std::sort(publications.begin(), publications.end(),
+            [](const auto & lhs, const auto & rhs) {
+                return lhs.manifest_id < rhs.manifest_id;
+            });
+        if (publications.front().manifest_id == 0 ||
+            std::adjacent_find(
+                publications.begin(), publications.end(),
+                [](const auto & lhs, const auto & rhs) {
+                    return lhs.manifest_id == rhs.manifest_id;
+                }) != publications.end()) {
+            return false;
+        }
+        // Exact inventory equality is a whole-batch structural precondition.
+        // Prove it before the first catalog or ledger mutation.
+        if (publications.size() != assembly.manifests().size()) {
+            return false;
+        }
+        for (size_t i = 0; i < publications.size(); ++i) {
+            if (publications[i].manifest_id !=
+                    assembly.manifests()[i].manifest_id) {
+                return false;
+            }
+        }
+
+        prepared.resize(assembly.manifests().size());
+        output.resize(assembly.manifests().size());
+        for (size_t index = 0; index < assembly.manifests().size(); ++index) {
+            const auto & row = assembly.manifests()[index];
+            auto & current = prepared[index];
+            auto & result = current.result;
+            result.manifest_id = row.manifest_id;
+            if (row.state != vbr_capture_manifest_state::ready) {
+                result.status =
+                    vbr_projected_manifest_publish_status::
+                        dependency_unavailable;
+                measured.dependency_unavailable++;
+                continue;
+            }
+            measured.ready_manifests++;
+
+            current.package = std::move(publications[index].package);
+            if (!normalize_projected_package(
+                    assembly, row, current.package,
+                    current.segments, current.ranges)) {
+                result.status =
+                    vbr_projected_manifest_publish_status::metadata_invalid;
+                continue;
+            }
+            auto sealed_companions =
+                std::move(publications[index].companions);
+            std::sort(sealed_companions.begin(), sealed_companions.end(),
+                [](const auto & lhs, const auto & rhs) {
+                    return lhs.companion_index() < rhs.companion_index();
+                });
+            if (current.package.companions.size() !=
+                    sealed_companions.size()) {
+                result.status =
+                    vbr_projected_manifest_publish_status::
+                        companion_unavailable;
+                continue;
+            }
+            bool companions_valid = true;
+            current.companions.reserve(sealed_companions.size());
+            for (uint32_t i = 0; i < sealed_companions.size(); ++i) {
+                auto & companion = sealed_companions[i];
+                if (!companion || companion.companion_index() != i ||
+                    companion.size() !=
+                        current.package.companions[i].payload_bytes) {
+                    companions_valid = false;
+                    break;
+                }
+                current.companions.push_back({
+                    i, std::move(companion.bytes_),
+                    companion.streaming_digest(),
+                });
+                current.package.companions[i].payload =
+                    current.companions.back().bytes->source();
+                // Sealing hashed B bytes once. Canonical companion metadata
+                // derives both the section checksum and payload digest (2B).
+                if (current.companions.back().bytes->size() > UINT64_MAX/3 ||
+                    current.companions.back().bytes->size()*3 >
+                        UINT64_MAX - measured.companion_payload_hash_bytes) {
+                    companions_valid = false;
+                    break;
+                }
+                measured.companion_payload_hash_bytes +=
+                    current.companions.back().bytes->size()*3;
+            }
+            if (!companions_valid) {
+                result.status =
+                    vbr_projected_manifest_publish_status::
+                        companion_unavailable;
+                continue;
+            }
+            const auto metadata =
+                vbr_artifact_prepare_projected_metadata(current.package);
+            if (metadata != vbr_artifact_status::ok) {
+                result.status =
+                    metadata == vbr_artifact_status::accounting_unavailable
+                    ? vbr_projected_manifest_publish_status::
+                          accounting_unavailable
+                    : vbr_projected_manifest_publish_status::metadata_invalid;
+                continue;
+            }
+            current.runnable = true;
+        }
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+
+    // Everything that can reject the shape or allocate batch-owned metadata
+    // has completed. Each publication below is an independent typed terminal;
+    // no later row can turn an earlier committed reference into an invisible
+    // whole-batch failure.
+    for (size_t index = 0; index < prepared.size(); ++index) {
+        auto & current = prepared[index];
+        auto & result = current.result;
+        if (current.runnable) {
+            if (!prepare_capture_package(current.package)) {
+                result.status =
+                    vbr_projected_manifest_publish_status::
+                        accounting_unavailable;
+                output[index] = std::move(result);
+                continue;
+            }
+            catalog_stream_state state;
+            state.catalog = this;
+            state.ledger = &impl_->ledger;
+            state.package = std::move(current.package);
+            state.budget = budget;
+            state.fault = fault;
+            state.charge_transfer_staging = false;
+            state.companions = std::move(current.companions);
+            result.publication = publish_stream_complete(
+                std::move(state.package), current.segments, budget, fault,
+                &state, true, &current.ranges,
+                &measured.main_payload_bytes_rehashed);
+            switch (result.publication.status) {
+                case llama_vbr_artifact_publish_status::published:
+                    result.status =
+                        vbr_projected_manifest_publish_status::published;
+                    break;
+                case llama_vbr_artifact_publish_status::adopted:
+                    result.status =
+                        vbr_projected_manifest_publish_status::adopted;
+                    break;
+                case llama_vbr_artifact_publish_status::accounting_unavailable:
+                    result.status =
+                        vbr_projected_manifest_publish_status::
+                            accounting_unavailable;
+                    break;
+                case llama_vbr_artifact_publish_status::admission_refused:
+                    result.status =
+                        vbr_projected_manifest_publish_status::
+                            admission_refused;
+                    break;
+                case llama_vbr_artifact_publish_status::invalid_argument:
+                case llama_vbr_artifact_publish_status::format_rejected:
+                case llama_vbr_artifact_publish_status::missing_completion:
+                case llama_vbr_artifact_publish_status::duplicate_completion:
+                    result.status =
+                        vbr_projected_manifest_publish_status::metadata_invalid;
+                    break;
+                case llama_vbr_artifact_publish_status::shard_failed:
+                case llama_vbr_artifact_publish_status::stage_failed:
+                case llama_vbr_artifact_publish_status::commit_failed:
+                case llama_vbr_artifact_publish_status::publication_failed:
+                    result.status =
+                        vbr_projected_manifest_publish_status::
+                            publication_failed;
+                    break;
+                case llama_vbr_artifact_publish_status::internal_error:
+                case llama_vbr_artifact_publish_status::_count:
+                    result.status =
+                        vbr_projected_manifest_publish_status::internal_error;
+                    break;
+            }
+            if (result.status ==
+                    vbr_projected_manifest_publish_status::published ||
+                result.status ==
+                    vbr_projected_manifest_publish_status::adopted) {
+                measured.published_manifests++;
+            }
+        }
+        output[index] = std::move(result);
+    }
+    if (diagnostics) {
+        *diagnostics = measured;
+    }
+    return true;
+}
+
 vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
         llama_cache_acct_artifact_id reference,
         vbr_artifact_package_view & out) noexcept {
@@ -2886,6 +3509,8 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
         state->reference = reference;
         state->topologies = impl_->topologies;
         state->manifest = it->second.manifest;
+        state->projected_ranges = it->second.projected_ranges;
+        state->projected_sealed = it->second.projected_sealed;
         state->units.reserve(it->second.unit_ids.size());
         for (const auto & id : it->second.unit_ids) {
             const auto found = impl_->blobs.find(id.bytes());

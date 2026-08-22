@@ -200,6 +200,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-vbr-artifact-capture PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_test_cmd(test-vbr-artifact
+        NAME test-vbr-h1-capture-projection-scale
+        LABEL "vbr-h1;slow"
+        ARGS --capture-projection-bench)
+    llama_test_cmd(test-vbr-artifact-capture
+        NAME test-vbr-h1-range-proof-scale
+        LABEL "vbr-h1;slow"
+        ARGS --range-pack-bench)
+    set_property(TEST test-vbr-artifact APPEND PROPERTY LABELS vbr-h1)
+    set_property(TEST test-vbr-artifact-capture APPEND PROPERTY LABELS vbr-h1)
 
     llama_build_and_test(
         test-cache-lease.cpp
@@ -293,6 +303,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-retention-sidecar PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
+    set_property(TEST test-retention-sidecar APPEND PROPERTY LABELS vbr-h1)
+    set_property(TEST test-vbr-controller-id-cpu APPEND PROPERTY LABELS vbr-h1)
+    set_property(TEST test-vbr-representation-a1-cpu APPEND PROPERTY LABELS vbr-h1)
+    set_property(TEST test-vbr-representation-a2-cpu APPEND PROPERTY LABELS vbr-h1)
 
     llama_build(test-dflash-tape-vs-plane.cpp)
     target_include_directories(test-dflash-tape-vs-plane PRIVATE ${PROJECT_SOURCE_DIR}/src)

@@ -109,6 +109,7 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
     add_test(NAME test-server-prompt-cache COMMAND test-server-prompt-cache)
     set_property(TEST test-server-prompt-cache PROPERTY LABELS main)
+    set_property(TEST test-server-prompt-cache APPEND PROPERTY LABELS vbr-h1)
     add_test(NAME test-server-prompt-cache-clone-fault
         COMMAND test-server-prompt-cache --clone-fault)
     set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
@@ -147,5 +148,26 @@ if (LLAMA_BUILD_TESTS)
             test-vbr-artifact-vbr-anchor-prepare-fault PROPERTIES
             LABELS main
             ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_anchor_prepare_fail")
+    endif()
+
+    if (TARGET test-vbr-artifact AND
+        TARGET test-vbr-artifact-capture AND
+        TARGET test-retention-sidecar AND
+        TARGET test-vbr-representation-epoch)
+        add_custom_target(vbr-h1-capstone
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                ${CMAKE_BINARY_DIR}/tmp
+            COMMAND ${CMAKE_COMMAND} -E env
+                TMPDIR=${CMAKE_BINARY_DIR}/tmp
+                ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR}
+                    --output-on-failure -L vbr-h1
+            DEPENDS
+                test-server-prompt-cache
+                test-vbr-artifact
+                test-vbr-artifact-capture
+                test-retention-sidecar
+                test-vbr-representation-epoch
+            USES_TERMINAL
+            COMMENT "Run the CPU-deterministic VBR-H1 capstone gate")
     endif()
 endif()

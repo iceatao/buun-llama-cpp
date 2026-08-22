@@ -145,8 +145,10 @@ struct llama_kv_cache_vbr_epoch_test {
     }
 
     static bool projected_backend_sources_exact(
-            llama_kv_cache * kv, uint32_t child_id) {
-        if (!kv || kv->other != nullptr || kv->vbr_pools_.empty()) {
+            llama_kv_cache * kv, uint32_t child_id,
+            uint32_t slot_count = 1) {
+        if (!kv || kv->other != nullptr || kv->vbr_pools_.empty() ||
+            slot_count == 0 || slot_count > 8) {
             return false;
         }
         if (!kv->vbr_capture_settle()) {
@@ -181,33 +183,42 @@ struct llama_kv_cache_vbr_epoch_test {
                 request, units, stability, nullptr) || units.empty()) {
             return false;
         }
-        llama_pos frontier = 0;
-        for (const auto & cells : kv->v_cells) {
-            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-                if (cells.seq_has(cell, 0)) {
-                    frontier = std::max(
-                        frontier, cells.pos_get(cell) + 1);
+        std::vector<vbr_capture_projection_manifest> manifests;
+        uint64_t expected_union_cells = 0;
+        for (uint32_t sequence = 0; sequence < slot_count; ++sequence) {
+            llama_pos frontier = 0;
+            for (const auto & cells : kv->v_cells) {
+                for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                    if (cells.seq_has(cell, sequence)) {
+                        frontier = std::max(
+                            frontier, cells.pos_get(cell) + 1);
+                    }
                 }
             }
-        }
-        vbr_checkpoint_generation_controller generation;
-        vbr_artifact_stream_placement placement;
-        if (frontier <= 0 || !kv->vbr_capture_generation_record(
-                child_id,
-                checkpoint_child_dependency_mode::live_guarded,
-                0, frontier, generation, &placement, nullptr) ||
-            placement.cells.empty()) {
-            return false;
+            vbr_checkpoint_generation_controller generation;
+            vbr_artifact_stream_placement placement;
+            if (frontier <= 0 || !kv->vbr_capture_generation_record(
+                    child_id,
+                    checkpoint_child_dependency_mode::live_guarded,
+                    sequence, frontier, generation, &placement, nullptr) ||
+                placement.cells.empty()) {
+                return false;
+            }
+            if (sequence == 0) {
+                expected_union_cells = placement.cells.size();
+            }
+            vbr_capture_projection_manifest manifest;
+            manifest.manifest_id = sequence + 1;
+            manifest.placements.push_back(std::move(placement));
+            manifests.push_back(std::move(manifest));
         }
         const uint64_t source_namespace = instance.lo != 0
             ? instance.lo : instance.hi;
-        vbr_capture_projection_manifest manifest;
-        manifest.manifest_id = 1;
-        manifest.placements.push_back(placement);
         vbr_capture_projection projection;
         if (!vbr_artifact_project_capture_union(
-                { source_namespace, { std::move(manifest) } },
-                {}, projection)) {
+                { source_namespace, std::move(manifests) }, {}, projection) ||
+            projection->manifest_count != slot_count ||
+            projection->union_cell_count != expected_union_cells) {
             return false;
         }
         std::vector<uint64_t> identities;
@@ -395,7 +406,7 @@ struct llama_kv_cache_vbr_epoch_test {
                 }
                 vbr_capture_projected_unit captured;
                 if (vbr_capture_projected_unit_transfer(
-                        projection, child_id, placement.stream_index,
+                        projection, child_id, 0,
                         unit.logical_unit, sources, {},
                         transfer_session.provider(), *ring, captured) !=
                             vbr_capture_stream_status::ok ||
@@ -2187,7 +2198,7 @@ int main(int argc, char ** argv) {
     cparams.n_ctx                  = 128;
     cparams.n_batch                = 32;
     cparams.n_ubatch               = 32;
-    cparams.n_seq_max              = 2;
+    cparams.n_seq_max              = 8;
     cparams.n_threads              = 2;
     cparams.n_threads_batch        = 2;
     cparams.type_k                 = GGML_TYPE_F16;
@@ -2265,6 +2276,38 @@ int main(int argc, char ** argv) {
             swa, 1)) {
         fprintf(stderr, "live VBR backend did not produce exact projected capture sources\n");
         return 1;
+    }
+    for (llama_seq_id sequence = 1; sequence < 4; ++sequence) {
+        llama_memory_seq_cp(mem, 0, sequence, -1, -1);
+    }
+    if (!llama_kv_cache_vbr_epoch_test::projected_backend_sources_exact(
+            base, 0, 4) ||
+        !llama_kv_cache_vbr_epoch_test::projected_backend_sources_exact(
+            swa, 1, 4)) {
+        fprintf(stderr, "four-slot projected capture was not coherent\n");
+        return 1;
+    }
+    for (llama_seq_id sequence = 1; sequence < 4; ++sequence) {
+        if (!llama_memory_seq_rm(mem, sequence, -1, -1)) {
+            fprintf(stderr, "four-slot projected capture cleanup failed\n");
+            return 1;
+        }
+    }
+    for (llama_seq_id sequence = 1; sequence < 8; ++sequence) {
+        llama_memory_seq_cp(mem, 0, sequence, -1, -1);
+    }
+    if (!llama_kv_cache_vbr_epoch_test::projected_backend_sources_exact(
+            base, 0, 8) ||
+        !llama_kv_cache_vbr_epoch_test::projected_backend_sources_exact(
+            swa, 1, 8)) {
+        fprintf(stderr, "eight-slot projected capture was not coherent\n");
+        return 1;
+    }
+    for (llama_seq_id sequence = 1; sequence < 8; ++sequence) {
+        if (!llama_memory_seq_rm(mem, sequence, -1, -1)) {
+            fprintf(stderr, "eight-slot projected capture cleanup failed\n");
+            return 1;
+        }
     }
     const auto seeded_base = base->memory_vbr_state_v2(0, 0);
     const auto seeded_swa  = swa ->memory_vbr_state_v2(0, 0);

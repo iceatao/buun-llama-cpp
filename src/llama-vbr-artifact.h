@@ -424,6 +424,14 @@ struct vbr_artifact_package {
 vbr_artifact_status vbr_artifact_prepare(
     vbr_artifact_package & package) noexcept;
 
+// Canonicalizes and validates the non-main-payload portion of a package whose
+// unit bytes were authenticated by the projected-capture Merkle authority.
+// Unit payload sources are deliberately not read. Companion sources, when
+// present, are still hashed and bound here until they gain an equivalent
+// opaque projected capability.
+vbr_artifact_status vbr_artifact_prepare_projected_metadata(
+    vbr_artifact_package & package) noexcept;
+
 // Revalidate an already-prepared immutable package without changing it. This
 // is the F4 import door: it reuses the codec's canonical metadata, placement,
 // digest, and payload checks rather than growing a second wire validator.

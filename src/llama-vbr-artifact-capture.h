@@ -275,6 +275,15 @@ struct vbr_capture_stream_stats {
 // process-local capture plan, not wire metadata.
 struct vbr_capture_projection_manifest {
     uint64_t manifest_id = 0;
+    // Exact semantic frontier captured with the placement evidence. These
+    // fields are retained by the sealed projection and later become the
+    // catalog manifest authority; publication callers cannot substitute a
+    // different identity, token block, or generation record after transfer.
+    std::array<uint8_t, 32> identity_policy_order_digest = {};
+    vbr_artifact_identity_block identity;
+    vbr_artifact_token_block token_block;
+    vbr_checkpoint_generation_record generation;
+    std::vector<vbr_artifact_companion_payload> companions;
     std::vector<vbr_artifact_stream_placement> placements;
 };
 
@@ -299,6 +308,18 @@ struct vbr_capture_projection_limits {
     uint32_t max_union_cells = 1048576;
     uint32_t max_segments = 1048576;
     uint32_t max_dependency_references = 1048576;
+    // Semantic frontier evidence is retained by the sealed projection. Keep
+    // its nested arenas under the same explicit bounded-input contract as the
+    // physical placement plan; these counts are aggregate across the batch.
+    uint32_t max_token_ids = 1048576;
+    uint32_t max_string_bytes = 1048576;
+    uint32_t max_generation_controllers = 4096;
+    uint32_t max_generation_units = 1048576;
+    uint32_t max_generation_streams = 4096;
+    uint32_t max_generation_pages = 1048576;
+    uint32_t max_companions = 16384;
+    uint64_t max_companion_payload_bytes = uint64_t(16)*1024*1024*1024;
+    uint64_t max_semantic_metadata_bytes = uint64_t(64)*1024*1024;
 };
 
 // One batch is structurally bound to one live memory-tree namespace. Child
@@ -316,6 +337,7 @@ struct vbr_capture_projection_plan {
     uint64_t input_cell_references = 0;
     uint64_t union_cell_count = 0;
     uint64_t dependency_references = 0;
+    std::vector<vbr_capture_projection_manifest> manifests;
     std::vector<vbr_capture_projection_stream> streams;
     std::vector<uint64_t> dependent_manifest_ids;
 };
@@ -451,6 +473,9 @@ struct vbr_capture_projected_shard_source {
 
 struct vbr_capture_projected_shard {
     uint32_t shard_index = UINT32_MAX;
+    uint32_t source_row_count = 0;
+    uint64_t row_bytes = 0;
+    uint64_t source_identity = 0;
     std::shared_ptr<const artifact_segment_chain> bytes;
     std::array<uint8_t, 32> streaming_digest = {};
     vbr_capture_range_tree authenticated_ranges;
@@ -515,6 +540,11 @@ struct vbr_capture_controller_target {
     uint64_t controller_generation = 0;
     vbr_artifact_controller_policy policy;
     std::vector<vbr_unit_generation> units;
+    // Complete immutable schema for each logical unit. The controller
+    // provider authenticates this alongside the generation tuple, so catalog
+    // publication cannot relabel one captured byte owner as another side,
+    // layout, representation, or device geometry.
+    std::vector<vbr_artifact_unit_descriptor> unit_descriptors;
 };
 
 struct vbr_capture_controller_target_provider {
@@ -556,6 +586,9 @@ struct vbr_capture_manifest_assembly_limits {
     // 4,096-placement ceiling is also the reachable target/reference ceiling.
     uint32_t max_controller_targets = 4096;
     uint32_t max_projected_units = 16384;
+    uint64_t max_unit_descriptor_shards = 1048576;
+    uint64_t max_unit_descriptor_metadata_bytes =
+        uint64_t(64)*1024*1024;
     uint32_t max_manifests = 4096;
     uint64_t max_controller_references = 4096;
     uint64_t max_unit_references = 1048576;
@@ -653,6 +686,42 @@ struct vbr_verified_companion {
     std::shared_ptr<const artifact_segment_chain> bytes;
     std::array<uint8_t, 32> streaming_digest = {};
 };
+
+// Projected companions cross the catalog boundary as a consumptive immutable
+// capability. The factory takes unique ownership of the completed chain and
+// authenticates it before publication, so no mutable shared_ptr alias can
+// rewrite bytes after the batch preflight.
+class vbr_capture_sealed_companion {
+  public:
+    vbr_capture_sealed_companion() noexcept = default;
+    vbr_capture_sealed_companion(
+        vbr_capture_sealed_companion &&) noexcept = default;
+    vbr_capture_sealed_companion & operator=(
+        vbr_capture_sealed_companion &&) noexcept = default;
+    vbr_capture_sealed_companion(
+        const vbr_capture_sealed_companion &) = delete;
+    vbr_capture_sealed_companion & operator=(
+        const vbr_capture_sealed_companion &) = delete;
+    explicit operator bool() const noexcept;
+    uint32_t companion_index() const noexcept;
+    uint64_t size() const noexcept;
+    const std::array<uint8_t, 32> & streaming_digest() const noexcept;
+
+  private:
+    uint32_t companion_index_ = UINT32_MAX;
+    std::shared_ptr<const artifact_segment_chain> bytes_;
+    std::array<uint8_t, 32> streaming_digest_ = {};
+
+    friend bool vbr_capture_seal_companion(
+        uint32_t, std::unique_ptr<artifact_segment_chain>,
+        vbr_capture_sealed_companion &) noexcept;
+    friend class llama_vbr_artifact_catalog;
+};
+
+bool vbr_capture_seal_companion(
+    uint32_t companion_index,
+    std::unique_ptr<artifact_segment_chain> bytes,
+    vbr_capture_sealed_companion & output) noexcept;
 
 struct vbr_capture_sink_result {
     vbr_capture_stream_status status =
