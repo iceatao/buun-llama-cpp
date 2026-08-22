@@ -6486,16 +6486,22 @@ bool server_prompt_cache::enforce_quality_anchor_budget(
         if (!incoming->payload.prepare_vbr_compact_only(compact)) {
             return false;
         }
-        const bool physical =
-            incoming->payload.vbr_anchor_retirement_exclusive();
-        vbr_artifact_prepared_retire prepared;
-        if (physical && (!acct ||
-            !incoming->payload.prepare_vbr_anchor_retire(
-                acct->serial(), prepared))) {
+        if (!acct) {
+            return false;
+        }
+        std::vector<const server_prompt_cache_payload *> selected;
+        try {
+            selected.push_back(&incoming->payload);
+        } catch (...) {
+            return false;
+        }
+        std::vector<vbr_artifact_prepared_retire> prepared_retires;
+        if (!server_prompt_cache_payload::prepare_vbr_anchor_retire_batch(
+                selected, acct->serial(), prepared_retires)) {
             return false;
         }
         incoming->payload = std::move(compact);
-        if (physical) {
+        for (auto & prepared : prepared_retires) {
             const auto status = prepared.commit();
             GGML_ASSERT(status !=
                 vbr_artifact_prepared_retire_status::unavailable);

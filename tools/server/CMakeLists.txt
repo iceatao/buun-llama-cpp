@@ -113,18 +113,18 @@ if (LLAMA_BUILD_TESTS)
     add_test(NAME test-server-prompt-cache-clone-fault
         COMMAND test-server-prompt-cache --clone-fault)
     set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
-        LABELS main
+        LABELS "main;vbr-h1"
         ENVIRONMENT "LLAMA_SERVER_FAULT=load_clone_fail")
     add_test(NAME test-server-prompt-cache-accounting-fault
         COMMAND test-server-prompt-cache --accounting-fault)
     set_tests_properties(test-server-prompt-cache-accounting-fault PROPERTIES
-        LABELS main
+        LABELS "main;vbr-h1"
         ENVIRONMENT "LLAMA_SERVER_FAULT=cache_lifecycle_after_commit")
     add_test(NAME test-server-prompt-cache-restore-checkpoint-fault
         COMMAND test-server-prompt-cache --restore-checkpoint-fault)
     set_tests_properties(
         test-server-prompt-cache-restore-checkpoint-fault PROPERTIES
-        LABELS main
+        LABELS "main;vbr-h1"
         ENVIRONMENT "LLAMA_SERVER_FAULT=restore_checkpoint_artifact_missing")
 
     # The catalog test target is declared before the server targets. Add the
@@ -140,13 +140,13 @@ if (LLAMA_BUILD_TESTS)
         add_test(NAME test-vbr-artifact-vbr-prefix-fault
             COMMAND test-vbr-artifact)
         set_tests_properties(test-vbr-artifact-vbr-prefix-fault PROPERTIES
-            LABELS main
+            LABELS "main;vbr-h1"
             ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_prompt_cache_prefix_fail")
         add_test(NAME test-vbr-artifact-vbr-anchor-prepare-fault
             COMMAND test-vbr-artifact)
         set_tests_properties(
             test-vbr-artifact-vbr-anchor-prepare-fault PROPERTIES
-            LABELS main
+            LABELS "main;vbr-h1"
             ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_anchor_prepare_fail")
     endif()
 

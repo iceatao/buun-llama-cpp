@@ -137,6 +137,50 @@ public:
     size_t lane_count() const noexcept;
 
 private:
+    // Direction adapters provide only byte-oriented fill/consume callbacks.
+    // Chunk leases, events, backpressure, and pending ownership stay inside
+    // the core so D2H and H2D cannot grow subtly different ring pumps.
+    struct pump_step {
+        size_t valid = 0;
+        ggml_backend_t backend = nullptr;
+        uint64_t tag = 0;
+        bool adapter_async = false;
+        bool adapter_synchronous_fallback = false;
+    };
+
+    struct pump_callbacks {
+        void * context = nullptr;
+        uint32_t ok = 0;
+        uint32_t ring_unavailable = 0;
+        uint32_t submit_failed = 0;
+        uint32_t wait_failed = 0;
+        uint32_t internal_error = 0;
+        uint32_t (*fill)(
+            void * context, uint8_t * destination,
+            size_t capacity, pump_step & step) noexcept = nullptr;
+        bool (*more)(void * context) noexcept = nullptr;
+        uint32_t (*consume)(
+            void * context, const uint8_t * source, size_t size,
+            uint64_t tag, bool adapter_async, uint64_t ordinal,
+            bool & event_completion) noexcept = nullptr;
+        void (*abandon)(
+            void * context, uint64_t tag,
+            bool adapter_async) noexcept = nullptr;
+    };
+
+    struct pump_stats {
+        uint64_t bytes = 0;
+        uint64_t chunks = 0;
+        uint64_t backpressure_waits = 0;
+        uint64_t event_completions = 0;
+        uint64_t synchronous_fallbacks = 0;
+        uint64_t peak_pinned_bytes = 0;
+    };
+
+    uint32_t pump(
+        uint32_t lane, const pump_callbacks & callbacks,
+        pump_stats & stats) noexcept;
+
     // Refuses immediately when the other direction currently owns the ring.
     // Only direction adapters can mint the operation token, so the shared
     // core necessarily outlives it.

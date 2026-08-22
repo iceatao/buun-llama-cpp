@@ -32,6 +32,31 @@ int failures = 0;
     }                                                                           \
 } while (0)
 
+void fill_checkpoint_bytes(
+        common_shared_byte_buffer & buffer,
+        size_t size,
+        uint8_t value) {
+    buffer.overwrite(size, [&](uint8_t * data, size_t count) {
+        std::fill_n(data, count, value);
+    });
+}
+
+void replace_checkpoint_byte(
+        common_shared_byte_buffer & buffer,
+        size_t index,
+        uint8_t value) {
+    const std::vector<uint8_t> source = buffer.view();
+    CHECK(index < source.size());
+    if (index >= source.size()) {
+        return;
+    }
+    buffer.overwrite(source.size(), [&](uint8_t * data, size_t count) {
+        std::copy(source.begin(), source.end(), data);
+        data[index] = value;
+        CHECK(count == source.size());
+    });
+}
+
 void configure_host_accounting(
         server_cache_authority & authority,
         bool with_sidecar = false) {
@@ -245,9 +270,9 @@ void test_typed_host_payload_boundary() {
     source.checkpoints.emplace_back();
     auto & source_checkpoint = source.checkpoints.back();
     source_checkpoint.n_tokens = 2;
-    source_checkpoint.data_tgt.assign(3, 1);
-    source_checkpoint.data_dft.assign(5, 2);
-    source_checkpoint.accel.ring.assign(7, 3);
+    fill_checkpoint_bytes(source_checkpoint.data_tgt, 3, 1);
+    fill_checkpoint_bytes(source_checkpoint.data_dft, 5, 2);
+    fill_checkpoint_bytes(source_checkpoint.accel.ring, 7, 3);
     const auto source_key = server_retention_instance_key::for_slot(source_slot);
     (void) publish_live_retention(authority.retention, source, source_slot);
     const auto checkpoint_key = server_retention_instance_key::for_checkpoint(
@@ -349,7 +374,7 @@ void test_host_save_missing_checkpoint_mirror_fails_locally() {
         checkpoint.n_tokens = 2;
         checkpoint.pos_min = 0;
         checkpoint.pos_max = 1;
-        checkpoint.data_tgt.assign(8, 9);
+        fill_checkpoint_bytes(checkpoint.data_tgt, 8, 9);
         return value;
     };
     auto entry = make_checkpoint_entry();
@@ -1012,10 +1037,10 @@ std::list<server_prompt_cache_state> make_redundant_entry() {
     checkpoint.n_tokens = 2;
     checkpoint.pos_min = 0;
     checkpoint.pos_max = 1;
-    checkpoint.data_tgt.assign(8, 9);
-    checkpoint.data_dft.assign(3, 10);
-    checkpoint.accel.ring.assign(5, 11);
-    checkpoint.accel.spec.assign(2, 12);
+    fill_checkpoint_bytes(checkpoint.data_tgt, 8, 9);
+    fill_checkpoint_bytes(checkpoint.data_dft, 3, 10);
+    fill_checkpoint_bytes(checkpoint.accel.ring, 5, 11);
+    fill_checkpoint_bytes(checkpoint.accel.spec, 2, 12);
     return entry;
 }
 
@@ -2251,7 +2276,7 @@ void test_declared_family_round_trip_and_price() {
     checkpoint.pos_min = 0;
     checkpoint.pos_max = 1;
     checkpoint.cache_family = declared_main;
-    checkpoint.data_tgt.assign(4, 7);
+    fill_checkpoint_bytes(checkpoint.data_tgt, 4, 7);
 
     common_prompt_checkpoint copied = checkpoint;
     CHECK(copied.cache_family == declared_main);
@@ -2261,43 +2286,35 @@ void test_declared_family_round_trip_and_price() {
     CHECK(assigned.cache_family == declared_main);
     CHECK(assigned.data_tgt.shares_storage_with(checkpoint.data_tgt));
     CHECK(checkpoint.data_tgt.storage_use_count() == 3);
-    copied.data_tgt.mutable_at(0) = 9;
+    replace_checkpoint_byte(copied.data_tgt, 0, 9);
     CHECK(!copied.data_tgt.shares_storage_with(checkpoint.data_tgt));
     CHECK(copied.data_tgt[0] == 9);
     CHECK(checkpoint.data_tgt[0] == 7);
-    auto pointer_source = checkpoint.data_tgt;
-    uint8_t * exposed_pointer = pointer_source.mutable_data();
-    auto pointer_copy = pointer_source;
-    exposed_pointer[0] = 11;
-    CHECK(pointer_source[0] == 11);
-    CHECK(pointer_copy[0] == 7);
-    auto reference_source = checkpoint.data_tgt;
-    uint8_t & exposed_reference = reference_source.mutable_at(0);
-    auto reference_copy = reference_source;
-    exposed_reference = 12;
-    CHECK(reference_source[0] == 12);
-    CHECK(reference_copy[0] == 7);
-    auto shared_resize = checkpoint.data_tgt;
-    CHECK(shared_resize.shares_storage_with(checkpoint.data_tgt));
-    bool resize_failed = false;
+    auto shared_overwrite = checkpoint.data_tgt;
+    CHECK(shared_overwrite.shares_storage_with(checkpoint.data_tgt));
+    bool overwrite_failed = false;
     try {
-        shared_resize.resize(std::numeric_limits<size_t>::max());
-    } catch (const std::length_error &) {
-        resize_failed = true;
+        shared_overwrite.overwrite(
+            std::numeric_limits<size_t>::max(),
+            [](uint8_t *, size_t) {});
+    } catch (const std::exception &) {
+        overwrite_failed = true;
     }
-    CHECK(resize_failed);
-    CHECK(shared_resize.shares_storage_with(checkpoint.data_tgt));
-    CHECK(shared_resize == checkpoint.data_tgt);
-    common_shared_byte_buffer empty_resize;
-    resize_failed = false;
+    CHECK(overwrite_failed);
+    CHECK(shared_overwrite.shares_storage_with(checkpoint.data_tgt));
+    CHECK(shared_overwrite == checkpoint.data_tgt);
+    common_shared_byte_buffer empty_overwrite;
+    overwrite_failed = false;
     try {
-        empty_resize.resize(std::numeric_limits<size_t>::max());
-    } catch (const std::length_error &) {
-        resize_failed = true;
+        empty_overwrite.overwrite(
+            std::numeric_limits<size_t>::max(),
+            [](uint8_t *, size_t) {});
+    } catch (const std::exception &) {
+        overwrite_failed = true;
     }
-    CHECK(resize_failed);
-    CHECK(empty_resize.empty());
-    CHECK(empty_resize.storage_use_count() == 0);
+    CHECK(overwrite_failed);
+    CHECK(empty_overwrite.empty());
+    CHECK(empty_overwrite.storage_use_count() == 0);
     copied.clear();
     CHECK(!copied.cache_family.declared());
 
@@ -2548,10 +2565,12 @@ void test_lifecycle_restore_retains_immutable_source() {
     entry.front().payload.fixed_state()->main.assign(32, 7);
     entry.front().prompt.checkpoints.emplace_back();
     entry.front().prompt.checkpoints.back().n_tokens = 2;
-    entry.front().prompt.checkpoints.back().data_tgt.assign(8, 9);
+    fill_checkpoint_bytes(
+        entry.front().prompt.checkpoints.back().data_tgt, 8, 9);
     entry.front().prompt.checkpoints.emplace_back();
     entry.front().prompt.checkpoints.back().n_tokens = 3;
-    entry.front().prompt.checkpoints.back().data_tgt.assign(8, 10);
+    fill_checkpoint_bytes(
+        entry.front().prompt.checkpoints.back().data_tgt, 8, 10);
     CHECK(cache.publish(std::move(entry)));
     CHECK(cache.states.size() == 1);
     common_chat_msg_spans checkpoint_spans;
@@ -3119,16 +3138,14 @@ void test_lifecycle_restore_batch_timing() {
         entry.front().prompt.checkpoints.emplace_back();
         auto & checkpoint = entry.front().prompt.checkpoints.back();
         checkpoint.n_tokens = 4096;
-        const auto fill = [](common_shared_byte_buffer & buffer,
-                             size_t size, uint8_t value) {
-            buffer.overwrite(size, [&](uint8_t * data, size_t count) {
-                std::fill_n(data, count, value);
-            });
-        };
-        fill(checkpoint.data_tgt, 64 * 1024, uint8_t(i + 1));
-        fill(checkpoint.data_dft, 8 * 1024, uint8_t(i + 3));
-        fill(checkpoint.accel.ring, 4 * 1024, uint8_t(i + 2));
-        fill(checkpoint.accel.spec, 1024, uint8_t(i + 4));
+        fill_checkpoint_bytes(
+            checkpoint.data_tgt, 64 * 1024, uint8_t(i + 1));
+        fill_checkpoint_bytes(
+            checkpoint.data_dft, 8 * 1024, uint8_t(i + 3));
+        fill_checkpoint_bytes(
+            checkpoint.accel.ring, 4 * 1024, uint8_t(i + 2));
+        fill_checkpoint_bytes(
+            checkpoint.accel.spec, 1024, uint8_t(i + 4));
     }
     CHECK(cache.publish(std::move(entry)));
     common_chat_msg_spans spans;
@@ -3180,7 +3197,7 @@ void test_lifecycle_restore_batch_timing() {
             host_checkpoint.accel.spec));
     }
     auto & detached = fanout.front().prompt.checkpoints.front();
-    detached.data_tgt.mutable_at(0) = 0xff;
+    replace_checkpoint_byte(detached.data_tgt, 0, 0xff);
     CHECK(!detached.data_tgt.shares_storage_with(
         host_checkpoint.data_tgt));
     CHECK(detached.data_tgt[0] == 0xff);
@@ -3279,8 +3296,9 @@ void test_checkpoint_creation_churn_timing() {
             identity.adapter_config_identity;
         checkpoint.computation_frontier.media_content_identity =
             identity.media_content_identity;
-        checkpoint.data_tgt.assign(64 * 1024, uint8_t(checkpoint.n_tokens));
-        checkpoint.accel.ring.assign(4 * 1024, 7);
+        fill_checkpoint_bytes(
+            checkpoint.data_tgt, 64 * 1024, uint8_t(checkpoint.n_tokens));
+        fill_checkpoint_bytes(checkpoint.accel.ring, 4 * 1024, 7);
         const auto key = server_retention_instance_key::for_checkpoint(
             7, &checkpoint);
         const auto publish_begin = std::chrono::steady_clock::now();
@@ -3551,7 +3569,8 @@ void test_consuming_rebind_mints_checkpoint_ownership() {
     auto entry = make_prompt_entry("same", { 1, 2, 3 });
     entry.front().prompt.checkpoints.emplace_back();
     entry.front().prompt.checkpoints.back().n_tokens = 2;
-    entry.front().prompt.checkpoints.back().data_tgt.assign(8, 9);
+    fill_checkpoint_bytes(
+        entry.front().prompt.checkpoints.back().data_tgt, 8, 9);
     CHECK(cache.publish(std::move(entry)));
     common_chat_msg_spans spans;
     CHECK(authority.retention.publish(
@@ -3593,7 +3612,7 @@ void test_restore_partial_checkpoint_ownership_fails_closed() {
         entry.front().prompt.checkpoints.emplace_back();
         auto & checkpoint = entry.front().prompt.checkpoints.back();
         checkpoint.n_tokens = i + 1;
-        checkpoint.data_tgt.assign(8, uint8_t(i + 1));
+        fill_checkpoint_bytes(checkpoint.data_tgt, 8, uint8_t(i + 1));
     }
     CHECK(cache.publish(std::move(entry)));
     common_chat_msg_spans spans;
@@ -3673,8 +3692,8 @@ void test_host_publication_accounting_fault_is_atomic() {
     source.checkpoints.emplace_back();
     auto & checkpoint = source.checkpoints.back();
     checkpoint.n_tokens = 3;
-    checkpoint.data_tgt.assign(64, 1);
-    checkpoint.accel.ring.assign(16, 2);
+    fill_checkpoint_bytes(checkpoint.data_tgt, 64, 1);
+    fill_checkpoint_bytes(checkpoint.accel.ring, 16, 2);
     const auto source_key = server_retention_instance_key::for_slot(
         source_slot);
     (void) publish_live_retention(
@@ -3895,19 +3914,22 @@ void test_redundancy_payload_mismatch_and_missing_catalog() {
     victim.front().payload.fixed_state()->main.assign(4, 1);
     victim.front().prompt.checkpoints.emplace_back();
     victim.front().prompt.checkpoints.back().n_tokens = 2;
-    victim.front().prompt.checkpoints.back().data_tgt.assign(2, 3);
+    fill_checkpoint_bytes(
+        victim.front().prompt.checkpoints.back().data_tgt, 2, 3);
     auto survivor = make_prompt_entry("same", { 1, 2, 3 });
     survivor.front().payload.fixed_state()->main.assign(4, 1);
     survivor.front().prompt.checkpoints.emplace_back();
     survivor.front().prompt.checkpoints.back().n_tokens = 2;
-    survivor.front().prompt.checkpoints.back().data_tgt.assign(2, 3);
+    fill_checkpoint_bytes(
+        survivor.front().prompt.checkpoints.back().data_tgt, 2, 3);
     survivor.front().prompt.tokens = server_tokens(
         llama_tokens { 1, 2, 3, 4 }, false);
     // Coverage superset is accepted only because all three physical payload
     // planes are still byte-identical.
     CHECK(server_prompt_cache::exactly_redundant(
         victim.front(), survivor.front()));
-    survivor.front().prompt.checkpoints.back().data_tgt.mutable_at(1) = 4;
+    replace_checkpoint_byte(
+        survivor.front().prompt.checkpoints.back().data_tgt, 1, 4);
     CHECK(!server_prompt_cache::exactly_redundant(
         victim.front(), survivor.front()));
 
@@ -4475,7 +4497,8 @@ void test_checkpoint_thin_lane_skips_pinned_member() {
             identity.adapter_config_identity;
         checkpoint.computation_frontier.media_content_identity =
             identity.media_content_identity;
-        checkpoint.data_tgt.assign(32, uint8_t(checkpoint.n_tokens));
+        fill_checkpoint_bytes(
+            checkpoint.data_tgt, 32, uint8_t(checkpoint.n_tokens));
         const auto key = server_retention_instance_key::for_checkpoint(
             17, &checkpoint);
         CHECK(authority.retention.publish(
@@ -4636,8 +4659,8 @@ void test_live_checkpoint_payload_ownership() {
     // make the canonical lifecycle checkpoint candidate unavailable.
     CHECK(authority.retention.enable_prefix_tracking());
     common_prompt_checkpoint checkpoint;
-    checkpoint.data_tgt.assign(64, 1);
-    checkpoint.accel.ring.assign(16, 2);
+    fill_checkpoint_bytes(checkpoint.data_tgt, 64, 1);
+    fill_checkpoint_bytes(checkpoint.accel.ring, 16, 2);
     const auto live =
         server_retention_instance_key::for_checkpoint(3, &checkpoint);
     common_chat_msg_spans spans;
@@ -4690,8 +4713,8 @@ void test_live_checkpoint_batch_admission() {
     for (uint64_t trial = 0; trial < 21; ++trial) {
         std::vector<common_prompt_checkpoint> sequential_checkpoints(8);
         for (auto & checkpoint : sequential_checkpoints) {
-            checkpoint.data_tgt.assign(64 * 1024, 1);
-            checkpoint.accel.ring.assign(4 * 1024, 2);
+            fill_checkpoint_bytes(checkpoint.data_tgt, 64 * 1024, 1);
+            fill_checkpoint_bytes(checkpoint.accel.ring, 4 * 1024, 2);
         }
         std::vector<llama_cache_acct_op_id> all_ops;
         const auto begin = std::chrono::steady_clock::now();
@@ -4712,8 +4735,10 @@ void test_live_checkpoint_batch_admission() {
         std::vector<server_cache_live_checkpoint_admission> batch(8);
         std::vector<common_prompt_checkpoint> checkpoints(8);
         for (uint64_t member = 0; member < batch.size(); ++member) {
-            checkpoints[member].data_tgt.assign(64 * 1024, 1);
-            checkpoints[member].accel.ring.assign(4 * 1024, 2);
+            fill_checkpoint_bytes(
+                checkpoints[member].data_tgt, 64 * 1024, 1);
+            fill_checkpoint_bytes(
+                checkpoints[member].accel.ring, 4 * 1024, 2);
             batch[member].artifact = { 2000 + trial * 8 + member };
             batch[member].checkpoint = &checkpoints[member];
         }
@@ -4745,8 +4770,8 @@ void test_live_checkpoint_batch_admission() {
     const auto before = authority.ledger.snapshot();
     std::vector<server_cache_live_checkpoint_admission> invalid(2);
     common_prompt_checkpoint invalid_checkpoint[2];
-    invalid_checkpoint[0].data_tgt.assign(64, 1);
-    invalid_checkpoint[1].data_tgt.assign(64, 1);
+    fill_checkpoint_bytes(invalid_checkpoint[0].data_tgt, 64, 1);
+    fill_checkpoint_bytes(invalid_checkpoint[1].data_tgt, 64, 1);
     invalid[0].artifact = { 9001 };
     invalid[0].checkpoint = &invalid_checkpoint[0];
     invalid[1].artifact = {};
@@ -4759,8 +4784,8 @@ void test_live_checkpoint_batch_admission() {
     server_cache_authority unavailable;
     std::vector<server_cache_live_checkpoint_admission> refused(2);
     common_prompt_checkpoint refused_checkpoint[2];
-    refused_checkpoint[0].data_tgt.assign(64, 1);
-    refused_checkpoint[1].data_tgt.assign(64, 1);
+    fill_checkpoint_bytes(refused_checkpoint[0].data_tgt, 64, 1);
+    fill_checkpoint_bytes(refused_checkpoint[1].data_tgt, 64, 1);
     refused[0].artifact = { 9101 };
     refused[0].checkpoint = &refused_checkpoint[0];
     refused[1].artifact = { 9102 };
@@ -4785,10 +4810,10 @@ void test_shared_checkpoint_physical_accounting() {
 
     {
         common_prompt_checkpoint source;
-        source.data_tgt.assign(64, 1);
-        source.data_dft.assign(32, 2);
-        source.accel.ring.assign(16, 3);
-        source.accel.spec.assign(8, 4);
+        fill_checkpoint_bytes(source.data_tgt, 64, 1);
+        fill_checkpoint_bytes(source.data_dft, 32, 2);
+        fill_checkpoint_bytes(source.accel.ring, 16, 3);
+        fill_checkpoint_bytes(source.accel.spec, 8, 4);
         std::vector<llama_cache_acct_op_id> source_ops;
         CHECK(authority.admit_live_checkpoint({ 10001 }, source, source_ops));
         CHECK(source_ops.size() == 4);
@@ -4810,7 +4835,8 @@ void test_shared_checkpoint_physical_accounting() {
 
         server_prompt unbound_prompt;
         unbound_prompt.checkpoints.emplace_back();
-        unbound_prompt.checkpoints.back().data_tgt.assign(64, 1);
+        fill_checkpoint_bytes(
+            unbound_prompt.checkpoints.back().data_tgt, 64, 1);
         CHECK(bounded.stage(
             unbound_prompt, 16, 0, "unbound-physical").empty());
 
@@ -4841,41 +4867,31 @@ void test_shared_checkpoint_physical_accounting() {
         CHECK(authority.ledger.snapshot().live_ops == 0);
     }
 
-    // Mutating one unaccounted alias detaches only that plane. Once admitted,
-    // each logical handle is sealed while the other planes keep sharing the
-    // existing physical allocations.
+    // Scoped overwrite of one unaccounted alias detaches only that plane. Once
+    // admitted, each logical handle is sealed while the other planes keep
+    // sharing the existing physical allocations.
     {
         common_prompt_checkpoint source;
-        source.data_tgt.assign(64, 1);
-        source.data_dft.assign(32, 2);
-        source.accel.ring.assign(16, 3);
-        source.accel.spec.assign(8, 4);
+        fill_checkpoint_bytes(source.data_tgt, 64, 1);
+        fill_checkpoint_bytes(source.data_dft, 32, 2);
+        fill_checkpoint_bytes(source.accel.ring, 16, 3);
+        fill_checkpoint_bytes(source.accel.spec, 8, 4);
         common_prompt_checkpoint detached = source;
-        detached.data_tgt.mutable_at(0) = 9;
+        replace_checkpoint_byte(detached.data_tgt, 0, 9);
         CHECK(!detached.data_tgt.shares_storage_with(source.data_tgt));
         CHECK(detached.data_dft.shares_storage_with(source.data_dft));
-        // Close the intentionally escaped reference before accounting seals
-        // this independently owned plane.
-        detached.data_tgt.assign(64, 9);
 
         std::vector<llama_cache_acct_op_id> source_ops;
         CHECK(authority.admit_live_checkpoint({ 11001 }, source, source_ops));
 
-        bool bound_mutation_refused = false;
+        bool bound_overwrite_refused = false;
         try {
-            source.data_tgt.mutable_at(0) = 7;
+            fill_checkpoint_bytes(source.data_tgt, 64, 7);
         } catch (const std::logic_error &) {
-            bound_mutation_refused = true;
+            bound_overwrite_refused = true;
         }
-        CHECK(bound_mutation_refused);
+        CHECK(bound_overwrite_refused);
         CHECK(source.data_tgt.view()[0] == 1);
-        bool bound_resize_refused = false;
-        try {
-            source.data_tgt.resize(65);
-        } catch (const std::logic_error &) {
-            bound_resize_refused = true;
-        }
-        CHECK(bound_resize_refused);
         CHECK(source.data_tgt.size() == 64);
 
         std::vector<llama_cache_acct_op_id> detached_ops;
@@ -4894,26 +4910,6 @@ void test_shared_checkpoint_physical_accounting() {
         CHECK(authority.ledger.snapshot().live_ops == 0);
     }
 
-    // An escaped mutable pointer cannot be sealed into the immutable
-    // accounting namespace. Replacing the buffer closes that escape and
-    // restores ordinary admission.
-    {
-        common_prompt_checkpoint exposed;
-        exposed.data_tgt.assign(32, 1);
-        auto * escaped = exposed.data_tgt.mutable_data();
-        CHECK(escaped != nullptr);
-        std::vector<llama_cache_acct_op_id> ops;
-        CHECK(!authority.admit_live_checkpoint({ 12001 }, exposed, ops));
-        CHECK(ops.empty());
-        CHECK(authority.ledger.snapshot().live_ops == 0);
-        exposed.data_tgt.assign(32, 2);
-        CHECK(authority.admit_live_checkpoint({ 12002 }, exposed, ops));
-        for (const auto op : ops) {
-            CHECK(authority.ledger.release(op));
-        }
-        CHECK(authority.ledger.snapshot().live_ops == 0);
-    }
-
     // Exact pressure progress is physical, not the logical checkpoint sum.
     // Five host snapshots each release 32 bytes; their 100-byte checkpoint
     // planes remain owned by the corresponding live checkpoint handles.
@@ -4926,7 +4922,8 @@ void test_shared_checkpoint_physical_accounting() {
         std::vector<common_prompt_checkpoint> live(5);
         std::vector<std::vector<llama_cache_acct_op_id>> live_ops(5);
         for (size_t i = 0; i < live.size(); ++i) {
-            live[i].data_tgt.assign(100, uint8_t(i + 1));
+            fill_checkpoint_bytes(
+                live[i].data_tgt, 100, uint8_t(i + 1));
             CHECK(pressure_authority.admit_live_checkpoint(
                 { 13001 + i }, live[i], live_ops[i]));
             server_prompt_cache_state host;
@@ -4969,10 +4966,10 @@ void test_shared_checkpoint_physical_accounting() {
         for (size_t i = 0; i < 8; ++i) {
             host.prompt.checkpoints.emplace_back();
             auto & checkpoint = host.prompt.checkpoints.back();
-            checkpoint.data_tgt.assign(64, 1);
-            checkpoint.data_dft.assign(32, 2);
-            checkpoint.accel.ring.assign(16, 3);
-            checkpoint.accel.spec.assign(8, 4);
+            fill_checkpoint_bytes(checkpoint.data_tgt, 64, 1);
+            fill_checkpoint_bytes(checkpoint.data_dft, 32, 2);
+            fill_checkpoint_bytes(checkpoint.accel.ring, 16, 3);
+            fill_checkpoint_bytes(checkpoint.accel.spec, 8, 4);
         }
         CHECK(drop_authority.admit_host_entry(host));
         cache.states.push_back(std::move(host));

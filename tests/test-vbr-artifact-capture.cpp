@@ -1055,7 +1055,7 @@ static vbr_projected_manifest_publication projected_publication(
         const vbr_artifact_portable_topology & topology) {
     vbr_projected_manifest_publication out;
     out.manifest_id = manifest_id;
-    out.package.topologies = { topology };
+    out.topologies = { topology };
     const auto * row = projected_manifest(assembly, manifest_id);
     CHECK(row != nullptr);
     if (!row || row->state != vbr_capture_manifest_state::ready) {
@@ -1068,55 +1068,6 @@ static vbr_projected_manifest_publication projected_publication(
     const uint32_t captured_index = assembly.unit_references()[
         row->first_unit];
     const auto & captured = assembly.projected_units()[captured_index];
-    vbr_artifact_unit_blob blob;
-    auto & descriptor = blob.descriptor;
-    descriptor.child_id = captured.child_id();
-    descriptor.logical_unit_id = captured.logical_unit_id();
-    descriptor.lineage_uuid = captured.snapshot().lineage_uuid;
-    descriptor.repr_gen = captured.snapshot().generation.repr_gen;
-    descriptor.current_type = captured.snapshot().generation.current_type;
-    descriptor.last_source_type =
-        captured.snapshot().generation.last_source_type;
-    descriptor.last_transition =
-        captured.snapshot().generation.last_transition;
-    descriptor.representation.kind =
-        vbr_artifact_representation_kind::raw;
-    descriptor.representation.codec_id = 1;
-    descriptor.representation.codec_version = 1;
-    descriptor.side = vbr_artifact_side::key;
-    descriptor.layout = vbr_artifact_layout::row_major;
-    descriptor.n_stream = 1;
-    descriptor.unified = true;
-    descriptor.wm_cells = captured.packed_bytes();
-    descriptor.rank = 2;
-    descriptor.dimensions = { captured.packed_bytes(), 1, 0, 0 };
-    descriptor.row_alignment = 1;
-    descriptor.row_codec_version = 1;
-    for (uint32_t i = 0; i < captured.shards().size(); ++i) {
-        vbr_artifact_shard_descriptor shard;
-        shard.shard_index = i;
-        shard.topology_index = 0;
-        shard.device_ordinal = 0;
-        shard.logical_offset = 0;
-        shard.row_count = captured.shards()[i].bytes->size();
-        shard.column_count = 1;
-        shard.row_bytes = 1;
-        shard.payload_bytes = captured.shards()[i].bytes->size();
-        descriptor.shards.push_back(shard);
-    }
-    vbr_artifact_unit_reference reference;
-    reference.lineage_uuid = descriptor.lineage_uuid;
-    reference.logical_unit_id = descriptor.logical_unit_id;
-    reference.repr_gen = descriptor.repr_gen;
-    out.package.unit_blobs.push_back(std::move(blob));
-    out.package.manifest.unit_references.push_back(reference);
-    out.package.manifest.identity.execution_identity = "projected-test";
-    out.package.manifest.identity.adapter_config_identity = "adapter";
-    out.package.manifest.identity.media_content_identity = "media";
-    out.package.manifest.identity.sequence_epoch = manifest_id;
-    out.package.manifest.identity.token_count = 1;
-    out.package.manifest.identity.next_position = 1;
-    out.package.manifest.token_block.tokens = { int32_t(manifest_id) };
     vbr_artifact_portable_accounting_row payload;
     payload.role = vbr_artifact_accounting_role::unit_payload;
     payload.domain = {
@@ -1126,17 +1077,17 @@ static vbr_projected_manifest_publication projected_publication(
     };
     payload.logical_bytes = captured.packed_bytes();
     payload.resident_bytes = captured.packed_bytes();
-    out.package.manifest.accounting.push_back(payload);
+    out.accounting.push_back(payload);
     const vbr_artifact_portable_domain host {
         llama_cache_acct_residency::pageable_host,
         llama_cache_acct_domain_kind::not_applicable,
         UINT32_MAX, UINT16_MAX,
     };
-    out.package.manifest.accounting.push_back({
+    out.accounting.push_back({
         vbr_artifact_accounting_role::descriptor_metadata,
         host, 512, 512, llama_cache_acct_attr_kind::artifact,
     });
-    out.package.manifest.accounting.push_back({
+    out.accounting.push_back({
         vbr_artifact_accounting_role::reference_metadata,
         host, 256, 256, llama_cache_acct_attr_kind::artifact,
     });
@@ -1214,7 +1165,7 @@ static void test_dependency_scoped_projected_catalog_publication() {
             UINT32_MAX, UINT16_MAX,
         };
         companion.payload_bytes = sizeof(recurrent_state);
-        companion_publication.package.manifest.accounting.push_back({
+        companion_publication.accounting.push_back({
             vbr_artifact_accounting_role::recurrent_payload,
             companion.domain,
             companion.payload_bytes, companion.payload_bytes,
@@ -1257,7 +1208,11 @@ static void test_dependency_scoped_projected_catalog_publication() {
         { host, llama_cache_acct_producer::retention_sidecar },
     };
     CHECK(ledger.configure_required_producers(requirements, 2));
-    CHECK(catalog.configure_accounting(publications.front().package));
+    vbr_artifact_package accounting_package;
+    accounting_package.topologies = publications.front().topologies;
+    accounting_package.manifest.accounting =
+        publications.front().accounting;
+    CHECK(catalog.configure_accounting(accounting_package));
     for (const auto category : {
             llama_cache_acct_category::live_attention_state,
             llama_cache_acct_category::live_recurrent_state,
@@ -1376,7 +1331,11 @@ static void test_dependency_scoped_projected_catalog_publication() {
         sparse_controller.provider(), {}, sparse_assembly));
     auto sparse_publication = projected_publication(
         90, sparse_assembly, topology);
-    CHECK(catalog.configure_accounting(sparse_publication.package));
+    vbr_artifact_package sparse_accounting_package;
+    sparse_accounting_package.topologies = sparse_publication.topologies;
+    sparse_accounting_package.manifest.accounting =
+        sparse_publication.accounting;
+    CHECK(catalog.configure_accounting(sparse_accounting_package));
     results.clear();
     diagnostics = {};
     std::vector<vbr_projected_manifest_publication> sparse_publications;

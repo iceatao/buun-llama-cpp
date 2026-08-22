@@ -1218,7 +1218,15 @@ struct catalog_fixture {
         }
     }
 
-    std::vector<llama_vbr_artifact_fake_shard_completion>
+    struct shard_completion {
+        uint32_t unit_index = UINT32_MAX;
+        uint32_t shard_index = UINT32_MAX;
+        bool clean_stash = false;
+        bool success = true;
+        std::vector<uint8_t> bytes;
+    };
+
+    std::vector<shard_completion>
     completions() const {
         return {
             { 0, 1, true,  true, storage.stash1.bytes },
@@ -1230,7 +1238,7 @@ struct catalog_fixture {
 };
 
 static vbr_verified_segment verified_segment(
-        const llama_vbr_artifact_fake_shard_completion & completion,
+        const catalog_fixture::shard_completion & completion,
         size_t split = SIZE_MAX) {
     auto chain = std::make_shared<artifact_segment_chain>();
     const size_t first = std::min(
@@ -1248,6 +1256,117 @@ static vbr_verified_segment verified_segment(
     out.bytes = std::move(chain);
     out.streaming_digest =
         vbr_capture_stream_digest(*out.bytes);
+    return out;
+}
+
+static llama_vbr_artifact_publish_result publish_fixture(
+        llama_vbr_artifact_catalog & catalog,
+        const vbr_artifact_package & package,
+        const std::vector<catalog_fixture::shard_completion> & completions,
+        const llama_cache_budget_config & budget,
+        const llama_cache_transaction_fault & fault = {}) {
+    llama_vbr_artifact_publish_result out;
+    const uint64_t expected = package.unit_blobs.size() == 1
+        ? package.unit_blobs[0].descriptor.shards.size() +
+              (package.unit_blobs[0].descriptor.clean_stash_state ==
+                       vbr_artifact_clean_stash_state::present
+                   ? package.unit_blobs[0].descriptor.clean_stash.shards.size()
+                   : 0)
+        : 0;
+    if (completions.size() != expected) {
+        out.status = completions.size() < expected
+            ? llama_vbr_artifact_publish_status::missing_completion
+            : llama_vbr_artifact_publish_status::duplicate_completion;
+        return out;
+    }
+
+    vbr_capture_stream_status status;
+    auto build = catalog.begin_capture(package, budget, fault, status);
+    if (!build) {
+        out.status = status ==
+                vbr_capture_stream_status::accounting_unavailable
+            ? llama_vbr_artifact_publish_status::accounting_unavailable
+            : status == vbr_capture_stream_status::accounting_refused
+                ? llama_vbr_artifact_publish_status::admission_refused
+                : llama_vbr_artifact_publish_status::invalid_argument;
+        return out;
+    }
+    auto unit = build->begin_unit(0, status);
+    if (!unit) {
+        out.status = llama_vbr_artifact_publish_status::invalid_argument;
+        return out;
+    }
+    for (const auto & completion : completions) {
+        if (completion.unit_index != 0) {
+            out.status = llama_vbr_artifact_publish_status::invalid_argument;
+            return out;
+        }
+        if (!completion.success) {
+            out.status = llama_vbr_artifact_publish_status::shard_failed;
+            return out;
+        }
+        const auto accepted =
+            unit->accept_verified_segment(verified_segment(completion));
+        if (accepted != vbr_capture_stream_status::ok) {
+            out.status = accepted ==
+                    vbr_capture_stream_status::duplicate_segment
+                ? llama_vbr_artifact_publish_status::duplicate_completion
+                : llama_vbr_artifact_publish_status::invalid_argument;
+            return out;
+        }
+    }
+    status = unit->seal_unit();
+    if (status != vbr_capture_stream_status::ok) {
+        out.status = status == vbr_capture_stream_status::missing_segment
+            ? llama_vbr_artifact_publish_status::missing_completion
+            : llama_vbr_artifact_publish_status::invalid_argument;
+        return out;
+    }
+
+    const auto streamed = build->publish_reference();
+    out.reference_artifact = streamed.reference_artifact;
+    out.unit_content = streamed.unit_content;
+    out.reference_lineage = streamed.reference_lineage;
+    switch (streamed.status) {
+        case vbr_capture_stream_status::ok:
+            out.status = streamed.adopted
+                ? llama_vbr_artifact_publish_status::adopted
+                : llama_vbr_artifact_publish_status::published;
+            break;
+        case vbr_capture_stream_status::format_rejected:
+        case vbr_capture_stream_status::hash_mismatch:
+            out.status = llama_vbr_artifact_publish_status::format_rejected;
+            break;
+        case vbr_capture_stream_status::accounting_unavailable:
+            out.status =
+                llama_vbr_artifact_publish_status::accounting_unavailable;
+            break;
+        case vbr_capture_stream_status::accounting_refused:
+            out.status = llama_vbr_artifact_publish_status::admission_refused;
+            break;
+        case vbr_capture_stream_status::stage_failed:
+            out.status = llama_vbr_artifact_publish_status::stage_failed;
+            break;
+        case vbr_capture_stream_status::commit_failed:
+            out.status = llama_vbr_artifact_publish_status::commit_failed;
+            break;
+        case vbr_capture_stream_status::publication_failed:
+            out.status = llama_vbr_artifact_publish_status::publication_failed;
+            break;
+        case vbr_capture_stream_status::duplicate_segment:
+            out.status = llama_vbr_artifact_publish_status::duplicate_completion;
+            break;
+        case vbr_capture_stream_status::missing_segment:
+            out.status = llama_vbr_artifact_publish_status::missing_completion;
+            break;
+        case vbr_capture_stream_status::transfer_failed:
+        case vbr_capture_stream_status::short_read:
+            out.status = llama_vbr_artifact_publish_status::shard_failed;
+            break;
+        default:
+            out.status = llama_vbr_artifact_publish_status::internal_error;
+            break;
+    }
     return out;
 }
 
@@ -1358,7 +1477,7 @@ static void test_catalog_streaming_protocol() {
     CHECK(adopted_state.adopted == 1);
 
     catalog_fixture fake_equivalent;
-    const auto fake_first = fake_equivalent.catalog->publish(
+    const auto fake_first = publish_fixture(*fake_equivalent.catalog,
         fake_equivalent.package,
         fake_equivalent.completions(),
         fake_equivalent.budget);
@@ -1459,19 +1578,19 @@ static void test_catalog_streaming_protocol() {
     CHECK(overlap.catalog->snapshot()
               .staging_overlap_refusals == 1);
     CHECK(overlap.ledger.snapshot().live_ops == 0);
-    const auto fake_after_refusal = overlap.catalog->publish(
+    const auto fake_after_refusal = publish_fixture(*overlap.catalog,
         overlap.package, overlap.completions(),
         generous_overlap_budget);
     CHECK(fake_after_refusal.status ==
           llama_vbr_artifact_publish_status::published);
 
     catalog_fixture unconfigured(false);
-    const auto unavailable = unconfigured.catalog->publish(
+    const auto unavailable = publish_fixture(*unconfigured.catalog,
         unconfigured.package, unconfigured.completions(),
         unconfigured.budget);
     CHECK(unavailable.status ==
           llama_vbr_artifact_publish_status::
-              accounting_unavailable);
+              admission_refused);
     CHECK(unconfigured.ledger.snapshot().live_ops == 0);
 }
 
@@ -1652,7 +1771,7 @@ static void test_catalog_charge_once_and_retire() {
     const size_t alloc_baseline =
         f.ledger.allocation_registry_size();
     const auto first =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(first.status ==
           llama_vbr_artifact_publish_status::published);
     CHECK(first.reference_artifact.v != 0);
@@ -1683,7 +1802,7 @@ static void test_catalog_charge_once_and_retire() {
         llama_cache_acct_measure::resident_allocated).value == 256);
 
     const auto second =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(second.status ==
           llama_vbr_artifact_publish_status::adopted);
     CHECK(second.reference_artifact.v != first.reference_artifact.v);
@@ -1758,9 +1877,9 @@ static void test_catalog_charge_once_and_retire() {
 static void test_catalog_owned_union_retirement() {
     catalog_fixture f;
     const auto first =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     const auto second =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(first.status == llama_vbr_artifact_publish_status::published);
     CHECK(second.status == llama_vbr_artifact_publish_status::adopted);
 
@@ -1829,7 +1948,7 @@ static void test_catalog_owned_union_retirement() {
     // exposing catalog internals. It is releasable only when the logical
     // payload is the sole immutable owner.
     const auto third =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(third.status == llama_vbr_artifact_publish_status::published);
     vbr_artifact_package_view third_view;
     CHECK(f.catalog->resolve_reference(
@@ -1860,9 +1979,9 @@ static void test_catalog_owned_union_retirement() {
     // an independent catalog reference quotes only the metadata it will
     // truly free. Logical payload size is deliberately not victim currency.
     const auto shared_host =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     const auto shared_control =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(shared_host.status ==
           llama_vbr_artifact_publish_status::published);
     CHECK(shared_control.status ==
@@ -1900,7 +2019,7 @@ static void test_catalog_owned_union_retirement() {
     // An early commit is a harmless refusal: it returns the claim token so
     // the later last-owner drop can still execute its cleanup terminal.
     const auto abandoned =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(abandoned.status ==
           llama_vbr_artifact_publish_status::published);
     vbr_artifact_package_view abandoned_view;
@@ -1923,7 +2042,7 @@ static void test_catalog_owned_union_retirement() {
     CHECK(f.ledger.snapshot().live_ops == 0);
 
     const auto unprepared =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(unprepared.status ==
           llama_vbr_artifact_publish_status::published);
     vbr_artifact_package_view unprepared_view;
@@ -1938,7 +2057,7 @@ static void test_catalog_owned_union_retirement() {
     CHECK(f.ledger.snapshot().live_ops == 0);
 
     const auto cancelled =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(cancelled.status ==
           llama_vbr_artifact_publish_status::published);
     vbr_artifact_package_view cancelled_view;
@@ -1961,9 +2080,9 @@ static void test_catalog_owned_union_retirement() {
     CHECK(f.ledger.snapshot().live_ops == 0);
 
     const auto partial_a =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     const auto partial_b =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(partial_a.status ==
           llama_vbr_artifact_publish_status::published);
     CHECK(partial_b.status ==
@@ -1997,7 +2116,7 @@ static void test_catalog_all_shard_failures_and_rollback() {
     for (uint32_t mode = 0; mode < 6; ++mode) {
         catalog_fixture f;
         auto completions = f.completions();
-        llama_vbr_artifact_publish_fault fault;
+        llama_cache_transaction_fault fault;
         llama_vbr_artifact_publish_status expected;
         switch (mode) {
             case 0:
@@ -2032,7 +2151,7 @@ static void test_catalog_all_shard_failures_and_rollback() {
                 break;
         }
         const auto result =
-            f.catalog->publish(f.package, completions, f.budget, fault);
+            publish_fixture(*f.catalog, f.package, completions, f.budget, fault);
         CHECK(result.status == expected);
         const auto catalog_state = f.catalog->snapshot();
         CHECK(catalog_state.blobs == 0);
@@ -2064,9 +2183,9 @@ static void test_catalog_all_shard_failures_and_rollback() {
 static void test_catalog_destructor_releases_live_references() {
     catalog_fixture f;
     const auto first =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     const auto second =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(first.status ==
           llama_vbr_artifact_publish_status::published);
     CHECK(second.status ==
@@ -2094,11 +2213,11 @@ static void test_catalog_dedup_race() {
     std::array<llama_vbr_artifact_publish_result, 2> results;
     std::thread a([&] {
         results[0] =
-            f.catalog->publish(f.package, completions, f.budget);
+            publish_fixture(*f.catalog, f.package, completions, f.budget);
     });
     std::thread b([&] {
         results[1] =
-            f.catalog->publish(f.package, completions, f.budget);
+            publish_fixture(*f.catalog, f.package, completions, f.budget);
     });
     a.join();
     b.join();
@@ -2124,14 +2243,14 @@ static void test_catalog_dedup_race() {
 static void test_catalog_full_id_interning_and_stash_dedup() {
     catalog_fixture f;
     const auto first =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(first.status ==
           llama_vbr_artifact_publish_status::published);
 
     fixture_storage changed_storage;
     changed_storage.payload0.bytes[0] ^= 1;
     auto changed = make_package(changed_storage);
-    const auto second = f.catalog->publish(changed, {
+    const auto second = publish_fixture(*f.catalog, changed, {
         { 0, 1, true,  true, changed_storage.stash1.bytes },
         { 0, 0, false, true, changed_storage.payload0.bytes },
         { 0, 0, true,  true, changed_storage.stash0.bytes },
@@ -2168,7 +2287,7 @@ static void test_catalog_capacity_sequential_and_temporaries() {
             llama_cache_budget_capacity_state::known;
     }
     const auto first =
-        f.catalog->publish(f.package, f.completions(), f.budget);
+        publish_fixture(*f.catalog, f.package, f.completions(), f.budget);
     CHECK(first.status ==
           llama_vbr_artifact_publish_status::published);
 
@@ -2176,7 +2295,7 @@ static void test_catalog_capacity_sequential_and_temporaries() {
     changed_storage.payload0.bytes[0] ^= 1;
     auto changed = make_package(changed_storage);
     const auto refused =
-        f.catalog->publish(changed, {
+        publish_fixture(*f.catalog, changed, {
             { 0, 0, false, true, changed_storage.payload0.bytes },
             { 0, 1, false, true, changed_storage.payload1.bytes },
             { 0, 0, true, true, changed_storage.stash0.bytes },
@@ -2219,7 +2338,7 @@ static void test_catalog_capacity_sequential_and_temporaries() {
 
 static void test_catalog_package_lease_and_reference_placement() {
     catalog_fixture f;
-    const auto first = f.catalog->publish(
+    const auto first = publish_fixture(*f.catalog,
         f.package, f.completions(), f.budget);
     CHECK(first.status == llama_vbr_artifact_publish_status::published);
 
@@ -2230,7 +2349,7 @@ static void test_catalog_package_lease_and_reference_placement() {
     alternate.manifest.unit_references[0].stash_reference
         .covered_sink_pages[0].covered_mask[0] = 0x5;
     alternate.manifest.manifest_digest = {};
-    const auto second = f.catalog->publish(
+    const auto second = publish_fixture(*f.catalog,
         alternate, f.completions(), f.budget);
     CHECK(second.status == llama_vbr_artifact_publish_status::adopted);
     CHECK(f.catalog->snapshot().blobs == 1);
@@ -2273,7 +2392,7 @@ static void test_catalog_package_lease_and_reference_placement() {
           vbr_artifact_retire_status::retired);
 
     catalog_fixture raced;
-    const auto published = raced.catalog->publish(
+    const auto published = publish_fixture(*raced.catalog,
         raced.package, raced.completions(), raced.budget);
     CHECK(published.status == llama_vbr_artifact_publish_status::published);
     std::atomic<bool> go { false };
@@ -2489,9 +2608,9 @@ static void test_prompt_cache_vbr_payload_fanout_lifetime() {
     // issued its first reference.
     catalog_fixture identity_a;
     catalog_fixture identity_b;
-    const auto identity_a_published = identity_a.catalog->publish(
+    const auto identity_a_published = publish_fixture(*identity_a.catalog,
         identity_a.package, identity_a.completions(), identity_a.budget);
-    const auto identity_b_published = identity_b.catalog->publish(
+    const auto identity_b_published = publish_fixture(*identity_b.catalog,
         identity_b.package, identity_b.completions(), identity_b.budget);
     CHECK(identity_a_published.status ==
           llama_vbr_artifact_publish_status::published);
@@ -2550,7 +2669,7 @@ static void test_prompt_cache_vbr_payload_fanout_lifetime() {
 
 static void test_prompt_cache_vbr_same_frontier_variants() {
     catalog_fixture f;
-    const auto compact_reference = f.catalog->publish(
+    const auto compact_reference = publish_fixture(*f.catalog,
         f.package, f.completions(), f.budget);
 
     const auto with_quality = [](const vbr_artifact_package & source,
@@ -2591,7 +2710,7 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
     auto anchor_package = with_quality(
         f.package, GGML_TYPE_TURBO8_0);
     CHECK(f.catalog->configure_accounting(anchor_package));
-    const auto anchor_reference = f.catalog->publish(
+    const auto anchor_reference = publish_fixture(*f.catalog,
         anchor_package, f.completions(), f.budget);
     CHECK(compact_reference.status ==
           llama_vbr_artifact_publish_status::published);
@@ -2742,7 +2861,7 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
           SERVER_PROMPT_CACHE_VBR_ANCHOR_MAX_CANDIDATES);
 
     // Equal, lower-quality, or reversed roles are not anchors.
-    const auto equal_reference = f.catalog->publish(
+    const auto equal_reference = publish_fixture(*f.catalog,
         f.package, f.completions(), f.budget);
     CHECK(equal_reference.status ==
           llama_vbr_artifact_publish_status::adopted);
@@ -2761,7 +2880,7 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
     auto lower_package = with_quality(
         f.package, GGML_TYPE_TURBO3_TCQ);
     CHECK(f.catalog->configure_accounting(lower_package));
-    const auto lower_reference = f.catalog->publish(
+    const auto lower_reference = publish_fixture(*f.catalog,
         lower_package, f.completions(), f.budget);
     CHECK(lower_reference.status ==
           llama_vbr_artifact_publish_status::published);
@@ -2794,7 +2913,7 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
     lossy_anchor_package.manifest.capture_generation_id = {};
     lossy_anchor_package.manifest.consistency = {};
     CHECK(f.catalog->configure_accounting(lossy_anchor_package));
-    const auto lossy_anchor_reference = f.catalog->publish(
+    const auto lossy_anchor_reference = publish_fixture(*f.catalog,
         lossy_anchor_package, f.completions(), f.budget);
     CHECK(lossy_anchor_reference.status ==
           llama_vbr_artifact_publish_status::published);
@@ -2989,7 +3108,7 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
     auto other_anchor_package = with_quality(
         other.package, GGML_TYPE_TURBO8_0);
     CHECK(other.catalog->configure_accounting(other_anchor_package));
-    const auto other_reference = other.catalog->publish(
+    const auto other_reference = publish_fixture(*other.catalog,
         other_anchor_package, other.completions(), other.budget);
     CHECK(other_reference.status ==
           llama_vbr_artifact_publish_status::published);
@@ -3011,7 +3130,7 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
     different.manifest.manifest_digest = {};
     different.manifest.capture_generation_id = {};
     different.manifest.consistency = {};
-    const auto different_reference = f.catalog->publish(
+    const auto different_reference = publish_fixture(*f.catalog,
         different, f.completions(), f.budget);
     CHECK(different_reference.status ==
               llama_vbr_artifact_publish_status::adopted ||
@@ -3202,7 +3321,7 @@ struct validator_fixture {
             manifest.version = 1;
             manifest.stream_placements.clear();
             manifest.token_block = {};
-            const auto published = base.catalog->publish(
+            const auto published = publish_fixture(*base.catalog,
                 base.package, base.completions(), base.budget);
             CHECK(published.status ==
                   llama_vbr_artifact_publish_status::published);
@@ -3984,7 +4103,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     fixture.package.manifest.identity.next_position =
         prompt.tokens.pos_next();
 
-    const auto published = fixture.catalog->publish(
+    const auto published = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(published.status ==
           llama_vbr_artifact_publish_status::published);
@@ -4073,7 +4192,9 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     // the shared 100-byte plane is not charged a second time.
     const uint64_t mixed_ops_before = fixture.ledger.snapshot().live_ops;
     common_prompt_checkpoint shared_live;
-    shared_live.data_tgt.assign(100, 7);
+    shared_live.data_tgt.overwrite(100, [](uint8_t * data, size_t size) {
+        std::fill_n(data, size, uint8_t(7));
+    });
     const auto shared_allocation = fixture.ledger.new_alloc();
     CHECK(shared_allocation);
     const auto live_checkpoint_op = fixture.ledger.reserve(
@@ -4321,9 +4442,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     fixture.package.manifest.identity.next_position =
         prompt.tokens.pos_next();
 
-    const auto first = fixture.catalog->publish(
+    const auto first = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
-    const auto second = fixture.catalog->publish(
+    const auto second = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(first.status == llama_vbr_artifact_publish_status::published);
     CHECK(second.status == llama_vbr_artifact_publish_status::adopted);
@@ -4454,7 +4575,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
 
     // Token pressure uses the logical frontier as its denominator while the
     // same prepared capability still owns the physical retirement terminal.
-    const auto token_reference = fixture.catalog->publish(
+    const auto token_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(token_reference.status ==
           llama_vbr_artifact_publish_status::published);
@@ -4476,7 +4597,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     // closes, byte accounting must still charge the shared sealed owner once,
     // and token pressure may erase one logical alias without retiring the
     // physical catalog reference that the survivor still owns.
-    const auto alias_reference = fixture.catalog->publish(
+    const auto alias_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(alias_reference.status ==
           llama_vbr_artifact_publish_status::published);
@@ -4531,7 +4652,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     // the survivor exclusive, after which the next bounded iteration can
     // prepare and retire the real physical union. A pin still blocks that
     // second terminal until its durable-use window closes.
-    const auto capacity_alias_reference = fixture.catalog->publish(
+    const auto capacity_alias_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(capacity_alias_reference.reference_artifact.v != 0);
     auto capacity_alias_payload = owned_payload(
@@ -4555,7 +4676,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(capacity_duplicate_stage.size() == 1);
     CHECK(cache.publish(
         std::move(capacity_duplicate_stage), &prompt, source_slot));
-    const auto mixed_unique_reference = fixture.catalog->publish(
+    const auto mixed_unique_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(mixed_unique_reference.reference_artifact.v != 0);
     auto mixed_unique_payload = owned_payload(
@@ -4585,9 +4706,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     // The publication transaction itself—not only later maintenance—may
     // reclaim a lawful incumbent. The incoming node is protected until the
     // exact selected-victim retirement commits.
-    const auto publication_incumbent = fixture.catalog->publish(
+    const auto publication_incumbent = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
-    const auto publication_incoming = fixture.catalog->publish(
+    const auto publication_incoming = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(publication_incumbent.reference_artifact.v != 0);
     CHECK(publication_incoming.reference_artifact.v != 0);
@@ -4620,9 +4741,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     // A limit tightened after staging is revalidated at publish. With the
     // incumbent pinned, refusal retires only the detached incoming owner and
     // cannot drain or rebind the durable incumbent/source association.
-    const auto pinned_incumbent_ref = fixture.catalog->publish(
+    const auto pinned_incumbent_ref = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
-    const auto refused_incoming_ref = fixture.catalog->publish(
+    const auto refused_incoming_ref = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(pinned_incumbent_ref.reference_artifact.v != 0);
     CHECK(refused_incoming_ref.reference_artifact.v != 0);
@@ -4659,12 +4780,12 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     // Quality anchors have their own sub-budget and competition. Ordinary
     // compact pressure must not smuggle anchor bytes into a compact victim
     // quote or retire the pair as one ordinary entry.
-    const auto compact_reference = fixture.catalog->publish(
+    const auto compact_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     auto anchor_package =
         prompt_cache_quality_anchor_package(fixture.package);
     CHECK(fixture.catalog->configure_accounting(anchor_package));
-    const auto anchor_reference = fixture.catalog->publish(
+    const auto anchor_reference = publish_fixture(*fixture.catalog,
         anchor_package, fixture.completions(), fixture.budget);
     CHECK(compact_reference.reference_artifact.v != 0);
     CHECK(anchor_reference.reference_artifact.v != 0);
@@ -4743,7 +4864,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     // A protected over-budget incumbent cannot turn publish(false) into a
     // hidden successful insertion. The compact-only incoming node is retired
     // transactionally while the pinned compact+anchor node remains intact.
-    const auto refused_compact_reference = fixture.catalog->publish(
+    const auto refused_compact_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(refused_compact_reference.reference_artifact.v != 0);
     auto refused_compact_payload = owned_payload(
@@ -4798,9 +4919,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     // incumbent causes publication dedup to retain an exact alias. Anchor
     // pressure must prepare one physical catalog retirement before changing
     // either node, then replace both logical variants and commit it once.
-    const auto shared_compact_reference = fixture.catalog->publish(
+    const auto shared_compact_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
-    const auto shared_anchor_reference = fixture.catalog->publish(
+    const auto shared_anchor_reference = publish_fixture(*fixture.catalog,
         anchor_package, fixture.completions(), fixture.budget);
     CHECK(shared_compact_reference.reference_artifact.v != 0);
     CHECK(shared_anchor_reference.reference_artifact.v != 0);
@@ -4893,9 +5014,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     // Missing anchor-ranking authority is fail-soft for a newly published
     // optional variant: a zero anchor budget strips only that variant and
     // still publishes the compact checkpoint.
-    const auto fallback_compact_reference = fixture.catalog->publish(
+    const auto fallback_compact_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
-    const auto fallback_anchor_reference = fixture.catalog->publish(
+    const auto fallback_anchor_reference = publish_fixture(*fixture.catalog,
         anchor_package, fixture.completions(), fixture.budget);
     CHECK(fallback_compact_reference.reference_artifact.v != 0);
     CHECK(fallback_anchor_reference.reference_artifact.v != 0);
@@ -4944,7 +5065,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
 
     // Whole-cache destruction is also an ownership terminal: a live owned
     // VBR node must drain its catalog references when the cache dies.
-    const auto shutdown_reference = fixture.catalog->publish(
+    const auto shutdown_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(shutdown_reference.reference_artifact.v != 0);
     {
@@ -4985,9 +5106,9 @@ static void test_prompt_cache_vbr_anchor_prepare_rollback() {
     auto anchor_package =
         prompt_cache_quality_anchor_package(fixture.package);
     CHECK(fixture.catalog->configure_accounting(anchor_package));
-    const auto compact_reference = fixture.catalog->publish(
+    const auto compact_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
-    const auto anchor_reference = fixture.catalog->publish(
+    const auto anchor_reference = publish_fixture(*fixture.catalog,
         anchor_package, fixture.completions(), fixture.budget);
     CHECK(compact_reference.reference_artifact.v != 0);
     CHECK(anchor_reference.reference_artifact.v != 0);

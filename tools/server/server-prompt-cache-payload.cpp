@@ -464,22 +464,6 @@ bool server_prompt_cache_vbr_variant_set::has_quality_anchor() const noexcept {
     return impl_ && bool(impl_->anchor);
 }
 
-bool server_prompt_cache_vbr_variant_set::anchor_retirement_exclusive()
-        const noexcept {
-    return impl_ && impl_->anchor && impl_->anchor->retirement_owned() &&
-           impl_->anchor.use_count() == 1;
-}
-
-bool server_prompt_cache_vbr_variant_set::prepare_anchor_retire(
-        uint64_t expected_serial,
-        vbr_artifact_prepared_retire & out) const noexcept {
-    out.reset();
-    if (!anchor_retirement_exclusive()) {
-        return false;
-    }
-    return prepare_anchor_retire_owned(expected_serial, out);
-}
-
 bool server_prompt_cache_vbr_variant_set::prepare_anchor_retire_owned(
         uint64_t expected_serial,
         vbr_artifact_prepared_retire & out) const noexcept {
@@ -670,22 +654,6 @@ uint64_t server_prompt_cache_payload::vbr_anchor_resident_bytes()
         const noexcept {
     const auto * variants = vbr_variants();
     return variants ? variants->anchor_resident_bytes() : 0;
-}
-
-bool server_prompt_cache_payload::vbr_anchor_retirement_exclusive()
-        const noexcept {
-    const auto * owner = std::get_if<vbr_variant_owner>(&storage_);
-    return owner && *owner && owner->use_count() == 1 &&
-           (*owner)->anchor_retirement_exclusive();
-}
-
-bool server_prompt_cache_payload::prepare_vbr_anchor_retire(
-        uint64_t expected_serial,
-        vbr_artifact_prepared_retire & out) const noexcept {
-    out.reset();
-    const auto * variants = vbr_variants();
-    return vbr_anchor_retirement_exclusive() &&
-           variants->prepare_anchor_retire(expected_serial, out);
 }
 
 bool server_prompt_cache_payload::prepare_vbr_compact_only(

@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <deque>
 #include <limits>
 #include <map>
 #include <new>
@@ -1436,14 +1435,7 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
     } else if (!source.read) {
         return vbr_capture_stream_status::invalid_argument;
     }
-    auto operation = impl_->core->try_begin_operation();
-    if (!operation) {
-        return vbr_capture_stream_status::ring_unavailable;
-    }
-    const size_t chunk_size = impl_->core->chunk_bytes();
     const bool legacy_digest = !destination.authenticated();
-
-    std::deque<vbr_pinned_chunk_lease> pending;
     llama_sha256_writer hash;
     static constexpr char domain_label[] =
         "buun.vbr.capture.segment-stream";
@@ -1452,134 +1444,120 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         hash.u64(transfer_bytes);
     }
 
-    const auto synchronize_only = [&]() noexcept {
-        for (auto & entry : pending) {
-            bool event_completion = false;
-            impl_->core->wait(entry, event_completion);
-            impl_->core->release(entry);
-        }
-        pending.clear();
-    };
-    const auto drain_front = [&]() -> vbr_capture_stream_status {
-        if (pending.empty()) {
-            return vbr_capture_stream_status::ok;
-        }
-        auto entry = std::move(pending.front());
-        pending.pop_front();
-        bool event_completion = false;
-        if (!impl_->core->wait(entry, event_completion)) {
-            impl_->core->release(entry);
-            return vbr_capture_stream_status::internal_error;
-        }
-        if (event_completion) {
-            stats.event_completions++;
-        }
-        // KNOWN LIMITATION: ggml's asynchronous copy/event APIs return no
-        // transfer result. The synthetic seam can report transfer_failed,
-        // while a real device error can only surface later as a length or
-        // digest mismatch; the F3.2 hardware gate must account for that.
-        if (stats.chunks == source.fail_completion_at) {
-            impl_->core->release(entry);
-            return vbr_capture_stream_status::transfer_failed;
-        }
-        if (!destination.append(entry.data(), entry.valid())) {
-            impl_->core->release(entry);
-            return vbr_capture_stream_status::internal_error;
-        }
-        if (legacy_digest) {
-            hash.bytes(entry.data(), entry.valid());
-        }
-        stats.bytes += entry.valid();
-        stats.chunks++;
-        impl_->core->release(entry);
-        return vbr_capture_stream_status::ok;
-    };
-
-    // TODO(F4.2a follow-up): lift shared drive(fill,consume) pump into the core.
-    try {
+    struct capture_pump_context {
+        const vbr_capture_stream_source * source = nullptr;
+        const vbr_capture_stream_range * ranges = nullptr;
+        size_t range_count = 0;
         size_t range_index = 0;
         uint64_t range_offset = 0;
-        while (range_index < range_count) {
-            bool would_block = false;
-            auto entry = impl_->core->acquire(source.lane, would_block);
-            if (!entry && would_block) {
-                stats.backpressure_waits++;
-                const auto drained = drain_front();
-                if (drained != vbr_capture_stream_status::ok) {
-                    synchronize_only();
-                    return drained;
-                }
-                entry = impl_->core->acquire(source.lane, would_block);
-            }
-            if (!entry || would_block) {
-                synchronize_only();
-                return vbr_capture_stream_status::internal_error;
-            }
+        bool tensor_source = false;
+        artifact_segment_chain * destination = nullptr;
+        llama_sha256_writer * hash = nullptr;
+        bool legacy_digest = false;
+    } pump_context {
+        &source, ranges, range_count, 0, 0, tensor_source,
+        &destination, &hash, legacy_digest,
+    };
+    vbr_bounded_pinned_ring_core::pump_callbacks callbacks;
+    callbacks.context = &pump_context;
+    callbacks.ok = uint32_t(vbr_capture_stream_status::ok);
+    callbacks.ring_unavailable =
+        uint32_t(vbr_capture_stream_status::ring_unavailable);
+    callbacks.submit_failed =
+        uint32_t(vbr_capture_stream_status::internal_error);
+    callbacks.wait_failed =
+        uint32_t(vbr_capture_stream_status::internal_error);
+    callbacks.internal_error =
+        uint32_t(vbr_capture_stream_status::internal_error);
+    callbacks.more = [](void * opaque) noexcept {
+        const auto & context =
+            *static_cast<capture_pump_context *>(opaque);
+        return context.range_index < context.range_count;
+    };
+    callbacks.fill = [](void * opaque, uint8_t * output,
+                        size_t capacity,
+                        vbr_bounded_pinned_ring_core::pump_step & step)
+            noexcept -> uint32_t {
+        auto & context = *static_cast<capture_pump_context *>(opaque);
+        const auto & source = *context.source;
+        try {
             size_t filled = 0;
-            while (filled < chunk_size && range_index < range_count) {
-                const auto & range = ranges[range_index];
+            while (filled < capacity &&
+                   context.range_index < context.range_count) {
+                const auto & range = context.ranges[context.range_index];
                 const size_t count = size_t(std::min<uint64_t>(
-                    chunk_size - filled, range.size - range_offset));
+                    capacity - filled,
+                    range.size - context.range_offset));
                 const uint64_t source_offset =
-                    range.source_offset + range_offset;
-                if (tensor_source) {
+                    range.source_offset + context.range_offset;
+                if (context.tensor_source) {
                     // Multiple gets are queued on the same backend stream;
                     // submit records one completion event after the complete
                     // packed chunk rather than one event per logical range.
                     ggml_backend_tensor_get_async(
                         source.backend, source.tensor,
-                        entry.data() + filled,
+                        output + filled,
                         size_t(source.tensor_offset + source_offset),
                         count);
                 } else if (!source.read(
                                source.context, source_offset,
-                               entry.data() + filled, count)) {
-                    impl_->core->release(entry);
-                    synchronize_only();
-                    return vbr_capture_stream_status::short_read;
+                               output + filled, count)) {
+                    return uint32_t(
+                        vbr_capture_stream_status::short_read);
                 }
                 filled += count;
-                range_offset += count;
-                if (range_offset == range.size) {
-                    ++range_index;
-                    range_offset = 0;
+                context.range_offset += count;
+                if (context.range_offset == range.size) {
+                    ++context.range_index;
+                    context.range_offset = 0;
                 }
             }
-            bool synchronous_fallback = false;
-            if (!impl_->core->submit(
-                    entry, filled,
-                    tensor_source ? source.backend : nullptr,
-                    synchronous_fallback)) {
-                impl_->core->release(entry);
-                synchronize_only();
-                return vbr_capture_stream_status::internal_error;
-            }
-            if (synchronous_fallback) {
-                stats.synchronous_fallbacks++;
-            }
-            pending.push_back(std::move(entry));
+            step.valid = filled;
+            step.backend = context.tensor_source ? source.backend : nullptr;
+            return uint32_t(vbr_capture_stream_status::ok);
+        } catch (...) {
+            return uint32_t(vbr_capture_stream_status::internal_error);
         }
-        while (!pending.empty()) {
-            const auto drained = drain_front();
-            if (drained != vbr_capture_stream_status::ok) {
-                synchronize_only();
-                return drained;
-            }
+    };
+    callbacks.consume = [](void * opaque, const uint8_t * input,
+                           size_t size, uint64_t, bool,
+                           uint64_t ordinal, bool &) noexcept -> uint32_t {
+        auto & context = *static_cast<capture_pump_context *>(opaque);
+        // KNOWN LIMITATION: ggml's asynchronous copy/event APIs return no
+        // transfer result. The synthetic seam can report transfer_failed,
+        // while a real device error can only surface later as a length or
+        // digest mismatch; the F3.2 hardware gate must account for that.
+        if (ordinal == context.source->fail_completion_at) {
+            return uint32_t(vbr_capture_stream_status::transfer_failed);
         }
-        if (stats.bytes != transfer_bytes) {
-            return vbr_capture_stream_status::short_read;
+        if (!context.destination->append(input, size)) {
+            return uint32_t(vbr_capture_stream_status::internal_error);
         }
-        stats.max_segment_size =
-            destination.max_segment_size();
-        if (legacy_digest) {
-            stats.streaming_digest = hash.finish();
+        if (context.legacy_digest) {
+            context.hash->bytes(input, size);
         }
-        return vbr_capture_stream_status::ok;
-    } catch (...) {
-        synchronize_only();
-        stats = {};
-        return vbr_capture_stream_status::internal_error;
+        return uint32_t(vbr_capture_stream_status::ok);
+    };
+
+    vbr_bounded_pinned_ring_core::pump_stats pump_stats;
+    const auto pumped = vbr_capture_stream_status(
+        impl_->core->pump(source.lane, callbacks, pump_stats));
+    stats.bytes = pump_stats.bytes;
+    stats.chunks = pump_stats.chunks;
+    stats.backpressure_waits = pump_stats.backpressure_waits;
+    stats.event_completions = pump_stats.event_completions;
+    stats.synchronous_fallbacks = pump_stats.synchronous_fallbacks;
+    if (pumped != vbr_capture_stream_status::ok) {
+        return pumped;
     }
+    if (stats.bytes != transfer_bytes) {
+        return vbr_capture_stream_status::short_read;
+    }
+    stats.max_segment_size = destination.max_segment_size();
+    if (legacy_digest) {
+        stats.streaming_digest = hash.finish();
+    }
+    return vbr_capture_stream_status::ok;
 }
 
 bool vbr_capture_projected_shard_topology(

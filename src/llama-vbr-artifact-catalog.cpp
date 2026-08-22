@@ -418,6 +418,8 @@ bool normalize_projected_package(
     package.manifest.stream_placements = declared_manifest->placements;
     package.companions = declared_manifest->companions;
     package.manifest.controller_policy.clear();
+    std::vector<const vbr_capture_controller_target *> controller_by_child(
+        package.manifest.generation.controllers.size(), nullptr);
     for (uint32_t i = 0; i < manifest_row.controller_count; ++i) {
         const uint32_t index = assembly.controller_references()[
             manifest_row.first_controller + i];
@@ -426,9 +428,11 @@ bool normalize_projected_package(
         }
         const auto & target = assembly.controller_targets()[index];
         if (target.child_id >=
-                package.manifest.generation.controllers.size()) {
+                package.manifest.generation.controllers.size() ||
+            controller_by_child[target.child_id] != nullptr) {
             return false;
         }
+        controller_by_child[target.child_id] = &target;
         const auto & controller =
             package.manifest.generation.controllers[target.child_id];
         if (controller.child_id != target.child_id ||
@@ -461,40 +465,25 @@ bool normalize_projected_package(
 
     segments.clear();
     ranges.clear();
-    std::vector<uint32_t> local_unit_by_captured(
-        assembly.projected_units().size(), UINT32_MAX);
+    std::vector<std::pair<uint32_t, uint32_t>> local_units;
+    local_units.reserve(manifest_row.unit_count);
     for (uint32_t i = 0; i < manifest_row.unit_count; ++i) {
         const uint32_t captured_index = assembly.unit_references()[
             manifest_row.first_unit + i];
-        if (captured_index >= assembly.projected_units().size() ||
-            local_unit_by_captured[captured_index] != UINT32_MAX) {
+        if (captured_index >= assembly.projected_units().size()) {
             return false;
         }
-        local_unit_by_captured[captured_index] = i;
+        local_units.push_back({ captured_index, i });
         const auto & captured = assembly.projected_units()[captured_index];
         auto & blob = package.unit_blobs[i];
         auto & descriptor = blob.descriptor;
-        const vbr_artifact_unit_descriptor * certified = nullptr;
-        for (uint32_t c = 0; c < manifest_row.controller_count; ++c) {
-            const uint32_t target_index = assembly.controller_references()[
-                manifest_row.first_controller + c];
-            if (target_index >= assembly.controller_targets().size()) {
-                return false;
-            }
-            const auto & target = assembly.controller_targets()[target_index];
-            if (target.child_id == captured.child_id() &&
-                captured.logical_unit_id() < target.unit_descriptors.size()) {
-                if (certified != nullptr) {
-                    return false;
-                }
-                certified = &target.unit_descriptors[
-                    captured.logical_unit_id()];
-            }
-        }
-        if (certified == nullptr) {
+        const auto * target = captured.child_id() < controller_by_child.size()
+            ? controller_by_child[captured.child_id()] : nullptr;
+        if (target == nullptr ||
+            captured.logical_unit_id() >= target->unit_descriptors.size()) {
             return false;
         }
-        descriptor = *certified;
+        descriptor = target->unit_descriptors[captured.logical_unit_id()];
         if (!captured || captured.shards().empty() ||
             descriptor.shards.size() != captured.shards().size() ||
             descriptor.clean_stash_state !=
@@ -562,6 +551,15 @@ bool normalize_projected_package(
         reference.stash_reference = {};
     }
 
+    std::sort(local_units.begin(), local_units.end());
+    if (std::adjacent_find(
+            local_units.begin(), local_units.end(),
+            [](const auto & lhs, const auto & rhs) {
+                return lhs.first == rhs.first;
+            }) != local_units.end()) {
+        return false;
+    }
+
     for (uint32_t i = 0; i < manifest_row.range_proof_count; ++i) {
         const auto & source = assembly.range_proofs()[
             manifest_row.first_range_proof + i];
@@ -569,13 +567,15 @@ bool normalize_projected_package(
             !source.proof) {
             return false;
         }
-        const uint32_t local_unit =
-            local_unit_by_captured[source.unit_index];
-        if (local_unit == UINT32_MAX) {
+        const auto local = std::lower_bound(
+            local_units.begin(), local_units.end(),
+            std::pair<uint32_t, uint32_t> { source.unit_index, 0 });
+        if (local == local_units.end() ||
+            local->first != source.unit_index) {
             return false;
         }
         ranges.push_back({
-            local_unit,
+            local->second,
             source.shard_index,
             source.proof,
         });
@@ -1743,209 +1743,6 @@ llama_vbr_artifact_catalog::begin_capture_impl(
     }
 }
 
-llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
-        const vbr_artifact_package & package,
-        const std::vector<llama_vbr_artifact_fake_shard_completion> & completions,
-        const llama_cache_budget_config & budget,
-        const llama_vbr_artifact_publish_fault & fault) noexcept {
-    llama_vbr_artifact_publish_result out;
-    try {
-        const uint64_t expected =
-            package.unit_blobs.size() == 1
-                ? package.unit_blobs[0].descriptor.shards.size() +
-                      (package.unit_blobs[0].descriptor
-                                   .clean_stash_state ==
-                               vbr_artifact_clean_stash_state::present
-                           ? package.unit_blobs[0].descriptor
-                                 .clean_stash.shards.size()
-                           : 0)
-                : 0;
-        if (completions.size() != expected) {
-            out.status = completions.size() < expected
-                ? llama_vbr_artifact_publish_status::
-                    missing_completion
-                : llama_vbr_artifact_publish_status::
-                    duplicate_completion;
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->n_refusals++;
-            return out;
-        }
-        vbr_capture_stream_status stream_status;
-        // F2's fake completions are already caller-owned resident vectors;
-        // unlike the F3 D2H stream they do not allocate a pageable transfer
-        // image. They still drive the exact same seal/dedup/publication core.
-        auto build = begin_capture_impl(
-            package, budget, fault, false, stream_status,
-            nullptr);
-        if (!build) {
-            out.status =
-                llama_vbr_artifact_publish_status::
-                    invalid_argument;
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->n_refusals++;
-            return out;
-        }
-        auto unit = build->begin_unit(0, stream_status);
-        if (!unit) {
-            out.status =
-                llama_vbr_artifact_publish_status::
-                    invalid_argument;
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->n_refusals++;
-            return out;
-        }
-        for (const auto & completion : completions) {
-            if (completion.unit_index != 0) {
-                out.status =
-                    llama_vbr_artifact_publish_status::
-                        invalid_argument;
-                std::lock_guard<std::mutex> lock(impl_->mutex);
-                impl_->n_refusals++;
-                return out;
-            }
-            if (!completion.success) {
-                out.status =
-                    llama_vbr_artifact_publish_status::
-                        shard_failed;
-                std::lock_guard<std::mutex> lock(impl_->mutex);
-                impl_->n_refusals++;
-                return out;
-            }
-            auto chain =
-                std::make_shared<artifact_segment_chain>();
-            if (!chain->append(
-                    completion.bytes.data(),
-                    completion.bytes.size())) {
-                out.status =
-                    llama_vbr_artifact_publish_status::
-                        internal_error;
-                std::lock_guard<std::mutex> lock(impl_->mutex);
-                impl_->n_refusals++;
-                return out;
-            }
-            vbr_verified_segment segment;
-            segment.unit_index = completion.unit_index;
-            segment.shard_index = completion.shard_index;
-            segment.clean_stash = completion.clean_stash;
-            segment.bytes = std::move(chain);
-            segment.streaming_digest =
-                vbr_capture_stream_digest(*segment.bytes);
-            stream_status =
-                unit->accept_verified_segment(segment);
-            if (stream_status !=
-                    vbr_capture_stream_status::ok) {
-                out.status =
-                    stream_status ==
-                        vbr_capture_stream_status::
-                            duplicate_segment
-                    ? llama_vbr_artifact_publish_status::
-                        duplicate_completion
-                    : llama_vbr_artifact_publish_status::
-                        invalid_argument;
-                std::lock_guard<std::mutex> lock(impl_->mutex);
-                impl_->n_refusals++;
-                return out;
-            }
-        }
-        stream_status = unit->seal_unit();
-        if (stream_status != vbr_capture_stream_status::ok) {
-            out.status =
-                stream_status ==
-                    vbr_capture_stream_status::missing_segment
-                ? llama_vbr_artifact_publish_status::
-                    missing_completion
-                : llama_vbr_artifact_publish_status::
-                    invalid_argument;
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->n_refusals++;
-            return out;
-        }
-        const auto streamed = build->publish_reference();
-        out.reference_artifact = streamed.reference_artifact;
-        out.unit_content = streamed.unit_content;
-        out.reference_lineage = streamed.reference_lineage;
-        if (streamed.status != vbr_capture_stream_status::ok) {
-            switch (streamed.status) {
-                case vbr_capture_stream_status::format_rejected:
-                case vbr_capture_stream_status::hash_mismatch:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            format_rejected;
-                    break;
-                case vbr_capture_stream_status::
-                        accounting_unavailable:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            accounting_unavailable;
-                    break;
-                case vbr_capture_stream_status::accounting_refused:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            admission_refused;
-                    break;
-                case vbr_capture_stream_status::stage_failed:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            stage_failed;
-                    break;
-                case vbr_capture_stream_status::commit_failed:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            commit_failed;
-                    break;
-                case vbr_capture_stream_status::publication_failed:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            publication_failed;
-                    break;
-                case vbr_capture_stream_status::duplicate_segment:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            duplicate_completion;
-                    break;
-                case vbr_capture_stream_status::missing_segment:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            missing_completion;
-                    break;
-                case vbr_capture_stream_status::transfer_failed:
-                case vbr_capture_stream_status::short_read:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            shard_failed;
-                    break;
-                case vbr_capture_stream_status::invalid_argument:
-                case vbr_capture_stream_status::ring_unavailable:
-                case vbr_capture_stream_status::late_segment:
-                case vbr_capture_stream_status::projection_invalid:
-                case vbr_capture_stream_status::snapshot_unavailable:
-                case vbr_capture_stream_status::snapshot_changed:
-                case vbr_capture_stream_status::internal_error:
-                case vbr_capture_stream_status::_count:
-                    out.status =
-                        llama_vbr_artifact_publish_status::
-                            internal_error;
-                    break;
-                case vbr_capture_stream_status::ok:
-                    break;
-            }
-            return out;
-        }
-        out.status = streamed.adopted
-            ? llama_vbr_artifact_publish_status::adopted
-            : llama_vbr_artifact_publish_status::published;
-        return out;
-    } catch (...) {
-        out.status =
-            llama_vbr_artifact_publish_status::internal_error;
-        if (impl_) {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->n_refusals++;
-        }
-        return out;
-    }
-}
-
 llama_vbr_artifact_publish_result
 llama_vbr_artifact_catalog::publish_stream(
         const vbr_artifact_package & package,
@@ -1958,6 +1755,10 @@ llama_vbr_artifact_catalog::publish_stream(
         auto * stream_state =
             static_cast<catalog_stream_state *>(
                 prepared_stream_state);
+        // The single-unit/no-companion route consumes the durable capacity
+        // reservation prepared before D2H. General and projected packages
+        // need the multi-owner transaction below; routing the fast shape
+        // through it would discard and reprice that reservation.
         if (package.unit_blobs.size() != 1 ||
             !package.companions.empty()) {
             return publish_stream_complete(
@@ -3324,7 +3125,12 @@ bool llama_vbr_artifact_catalog::publish_projected_batch(
             }
             measured.ready_manifests++;
 
-            current.package = std::move(publications[index].package);
+            current.package.topologies =
+                std::move(publications[index].topologies);
+            current.package.manifest.accounting =
+                std::move(publications[index].accounting);
+            current.package.unit_blobs.resize(row.unit_count);
+            current.package.manifest.unit_references.resize(row.unit_count);
             if (!normalize_projected_package(
                     assembly, row, current.package,
                     current.segments, current.ranges)) {

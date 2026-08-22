@@ -107,10 +107,6 @@ public:
     bool retirement_exclusive() const noexcept;
     bool logical_erase_preserves_storage() const noexcept;
     bool has_quality_anchor() const noexcept;
-    bool anchor_retirement_exclusive() const noexcept;
-    bool prepare_anchor_retire(
-        uint64_t expected_serial,
-        vbr_artifact_prepared_retire & out) const noexcept;
     std::shared_ptr<const server_prompt_cache_vbr_variant_set>
         compact_only() const noexcept;
     bool preview_retire(
@@ -172,10 +168,6 @@ public:
     bool vbr_logical_erase_only() const noexcept;
     bool vbr_has_quality_anchor() const noexcept;
     uint64_t vbr_anchor_resident_bytes() const noexcept;
-    bool vbr_anchor_retirement_exclusive() const noexcept;
-    bool prepare_vbr_anchor_retire(
-        uint64_t expected_serial,
-        vbr_artifact_prepared_retire & out) const noexcept;
     bool prepare_vbr_compact_only(
         server_prompt_cache_payload & out) const noexcept;
     // Prepare every physical anchor retirement that will be caused by

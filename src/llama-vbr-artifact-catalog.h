@@ -31,22 +31,6 @@ struct llama_vbr_artifact_domain_binding {
     llama_cache_acct_resource_domain domain;
 };
 
-// F2.2 substitutes deterministic CPU bytes for future F3 backend completions.
-// The vector order is intentionally irrelevant; (unit,stash,shard) is the
-// participant identity and every sealed participant must occur exactly once.
-struct llama_vbr_artifact_fake_shard_completion {
-    uint32_t unit_index = UINT32_MAX;
-    uint32_t shard_index = UINT32_MAX;
-    bool clean_stash = false;
-    bool success = true;
-    std::vector<uint8_t> bytes;
-};
-
-// F2 keeps its public test vocabulary while using the one authority-owned
-// transaction fault type shared with F0b.
-using llama_vbr_artifact_publish_fault =
-    llama_cache_transaction_fault;
-
 struct llama_vbr_artifact_publish_result {
     llama_vbr_artifact_publish_status status =
         llama_vbr_artifact_publish_status::internal_error;
@@ -137,13 +121,17 @@ enum class vbr_projected_manifest_publish_status : uint8_t {
     _count,
 };
 
-// Metadata and companion evidence for one logical row of an immutable
-// projected assembly. `package` supplies reference-local identity, placement,
-// topology and unit geometry; the catalog replaces every payload source and
-// content ID from the assembly's sealed capabilities before publication.
+// Admission and companion evidence for one logical row of an immutable
+// projected assembly. Semantic identity, placement, generation, controller
+// policy, unit geometry, payload sources, and content IDs come exclusively
+// from the sealed assembly. The caller supplies only the portable accounting
+// budget and the topology namespace in which those rows are interpreted.
+// Keeping this envelope narrow prevents an H2 scheduler from manufacturing a
+// mostly-placeholder artifact package that the catalog then overwrites.
 struct vbr_projected_manifest_publication {
     uint64_t manifest_id = 0;
-    vbr_artifact_package package;
+    std::vector<vbr_artifact_portable_topology> topologies;
+    std::vector<vbr_artifact_portable_accounting_row> accounting;
     std::vector<vbr_capture_sealed_companion> companions;
 };
 
@@ -281,15 +269,6 @@ public:
     // package topology set and creates every measured-zero accounting cell.
     bool prepare_capture_package(
         const vbr_artifact_package & package) noexcept;
-
-    // Bounded F2.2 per-unit publication. The format package must contain one
-    // unit blob/reference; F3 composes checkpoint-wide capture from these
-    // immutable unit publications.
-    llama_vbr_artifact_publish_result publish(
-        const vbr_artifact_package & package,
-        const std::vector<llama_vbr_artifact_fake_shard_completion> & completions,
-        const llama_cache_budget_config & budget,
-        const llama_vbr_artifact_publish_fault & fault = {}) noexcept;
 
     // F3.1 streaming path and the abstract F3.2 capture sink entry point.
     std::unique_ptr<vbr_capture_build> begin_capture(

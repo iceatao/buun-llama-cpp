@@ -1,7 +1,6 @@
 #include "llama-vbr-artifact-stage.h"
 
 #include <algorithm>
-#include <deque>
 #include <limits>
 #include <new>
 #include <utility>
@@ -191,156 +190,114 @@ vbr_h2d_status vbr_h2d_chunk_ring::stream(
     } else if (!transfer.fake.complete) {
         return vbr_h2d_status::invalid_argument;
     }
-    auto operation = impl_->core->try_begin_operation();
-    if (!operation) {
-        return vbr_h2d_status::ring_unavailable;
-    }
-    const size_t chunk_size = impl_->core->chunk_bytes();
-
-    struct pending_transfer {
-        vbr_pinned_chunk_lease lease;
-        uint64_t ticket = 0;
-        bool fake_async = false;
-    };
-    std::deque<pending_transfer> pending;
-    uint64_t next_ticket = 1;
-    uint64_t live_pinned = 0;
-
-    const auto release_pending = [&]() noexcept {
-        for (auto & item : pending) {
-            bool event_completion = false;
-            impl_->core->wait(item.lease, event_completion);
-            if (item.fake_async) {
-                transfer.fake.complete(
-                    transfer.fake.context, item.ticket);
-            }
-            impl_->core->release(item.lease);
-        }
-        pending.clear();
-    };
-    const auto drain_front = [&]() -> vbr_h2d_status {
-        if (pending.empty()) {
-            return vbr_h2d_status::ok;
-        }
-        auto item = std::move(pending.front());
-        pending.pop_front();
-        bool event_completion = false;
-        if (!impl_->core->wait(item.lease, event_completion)) {
-            impl_->core->release(item.lease);
-            return vbr_h2d_status::event_failed;
-        }
-        if (item.fake_async) {
-            if (!transfer.fake.complete(
-                    transfer.fake.context, item.ticket)) {
-                impl_->core->release(item.lease);
-                return vbr_h2d_status::event_failed;
-            }
-            event_completion = true;
-        }
-        if (event_completion) {
-            stats.event_completions++;
-        }
-        if (stats.chunks == transfer.fail_completion_at) {
-            impl_->core->release(item.lease);
-            return vbr_h2d_status::transfer_failed;
-        }
-        live_pinned -= item.lease.valid();
-        stats.bytes += item.lease.valid();
-        stats.chunks++;
-        impl_->core->release(item.lease);
-        return vbr_h2d_status::ok;
-    };
-
-    // TODO(F4.2a follow-up): lift shared drive(fill,consume) pump into the core.
-    try {
+    struct h2d_pump_context {
+        const vbr_h2d_transfer * transfer = nullptr;
         uint64_t offset = 0;
-        while (offset < transfer.size) {
-            bool would_block = false;
-            auto lease = impl_->core->acquire(transfer.lane, would_block);
-            if (!lease && would_block) {
-                stats.backpressure_waits++;
-                const auto drained = drain_front();
-                if (drained != vbr_h2d_status::ok) {
-                    release_pending();
-                    return drained;
-                }
-                lease = impl_->core->acquire(transfer.lane, would_block);
-            }
-            if (!lease || would_block) {
-                release_pending();
-                return vbr_h2d_status::internal_error;
-            }
+        uint64_t next_ticket = 1;
+        bool tensor_destination = false;
+    } pump_context { &transfer, 0, 1, tensor_destination };
+    vbr_bounded_pinned_ring_core::pump_callbacks callbacks;
+    callbacks.context = &pump_context;
+    callbacks.ok = uint32_t(vbr_h2d_status::ok);
+    callbacks.ring_unavailable = uint32_t(vbr_h2d_status::ring_unavailable);
+    callbacks.submit_failed = uint32_t(vbr_h2d_status::internal_error);
+    callbacks.wait_failed = uint32_t(vbr_h2d_status::event_failed);
+    callbacks.internal_error = uint32_t(vbr_h2d_status::internal_error);
+    callbacks.more = [](void * opaque) noexcept {
+        const auto & context = *static_cast<h2d_pump_context *>(opaque);
+        return context.offset < context.transfer->size;
+    };
+    callbacks.fill = [](void * opaque, uint8_t * output,
+                        size_t capacity,
+                        vbr_bounded_pinned_ring_core::pump_step & step)
+            noexcept -> uint32_t {
+        auto & context = *static_cast<h2d_pump_context *>(opaque);
+        const auto & transfer = *context.transfer;
+        try {
             const size_t count = size_t(std::min<uint64_t>(
-                chunk_size, transfer.size - offset));
+                capacity, transfer.size - context.offset));
             if (!transfer.source.read(
                     transfer.source.context,
-                    transfer.source_offset + offset,
-                    lease.data(), count)) {
-                impl_->core->release(lease);
-                release_pending();
-                return vbr_h2d_status::source_read_failed;
+                    transfer.source_offset + context.offset,
+                    output, count)) {
+                return uint32_t(vbr_h2d_status::source_read_failed);
             }
             const uint64_t destination_offset =
-                transfer.destination_offset + offset;
-            const uint64_t ticket = next_ticket++;
+                transfer.destination_offset + context.offset;
+            const uint64_t ticket = context.next_ticket++;
             bool fake_async = false;
-            if (tensor_destination) {
+            if (context.tensor_destination) {
                 ggml_backend_tensor_set_async(
                     transfer.backend, transfer.destination,
-                    lease.data(), size_t(destination_offset), count);
+                    output, size_t(destination_offset), count);
             } else {
                 fake_async = transfer.fake.supports_events;
                 if (!transfer.fake.issue(
                         transfer.fake.context, ticket,
-                        destination_offset, lease.data(), count,
+                        destination_offset, output, count,
                         fake_async)) {
-                    impl_->core->release(lease);
-                    release_pending();
-                    return vbr_h2d_status::transfer_failed;
+                    return uint32_t(vbr_h2d_status::transfer_failed);
                 }
                 if (!fake_async) {
                     if (!transfer.fake.complete(
                             transfer.fake.context, ticket)) {
-                        impl_->core->release(lease);
-                        release_pending();
-                        return vbr_h2d_status::event_failed;
+                        return uint32_t(vbr_h2d_status::event_failed);
                     }
-                    stats.synchronous_fallbacks++;
+                    step.adapter_synchronous_fallback = true;
                 }
             }
-            bool synchronous_fallback = false;
-            if (!impl_->core->submit(
-                    lease, count,
-                    tensor_destination ? transfer.backend : nullptr,
-                    synchronous_fallback)) {
-                impl_->core->release(lease);
-                release_pending();
-                return vbr_h2d_status::internal_error;
-            }
-            if (synchronous_fallback) {
-                stats.synchronous_fallbacks++;
-            }
-            live_pinned += count;
-            stats.peak_pinned_bytes =
-                std::max(stats.peak_pinned_bytes, live_pinned);
-            pending.push_back({ std::move(lease), ticket, fake_async });
-            offset += count;
+            step.valid = count;
+            step.backend = context.tensor_destination
+                ? transfer.backend : nullptr;
+            step.tag = ticket;
+            step.adapter_async = fake_async;
+            context.offset += count;
+            return uint32_t(vbr_h2d_status::ok);
+        } catch (...) {
+            return uint32_t(vbr_h2d_status::internal_error);
         }
-        while (!pending.empty()) {
-            const auto drained = drain_front();
-            if (drained != vbr_h2d_status::ok) {
-                release_pending();
-                return drained;
+    };
+    callbacks.consume = [](void * opaque, const uint8_t *, size_t,
+                           uint64_t ticket, bool fake_async,
+                           uint64_t ordinal, bool & event_completion)
+            noexcept -> uint32_t {
+        const auto & context = *static_cast<h2d_pump_context *>(opaque);
+        const auto & transfer = *context.transfer;
+        if (fake_async) {
+            if (!transfer.fake.complete(
+                    transfer.fake.context, ticket)) {
+                return uint32_t(vbr_h2d_status::event_failed);
             }
+            event_completion = true;
         }
-        return stats.bytes == transfer.size
-            ? vbr_h2d_status::ok
-            : vbr_h2d_status::transfer_failed;
-    } catch (...) {
-        release_pending();
-        stats = {};
-        return vbr_h2d_status::internal_error;
+        return ordinal == transfer.fail_completion_at
+            ? uint32_t(vbr_h2d_status::transfer_failed)
+            : uint32_t(vbr_h2d_status::ok);
+    };
+    callbacks.abandon = [](void * opaque, uint64_t ticket,
+                           bool fake_async) noexcept {
+        const auto & context = *static_cast<h2d_pump_context *>(opaque);
+        if (fake_async) {
+            (void) context.transfer->fake.complete(
+                context.transfer->fake.context, ticket);
+        }
+    };
+
+    vbr_bounded_pinned_ring_core::pump_stats pump_stats;
+    const auto pumped = vbr_h2d_status(
+        impl_->core->pump(transfer.lane, callbacks, pump_stats));
+    stats.bytes = pump_stats.bytes;
+    stats.chunks = pump_stats.chunks;
+    stats.backpressure_waits = pump_stats.backpressure_waits;
+    stats.event_completions = pump_stats.event_completions;
+    stats.synchronous_fallbacks = pump_stats.synchronous_fallbacks;
+    stats.peak_pinned_bytes = pump_stats.peak_pinned_bytes;
+    if (pumped != vbr_h2d_status::ok) {
+        return pumped;
     }
+    return stats.bytes == transfer.size
+        ? vbr_h2d_status::ok
+        : vbr_h2d_status::transfer_failed;
 }
 
 struct vbr_staged_payloads::impl {

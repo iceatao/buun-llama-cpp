@@ -1,6 +1,7 @@
 #include "llama-vbr-pinned-ring.h"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -492,4 +493,155 @@ void vbr_bounded_pinned_ring_core::release(
         chunk->valid = 0;
     }
     lease.reset();
+}
+
+uint32_t vbr_bounded_pinned_ring_core::pump(
+        uint32_t lane, const pump_callbacks & callbacks,
+        pump_stats & stats) noexcept {
+    stats = {};
+    if (!impl_ || lane >= impl_->lanes.size() || !callbacks.more ||
+        !callbacks.fill || !callbacks.consume) {
+        return callbacks.internal_error;
+    }
+    auto operation = try_begin_operation();
+    if (!operation) {
+        return callbacks.ring_unavailable;
+    }
+
+    struct pending_step {
+        vbr_pinned_chunk_lease lease;
+        uint64_t tag = 0;
+        bool adapter_async = false;
+    };
+    std::deque<pending_step> pending;
+    uint64_t live_pinned = 0;
+
+    const auto abandon = [&](pending_step & item) noexcept {
+        bool ignored = false;
+        (void) wait(item.lease, ignored);
+        if (callbacks.abandon) {
+            callbacks.abandon(
+                callbacks.context, item.tag, item.adapter_async);
+        }
+        release(item.lease);
+    };
+    const auto abandon_pending = [&]() noexcept {
+        for (auto & item : pending) {
+            abandon(item);
+        }
+        pending.clear();
+    };
+    const auto drain_front = [&]() noexcept -> uint32_t {
+        if (pending.empty()) {
+            return callbacks.ok;
+        }
+        auto item = std::move(pending.front());
+        pending.pop_front();
+        bool event_completion = false;
+        if (!wait(item.lease, event_completion)) {
+            release(item.lease);
+            return callbacks.wait_failed;
+        }
+        const uint32_t consumed = callbacks.consume(
+            callbacks.context, item.lease.data(), item.lease.valid(),
+            item.tag, item.adapter_async, stats.chunks,
+            event_completion);
+        if (consumed != callbacks.ok) {
+            release(item.lease);
+            return consumed;
+        }
+        if (event_completion) {
+            stats.event_completions++;
+        }
+        live_pinned -= item.lease.valid();
+        stats.bytes += item.lease.valid();
+        stats.chunks++;
+        release(item.lease);
+        return callbacks.ok;
+    };
+
+    try {
+        while (callbacks.more(callbacks.context)) {
+            bool would_block = false;
+            auto lease = acquire(lane, would_block);
+            if (!lease && would_block) {
+                stats.backpressure_waits++;
+                const uint32_t drained = drain_front();
+                if (drained != callbacks.ok) {
+                    abandon_pending();
+                    return drained;
+                }
+                lease = acquire(lane, would_block);
+            }
+            if (!lease || would_block) {
+                abandon_pending();
+                return callbacks.internal_error;
+            }
+
+            pump_step step;
+            const uint32_t filled = callbacks.fill(
+                callbacks.context, lease.data(), lease.capacity(), step);
+            if (filled != callbacks.ok) {
+                if (step.adapter_async && callbacks.abandon) {
+                    callbacks.abandon(
+                        callbacks.context, step.tag,
+                        step.adapter_async);
+                }
+                release(lease);
+                abandon_pending();
+                return filled;
+            }
+            if (step.valid == 0 || step.valid > lease.capacity()) {
+                if (step.adapter_async && callbacks.abandon) {
+                    callbacks.abandon(
+                        callbacks.context, step.tag,
+                        step.adapter_async);
+                }
+                release(lease);
+                abandon_pending();
+                return callbacks.internal_error;
+            }
+
+            bool synchronous_fallback = false;
+            if (!submit(
+                    lease, step.valid, step.backend,
+                    synchronous_fallback)) {
+                if (step.adapter_async && callbacks.abandon) {
+                    callbacks.abandon(
+                        callbacks.context, step.tag,
+                        step.adapter_async);
+                }
+                release(lease);
+                abandon_pending();
+                return callbacks.submit_failed;
+            }
+            stats.synchronous_fallbacks +=
+                uint64_t(synchronous_fallback) +
+                uint64_t(step.adapter_synchronous_fallback);
+            live_pinned += step.valid;
+            stats.peak_pinned_bytes =
+                std::max(stats.peak_pinned_bytes, live_pinned);
+            pending_step current {
+                std::move(lease), step.tag, step.adapter_async,
+            };
+            try {
+                pending.push_back(std::move(current));
+            } catch (...) {
+                abandon(current);
+                throw;
+            }
+        }
+        while (!pending.empty()) {
+            const uint32_t drained = drain_front();
+            if (drained != callbacks.ok) {
+                abandon_pending();
+                return drained;
+            }
+        }
+        return callbacks.ok;
+    } catch (...) {
+        abandon_pending();
+        stats = {};
+        return callbacks.internal_error;
+    }
 }

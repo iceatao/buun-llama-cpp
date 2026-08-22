@@ -1379,8 +1379,9 @@ struct common_computation_frontier {
 // Copy-on-write byte owner for immutable checkpoint planes. Copying a
 // checkpoint into the host cache or a non-consuming restore delivery shares
 // the exact allocation; the first live mutation detaches only that plane.
-// Empty buffers allocate nothing. This keeps common_prompt_checkpoint's
-// existing byte-oriented API while making fixed-cache fan-out zero-copy.
+// Empty buffers allocate nothing. Read access is immutable; replacement uses
+// one scoped writer so fixed-cache fan-out stays zero-copy without letting a
+// pointer or reference escape the copy-on-write boundary.
 class common_shared_byte_buffer {
     struct storage {
         storage() = default;
@@ -1405,10 +1406,7 @@ public:
     size_t size() const noexcept;
     bool empty() const noexcept;
     const uint8_t * data() const noexcept;
-    uint8_t * mutable_data();
     void clear() noexcept;
-    void resize(size_t size);
-    void assign(size_t size, uint8_t value);
 
     // Publishes newly filled storage only after the synchronous writer
     // returns. The writer must not retain the supplied pointer.
@@ -1427,11 +1425,9 @@ public:
             std::make_shared<storage>(size);
         std::forward<Writer>(writer)(replacement->bytes.data(), size);
         bytes_ = std::move(replacement);
-        mutable_exposed_ = false;
     }
 
     const uint8_t & operator[](size_t index) const noexcept;
-    uint8_t & mutable_at(size_t index);
 
     const std::vector<uint8_t> & view() const noexcept;
     bool shares_storage_with(
@@ -1458,9 +1454,7 @@ public:
     }
 
 private:
-    std::vector<uint8_t> & mutable_view();
     std::shared_ptr<storage> bytes_;
-    bool mutable_exposed_ = false;
     mutable bool accounting_owned_ = false;
 };
 
