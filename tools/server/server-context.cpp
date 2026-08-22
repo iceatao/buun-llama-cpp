@@ -11851,6 +11851,15 @@ private:
                         res->downward_subphase = imported.downward_subphase;
                         res->downward_edge = imported.downward_edge;
                         res->schedule_status = imported.schedule_status;
+                        res->destination_status = imported.destination_status;
+                        res->destination_policy_steps =
+                            imported.destination_policy_steps;
+                        res->destination_logical_bytes =
+                            imported.destination_logical_bytes;
+                        res->destination_physical_growth_bytes =
+                            imported.destination_physical_growth_bytes;
+                        res->destination_max_deficit =
+                            imported.destination_max_deficit;
                         res->decision = imported.decision;
                         res->consistency = server_cache_import_route_consistency(
                             imported.status, imported.consistency);

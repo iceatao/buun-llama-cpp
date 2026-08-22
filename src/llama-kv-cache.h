@@ -544,6 +544,47 @@ private:
         uint32_t projected_wm_cells,
         int demanded_device,
         vbr_downward_policy_child & output) const noexcept;
+    bool vbr_import_destination_input(
+        uint32_t projected_wm_cells,
+        vbr_import_destination_child & output) const noexcept;
+    struct vbr_import_destination_pricing {
+        struct pool_row {
+            const ggml_vbr_backend_iface * be = nullptr;
+            int device = -1;
+            uint64_t mapped = 0;
+            uint64_t available = 0;
+            uint64_t needed = 0;
+        };
+        struct device_row {
+            const ggml_vbr_backend_iface * be = nullptr;
+            int device = -1;
+            uint64_t available = 0;
+            uint64_t scratch_k_needed = 0;
+            uint64_t scratch_v_needed = 0;
+            uint64_t scratch_k_current = 0;
+            uint64_t scratch_v_current = 0;
+        };
+        uint32_t watermark_cells = 0;
+        bool active = false;
+        bool overflow = false;
+        std::vector<ggml_type> types;
+        std::vector<pool_row> pools;
+        std::vector<device_row> devices;
+    };
+    bool vbr_import_destination_pricing_begin(
+        const std::vector<ggml_type> & types,
+        uint32_t projected_wm_cells,
+        vbr_import_destination_pricing & output) const noexcept;
+    bool vbr_import_destination_pricing_apply(
+        const llama_vbr_policy::step & step,
+        vbr_import_destination_pricing & pricing) const noexcept;
+    llama_memory_vbr_preflight_data vbr_import_destination_preflight(
+        const vbr_import_destination_pricing & pricing,
+        std::vector<llama_memory_vbr_physical_growth> * physical) const noexcept;
+    llama_memory_vbr_preflight_data vbr_import_destination_preflight(
+        const std::vector<ggml_type> & types,
+        uint32_t projected_wm_cells,
+        std::vector<llama_memory_vbr_physical_growth> * physical) const noexcept;
     bool vbr_policy_priced_steps(
         std::vector<ggml_type> & sim, size_t start_cursor,
         int demanded_device, uint32_t watermark, bool fixed_watermark,

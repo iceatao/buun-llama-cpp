@@ -12,16 +12,6 @@
 // utilizes two instances of llama_kv_cache
 //   the first instance is for the non-SWA layers of the model and the second instance is for the SWA layers
 
-// Pure two-child reduction used by iSWA and its model-free skew regression.
-// Logical pool totals remain additive; physical capacity is reduced only
-// after rows sharing the same backend/device have been combined.
-llama_memory_vbr_preflight_data llama_memory_vbr_merge_preflight_children(
-    const llama_memory_vbr_preflight_data & first,
-    const std::vector<llama_memory_vbr_physical_growth> & first_physical,
-    const llama_memory_vbr_preflight_data & second,
-    const std::vector<llama_memory_vbr_physical_growth> & second_physical,
-    std::vector<llama_memory_vbr_physical_growth> * physical = nullptr);
-
 // Keep collection and reduction in one production seam so model-free tests can
 // prove that child evidence is actually requested rather than only testing the
 // arithmetic reducer in isolation.

@@ -117,6 +117,77 @@ struct vbr_downward_policy_child {
     uint64_t initial_cursor = 0;
 };
 
+// Controller-owned input to empty-target destination negotiation.  The
+// initial vector is the live tree schedule; policy contains only lawful
+// remaining degradation steps in the controller's canonical price order.
+// Import code may select a prefix, but it must never manufacture steps.
+struct vbr_import_destination_child {
+    llama_vbr_policy::child policy;
+    std::vector<ggml_type> initial_types;
+    uint64_t initial_cursor = 0;
+    uint32_t watermark_cells = 0;
+};
+
+enum class vbr_import_destination_status : uint8_t {
+    invalid = 0,
+    feasible_current,
+    feasible_degraded,
+    exhausted,
+    overflow,
+    _count,
+};
+
+const char * vbr_import_destination_status_name(
+    vbr_import_destination_status status) noexcept;
+
+// Immutable result of the controller-owned empty-target schedule projection.
+// The byte fields are observations, not reservations.  A later materializer
+// must recheck this capability and reserve/apply the exact prefix atomically.
+struct vbr_import_destination_projection {
+    vbr_import_destination_status status =
+        vbr_import_destination_status::invalid;
+    std::vector<llama_vbr_policy::selection> prefix;
+    std::vector<std::vector<ggml_type>> final_types;
+    std::vector<uint64_t> final_cursors;
+    std::vector<std::array<uint8_t, 32>> child_type_digests;
+    std::array<uint8_t, 32> tree_digest = {};
+    uint32_t pools = 0;
+    uint64_t logical_bytes_needed = 0;
+    uint64_t logical_bytes_available = 0;
+    uint64_t physical_growth_needed = 0;
+    uint64_t physical_growth_available = 0;
+    int64_t max_deficit = 0;
+
+    bool feasible() const noexcept {
+        return status == vbr_import_destination_status::feasible_current ||
+               status == vbr_import_destination_status::feasible_degraded;
+    }
+};
+
+struct vbr_import_destination_evidence {
+    bool active = false;
+    bool fits = false;
+    uint32_t pools = 0;
+    uint64_t logical_bytes_needed = 0;
+    uint64_t logical_bytes_available = 0;
+    uint64_t physical_growth_needed = 0;
+    uint64_t physical_growth_available = 0;
+    int64_t max_deficit = 0;
+};
+
+using vbr_import_destination_measure_fn = bool (*)(
+    void * context,
+    const std::vector<std::vector<ggml_type>> & types,
+    const llama_vbr_policy::selection * selected,
+    vbr_import_destination_evidence & evidence) noexcept;
+
+// Select the shortest feasible prefix of the controller's canonical merged
+// policy stream. The callback owns resource pricing; selection owns ordering.
+vbr_import_destination_projection vbr_select_import_destination(
+    const std::vector<vbr_import_destination_child> & children,
+    void * context,
+    vbr_import_destination_measure_fn measure) noexcept;
+
 struct vbr_downward_policy_projection {
     vbr_downward_policy_status status = vbr_downward_policy_status::invalid;
     std::vector<llama_vbr_policy::selection> prefix;

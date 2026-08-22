@@ -2078,6 +2078,15 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
                         impl_->counters.imports_unavailable);
         }
         output.schedule_status = schedule_quote.status();
+        const auto & destination = schedule_quote.destination();
+        output.destination_status = destination.status;
+        output.destination_policy_steps = uint32_t(
+            std::min<size_t>(destination.prefix.size(), UINT32_MAX));
+        output.destination_logical_bytes =
+            destination.logical_bytes_needed;
+        output.destination_physical_growth_bytes =
+            destination.physical_growth_needed;
+        output.destination_max_deficit = destination.max_deficit;
         context.schedule_quote = &schedule_quote;
         if (schedule_quote.status() != vbr_import_schedule_status::_count) {
             impl_->counters.import_schedules[

@@ -29,6 +29,65 @@ struct llama_memory_vbr_physical_growth {
     uint64_t scratch_k_current = 0;
     uint64_t scratch_v_current = 0;
     uint64_t available = 0;
+
+    bool same_domain(const llama_memory_vbr_physical_growth & other) const noexcept {
+        return backend == other.backend && device == other.device;
+    }
+    bool operator<(const llama_memory_vbr_physical_growth & other) const noexcept {
+        if (backend != other.backend) {
+            return std::less<const void *>{}(backend, other.backend);
+        }
+        return device < other.device;
+    }
+};
+
+// Generic reduction for independently priced memory children. Logical totals
+// add; physical rows sharing one backend/device are combined before fit is
+// decided so tensor-split skew cannot disappear into scalar totals.
+llama_memory_vbr_preflight_data llama_memory_vbr_merge_preflight_children(
+    const llama_memory_vbr_preflight_data & first,
+    const std::vector<llama_memory_vbr_physical_growth> & first_physical,
+    const llama_memory_vbr_preflight_data & second,
+    const std::vector<llama_memory_vbr_physical_growth> & second_physical,
+    std::vector<llama_memory_vbr_physical_growth> * physical = nullptr,
+    uint64_t * domain_comparisons = nullptr);
+
+// Incremental reduction for a stable set of memory children. The physical
+// domain shape of each leaf is immutable after build; replacing one leaf then
+// recomputes only its ancestors.
+class llama_memory_vbr_preflight_tree {
+public:
+    bool reset(size_t leaf_count) noexcept;
+    bool set_leaf(
+        size_t index,
+        const llama_memory_vbr_preflight_data & preflight,
+        const std::vector<llama_memory_vbr_physical_growth> & physical) noexcept;
+    bool build() noexcept;
+    bool replace_leaf(
+        size_t index,
+        const llama_memory_vbr_preflight_data & preflight,
+        const std::vector<llama_memory_vbr_physical_growth> & physical) noexcept;
+
+    bool ready() const noexcept;
+    const llama_memory_vbr_preflight_data & preflight() const noexcept;
+    const std::vector<llama_memory_vbr_physical_growth> & physical() const noexcept;
+    uint64_t merge_count() const noexcept;
+    uint64_t domain_comparison_count() const noexcept;
+
+private:
+    struct node {
+        bool present = false;
+        llama_memory_vbr_preflight_data preflight = {};
+        std::vector<llama_memory_vbr_physical_growth> physical;
+    };
+    void merge_node(size_t index);
+
+    size_t leaf_count_ = 0;
+    size_t leaf_base_ = 0;
+    bool ready_ = false;
+    uint64_t merge_count_ = 0;
+    uint64_t domain_comparison_count_ = 0;
+    std::vector<node> tree_;
 };
 
 class llama_batch_allocr;

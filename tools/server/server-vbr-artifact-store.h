@@ -333,6 +333,12 @@ struct server_vbr_artifact_import_output {
     uint64_t rollback_count = 0;
     vbr_import_schedule_status schedule_status =
         vbr_import_schedule_status::unavailable;
+    vbr_import_destination_status destination_status =
+        vbr_import_destination_status::invalid;
+    uint32_t destination_policy_steps = 0;
+    uint64_t destination_logical_bytes = 0;
+    uint64_t destination_physical_growth_bytes = 0;
+    int64_t destination_max_deficit = 0;
     vbr_import_decision decision = vbr_import_decision::reject;
     vbr_artifact_consistency_kind consistency =
         vbr_artifact_consistency_kind::live_rebased;

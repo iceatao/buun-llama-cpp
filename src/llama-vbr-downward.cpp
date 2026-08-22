@@ -24,19 +24,6 @@ int tier_rank(ggml_type type) noexcept {
     return it == TIERS.end() ? -1 : int(it - TIERS.begin());
 }
 
-std::array<uint8_t, 32> tree_digest(
-        const std::vector<std::array<uint8_t, 32>> & children) {
-    llama_sha256_writer writer;
-    static constexpr char domain_label[] = "buun.vbr.downward/tree-policy";
-    writer.string(domain_label, sizeof(domain_label) - 1);
-    writer.u32(VBR_DOWNWARD_RECIPE_VERSION);
-    writer.u64(children.size());
-    for (const auto & digest : children) {
-        writer.bytes(digest.data(), digest.size());
-    }
-    return writer.finish();
-}
-
 } // namespace
 
 vbr_repr_domain vbr_downward_tier_domain(ggml_type type) noexcept {
@@ -143,6 +130,125 @@ const char * vbr_downward_policy_status_name(vbr_downward_policy_status status) 
     return "invalid";
 }
 
+const char * vbr_import_destination_status_name(
+        vbr_import_destination_status status) noexcept {
+    switch (status) {
+        case vbr_import_destination_status::feasible_current:
+            return "feasible_current";
+        case vbr_import_destination_status::feasible_degraded:
+            return "feasible_degraded";
+        case vbr_import_destination_status::exhausted: return "exhausted";
+        case vbr_import_destination_status::invalid: return "invalid";
+        case vbr_import_destination_status::overflow: return "overflow";
+        case vbr_import_destination_status::_count: break;
+    }
+    return "invalid";
+}
+
+vbr_import_destination_projection vbr_select_import_destination(
+        const std::vector<vbr_import_destination_child> & children,
+        void * context,
+        vbr_import_destination_measure_fn measure) noexcept {
+    vbr_import_destination_projection result;
+    try {
+        if (children.empty() || measure == nullptr) {
+            return result;
+        }
+        result.final_types.reserve(children.size());
+        result.final_cursors.reserve(children.size());
+        std::vector<llama_vbr_policy::child> policies;
+        policies.reserve(children.size());
+        for (const auto & child : children) {
+            if (child.initial_types.empty() ||
+                child.watermark_cells == 0) {
+                return result;
+            }
+            result.final_types.push_back(child.initial_types);
+            result.final_cursors.push_back(child.initial_cursor);
+            policies.push_back(child.policy);
+        }
+        bool measure_ok = true;
+        const auto fits = [&](const llama_vbr_policy::selection * selected) {
+            vbr_import_destination_evidence evidence;
+            if (!measure(
+                    context, result.final_types, selected, evidence) ||
+                !evidence.active) {
+                measure_ok = false;
+                return false;
+            }
+            result.pools = evidence.pools;
+            result.logical_bytes_needed = evidence.logical_bytes_needed;
+            result.logical_bytes_available = evidence.logical_bytes_available;
+            result.physical_growth_needed = evidence.physical_growth_needed;
+            result.physical_growth_available =
+                evidence.physical_growth_available;
+            result.max_deficit = evidence.max_deficit;
+            return evidence.fits;
+        };
+        const bool current_fits = fits(nullptr);
+        if (!measure_ok) {
+            return result;
+        }
+        if (current_fits) {
+            result.status =
+                vbr_import_destination_status::feasible_current;
+        } else {
+            llama_vbr_policy::shortest_prefix_stream stream(
+                std::move(policies));
+            llama_vbr_policy::selection selected;
+            for (;;) {
+                const auto status = stream.next(selected);
+                if (status != llama_vbr_policy::result::selected) {
+                    result.status = status ==
+                            llama_vbr_policy::result::exhausted
+                        ? vbr_import_destination_status::exhausted
+                        : status == llama_vbr_policy::result::overflow
+                            ? vbr_import_destination_status::overflow
+                            : vbr_import_destination_status::invalid;
+                    return result;
+                }
+                if (selected.child_index >= result.final_types.size() ||
+                    selected.value.slot >= result.final_types[
+                        selected.child_index].size() ||
+                    result.final_types[selected.child_index][
+                        selected.value.slot] !=
+                            static_cast<ggml_type>(selected.value.type_a)) {
+                    return {};
+                }
+                result.final_types[selected.child_index][
+                    selected.value.slot] = static_cast<ggml_type>(
+                        selected.value.type_b);
+                result.final_cursors[selected.child_index] =
+                    std::max<uint64_t>(
+                        result.final_cursors[selected.child_index],
+                        selected.value.order_index + 1);
+                result.prefix.push_back(selected);
+                const bool selected_fits = fits(&selected);
+                if (!measure_ok) {
+                    return {};
+                }
+                if (selected_fits) {
+                    result.status =
+                        vbr_import_destination_status::feasible_degraded;
+                    break;
+                }
+            }
+        }
+        result.child_type_digests.reserve(result.final_types.size());
+        for (const auto & types : result.final_types) {
+            result.child_type_digests.push_back(
+                vbr_type_vector_digest(types));
+        }
+        result.tree_digest =
+            vbr_type_tree_digest(
+                result.child_type_digests,
+                VBR_DOWNWARD_RECIPE_VERSION);
+        return result;
+    } catch (...) {
+        return {};
+    }
+}
+
 vbr_downward_policy_projection vbr_downward_project_policy_prefix(
         const std::vector<vbr_downward_policy_child> & children) noexcept {
     vbr_downward_policy_projection out;
@@ -226,7 +332,8 @@ vbr_downward_policy_projection vbr_downward_project_policy_prefix(
         for (const auto & types : out.final_types) {
             out.child_type_digests.push_back(vbr_type_vector_digest(types));
         }
-        out.tree_digest = tree_digest(out.child_type_digests);
+        out.tree_digest = vbr_type_tree_digest(
+            out.child_type_digests, VBR_DOWNWARD_RECIPE_VERSION);
         out.status = vbr_downward_policy_status::coherent;
         return out;
     } catch (...) {

@@ -150,6 +150,124 @@ static void test_iswa_physical_preflight_shared_scratch_and_overflow() {
     assert(overflow.max_deficit == std::numeric_limits<int64_t>::max());
 }
 
+static void test_incremental_preflight_tree_matches_full_fold() {
+    const auto make_preflight = [](uint64_t logical, uint64_t available) {
+        llama_memory_vbr_preflight_data value = {};
+        value.active = true;
+        value.fits = logical <= available;
+        value.pools = 1;
+        value.watermark_cells = 64;
+        value.bytes_needed = logical;
+        value.bytes_available = available;
+        value.max_deficit = logical > available
+            ? int64_t(logical - available) : 0;
+        return value;
+    };
+    const auto row = [](const void * backend, int device,
+                        uint64_t kv, uint64_t available) {
+        return llama_memory_vbr_physical_growth {
+            backend, device, kv, 0, 0, 0, 0, available };
+    };
+    std::vector<llama_memory_vbr_preflight_data> leaves = {
+        make_preflight(10, 100), make_preflight(20, 100),
+        make_preflight(30, 100), make_preflight(40, 100),
+        make_preflight(50, 100),
+    };
+    std::vector<std::vector<llama_memory_vbr_physical_growth>> physical = {
+        { row(&VBR_TEST_BACKEND_IDENTITY, 0, 10, 500) },
+        { row(&VBR_TEST_BACKEND_IDENTITY, 1, 20, 500) },
+        { row(&VBR_TEST_BACKEND_IDENTITY, 0, 30, 500) },
+        { row(&VBR_TEST_BACKEND_IDENTITY_SECOND, 0, 40, 500) },
+        { row(&VBR_TEST_BACKEND_IDENTITY, 0, 50, 500),
+          row(&VBR_TEST_BACKEND_IDENTITY_SECOND, 0, 5, 500) },
+    };
+    const auto assert_equal = [](const auto & actual,
+                                 const auto & actual_physical,
+                                 const auto & expected,
+                                 const auto & expected_physical) {
+        assert(actual.active == expected.active);
+        assert(actual.fits == expected.fits);
+        assert(actual.pools == expected.pools);
+        assert(actual.watermark_cells == expected.watermark_cells);
+        assert(actual.bytes_needed == expected.bytes_needed);
+        assert(actual.bytes_available == expected.bytes_available);
+        assert(actual.physical_growth_needed ==
+               expected.physical_growth_needed);
+        assert(actual.physical_growth_available ==
+               expected.physical_growth_available);
+        assert(actual.max_deficit == expected.max_deficit);
+        assert(actual_physical.size() == expected_physical.size());
+        for (size_t i = 0; i < actual_physical.size(); ++i) {
+            const auto & a = actual_physical[i];
+            const auto & e = expected_physical[i];
+            assert(a.same_domain(e));
+            assert(a.kv_needed == e.kv_needed);
+            assert(a.scratch_k_needed == e.scratch_k_needed);
+            assert(a.scratch_v_needed == e.scratch_v_needed);
+            assert(a.scratch_k_current == e.scratch_k_current);
+            assert(a.scratch_v_current == e.scratch_v_current);
+            assert(a.available == e.available);
+        }
+    };
+    const auto full_fold = [&](llama_memory_vbr_preflight_data & aggregate,
+                               std::vector<llama_memory_vbr_physical_growth> & rows) {
+        aggregate = leaves[0];
+        rows = physical[0];
+        for (size_t i = 1; i < leaves.size(); ++i) {
+            std::vector<llama_memory_vbr_physical_growth> merged;
+            aggregate = llama_memory_vbr_merge_preflight_children(
+                aggregate, rows, leaves[i], physical[i], &merged);
+            rows.swap(merged);
+        }
+    };
+
+    llama_memory_vbr_preflight_tree tree;
+    assert(tree.reset(leaves.size()));
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        assert(tree.set_leaf(i, leaves[i], physical[i]));
+    }
+    assert(tree.build());
+    llama_memory_vbr_preflight_data expected;
+    std::vector<llama_memory_vbr_physical_growth> expected_physical;
+    full_fold(expected, expected_physical);
+    assert_equal(tree.preflight(), tree.physical(),
+                 expected, expected_physical);
+    assert(tree.merge_count() == 7);
+
+    leaves[4] = make_preflight(15, 100);
+    physical[4][0].kv_needed = 15;
+    physical[4][1].kv_needed = 7;
+    std::sort(physical[4].begin(), physical[4].end());
+    assert(tree.replace_leaf(4, leaves[4], physical[4]));
+    full_fold(expected, expected_physical);
+    assert_equal(tree.preflight(), tree.physical(),
+                 expected, expected_physical);
+
+    leaves[1] = make_preflight(25, 100);
+    physical[1][0].kv_needed = 25;
+    assert(tree.replace_leaf(1, leaves[1], physical[1]));
+    full_fold(expected, expected_physical);
+    assert_equal(tree.preflight(), tree.physical(),
+                 expected, expected_physical);
+    assert(tree.merge_count() == 13);
+    assert(tree.domain_comparison_count() < 256);
+
+    const auto before = tree.preflight();
+    auto wrong_shape = physical[1];
+    wrong_shape.push_back(row(&VBR_TEST_BACKEND_IDENTITY, 2, 1, 500));
+    std::sort(wrong_shape.begin(), wrong_shape.end());
+    assert(!tree.replace_leaf(1, leaves[1], wrong_shape));
+    assert(tree.preflight().bytes_needed == before.bytes_needed);
+    auto wrong_domain = physical[1];
+    wrong_domain[0].device = 7;
+    assert(!tree.replace_leaf(1, leaves[1], wrong_domain));
+    assert(tree.preflight().bytes_needed == before.bytes_needed);
+    auto wrong_order = physical[4];
+    std::reverse(wrong_order.begin(), wrong_order.end());
+    assert(!tree.replace_leaf(4, leaves[4], wrong_order));
+    assert(tree.preflight().bytes_needed == before.bytes_needed);
+}
+
 static void test_all_recipes_and_rejections() {
     size_t pairs = 0;
     for (size_t source = 0; source < 6; ++source) {
@@ -181,6 +299,139 @@ static void test_all_recipes_and_rejections() {
         GGML_TYPE_TURBO3_TCQ, true, out) == vbr_downward_recipe_status::below_floor);
     assert(vbr_downward_resolve_recipe(GGML_TYPE_F16, GGML_TYPE_TURBO8_0,
         GGML_TYPE_TURBO1_TCQ, false, out) == vbr_downward_recipe_status::nonmovable);
+}
+
+struct destination_measure_fixture {
+    size_t required_degraded_units = 0;
+    uint32_t calls = 0;
+    bool fail = false;
+};
+
+static bool measure_destination_schedule(
+        void * opaque,
+        const std::vector<std::vector<ggml_type>> & types,
+        const llama_vbr_policy::selection *,
+        vbr_import_destination_evidence & evidence) noexcept {
+    auto * fixture = static_cast<destination_measure_fixture *>(opaque);
+    if (!fixture || fixture->fail) {
+        return false;
+    }
+    fixture->calls++;
+    size_t degraded = 0;
+    for (const auto & child : types) {
+        for (const auto type : child) {
+            degraded += type == GGML_TYPE_TURBO8_0;
+        }
+    }
+    evidence.active = true;
+    evidence.fits = degraded >= fixture->required_degraded_units;
+    evidence.pools = uint32_t(types.size());
+    evidence.logical_bytes_needed = 100 - 20*degraded;
+    evidence.logical_bytes_available =
+        100 - 20*fixture->required_degraded_units;
+    evidence.physical_growth_needed = 40 - 10*degraded;
+    evidence.physical_growth_available =
+        40 - 10*fixture->required_degraded_units;
+    evidence.max_deficit = evidence.fits ? 0 : int64_t(std::max(
+        evidence.logical_bytes_needed - evidence.logical_bytes_available,
+        evidence.physical_growth_needed -
+            evidence.physical_growth_available));
+    return true;
+}
+
+static void test_import_destination_selects_shortest_controller_prefix() {
+    std::vector<vbr_import_destination_child> children(2);
+    for (size_t i = 0; i < children.size(); ++i) {
+        children[i].initial_types = { GGML_TYPE_F16 };
+        children[i].initial_cursor = 7 + i;
+        children[i].watermark_cells = 256;
+        children[i].policy.terminal_progress = 10;
+        children[i].policy.steps.push_back({
+            7 + i, 0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0, 10,
+        });
+    }
+
+    destination_measure_fixture current;
+    const auto unchanged = vbr_select_import_destination(
+        children, &current, measure_destination_schedule);
+    assert(unchanged.status ==
+        vbr_import_destination_status::feasible_current);
+    assert(unchanged.prefix.empty());
+    assert(current.calls == 1);
+
+    destination_measure_fixture one { 1 };
+    const auto selected = vbr_select_import_destination(
+        children, &one, measure_destination_schedule);
+    assert(selected.status ==
+        vbr_import_destination_status::feasible_degraded);
+    assert(selected.prefix.size() == 1);
+    assert(selected.prefix[0].child_index == 0);
+    assert(selected.final_types[0][0] == GGML_TYPE_TURBO8_0);
+    assert(selected.final_types[1][0] == GGML_TYPE_F16);
+    assert(selected.final_cursors[0] == 8);
+    assert(one.calls == 2);
+    assert(selected.pools == 2);
+    assert(selected.logical_bytes_needed == 80);
+    assert(selected.logical_bytes_available == 80);
+    assert(selected.physical_growth_needed == 30);
+    assert(selected.physical_growth_available == 30);
+    assert(selected.max_deficit == 0);
+    assert(std::any_of(
+        selected.tree_digest.begin(), selected.tree_digest.end(),
+        [](uint8_t value) { return value != 0; }));
+
+    destination_measure_fixture both { 2 };
+    const auto pair = vbr_select_import_destination(
+        children, &both, measure_destination_schedule);
+    assert(pair.status ==
+        vbr_import_destination_status::feasible_degraded);
+    assert(pair.prefix.size() == 2);
+    assert(pair.final_types[0][0] == GGML_TYPE_TURBO8_0);
+    assert(pair.final_types[1][0] == GGML_TYPE_TURBO8_0);
+    assert(both.calls == 3);
+
+    destination_measure_fixture impossible { 3 };
+    const auto exhausted = vbr_select_import_destination(
+        children, &impossible, measure_destination_schedule);
+    assert(exhausted.status == vbr_import_destination_status::exhausted);
+    assert(exhausted.prefix.size() == 2);
+    assert(exhausted.logical_bytes_needed == 60);
+    assert(exhausted.logical_bytes_available == 40);
+    assert(exhausted.physical_growth_needed == 20);
+    assert(exhausted.physical_growth_available == 10);
+    assert(exhausted.max_deficit == 20);
+
+    destination_measure_fixture failed;
+    failed.fail = true;
+    const auto invalid = vbr_select_import_destination(
+        children, &failed, measure_destination_schedule);
+    assert(invalid.status == vbr_import_destination_status::invalid);
+    assert(invalid.prefix.empty());
+}
+
+static void test_policy_stream_max_shape_is_heap_bounded() {
+    constexpr size_t children_count = 4096;
+    constexpr size_t steps_per_child = 4;
+    std::vector<llama_vbr_policy::child> children(children_count);
+    for (size_t child = 0; child < children.size(); ++child) {
+        children[child].terminal_progress = steps_per_child;
+        children[child].steps.reserve(steps_per_child);
+        for (size_t step = 0; step < steps_per_child; ++step) {
+            children[child].steps.push_back({
+                step, step, int32_t(step), int32_t(step + 1), 1,
+            });
+        }
+    }
+    llama_vbr_policy::shortest_prefix_stream stream(std::move(children));
+    llama_vbr_policy::selection selected;
+    size_t selected_count = 0;
+    while (stream.next(selected) == llama_vbr_policy::result::selected) {
+        selected_count++;
+    }
+    assert(selected_count == children_count*steps_per_child);
+    // A scan selector needs ~67M comparisons here. The indexed heap stays
+    // comfortably within the O((C+S) log C) envelope.
+    assert(stream.comparison_count() < 1000000);
 }
 
 static llama_vbr_policy::child policy_child(
@@ -478,7 +729,10 @@ static void test_projection_reserve_retry_and_stashless() {
 int main() {
     test_iswa_physical_preflight_preserves_device_skew();
     test_iswa_physical_preflight_shared_scratch_and_overflow();
+    test_incremental_preflight_tree_matches_full_fold();
     test_all_recipes_and_rejections();
+    test_import_destination_selects_shortest_controller_prefix();
+    test_policy_stream_max_shape_is_heap_bounded();
     test_policy_projection_tree_and_ordinary();
     test_edge_oracles_and_stash_boundaries();
     test_straddled_kv_independent_chains();

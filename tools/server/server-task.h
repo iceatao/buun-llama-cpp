@@ -652,6 +652,7 @@ enum class vbr_adopt_phase : uint8_t;
 enum class vbr_downward_adopt_subphase : uint8_t;
 enum class vbr_import_decision : uint8_t;
 enum class vbr_import_schedule_status : uint8_t;
+enum class vbr_import_destination_status : uint8_t;
 
 enum class server_cache_capture_consistency : uint8_t {
     unavailable = 0,
@@ -700,6 +701,11 @@ struct server_task_result_cache_import : server_task_result {
     vbr_downward_adopt_subphase downward_subphase {};
     uint32_t downward_edge = UINT32_MAX;
     vbr_import_schedule_status schedule_status {};
+    vbr_import_destination_status destination_status {};
+    uint32_t destination_policy_steps = 0;
+    uint64_t destination_logical_bytes = 0;
+    uint64_t destination_physical_growth_bytes = 0;
+    int64_t destination_max_deficit = 0;
     vbr_import_decision decision {};
     server_cache_import_consistency consistency =
         server_cache_import_consistency::unavailable;

@@ -4800,7 +4800,8 @@ bool llama_kv_cache::vbr_policy_priced_steps(
         int64_t gain = 0;
         bool valid = true;
         for (const auto & pool : vbr_pools_) {
-            if (!pool.vmm || pool.device != demanded_device) {
+            if (!pool.vmm ||
+                (demanded_device >= 0 && pool.device != demanded_device)) {
                 continue;
             }
             const auto & extent = order.is_v ? pool.v[ikv] : pool.k[ikv];
@@ -5381,6 +5382,58 @@ bool llama_kv_cache::vbr_downward_policy_input(
         }
         return output.policy.terminal_progress > 0 ||
             output.initial_types == output.target_types;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_import_destination_input(
+        uint32_t projected_wm_cells,
+        vbr_import_destination_child & output) const noexcept {
+    output = {};
+    try {
+        if (other) {
+            return other->vbr_import_destination_input(
+                projected_wm_cells, output);
+        }
+        if (!vbr_vmm_active() || projected_wm_cells == 0) {
+            return false;
+        }
+        output.watermark_cells = projected_wm_cells;
+        output.initial_cursor = vbr_degrade_cursor_;
+        std::vector<ggml_type> policy_types;
+        vbr_sim_seed(policy_types, /* pooled_only = */ true,
+                     GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                     nullptr, nullptr, nullptr);
+        auto sim = policy_types;
+        // Destination negotiation is tree-wide and may span several devices.
+        // Summing logical gain across every pool preserves the controller's
+        // canonical per-child ladder while giving the tree interleaver one
+        // honest progress denominator.
+        vbr_hard_seal_consult_session seal_session;
+        if (!vbr_policy_priced_steps(
+            sim, vbr_degrade_cursor_, /* demanded_device = */ -1,
+            projected_wm_cells, true, true, output.policy,
+            vbr_hard_seal_guard_ ? &seal_session : nullptr)) {
+            return false;
+        }
+        output.initial_types = std::move(policy_types);
+        // The policy stream contains only VMM-pooled movable units, but the
+        // negotiated identity must cover the complete controller vector.
+        // Fill non-pooled slots from the live canonical tensors only after
+        // the stream has been minted so they can never become policy steps.
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            if (output.initial_types[ikv*2] == GGML_TYPE_COUNT &&
+                layers[ikv].k) {
+                output.initial_types[ikv*2] = layers[ikv].k->type;
+            }
+            if (output.initial_types[ikv*2 + 1] == GGML_TYPE_COUNT &&
+                layers[ikv].v) {
+                output.initial_types[ikv*2 + 1] = layers[ikv].v->type;
+            }
+        }
+        return true;
     } catch (...) {
         output = {};
         return false;
@@ -8645,138 +8698,341 @@ void llama_kv_cache::vbr_retier_freeze_end(
                     : "env_freeze_noop");
 }
 
-llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
-        uint32_t n_tokens_extra,
-        std::vector<llama_memory_vbr_physical_growth> * physical) const {
+bool llama_kv_cache::vbr_import_destination_pricing_begin(
+        const std::vector<ggml_type> & types,
+        uint32_t projected_wm_cells,
+        vbr_import_destination_pricing & output) const noexcept {
+    output = {};
+    try {
+        if (other) {
+            return other->vbr_import_destination_pricing_begin(
+                types, projected_wm_cells, output);
+        }
+        if (!vbr_vmm_active() || vbr_budget_bytes_ == 0 ||
+            projected_wm_cells == 0 || types.size() != layers.size()*2) {
+            return false;
+        }
+        output.watermark_cells = projected_wm_cells;
+        output.types = types;
+        output.pools.reserve(vbr_pools_.size());
+        output.devices.reserve(vbr_pools_.size());
+        const auto add = [&](uint64_t lhs, uint64_t rhs) {
+            if (rhs > UINT64_MAX - lhs) {
+                output.overflow = true;
+                return UINT64_MAX;
+            }
+            return lhs + rhs;
+        };
+        const auto multiply = [&](uint64_t lhs, uint64_t rhs) {
+            if (lhs != 0 && rhs > UINT64_MAX/lhs) {
+                output.overflow = true;
+                return UINT64_MAX;
+            }
+            return lhs*rhs;
+        };
+        for (const auto & p : vbr_pools_) {
+            if (!p.vmm) {
+                continue;
+            }
+            vbr_import_destination_pricing::pool_row row;
+            row.be = p.be;
+            row.device = p.device;
+            row.mapped = p.be->vmm_pool_mapped(p.vmm);
+            row.available = vbr_budget_eff_uncached(p);
+            row.needed = p.mapped_base;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                for (int side = 0; side < 2; ++side) {
+                    const auto & extent = side ? p.v[ikv] : p.k[ikv];
+                    const auto * tensor = extent.t;
+                    if (!tensor || types[ikv*2 + side] == GGML_TYPE_COUNT) {
+                        if (tensor) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    uint64_t endpoint = 0;
+                    if (!llama_vbr_policy::logical_endpoint_bytes(
+                            ggml_row_size(types[ikv*2 + side], tensor->ne[0]),
+                            projected_wm_cells, vbr_slot_span(tensor, p.gran),
+                            p.gran, endpoint)) {
+                        output.overflow = true;
+                        endpoint = UINT64_MAX;
+                    }
+                    row.needed = add(row.needed, endpoint);
+                }
+            }
+            output.pools.push_back(row);
+            auto device = std::find_if(
+                output.devices.begin(), output.devices.end(),
+                [&](const auto & value) {
+                    return value.be == p.be && value.device == p.device;
+                });
+            if (device == output.devices.end()) {
+                vbr_import_destination_pricing::device_row created;
+                created.be = p.be;
+                created.device = p.device;
+                size_t free_bytes = 0;
+                size_t total = 0;
+                p.be->get_device_memory(p.device, &free_bytes, &total);
+                created.available = free_bytes;
+                output.devices.push_back(created);
+                device = output.devices.end() - 1;
+            }
+            device->scratch_k_current = std::max<uint64_t>(
+                device->scratch_k_current, p.scratch_k_reserved);
+            device->scratch_v_current = std::max<uint64_t>(
+                device->scratch_v_current, p.scratch_v_reserved);
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                const auto * tk = p.k[ikv].t;
+                const auto * tv = p.v[ikv].t;
+                bool need_k = false;
+                bool need_v = false;
+                ggml_vbr_kv_dequant_sides(
+                    tk ? types[ikv*2] : GGML_TYPE_F16,
+                    tv ? types[ikv*2 + 1] : GGML_TYPE_F16,
+                    &need_k, &need_v);
+                if (need_k && tk) {
+                    device->scratch_k_needed = std::max(
+                        device->scratch_k_needed, multiply(
+                            ggml_row_size(GGML_TYPE_F16, tk->ne[0]),
+                            projected_wm_cells));
+                }
+                if (need_v && tv) {
+                    device->scratch_v_needed = std::max(
+                        device->scratch_v_needed, multiply(
+                            ggml_row_size(GGML_TYPE_F16, tv->ne[0]),
+                            projected_wm_cells));
+                }
+            }
+        }
+        std::sort(
+            output.devices.begin(), output.devices.end(),
+            [](const auto & lhs, const auto & rhs) {
+                if (lhs.be != rhs.be) {
+                    return std::less<const void *>{}(lhs.be, rhs.be);
+                }
+                return lhs.device < rhs.device;
+            });
+        output.active = !output.pools.empty() && !output.devices.empty();
+        return output.active;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_import_destination_pricing_apply(
+        const llama_vbr_policy::step & step,
+        vbr_import_destination_pricing & pricing) const noexcept {
+    try {
+        if (!pricing.active || step.slot >= pricing.types.size() ||
+            pricing.types[step.slot] != ggml_type(step.type_a) ||
+            step.type_b < 0 || step.type_b >= GGML_TYPE_COUNT) {
+            return false;
+        }
+        const size_t ikv = step.slot/2;
+        const bool is_v = (step.slot & 1u) != 0;
+        if (ikv >= layers.size()) {
+            return false;
+        }
+        const auto before_type = ggml_type(step.type_a);
+        const auto after_type = ggml_type(step.type_b);
+        size_t pool_row = 0;
+        for (const auto & p : vbr_pools_) {
+            if (!p.vmm) {
+                continue;
+            }
+            if (pool_row >= pricing.pools.size()) {
+                return false;
+            }
+            const auto * tensor = (is_v ? p.v[ikv] : p.k[ikv]).t;
+            if (tensor) {
+                uint64_t before = 0;
+                uint64_t after = 0;
+                if (!llama_vbr_policy::logical_endpoint_bytes(
+                        ggml_row_size(before_type, tensor->ne[0]),
+                        pricing.watermark_cells,
+                        vbr_slot_span(tensor, p.gran), p.gran, before) ||
+                    !llama_vbr_policy::logical_endpoint_bytes(
+                        ggml_row_size(after_type, tensor->ne[0]),
+                        pricing.watermark_cells,
+                        vbr_slot_span(tensor, p.gran), p.gran, after) ||
+                    after > before || pricing.pools[pool_row].needed < before) {
+                    return false;
+                }
+                pricing.pools[pool_row].needed -= before - after;
+            }
+            ++pool_row;
+        }
+        pricing.types[step.slot] = after_type;
+        for (auto & device : pricing.devices) {
+            size_t k_row = 0;
+            size_t v_row = 0;
+            for (const auto & p : vbr_pools_) {
+                if (!p.vmm || p.be != device.be || p.device != device.device) {
+                    continue;
+                }
+                const auto * tk = p.k[ikv].t;
+                const auto * tv = p.v[ikv].t;
+                bool need_k = false;
+                bool need_v = false;
+                ggml_vbr_kv_dequant_sides(
+                    tk ? pricing.types[ikv*2] : GGML_TYPE_F16,
+                    tv ? pricing.types[ikv*2 + 1] : GGML_TYPE_F16,
+                    &need_k, &need_v);
+                if (need_k && tk) {
+                    k_row = std::max(
+                        k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+                }
+                if (need_v && tv) {
+                    v_row = std::max(
+                        v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+                }
+            }
+            if (k_row != 0) {
+                if (k_row > UINT64_MAX/pricing.watermark_cells) {
+                    pricing.overflow = true;
+                } else {
+                    device.scratch_k_needed = std::max<uint64_t>(
+                        device.scratch_k_needed,
+                        k_row*pricing.watermark_cells);
+                }
+            }
+            if (v_row != 0) {
+                if (v_row > UINT64_MAX/pricing.watermark_cells) {
+                    pricing.overflow = true;
+                } else {
+                    device.scratch_v_needed = std::max<uint64_t>(
+                        device.scratch_v_needed,
+                        v_row*pricing.watermark_cells);
+                }
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache::vbr_import_destination_preflight(
+        const vbr_import_destination_pricing & pricing,
+        std::vector<llama_memory_vbr_physical_growth> * physical) const noexcept {
     if (physical) {
         physical->clear();
     }
+    try {
+    llama_memory_vbr_preflight_data result = {};
+    result.active = pricing.active;
+    result.fits = pricing.active && !pricing.overflow;
+    result.watermark_cells = pricing.watermark_cells;
+    const auto add = [](uint64_t lhs, uint64_t rhs) {
+        return rhs > UINT64_MAX - lhs ? UINT64_MAX : lhs + rhs;
+    };
+    for (const auto & pool : pricing.pools) {
+        result.pools = result.pools == UINT32_MAX
+            ? UINT32_MAX : result.pools + 1;
+        result.bytes_needed = add(result.bytes_needed, pool.needed);
+        result.bytes_available = add(
+            result.bytes_available, pool.available);
+        const int64_t deficit = pricing.overflow
+            ? INT64_MAX
+            : pool.needed > pool.available
+                ? pool.needed - pool.available > uint64_t(INT64_MAX)
+                    ? INT64_MAX : int64_t(pool.needed - pool.available)
+                : 0;
+        result.max_deficit = std::max(result.max_deficit, deficit);
+        result.fits = result.fits && deficit == 0;
+    }
+    if (physical) {
+        physical->reserve(pricing.devices.size());
+    }
+    for (const auto & device : pricing.devices) {
+        uint64_t kv = 0;
+        bool overflow = pricing.overflow;
+        for (const auto & pool : pricing.pools) {
+            if (pool.be != device.be || pool.device != device.device) {
+                continue;
+            }
+            const uint64_t growth = pool.needed > pool.mapped
+                ? pool.needed - pool.mapped : 0;
+            if (growth > UINT64_MAX-kv) {
+                overflow = true;
+                kv = UINT64_MAX;
+            } else {
+                kv += growth;
+            }
+        }
+        const uint64_t scratch_k =
+            device.scratch_k_needed > device.scratch_k_current
+                ? device.scratch_k_needed - device.scratch_k_current : 0;
+        const uint64_t scratch_v =
+            device.scratch_v_needed > device.scratch_v_current
+                ? device.scratch_v_needed - device.scratch_v_current : 0;
+        uint64_t needed = kv;
+        for (const uint64_t value : { scratch_k, scratch_v }) {
+            if (value > UINT64_MAX-needed) {
+                overflow = true;
+                needed = UINT64_MAX;
+            } else {
+                needed += value;
+            }
+        }
+        const int64_t deficit = overflow
+            ? INT64_MAX
+            : needed > device.available
+                ? needed - device.available > uint64_t(INT64_MAX)
+                    ? INT64_MAX : int64_t(needed - device.available)
+                : 0;
+        result.physical_growth_needed = add(
+            result.physical_growth_needed, needed);
+        result.physical_growth_available = add(
+            result.physical_growth_available, device.available);
+        result.max_deficit = std::max(result.max_deficit, deficit);
+        result.fits = result.fits && deficit == 0;
+        if (physical) {
+            physical->push_back({
+                device.be, device.device, kv,
+                device.scratch_k_needed, device.scratch_v_needed,
+                device.scratch_k_current, device.scratch_v_current,
+                device.available });
+        }
+    }
+    return result;
+    } catch (...) {
+        if (physical) {
+            physical->clear();
+        }
+        return {};
+    }
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache::vbr_import_destination_preflight(
+        const std::vector<ggml_type> & types,
+        uint32_t projected_wm_cells,
+        std::vector<llama_memory_vbr_physical_growth> * physical) const noexcept {
+    vbr_import_destination_pricing pricing;
+    if (!vbr_import_destination_pricing_begin(
+            types, projected_wm_cells, pricing)) {
+        if (physical) {
+            physical->clear();
+        }
+        return {};
+    }
+    return vbr_import_destination_preflight(pricing, physical);
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
+        uint32_t n_tokens_extra,
+        std::vector<llama_memory_vbr_physical_growth> * physical) const {
     if (other) {
         return other->vbr_retier_preflight(n_tokens_extra, physical);
     }
-    llama_memory_vbr_preflight_data r = {};
-    r.fits = true;
-    if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
-        return r;
-    }
-    r.active = true;
-    r.watermark_cells = vbr_watermark_cells(n_tokens_extra);
-    struct device_growth {
-        const ggml_vbr_backend_iface * be = nullptr;
-        uint64_t kv = 0;
-        uint64_t scratch_k_need = 0;
-        uint64_t scratch_v_need = 0;
-        uint64_t scratch_k_have = 0;
-        uint64_t scratch_v_have = 0;
-        bool needed_overflow = false;
-    };
-    const auto add_needed = [](uint64_t lhs, uint64_t rhs, bool & overflow) {
-        if (rhs > UINT64_MAX - lhs) {
-            overflow = true;
-            return UINT64_MAX;
-        }
-        return lhs + rhs;
-    };
-    const auto multiply_needed = [](uint64_t lhs, uint64_t rhs, bool & overflow) {
-        if (lhs != 0 && rhs > UINT64_MAX / lhs) {
-            overflow = true;
-            return UINT64_MAX;
-        }
-        return lhs * rhs;
-    };
-    const auto add_observed = [](uint64_t lhs, uint64_t rhs) {
-        return rhs > UINT64_MAX - lhs ? UINT64_MAX : lhs + rhs;
-    };
-    std::map<int, device_growth> growth;
-    for (const auto & p : vbr_pools_) {
-        if (p.vmm == nullptr) {
-            continue;
-        }
-        const size_t needed   = vbr_vmm_projected_bytes(p, r.watermark_cells);
-        // A restore can begin after a long idle period but before another decode boundary.
-        // The controller memo is boundary-scoped, so preflight must sample live capacity now.
-        const size_t available = vbr_budget_eff_uncached(p);
-        const int64_t deficit =
-            needed > available ? (int64_t) (needed - available) : 0;
-        r.pools++;
-        r.bytes_needed    += needed;
-        r.bytes_available += available;
-        r.max_deficit = std::max(r.max_deficit, deficit);
-        r.fits = r.fits && deficit == 0;
-
-        // The KV budget deliberately excludes fattn's shared per-device f16 dequant scratch
-        // (#88). A frozen-tier replay can grow both, so price their physical deltas together.
-        auto & g = growth[p.device];
-        g.be = p.be;
-        const size_t mapped = p.be->vmm_pool_mapped(p.vmm);
-        g.kv = add_needed(
-            g.kv, needed > mapped ? needed - mapped : 0,
-            g.needed_overflow);
-        size_t k_row = 0;
-        size_t v_row = 0;
-        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-            const ggml_tensor * tk = p.k[ikv].t;
-            const ggml_tensor * tv = p.v[ikv].t;
-            bool need_k = false;
-            bool need_v = false;
-            ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
-                                      tv ? tv->type : GGML_TYPE_F16,
-                                      &need_k, &need_v);
-            if (need_k && tk) {
-                k_row = std::max(k_row,
-                        ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
-            }
-            if (need_v && tv) {
-                v_row = std::max(v_row,
-                        ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
-            }
-        }
-        // The backend scratch is shared per device and sized by a max, not a sum.
-        g.scratch_k_need = std::max(
-            g.scratch_k_need, multiply_needed(
-                k_row, r.watermark_cells, g.needed_overflow));
-        g.scratch_v_need = std::max(
-            g.scratch_v_need, multiply_needed(
-                v_row, r.watermark_cells, g.needed_overflow));
-        g.scratch_k_have = std::max(g.scratch_k_have, p.scratch_k_reserved);
-        g.scratch_v_have = std::max(g.scratch_v_have, p.scratch_v_reserved);
-    }
-    for (const auto & [device, g] : growth) {
-        size_t free_b = 0;
-        size_t total_b = 0;
-        g.be->get_device_memory(device, &free_b, &total_b);
-        const uint64_t scratch_k_delta =
-            g.scratch_k_need > g.scratch_k_have
-                ? g.scratch_k_need - g.scratch_k_have : 0;
-        const uint64_t scratch_v_delta =
-            g.scratch_v_need > g.scratch_v_have
-                ? g.scratch_v_need - g.scratch_v_have : 0;
-        bool physical_overflow = g.needed_overflow;
-        uint64_t physical_need = add_needed(
-            g.kv, scratch_k_delta, physical_overflow);
-        physical_need = add_needed(
-            physical_need, scratch_v_delta, physical_overflow);
-        const int64_t physical_deficit = physical_overflow
-            ? INT64_MAX
-            : physical_need > free_b
-                ? physical_need - free_b > uint64_t(INT64_MAX)
-                    ? INT64_MAX : int64_t(physical_need - free_b)
-                : 0;
-        r.physical_growth_needed = add_observed(
-            r.physical_growth_needed, physical_need);
-        r.physical_growth_available = add_observed(
-            r.physical_growth_available, free_b);
-        if (physical) {
-            physical->push_back({
-                g.be, device, g.kv,
-                g.scratch_k_need, g.scratch_v_need,
-                g.scratch_k_have, g.scratch_v_have,
-                free_b });
-        }
-        r.max_deficit = std::max(r.max_deficit, physical_deficit);
-        r.fits = r.fits && physical_deficit == 0;
-    }
-    return r;
+    std::vector<ggml_type> types;
+    vbr_sim_seed(types, /* pooled_only = */ true,
+                 GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                 nullptr, nullptr, nullptr);
+    return vbr_import_destination_preflight(
+        types, vbr_watermark_cells(n_tokens_extra), physical);
 }
 
 // ---- co-tenancy donor side (P2) ----

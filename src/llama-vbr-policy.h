@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -134,6 +135,14 @@ public:
                 }
             }
         }
+        for (size_t i = 0; i < children_.size(); ++i) {
+            if (eligible(i)) {
+                heap_.push_back(i);
+            }
+        }
+        std::make_heap(
+            heap_.begin(), heap_.end(),
+            [this](size_t lhs, size_t rhs) { return better(rhs, lhs); });
     }
 
     result next(selection & out) {
@@ -141,31 +150,14 @@ public:
             return result::invalid;
         }
 
-        size_t pick = children_.size();
-        for (size_t i = 0; i < children_.size(); ++i) {
-            const child & c = children_[i];
-            const state & s = states_[i];
-            if (c.terminal_progress <= 0 || s.next >= c.steps.size()) {
-                continue;
-            }
-            if (pick == children_.size()) {
-                pick = i;
-                continue;
-            }
-
-            const uint64_t ni = s.progress > 0 ? (uint64_t) s.progress : 0;
-            const uint64_t np = states_[pick].progress > 0 ? (uint64_t) states_[pick].progress : 0;
-            const uint64_t di = (uint64_t) c.terminal_progress;
-            const uint64_t dp = (uint64_t) children_[pick].terminal_progress;
-            // Strict less preserves the existing root-first stable tie.
-            if (fraction_less(ni, di, np, dp)) {
-                pick = i;
-            }
-        }
-
-        if (pick == children_.size()) {
+        if (heap_.empty()) {
             return result::exhausted;
         }
+        std::pop_heap(
+            heap_.begin(), heap_.end(),
+            [this](size_t lhs, size_t rhs) { return better(rhs, lhs); });
+        const size_t pick = heap_.back();
+        heap_.pop_back();
 
         state & s = states_[pick];
         const size_t child_step_index = s.next;
@@ -177,6 +169,12 @@ public:
 
         s.progress = progress_next;
         s.next++;
+        if (eligible(pick)) {
+            heap_.push_back(pick);
+            std::push_heap(
+                heap_.begin(), heap_.end(),
+                [this](size_t lhs, size_t rhs) { return better(rhs, lhs); });
+        }
         out = { pick, child_step_index, st };
         selected_.push_back(out);
         return result::selected;
@@ -204,15 +202,46 @@ public:
         return selected_;
     }
 
+    uint64_t comparison_count() const {
+        return comparisons_;
+    }
+
 private:
     struct state {
         size_t  next = 0;
         int64_t progress = 0;
     };
 
+    bool eligible(size_t index) const {
+        return index < children_.size() &&
+               children_[index].terminal_progress > 0 &&
+               states_[index].next < children_[index].steps.size();
+    }
+
+    bool better(size_t lhs, size_t rhs) const {
+        comparisons_++;
+        const auto & lchild = children_[lhs];
+        const auto & rchild = children_[rhs];
+        const uint64_t ln = states_[lhs].progress > 0
+            ? uint64_t(states_[lhs].progress) : 0;
+        const uint64_t rn = states_[rhs].progress > 0
+            ? uint64_t(states_[rhs].progress) : 0;
+        const uint64_t ld = uint64_t(lchild.terminal_progress);
+        const uint64_t rd = uint64_t(rchild.terminal_progress);
+        if (fraction_less(ln, ld, rn, rd)) {
+            return true;
+        }
+        if (fraction_less(rn, rd, ln, ld)) {
+            return false;
+        }
+        return lhs < rhs;
+    }
+
     std::vector<child> children_;
     std::vector<state> states_;
     std::vector<selection> selected_;
+    std::vector<size_t> heap_;
+    mutable uint64_t comparisons_ = 0;
     bool valid_ = true;
 };
 

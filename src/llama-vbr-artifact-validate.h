@@ -124,6 +124,9 @@ public:
     const std::vector<vbr_import_schedule_unit> & units() const noexcept {
         return units_;
     }
+    const vbr_import_destination_projection & destination() const noexcept {
+        return destination_;
+    }
 
 private:
     vbr_import_schedule_status status_ =
@@ -137,6 +140,7 @@ private:
     uint64_t source_payload_bytes_ = 0;
     uint64_t target_mapped_bytes_ = 0;
     std::vector<vbr_import_schedule_unit> units_;
+    vbr_import_destination_projection destination_;
 
     friend bool vbr_quote_import_schedule(
         const vbr_target_validation_snapshot &,
@@ -146,6 +150,7 @@ private:
         const vbr_import_schedule_quote &,
         const vbr_target_validation_snapshot &,
         const vbr_artifact_package_view &) noexcept;
+    friend class vbr_live_capture_adapter;
 };
 
 struct vbr_import_identity {

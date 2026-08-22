@@ -960,6 +960,136 @@ public:
         return true;
     }
 
+    static bool negotiate_import_destination(
+            const std::vector<llama_memory_tree_child> & tree,
+            const vbr_artifact_package_view & package,
+            vbr_import_schedule_quote & quote) noexcept {
+        quote.destination_ = {};
+        try {
+            struct child_state {
+                llama_kv_cache * cache = nullptr;
+                vbr_import_destination_child input;
+                llama_kv_cache::vbr_import_destination_pricing pricing;
+                std::vector<llama_memory_vbr_physical_growth> physical;
+            };
+            std::vector<child_state> children;
+            for (const auto & tree_child : tree) {
+                if (!tree_child.attention) {
+                    continue;
+                }
+                if (tree_child.child_id >=
+                        package.manifest().controller_policy.size()) {
+                    return false;
+                }
+                const uint64_t wm = package.manifest().controller_policy[
+                    tree_child.child_id].wm_cells;
+                if (wm == 0 || wm > UINT32_MAX) {
+                    return false;
+                }
+                child_state state;
+                state.cache = tree_child.attention;
+                if (!state.cache->vbr_import_destination_input(
+                        uint32_t(wm), state.input) ||
+                    !state.cache->vbr_import_destination_pricing_begin(
+                        state.input.initial_types, uint32_t(wm),
+                        state.pricing)) {
+                    return false;
+                }
+                state.physical.reserve(state.pricing.devices.size());
+                children.push_back(std::move(state));
+            }
+            if (children.empty()) {
+                return false;
+            }
+
+            struct measure_context {
+                std::vector<child_state> * children = nullptr;
+                llama_memory_vbr_preflight_tree tree;
+            } context { &children, {} };
+            const auto measure = [](
+                    void * opaque,
+                    const std::vector<std::vector<ggml_type>> & types,
+                    const llama_vbr_policy::selection * selected,
+                    vbr_import_destination_evidence & evidence) noexcept {
+                try {
+                    auto * context = static_cast<measure_context *>(
+                        opaque);
+                    if (!context || !context->children ||
+                        types.size() != context->children->size()) {
+                        return false;
+                    }
+                    if (!context->tree.ready()) {
+                        if (!context->tree.reset(
+                                context->children->size())) {
+                            return false;
+                        }
+                        for (size_t i = 0; i <
+                                context->children->size(); ++i) {
+                            auto & state = (*context->children)[i];
+                            const auto child = state.cache->
+                                vbr_import_destination_preflight(
+                                    state.pricing, &state.physical);
+                            if (!child.active || !context->tree.set_leaf(
+                                    i, child, state.physical)) {
+                                return false;
+                            }
+                        }
+                        if (!context->tree.build()) {
+                            return false;
+                        }
+                    } else if (selected) {
+                        if (selected->child_index >=
+                                context->children->size()) {
+                            return false;
+                        }
+                        auto & state = (*context->children)[
+                            selected->child_index];
+                        if (!state.cache->vbr_import_destination_pricing_apply(
+                                selected->value, state.pricing)) {
+                            return false;
+                        }
+                        const auto child = state.cache->
+                            vbr_import_destination_preflight(
+                                state.pricing, &state.physical);
+                        if (!child.active || !context->tree.replace_leaf(
+                                selected->child_index,
+                                child, state.physical)) {
+                            return false;
+                        }
+                    }
+                    const auto & aggregate = context->tree.preflight();
+                    evidence.active = aggregate.active;
+                    evidence.fits = aggregate.fits;
+                    evidence.pools = aggregate.pools;
+                    evidence.logical_bytes_needed = aggregate.bytes_needed;
+                    evidence.logical_bytes_available =
+                        aggregate.bytes_available;
+                    evidence.physical_growth_needed =
+                        aggregate.physical_growth_needed;
+                    evidence.physical_growth_available =
+                        aggregate.physical_growth_available;
+                    evidence.max_deficit = aggregate.max_deficit;
+                    return true;
+                } catch (...) {
+                    return false;
+                }
+            };
+            std::vector<vbr_import_destination_child> inputs;
+            inputs.reserve(children.size());
+            for (const auto & child : children) {
+                inputs.push_back(child.input);
+            }
+            quote.destination_ = vbr_select_import_destination(
+                inputs, &context, measure);
+            return quote.destination_.feasible() ||
+                quote.destination_.status ==
+                    vbr_import_destination_status::exhausted;
+        } catch (...) {
+            quote.destination_ = {};
+            return false;
+        }
+    }
+
     static bool capture_metadata(
             llama_kv_cache & cache,
             uint32_t child_id,
@@ -2616,6 +2746,12 @@ static bool import_target_snapshot_core(
                 ? schedule_quote : &local_schedule;
             if (!vbr_quote_import_schedule(output, package, *destination)) {
                 output = {};
+                return false;
+            }
+            if (!vbr_live_capture_adapter::negotiate_import_destination(
+                    tree, package, *destination)) {
+                output = {};
+                *destination = {};
                 return false;
             }
             negotiated = destination;

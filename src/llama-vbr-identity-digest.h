@@ -46,6 +46,21 @@ inline std::array<uint8_t, 32> vbr_type_vector_digest(
     return vbr_type_vector_digest(types.data(), types.size());
 }
 
+inline std::array<uint8_t, 32> vbr_type_tree_digest(
+        const std::vector<std::array<uint8_t, 32>> & children,
+        uint32_t recipe_version) {
+    llama_sha256_writer writer;
+    static constexpr char domain_label[] =
+        "buun.vbr.downward/tree-policy";
+    writer.string(domain_label, sizeof(domain_label) - 1);
+    writer.u32(recipe_version);
+    writer.u64(children.size());
+    for (const auto & digest : children) {
+        writer.bytes(digest.data(), digest.size());
+    }
+    return writer.finish();
+}
+
 inline std::array<uint8_t, 32> vbr_identity_policy_digest(
         const vbr_checkpoint_frontier_fields & frontier,
         const std::vector<vbr_identity_policy_digest_row> & policy) {
