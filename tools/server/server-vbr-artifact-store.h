@@ -331,6 +331,8 @@ struct server_vbr_artifact_import_output {
         vbr_manifest_validation_status::internal_error;
     vbr_adopt_stage_status stage_status =
         vbr_adopt_stage_status::internal_error;
+    // Route/API compatibility name; reports the shared transform-resource
+    // reservation for either downward or supported upward reconstruction.
     vbr_downward_reserve_status downward_reserve_status =
         vbr_downward_reserve_status::not_attempted;
     vbr_adopt_status adopt_status = vbr_adopt_status::internal_error;

@@ -4350,7 +4350,8 @@ static void test_server_import_route_classification() {
     for (const auto decision : {
             vbr_import_decision::native_import,
             vbr_import_decision::live_rebased,
-            vbr_import_decision::downward_rebase }) {
+            vbr_import_decision::downward_rebase,
+            vbr_import_decision::upward_reconstruct }) {
         CHECK(server_vbr_artifact_import_validation_disposition(
                   vbr_manifest_validation_status::validated,
                   decision) == status::ok);

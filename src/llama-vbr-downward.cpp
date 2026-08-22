@@ -510,6 +510,12 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
         }
         std::vector<projected> projected_rows;
         projected_rows.reserve(workspaces.size() + stashes.size());
+        struct workspace_reservation {
+            const vbr_downward_workspace_endpoint * endpoint = nullptr;
+            llama_vbr_transaction::workspace_request request;
+        };
+        std::vector<workspace_reservation> workspace_reservations;
+        workspace_reservations.reserve(workspaces.size());
         const auto duplicate_key = [&](const endpoint_key & key) {
             return std::any_of(projected_rows.begin(), projected_rows.end(),
                 [&](const projected & row) { return row.key == key; });
@@ -548,6 +554,7 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
                 llama_cache_acct_category::codec_workspace, workspace.domain };
             uint64_t now = 0;
             uint64_t endpoint = 0;
+            llama_vbr_transaction::workspace_request endpoint_request;
             const bool ok = llama_vbr_transaction::workspace_endpoint(
                 workspace.requests,
                 [&](const llama_vbr_transaction::workspace_request & request,
@@ -562,12 +569,13 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
                     current = c;
                     reserved = r;
                     return true;
-                }, now, endpoint);
+                }, now, endpoint, &endpoint_request);
             if (!ok || !project_row(key, workspace.attribution, now, endpoint,
                     out.workspace_growth)) {
                 out.status = vbr_downward_reserve_status::projection_unavailable;
                 return out;
             }
+            workspace_reservations.push_back({ &workspace, endpoint_request });
         }
 
         for (const auto & stash : stashes) {
@@ -643,13 +651,14 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
             }
         }
 
-        for (const auto & workspace : workspaces) {
-            for (const auto & request : workspace.requests) {
-                if (!workspace.iface->kv_transcode_workspace_reserve(
-                        workspace.backend, request.n_cells, request.ne0, request.stash_rows)) {
-                    out.status = vbr_downward_reserve_status::workspace_reserve_failed;
-                    return out;
-                }
+        for (const auto & reservation : workspace_reservations) {
+            const auto & workspace = *reservation.endpoint;
+            const auto & request = reservation.request;
+            if (!workspace.iface->kv_transcode_workspace_reserve(
+                    workspace.backend, request.n_cells, request.ne0,
+                    request.stash_rows)) {
+                out.status = vbr_downward_reserve_status::workspace_reserve_failed;
+                return out;
             }
         }
         for (const auto & stash : stashes) {

@@ -5,6 +5,7 @@
 #include "llama-vbr-artifact-catalog.h"
 #include "llama-vbr-operation.h"
 #include "llama-vbr-downward.h"
+#include "llama-vbr-upward.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@ enum class vbr_import_decision : uint8_t {
     native_import = 0,
     live_rebased,
     downward_rebase,
+    upward_reconstruct,
     rebuild,
     cold,
     reject,
@@ -57,7 +59,7 @@ enum class vbr_manifest_validation_status : uint8_t {
     _count,
 };
 
-static_assert(uint8_t(vbr_import_decision::_count) == 6);
+static_assert(uint8_t(vbr_import_decision::_count) == 7);
 static_assert(uint8_t(vbr_manifest_validation_status::_count) == 27);
 
 const char * vbr_import_decision_name(vbr_import_decision decision) noexcept;
@@ -80,6 +82,14 @@ enum class vbr_import_schedule_status : uint8_t {
     _count,
 };
 static_assert(uint8_t(vbr_import_schedule_status::_count) == 6);
+
+enum class vbr_import_transform_kind : uint8_t {
+    none = 0,
+    downward,
+    upward_same_domain,
+    _count,
+};
+static_assert(uint8_t(vbr_import_transform_kind::_count) == 3);
 
 const char * vbr_import_schedule_status_name(
     vbr_import_schedule_status status) noexcept;
@@ -227,11 +237,22 @@ struct vbr_target_unit_snapshot {
     uint64_t downward_mapped_bytes = 0;
     uint64_t downward_transfer_bytes = 0;
     uint64_t downward_codec_workspace_bytes = 0;
-    // F4.2b proof inputs.  The recipe is the unique recipe-v1 chain resolved
-    // against this exact unit; the projection digests are supplied by the one
-    // tree-policy simulator and checked as a complete-tree value below.
+    // F4.2 proof inputs. Each transform direction carries its one canonical
+    // recipe and build identity; both bind the controller-owned selected tree.
     vbr_downward_recipe downward_recipe;
     int32_t downward_meansub_model_id = -1;
+    bool upward_supported = false;
+    int32_t upward_type = -1;
+    vbr_repr_domain upward_domain = vbr_repr_domain::full;
+    uint32_t upward_recipe_id = 0;
+    uint32_t upward_recipe_version = 0;
+    std::array<uint8_t, 32> upward_build_identity_digest = {};
+    uint64_t upward_row_bytes = 0;
+    uint64_t upward_mapped_bytes = 0;
+    uint64_t upward_transfer_bytes = 0;
+    uint64_t upward_codec_workspace_bytes = 0;
+    vbr_upward_recipe upward_recipe;
+    int32_t upward_meansub_model_id = -1;
 };
 
 struct vbr_target_child_snapshot {
@@ -324,7 +345,7 @@ struct vbr_adopt_policy {
         const std::vector<llama_memory_tree_child> & canonical_tree,
         vbr_target_validation_snapshot & output) noexcept;
     using serial_fn = uint64_t (*)(const void * context) noexcept;
-    using downward_digest_fn = bool (*)(
+    using transform_digest_fn = bool (*)(
         const void * context, std::array<uint8_t, 32> & output) noexcept;
     using target_recheck_fn = bool (*)(
         const void * context,
@@ -342,6 +363,7 @@ struct vbr_adopt_policy {
     bool allow_native = true;
     bool allow_live_rebased = true;
     bool allow_downward = true;
+    bool allow_upward = true;
     bool allow_rebuild = true;
     bool allow_cold = true;
     // Compatibility spelling: false means a fresh target runtime instance
@@ -354,7 +376,7 @@ struct vbr_adopt_policy {
     std::vector<llama_vbr_artifact_domain_binding> domain_bindings;
     const llama_cache_acct_snapshot * accounting_snapshot = nullptr;
     const llama_cache_budget_config * budget_config = nullptr;
-    const llama_cache_budget_plan * downward_budget_plan = nullptr;
+    const llama_cache_budget_plan * transform_budget_plan = nullptr;
     const vbr_downward_policy_projection * downward_projection = nullptr;
     const vbr_import_schedule_quote * schedule_quote = nullptr;
     const void * context = nullptr;
@@ -363,7 +385,7 @@ struct vbr_adopt_policy {
     target_recheck_fn recheck_target_empty = nullptr;
     serial_fn read_accounting_serial = nullptr;
     serial_fn read_policy_epoch = nullptr;
-    downward_digest_fn read_downward_tree_digest = nullptr;
+    transform_digest_fn read_transform_tree_digest = nullptr;
 };
 
 struct vbr_child_empty_fingerprint {
@@ -436,11 +458,13 @@ struct vbr_validated_child_plan {
     uint32_t transcode_recipe_version = 0;
     std::array<uint8_t, 32> transcode_build_identity_digest = {};
     vbr_downward_recipe transcode_recipe;
+    vbr_upward_recipe upward_recipe;
     std::array<uint8_t, 32> transcode_policy_digest = {};
     std::array<uint8_t, 32> transcode_tree_digest = {};
     int32_t transcode_meansub_model_id = -1;
     uint64_t target_controller_cursor = 0;
-    bool downward = false;
+    vbr_import_transform_kind transform_kind =
+        vbr_import_transform_kind::none;
     vbr_validated_stash_action stash_action =
         vbr_validated_stash_action::none_at_source;
     uint64_t target_row_bytes = 0;
@@ -563,8 +587,8 @@ private:
     vbr_adopt_policy::target_recheck_fn recheck_target_empty_ = nullptr;
     vbr_adopt_policy::serial_fn read_accounting_serial_ = nullptr;
     vbr_adopt_policy::serial_fn read_policy_epoch_ = nullptr;
-    vbr_adopt_policy::downward_digest_fn
-        read_downward_tree_digest_ = nullptr;
+    vbr_adopt_policy::transform_digest_fn
+        read_transform_tree_digest_ = nullptr;
 
     friend struct vbr_manifest_validation_result;
     friend vbr_manifest_validation_result vbr_validate_unit_manifest(

@@ -70,10 +70,15 @@ bool workspace_endpoint(
         const std::vector<workspace_request> & requests,
         Project project,
         uint64_t & physical_now,
-        uint64_t & physical_if_reserved) {
+        uint64_t & physical_if_reserved,
+        workspace_request * endpoint_request = nullptr) {
     physical_now = 0;
     physical_if_reserved = 0;
+    if (endpoint_request) {
+        *endpoint_request = {};
+    }
     bool have = false;
+    bool selected = false;
     for (const auto & request : requests) {
         uint64_t now = 0;
         uint64_t projected = 0;
@@ -85,6 +90,11 @@ bool workspace_endpoint(
             have = true;
         } else if (physical_now != now) {
             return false;
+        }
+        if (endpoint_request != nullptr &&
+            (!selected || physical_if_reserved < projected)) {
+            *endpoint_request = request;
+            selected = true;
         }
         physical_if_reserved = std::max(physical_if_reserved, projected);
     }

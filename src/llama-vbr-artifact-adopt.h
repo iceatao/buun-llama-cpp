@@ -39,6 +39,8 @@ enum class vbr_adopt_status : uint8_t {
     downward_recipe_invalid,
     downward_transform_failed,
     downward_stash_unavailable,
+    upward_recipe_invalid,
+    upward_transform_failed,
     target_drift,
     operation_unavailable,
     recovery_unavailable,
@@ -57,7 +59,7 @@ enum class vbr_adopt_status : uint8_t {
     internal_error,
     _count,
 };
-static_assert(uint8_t(vbr_adopt_status::_count) == 23);
+static_assert(uint8_t(vbr_adopt_status::_count) == 25);
 
 enum class vbr_downward_adopt_subphase : uint8_t {
     none = 0,
@@ -172,6 +174,10 @@ class vbr_adopt_test_seam {
         uint32_t, const vbr_validated_child_plan &) noexcept {
         return true;
     }
+    virtual bool session_initialize_upward_backing(
+        uint32_t, const vbr_validated_child_plan &) noexcept {
+        return true;
+    }
     virtual vbr_downward_transform_status session_transform_downward(
         uint32_t, const vbr_validated_child_plan &, bool,
         uint32_t, bool, uint32_t & stash_valid,
@@ -181,6 +187,14 @@ class vbr_adopt_test_seam {
         return vbr_downward_transform_status::transformed;
     }
     virtual bool session_synchronize_downward(
+        uint32_t, const std::vector<const vbr_validated_child_plan *> &) noexcept {
+        return true;
+    }
+    virtual bool session_transform_upward(
+        uint32_t, const vbr_validated_child_plan &) noexcept {
+        return true;
+    }
+    virtual bool session_synchronize_upward(
         uint32_t, const std::vector<const vbr_validated_child_plan *> &) noexcept {
         return true;
     }

@@ -7,6 +7,7 @@
 #include "llama-vbr-generation.h"
 #include "llama-vbr-hard-seal.h"
 #include "llama-vbr-downward.h"
+#include "llama-vbr-upward.h"
 #include "llama-vbr-policy.h"
 #include "llama-vbr-transaction.h"
 
@@ -533,7 +534,7 @@ private:
         vbr_explicit_generation_failure * failure = nullptr) const noexcept;
     bool vbr_capture_policy_snapshot(
         vbr_capture_stability_token & output) const noexcept;
-    bool vbr_downward_reserve_import(
+    bool vbr_import_transform_reserve(
         const std::vector<const vbr_validated_child_plan *> & plans,
         llama_cache_acct_ledger & ledger,
         const llama_cache_budget_config & budget,
@@ -600,6 +601,8 @@ private:
         bool stashless,
         uint32_t & stash_valid,
         uint32_t & edge_reached) noexcept;
+    bool vbr_upward_transform_import(
+        const vbr_validated_child_plan & plan) noexcept;
     bool vbr_import_source_alias(
         const ggml_tensor & destination,
         ggml_type source_type,
@@ -706,7 +709,7 @@ private:
         // F4.2b persistent workspace/stash receipts have exactly the owning
         // pool/side-backend lifetime.  The ledger remains the charge-once
         // authority; this holder owns only the committed C references.
-        std::unique_ptr<vbr_downward_resource_receipts> downward_receipts;
+        std::unique_ptr<vbr_downward_resource_receipts> transform_receipts;
     };
     // A share-linked cache aliases another context's K/V tensors but executes attention on
     // this context's compute backends. Since fattn scratch is backend-context-owned, each

@@ -191,9 +191,10 @@ enum class vbr_import_target_snapshot_status : uint8_t {
 };
 static_assert(uint8_t(vbr_import_target_snapshot_status::_count) == 3);
 
-// Typed reporting seam. Unlike the legacy actionable-only boolean above,
-// report-only upward/mixed schedules return their immutable quote without
-// implying that validation, staging, or adoption may proceed.
+// Typed reporting seam. The first upward materializer admits only the
+// canonical full-domain T8->F16 recipe; unsupported same-domain, cross-domain,
+// and mixed schedules return their immutable quote without implying that
+// validation, staging, or adoption may proceed.
 vbr_import_target_snapshot_status
 vbr_explicit_import_target_schedule_snapshot(
     llama_memory_i & memory,
@@ -207,10 +208,10 @@ vbr_explicit_import_target_schedule_snapshot(
     bool & downward_required,
     vbr_import_schedule_quote & schedule_quote) noexcept;
 
-// Final downward barrier. Reuses the immutable validated schedule capability
-// and recomputes only live target/projection evidence; it does not rematerialize
-// or rehash the package.
-bool vbr_explicit_import_downward_projection_recheck(
+// Final transform-currency barrier shared by downward and the supported
+// same-domain upward reconstruction path. The authenticated schedule remains
+// the sole representation/destination authority.
+bool vbr_explicit_import_transform_projection_recheck(
     llama_memory_i & memory,
     llama_seq_id destination,
     const vbr_artifact_package_view & package,
@@ -221,7 +222,7 @@ bool vbr_explicit_import_target_recheck(
     llama_memory_i & memory,
     llama_seq_id destination,
     const vbr_target_empty_fingerprint & expected) noexcept;
-bool vbr_explicit_import_reserve_downward(
+bool vbr_explicit_import_reserve_transform(
     llama_memory_i & memory,
     const std::vector<vbr_validated_child_plan> & plans,
     llama_cache_acct_ledger & ledger,

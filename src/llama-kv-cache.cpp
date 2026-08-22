@@ -30,6 +30,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Dynamic VBR (S3): degrade tier ladder + the measured price order (generated table).
@@ -5193,7 +5194,7 @@ bool llama_kv_cache::vbr_stash_reserve(
     return true;
 }
 
-bool llama_kv_cache::vbr_downward_reserve_import(
+bool llama_kv_cache::vbr_import_transform_reserve(
         const std::vector<const vbr_validated_child_plan *> & plans,
         llama_cache_acct_ledger & ledger,
         const llama_cache_budget_config & budget,
@@ -5205,89 +5206,130 @@ bool llama_kv_cache::vbr_downward_reserve_import(
         std::vector<vbr_stash_request> requests;
         std::vector<uint64_t> unit_ids;
     };
+    struct pool_projection {
+        vbr_pool * pool = nullptr;
+        vbr_downward_workspace_endpoint workspace;
+        stash_context stash;
+        llama_cache_acct_resource_domain domain;
+        bool have_domain = false;
+    };
     try {
         if (plans.empty()) {
             output.status = vbr_downward_reserve_status::projection_unavailable;
             return false;
         }
+        std::unordered_map<const void *, size_t> pool_indices;
+        pool_indices.reserve(vbr_pools_.size());
+        std::vector<pool_projection> projections(vbr_pools_.size());
+        for (size_t i = 0; i < vbr_pools_.size(); ++i) {
+            auto & pool = vbr_pools_[i];
+            if (!pool_indices.emplace(&pool, i).second) {
+                output.status =
+                    vbr_downward_reserve_status::projection_unavailable;
+                return false;
+            }
+            auto & projection = projections[i];
+            projection.pool = &pool;
+            projection.workspace.owner = &pool;
+            projection.workspace.iface = pool.be;
+            projection.workspace.backend = pool.backend;
+            projection.workspace.device = pool.device;
+            projection.stash.cache = this;
+            projection.stash.pool = &pool;
+        }
+        output.stashless_units.reserve(plans.size());
         output.status = vbr_downward_reserve_status::reserved;
-        for (auto & pool : vbr_pools_) {
-            std::vector<vbr_downward_workspace_endpoint> workspaces;
-            std::vector<vbr_downward_stash_endpoint> stashes;
-            stash_context stash_projection;
-            stash_projection.cache = this;
-            stash_projection.pool = &pool;
-            vbr_downward_workspace_endpoint workspace;
-            workspace.owner = &pool;
-            workspace.iface = pool.be;
-            workspace.backend = pool.backend;
-            workspace.device = pool.device;
-            llama_cache_acct_resource_domain pool_domain;
-            bool have_domain = false;
-
-            for (const auto * plan : plans) {
-                if (!plan || !plan->downward) {
-                    continue;
-                }
-                const size_t ikv = plan->logical_unit_id/2;
-                const bool is_v = (plan->logical_unit_id & 1u) != 0;
-                if (ikv >= layers.size()) {
+        bool have_transform = false;
+        for (const auto * plan : plans) {
+            if (!plan || plan->transform_kind ==
+                    vbr_import_transform_kind::none) {
+                continue;
+            }
+            if (plan->transform_kind !=
+                    vbr_import_transform_kind::downward &&
+                plan->transform_kind !=
+                    vbr_import_transform_kind::upward_same_domain) {
+                output.status =
+                    vbr_downward_reserve_status::projection_unavailable;
+                return false;
+            }
+            have_transform = true;
+            const size_t ikv = plan->logical_unit_id/2;
+            const bool is_v = (plan->logical_unit_id & 1u) != 0;
+            if (ikv >= layers.size()) {
+                output.status =
+                    vbr_downward_reserve_status::projection_unavailable;
+                return false;
+            }
+            const auto & units = vbr_units_of(ikv, is_v);
+            if (units.size() != plan->shards.size()) {
+                output.status =
+                    vbr_downward_reserve_status::projection_unavailable;
+                return false;
+            }
+            for (const auto & shard : plan->shards) {
+                const auto pool_index = pool_indices.find(
+                    shard.target_pool_cookie);
+                if (pool_index == pool_indices.end()) {
                     output.status =
                         vbr_downward_reserve_status::projection_unavailable;
                     return false;
                 }
-                const auto & units = vbr_units_of(ikv, is_v);
-                const auto shard = std::find_if(
-                    plan->shards.begin(), plan->shards.end(),
-                    [&](const vbr_validated_shard_plan & value) {
-                        return value.target_pool_cookie == &pool;
-                    });
-                if (shard == plan->shards.end()) {
-                    continue;
-                }
-                const auto unit = std::find_if(
-                    units.begin(), units.end(),
-                    [&](const auto & value) { return value.first == &pool; });
-                if (unit == units.end() || !unit->second ||
-                    !unit->second->t || pool.be == nullptr ||
+                auto & projection = projections[pool_index->second];
+                auto & pool = *projection.pool;
+                if (shard.shard_index >= units.size() ||
+                    units[shard.shard_index].first != &pool ||
+                    !units[shard.shard_index].second ||
+                    !units[shard.shard_index].second->t ||
+                    pool.be == nullptr ||
                     pool.be->kv_transcode_workspace_memory == nullptr ||
                     pool.be->kv_transcode_workspace_reserve == nullptr) {
                     output.status =
                         vbr_downward_reserve_status::projection_unavailable;
                     return false;
                 }
-                if (!have_domain) {
-                    pool_domain = shard->domain;
-                    workspace.domain = shard->domain;
-                    have_domain = true;
-                } else if (pool_domain != shard->domain) {
+                if (!projection.have_domain) {
+                    projection.domain = shard.domain;
+                    projection.workspace.domain = shard.domain;
+                    projection.have_domain = true;
+                } else if (projection.domain != shard.domain) {
                     output.status =
                         vbr_downward_reserve_status::projection_unavailable;
                     return false;
                 }
                 uint32_t stash_rows = 0;
-                const bool needs_stash =
-                    vbr_downward_recipe_needs_stash(plan->transcode_recipe);
-                if (needs_stash && vbr_stash_rows_ > 0) {
+                if (plan->transform_kind ==
+                        vbr_import_transform_kind::downward &&
+                    vbr_downward_recipe_needs_stash(
+                        plan->transcode_recipe) && vbr_stash_rows_ > 0) {
                     stash_rows = std::min<uint64_t>(
                         vbr_stash_rows_, plan->descriptor.wm_cells);
                 }
-                workspace.requests.push_back({
+                projection.workspace.requests.push_back({
                     int64_t(plan->descriptor.wm_cells),
-                    unit->second->t->ne[0], int64_t(stash_rows),
+                    units[shard.shard_index].second->t->ne[0],
+                    int64_t(stash_rows),
                 });
                 if (stash_rows > 0) {
-                    stash_projection.requests.push_back({
-                        unit->second, stash_rows,
+                    projection.stash.requests.push_back({
+                        units[shard.shard_index].second, stash_rows,
                     });
-                    stash_projection.unit_ids.push_back(
+                    projection.stash.unit_ids.push_back(
                         vbr_downward_unit_key(
                             plan->child_id, plan->logical_unit_id));
                 }
             }
-            if (workspace.requests.empty()) {
+        }
+        if (!have_transform) {
+            output.status =
+                vbr_downward_reserve_status::projection_unavailable;
+            return false;
+        }
+        for (auto & projection : projections) {
+            if (projection.workspace.requests.empty()) {
                 continue;
             }
+            auto & pool = *projection.pool;
             if (pool.backend == nullptr) {
                 pool.backend = pool.be->backend_init(pool.device);
                 if (pool.backend == nullptr) {
@@ -5295,15 +5337,17 @@ bool llama_kv_cache::vbr_downward_reserve_import(
                         vbr_downward_reserve_status::workspace_reserve_failed;
                     return true;
                 }
-                workspace.backend = pool.backend;
+                projection.workspace.backend = pool.backend;
             }
-            workspaces.push_back(std::move(workspace));
-            if (!stash_projection.requests.empty()) {
+            std::vector<vbr_downward_workspace_endpoint> workspaces;
+            std::vector<vbr_downward_stash_endpoint> stashes;
+            workspaces.push_back(std::move(projection.workspace));
+            if (!projection.stash.requests.empty()) {
                 vbr_downward_stash_endpoint endpoint;
                 endpoint.owner = &pool;
-                endpoint.unit_ids = std::move(stash_projection.unit_ids);
-                endpoint.domain = pool_domain;
-                endpoint.context = &stash_projection;
+                endpoint.unit_ids = std::move(projection.stash.unit_ids);
+                endpoint.domain = projection.domain;
+                endpoint.context = &projection.stash;
                 endpoint.memory = [](void * opaque, uint64_t & now,
                                      uint64_t & reserved) {
                     auto & value = *static_cast<stash_context *>(opaque);
@@ -5324,11 +5368,11 @@ bool llama_kv_cache::vbr_downward_reserve_import(
                 };
                 stashes.push_back(std::move(endpoint));
             }
-            if (!pool.downward_receipts) {
-                pool.downward_receipts =
+            if (!pool.transform_receipts) {
+                pool.transform_receipts =
                     std::make_unique<vbr_downward_resource_receipts>(ledger);
             }
-            const auto reserved = pool.downward_receipts->reserve_resources(
+            const auto reserved = pool.transform_receipts->reserve_resources(
                 budget, workspaces, stashes);
             if (reserved.status != vbr_downward_reserve_status::reserved &&
                 reserved.status !=
@@ -5478,6 +5522,13 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
         }
         const bool downward =
             relation == vbr_downward_recipe_status::resolved;
+        vbr_upward_recipe upward_recipe;
+        const bool upward =
+            relation == vbr_downward_recipe_status::upward_forbidden &&
+            vbr_upward_resolve_recipe(
+                source_type, target_type, upward_recipe) ==
+                    vbr_upward_recipe_status::resolved;
+        const bool transformed = downward || upward;
         const auto & units = vbr_units_of(ikv, is_v);
         if (units.empty() || units.size() != output.shards.size()) {
             return false;
@@ -5492,7 +5543,8 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
             const auto * pool = units[i].first;
             const auto * extent = units[i].second;
             if (!pool || !extent || !extent->t || !pool->be ||
-                (downward && !pool->be->kv_transcode_workspace_memory)) {
+                (transformed &&
+                 !pool->be->kv_transcode_workspace_memory)) {
                 return false;
             }
             const uint64_t target_row = ggml_row_size(
@@ -5513,7 +5565,7 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
             }
             mapped += target_bytes;
             transfer += source_bytes;
-            if (downward) {
+            if (transformed) {
                 size_t now = 0;
                 size_t endpoint = 0;
                 if (!pool->be->kv_transcode_workspace_memory(
@@ -5530,28 +5582,47 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
         }
         output.current_type = target_type;
         output.current_domain = vbr_downward_tier_domain(target_type);
-        if (!downward) {
+        if (!transformed) {
             return true;
         }
-        output.downward_supported = true;
-        output.downward_movable = movable;
-        output.controller_floor_type = policy.floor_type;
-        output.downward_type = target_type;
-        output.downward_domain = vbr_downward_tier_domain(target_type);
-        output.downward_recipe_id = VBR_DOWNWARD_RECIPE_ID;
-        output.downward_recipe_version = VBR_DOWNWARD_RECIPE_VERSION;
-        output.downward_recipe = recipe;
-        output.downward_meansub_model_id = hparams.turbo_meansub_id;
-        output.downward_row_bytes = output.shards.front().row_bytes;
-        output.downward_mapped_bytes = mapped;
-        output.downward_transfer_bytes = transfer;
-        output.downward_codec_workspace_bytes = workspace;
-        output.downward_build_identity_digest = vbr_downward_build_identity(
-            recipe, output.downward_meansub_model_id,
+        if (downward) {
+            output.downward_supported = true;
+            output.downward_movable = movable;
+            output.controller_floor_type = policy.floor_type;
+            output.downward_type = target_type;
+            output.downward_domain = vbr_downward_tier_domain(target_type);
+            output.downward_recipe_id = VBR_DOWNWARD_RECIPE_ID;
+            output.downward_recipe_version = VBR_DOWNWARD_RECIPE_VERSION;
+            output.downward_recipe = recipe;
+            output.downward_meansub_model_id = hparams.turbo_meansub_id;
+            output.downward_row_bytes = output.shards.front().row_bytes;
+            output.downward_mapped_bytes = mapped;
+            output.downward_transfer_bytes = transfer;
+            output.downward_codec_workspace_bytes = workspace;
+            output.downward_build_identity_digest = vbr_downward_build_identity(
+                recipe, output.downward_meansub_model_id,
+                output.meansub_digest,
+                projection.child_type_digests[projection_child],
+                projection.tree_digest);
+            return vbr_digest_nonzero(output.downward_build_identity_digest);
+        }
+        output.upward_supported = true;
+        output.upward_type = target_type;
+        output.upward_domain = vbr_downward_tier_domain(target_type);
+        output.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
+        output.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
+        output.upward_recipe = upward_recipe;
+        output.upward_meansub_model_id = hparams.turbo_meansub_id;
+        output.upward_row_bytes = output.shards.front().row_bytes;
+        output.upward_mapped_bytes = mapped;
+        output.upward_transfer_bytes = transfer;
+        output.upward_codec_workspace_bytes = workspace;
+        output.upward_build_identity_digest = vbr_upward_build_identity(
+            upward_recipe, output.upward_meansub_model_id,
             output.meansub_digest,
             projection.child_type_digests[projection_child],
             projection.tree_digest);
-        return vbr_digest_nonzero(output.downward_build_identity_digest);
+        return vbr_digest_nonzero(output.upward_build_identity_digest);
     } catch (...) {
         return false;
     }
@@ -5565,7 +5636,8 @@ vbr_downward_transform_status llama_kv_cache::vbr_downward_transform_import(
     stash_valid = 0;
     edge_reached = UINT32_MAX;
     try {
-        if (!plan.downward || plan.logical_unit_id/2 >= layers.size() ||
+        if (plan.transform_kind != vbr_import_transform_kind::downward ||
+            plan.logical_unit_id/2 >= layers.size() ||
             plan.transcode_recipe.n_edges == 0) {
             return vbr_downward_transform_status::invalid_recipe;
         }
@@ -5578,16 +5650,16 @@ vbr_downward_transform_status llama_kv_cache::vbr_downward_transform_import(
         for (const auto & shard : plan.shards) {
             auto * pool = static_cast<vbr_pool *>(
                 const_cast<void *>(shard.target_pool_cookie));
-            const auto unit = std::find_if(
-                units.begin(), units.end(),
-                [&](const auto & value) { return value.first == pool; });
-            if (unit == units.end() || !pool || !unit->second ||
-                !unit->second->t || !pool->be || !pool->backend ||
+            if (!pool || shard.shard_index >= units.size() ||
+                units[shard.shard_index].first != pool ||
+                !units[shard.shard_index].second ||
+                !units[shard.shard_index].second->t ||
+                !pool->be || !pool->backend ||
                 pool->be->kv_transcode == nullptr ||
                 pool->be->kv_stash_capture == nullptr) {
                 return vbr_downward_transform_status::transform_failed;
             }
-            auto & extent = *unit->second;
+            auto & extent = *units[shard.shard_index].second;
             ggml_tensor source;
             if (!vbr_import_source_alias(
                     *extent.t, plan.transcode_recipe.source_type, source)) {
@@ -5688,6 +5760,79 @@ vbr_downward_transform_status llama_kv_cache::vbr_downward_transform_import(
         return vbr_downward_transform_status::transformed;
     } catch (...) {
         return vbr_downward_transform_status::internal_error;
+    }
+}
+
+bool llama_kv_cache::vbr_upward_transform_import(
+        const vbr_validated_child_plan & plan) noexcept {
+    try {
+        if (plan.transform_kind !=
+                vbr_import_transform_kind::upward_same_domain ||
+            plan.logical_unit_id/2 >= layers.size() ||
+            plan.upward_recipe.n_edges != 1 ||
+            plan.descriptor.current_type !=
+                int32_t(plan.upward_recipe.source_type) ||
+            plan.selected_target_type !=
+                int32_t(plan.upward_recipe.target_type)) {
+            return false;
+        }
+        vbr_upward_recipe resolved;
+        if (vbr_upward_resolve_recipe(
+                plan.upward_recipe.source_type,
+                plan.upward_recipe.target_type, resolved) !=
+                    vbr_upward_recipe_status::resolved ||
+            !(resolved == plan.upward_recipe)) {
+            return false;
+        }
+        const size_t ikv = plan.logical_unit_id/2;
+        const bool is_v = (plan.logical_unit_id & 1u) != 0;
+        const auto & units = vbr_units_of(ikv, is_v);
+        if (units.size() != plan.shards.size()) {
+            return false;
+        }
+        for (const auto & shard : plan.shards) {
+            auto * pool = static_cast<vbr_pool *>(
+                const_cast<void *>(shard.target_pool_cookie));
+            if (!pool || shard.shard_index >= units.size() ||
+                units[shard.shard_index].first != pool ||
+                !units[shard.shard_index].second ||
+                !units[shard.shard_index].second->t ||
+                units[shard.shard_index].second->t->type !=
+                    plan.upward_recipe.target_type ||
+                !pool->be || !pool->backend ||
+                pool->be->kv_transcode == nullptr) {
+                return false;
+            }
+            ggml_tensor source;
+            if (!vbr_import_source_alias(
+                    *units[shard.shard_index].second->t,
+                    plan.upward_recipe.source_type, source)) {
+                return false;
+            }
+        }
+        // Validate the complete shard set before the first asynchronous
+        // submission. After this point the loop is deliberately no-fail;
+        // the caller synchronizes all touched backends before publication.
+        for (const auto & shard : plan.shards) {
+            auto * pool = static_cast<vbr_pool *>(
+                const_cast<void *>(shard.target_pool_cookie));
+            auto * extent = units[shard.shard_index].second;
+            ggml_tensor source = *extent->t;
+            const std::vector<ggml_tensor *> no_views;
+            vbr_set_tensor_type_impl(
+                &source, no_views, plan.upward_recipe.source_type);
+            source.data = extent->t->data;
+            const ggml_vbr_transcode_params params = {
+                &source, plan.upward_recipe.target_type,
+                extent->t->data, pool->buf,
+                int64_t(plan.descriptor.wm_cells), is_v,
+                nullptr, 0, 0,
+            };
+            pool->be->kv_transcode(pool->backend, &params);
+        }
+        return true;
+    } catch (...) {
+        return false;
     }
 }
 

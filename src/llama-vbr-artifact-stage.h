@@ -190,8 +190,8 @@ enum class vbr_adopt_stage_status : uint8_t {
     accounting_unavailable,
     admission_refused,
     ring_unavailable,
-    downward_projection_unavailable,
-    downward_reserve_failed,
+    transform_projection_unavailable,
+    transform_reserve_failed,
     internal_error,
     _count,
 };
@@ -206,7 +206,7 @@ struct vbr_adopt_stage_fault {
 };
 
 struct vbr_adopt_stage_policy {
-    using reserve_downward_fn = bool (*)(
+    using reserve_transform_fn = bool (*)(
         void * context,
         const std::vector<vbr_validated_child_plan> & plans,
         llama_cache_acct_ledger & ledger,
@@ -221,8 +221,8 @@ struct vbr_adopt_stage_policy {
     // Production supplies the store-owned ring. When absent, explicit tests
     // and standalone clients retain the legacy per-stage construction path.
     std::shared_ptr<vbr_h2d_chunk_ring> persistent_ring;
-    void * downward_context = nullptr;
-    reserve_downward_fn reserve_downward = nullptr;
+    void * transform_context = nullptr;
+    reserve_transform_fn reserve_transform = nullptr;
     vbr_adopt_stage_fault fault;
 };
 
@@ -249,8 +249,8 @@ public:
     const std::vector<vbr_staged_read_descriptor> & reads() const noexcept;
     uint64_t ring_capacity_bytes() const noexcept;
     bool claims_ready() const noexcept;
-    const std::vector<uint64_t> & downward_stashless_units() const noexcept;
-    bool downward_resources_ready() const noexcept;
+    const std::vector<uint64_t> & transform_stashless_units() const noexcept;
+    bool transform_resources_ready() const noexcept;
 
 private:
     llama_cache_transaction_result adoption_materialize_claims() noexcept;
@@ -275,7 +275,7 @@ private:
 struct vbr_adopt_stage_result {
     vbr_adopt_stage_status status =
         vbr_adopt_stage_status::internal_error;
-    vbr_downward_reserve_status downward_status =
+    vbr_downward_reserve_status transform_status =
         vbr_downward_reserve_status::not_attempted;
     std::unique_ptr<vbr_validated_manifest> manifest;
     std::unique_ptr<vbr_staged_payloads> staged;

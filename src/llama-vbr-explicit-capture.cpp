@@ -9,6 +9,7 @@
 #include "llama-sha256.h"
 #include "llama-vbr-identity-digest.h"
 #include "llama-vbr-operation.h"
+#include "llama-vbr-upward.h"
 #include "turbo-rotation-data.h"
 
 #include "ggml-turbo-meansub.h"
@@ -22,6 +23,7 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace {
@@ -834,13 +836,13 @@ public:
                empty(cache);
     }
 
-    static bool reserve_import_downward(
+    static bool reserve_import_transform(
             llama_kv_cache & cache,
             const std::vector<const vbr_validated_child_plan *> & plans,
             llama_cache_acct_ledger & ledger,
             const llama_cache_budget_config & budget,
             vbr_downward_stage_reservation & output) noexcept {
-        return cache.vbr_downward_reserve_import(
+        return cache.vbr_import_transform_reserve(
             plans, ledger, budget, output);
     }
 
@@ -2994,6 +2996,26 @@ uint64_t vbr_explicit_import_policy_epoch(
     }
 }
 
+static bool import_upward_schedule_supported(
+        const vbr_import_schedule_quote & schedule) noexcept {
+    if (schedule.status() !=
+            vbr_import_schedule_status::upward_same_domain) {
+        return false;
+    }
+    return std::all_of(
+        schedule.units().begin(), schedule.units().end(),
+        [](const vbr_import_schedule_unit & unit) {
+            if (unit.source_type == unit.target_type) {
+                return unit.source_domain == unit.target_domain;
+            }
+            vbr_upward_recipe recipe;
+            return vbr_upward_resolve_recipe(
+                       static_cast<ggml_type>(unit.source_type),
+                       static_cast<ggml_type>(unit.target_type), recipe) ==
+                vbr_upward_recipe_status::resolved;
+        });
+}
+
 static bool import_target_snapshot_core(
         llama_memory_i & memory,
         llama_seq_id destination,
@@ -3002,19 +3024,23 @@ static bool import_target_snapshot_core(
         bool previously_observed,
         uint64_t accounting_serial,
         vbr_target_validation_snapshot & output,
-        vbr_downward_policy_projection * downward_projection,
+        vbr_downward_policy_projection * transform_projection,
         bool * downward_required,
         vbr_import_schedule_quote * schedule_quote,
-        const vbr_import_schedule_quote * authenticated_schedule) noexcept {
+        const vbr_import_schedule_quote * authenticated_schedule,
+        std::array<uint8_t, 32> * transform_tree_digest = nullptr) noexcept {
     output = {};
-    if (downward_projection) {
-        *downward_projection = {};
+    if (transform_projection) {
+        *transform_projection = {};
     }
     if (downward_required) {
         *downward_required = false;
     }
     if (schedule_quote) {
         *schedule_quote = {};
+    }
+    if (transform_tree_digest) {
+        *transform_tree_digest = {};
     }
     try {
         std::vector<llama_memory_tree_child> tree;
@@ -3140,33 +3166,45 @@ static bool import_target_snapshot_core(
             negotiated = destination;
         }
         const auto schedule_status = negotiated->status();
+        const bool upward_actionable =
+            (schedule_quote != nullptr || authenticated_schedule != nullptr) &&
+            import_upward_schedule_supported(*negotiated);
         if (schedule_status != vbr_import_schedule_status::exact &&
-            schedule_status != vbr_import_schedule_status::downward) {
+            schedule_status != vbr_import_schedule_status::downward &&
+            !upward_actionable) {
             // A caller asking for the quote can report the unsupported
             // schedule without pretending it was a downward-bind failure.
             return schedule_quote != nullptr;
         }
-        if (schedule_status == vbr_import_schedule_status::downward) {
-            if (downward_projection == nullptr) {
+        if (schedule_status == vbr_import_schedule_status::downward ||
+            upward_actionable) {
+            if (transform_projection == nullptr) {
                 output = {};
                 if (schedule_quote) {
                     *schedule_quote = {};
                 }
                 return false;
             }
-            *downward_projection = std::move(selected_projection);
-            if (downward_required) {
+            *transform_projection = std::move(selected_projection);
+            if (transform_tree_digest) {
+                *transform_tree_digest = transform_projection->tree_digest;
+            }
+            if (downward_required &&
+                schedule_status == vbr_import_schedule_status::downward) {
                 *downward_required = true;
             }
         }
         return true;
     } catch (...) {
         output = {};
-        if (downward_projection) {
-            *downward_projection = {};
+        if (transform_projection) {
+            *transform_projection = {};
         }
         if (schedule_quote) {
             *schedule_quote = {};
+        }
+        if (transform_tree_digest) {
+            *transform_tree_digest = {};
         }
         return false;
     }
@@ -3200,11 +3238,16 @@ vbr_explicit_import_target_schedule_snapshot(
         vbr_downward_policy_projection & downward_projection,
         bool & downward_required,
         vbr_import_schedule_quote & schedule_quote) noexcept {
+    downward_projection = {};
+    vbr_downward_policy_projection transform_projection;
     if (!import_target_snapshot_core(
             memory, destination, package, bindings, previously_observed,
-            accounting_serial, output, &downward_projection,
+            accounting_serial, output, &transform_projection,
             &downward_required, &schedule_quote, nullptr)) {
         return vbr_import_target_snapshot_status::unavailable;
+    }
+    if (downward_required) {
+        downward_projection = std::move(transform_projection);
     }
     if (!schedule_quote.destination().feasible()) {
         return vbr_import_target_snapshot_status::unavailable;
@@ -3214,6 +3257,9 @@ vbr_explicit_import_target_schedule_snapshot(
         case vbr_import_schedule_status::downward:
             return vbr_import_target_snapshot_status::actionable;
         case vbr_import_schedule_status::upward_same_domain:
+            return import_upward_schedule_supported(schedule_quote)
+                ? vbr_import_target_snapshot_status::actionable
+                : vbr_import_target_snapshot_status::report_only;
         case vbr_import_schedule_status::upward_cross_domain:
         case vbr_import_schedule_status::mixed_direction_unsupported:
             return vbr_import_target_snapshot_status::report_only;
@@ -3224,7 +3270,7 @@ vbr_explicit_import_target_schedule_snapshot(
     return vbr_import_target_snapshot_status::unavailable;
 }
 
-bool vbr_explicit_import_downward_projection_recheck(
+bool vbr_explicit_import_transform_projection_recheck(
         llama_memory_i & memory,
         llama_seq_id destination,
         const vbr_artifact_package_view & package,
@@ -3232,6 +3278,11 @@ bool vbr_explicit_import_downward_projection_recheck(
         const vbr_import_schedule_quote & authenticated_schedule,
         std::array<uint8_t, 32> & tree_digest) noexcept {
     tree_digest = {};
+    if (authenticated_schedule.status() !=
+            vbr_import_schedule_status::downward &&
+        !import_upward_schedule_supported(authenticated_schedule)) {
+        return false;
+    }
     vbr_target_validation_snapshot snapshot;
     vbr_downward_policy_projection projection;
     bool downward = false;
@@ -3239,12 +3290,14 @@ bool vbr_explicit_import_downward_projection_recheck(
             memory, destination, package, bindings, false,
             authenticated_schedule.accounting_serial(), snapshot,
             &projection, &downward,
-            nullptr, &authenticated_schedule) || !downward ||
+            nullptr, &authenticated_schedule, &tree_digest) ||
+        (authenticated_schedule.status() ==
+             vbr_import_schedule_status::downward) != downward ||
         projection.status != vbr_downward_policy_status::coherent) {
+        tree_digest = {};
         return false;
     }
-    tree_digest = projection.tree_digest;
-    return std::any_of(
+    return tree_digest == projection.tree_digest && std::any_of(
         tree_digest.begin(), tree_digest.end(),
         [](uint8_t byte) { return byte != 0; });
 }
@@ -3296,7 +3349,7 @@ bool vbr_explicit_import_target_recheck(
     }
 }
 
-bool vbr_explicit_import_reserve_downward(
+bool vbr_explicit_import_reserve_transform(
         llama_memory_i & memory,
         const std::vector<vbr_validated_child_plan> & plans,
         llama_cache_acct_ledger & ledger,
@@ -3308,24 +3361,60 @@ bool vbr_explicit_import_reserve_downward(
         if (!llama_memory_tree_collect(&memory, tree)) {
             return false;
         }
+        struct grouped_plan {
+            const vbr_validated_child_plan * plan = nullptr;
+            size_t next = SIZE_MAX;
+        };
+        std::unordered_map<uint32_t, size_t> child_indices;
+        child_indices.reserve(tree.size());
+        std::vector<size_t> heads(tree.size(), SIZE_MAX);
+        std::vector<size_t> tails(tree.size(), SIZE_MAX);
+        for (size_t i = 0; i < tree.size(); ++i) {
+            if (tree[i].attention != nullptr &&
+                !child_indices.emplace(tree[i].child_id, i).second) {
+                return false;
+            }
+        }
+        std::vector<grouped_plan> grouped;
+        grouped.reserve(plans.size());
+        for (const auto & plan : plans) {
+            if (plan.transform_kind == vbr_import_transform_kind::none) {
+                continue;
+            }
+            const auto child = child_indices.find(plan.child_id);
+            if (child == child_indices.end()) {
+                continue;
+            }
+            const size_t index = grouped.size();
+            grouped.push_back({ &plan, SIZE_MAX });
+            const size_t tree_index = child->second;
+            if (tails[tree_index] == SIZE_MAX) {
+                heads[tree_index] = index;
+            } else {
+                grouped[tails[tree_index]].next = index;
+            }
+            tails[tree_index] = index;
+        }
         output.status = vbr_downward_reserve_status::reserved;
         bool any = false;
-        for (const auto & child : tree) {
+        std::vector<const vbr_validated_child_plan *> selected;
+        selected.reserve(grouped.size());
+        for (size_t tree_index = 0; tree_index < tree.size(); ++tree_index) {
+            const auto & child = tree[tree_index];
             if (!child.attention) {
                 continue;
             }
-            std::vector<const vbr_validated_child_plan *> selected;
-            for (const auto & plan : plans) {
-                if (plan.child_id == child.child_id && plan.downward) {
-                    selected.push_back(&plan);
-                }
+            selected.clear();
+            for (size_t index = heads[tree_index]; index != SIZE_MAX;
+                    index = grouped[index].next) {
+                selected.push_back(grouped[index].plan);
             }
             if (selected.empty()) {
                 continue;
             }
             any = true;
             vbr_downward_stage_reservation one;
-            if (!vbr_live_capture_adapter::reserve_import_downward(
+            if (!vbr_live_capture_adapter::reserve_import_transform(
                     *child.attention, selected, ledger, budget, one)) {
                 output = one;
                 return false;

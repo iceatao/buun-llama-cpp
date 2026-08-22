@@ -712,19 +712,24 @@ struct fake_workspace {
     size_t current = 0;
     size_t endpoint = 4096;
     bool fail_once = false;
+    bool request_scaled_endpoint = false;
+    size_t prices = 0;
     size_t reserves = 0;
 };
 
 static bool workspace_memory(
-        ggml_backend_t backend, int, int64_t, int64_t, int64_t,
+        ggml_backend_t backend, int, int64_t n_cells, int64_t, int64_t,
         size_t * now, size_t * endpoint) {
     auto * state = reinterpret_cast<fake_workspace *>(backend);
+    state->prices++;
     *now = state->current;
-    *endpoint = state->endpoint;
+    *endpoint = state->request_scaled_endpoint
+        ? size_t(n_cells)*4096 : state->endpoint;
     return true;
 }
 
-static bool workspace_reserve(ggml_backend_t backend, int64_t, int64_t, int64_t) {
+static bool workspace_reserve(
+        ggml_backend_t backend, int64_t n_cells, int64_t, int64_t) {
     auto * state = reinterpret_cast<fake_workspace *>(backend);
     state->reserves++;
     if (state->fail_once) {
@@ -732,7 +737,8 @@ static bool workspace_reserve(ggml_backend_t backend, int64_t, int64_t, int64_t)
         state->current = state->endpoint / 2;
         return false;
     }
-    state->current = state->endpoint;
+    state->current = state->request_scaled_endpoint
+        ? size_t(n_cells)*4096 : state->endpoint;
     return true;
 }
 
@@ -823,6 +829,40 @@ static void test_projection_reserve_retry_and_stashless() {
     assert(ledger.snapshot().live_ops == baseline_ops);
 }
 
+static void test_workspace_prices_max_shape_but_reserves_once() {
+    constexpr size_t request_count = 16384;
+    llama_cache_acct_ledger ledger;
+    configure_resource_ledger(ledger);
+    fake_workspace workspace;
+    workspace.request_scaled_endpoint = true;
+    ggml_vbr_backend_iface iface = {};
+    iface.kv_transcode_workspace_memory = workspace_memory;
+    iface.kv_transcode_workspace_reserve = workspace_reserve;
+    const int workspace_owner = 1;
+    vbr_downward_workspace_endpoint endpoint;
+    endpoint.owner = &workspace_owner;
+    endpoint.iface = &iface;
+    endpoint.backend = reinterpret_cast<ggml_backend_t>(&workspace);
+    endpoint.device = 0;
+    endpoint.domain = HOST;
+    endpoint.requests.reserve(request_count);
+    for (size_t i = 0; i < request_count; ++i) {
+        // A full permutation keeps the largest tuple away from either edge,
+        // catching first/last-request shortcuts while preserving exact scale.
+        const int64_t n_cells = int64_t((i*8191) % request_count + 1);
+        endpoint.requests.push_back({ n_cells, 256, 0 });
+    }
+    {
+        vbr_downward_resource_receipts receipts(ledger);
+        const auto result = receipts.reserve_resources({}, { endpoint }, {});
+        assert(result.status == vbr_downward_reserve_status::reserved);
+        assert(result.workspace_growth == request_count*4096);
+        assert(workspace.prices == request_count);
+        assert(workspace.reserves == 1);
+        assert(workspace.current == request_count*4096);
+    }
+}
+
 int main() {
     test_iswa_physical_preflight_preserves_device_skew();
     test_iswa_physical_preflight_shared_scratch_and_overflow();
@@ -835,6 +875,7 @@ int main() {
     test_edge_oracles_and_stash_boundaries();
     test_straddled_kv_independent_chains();
     test_projection_reserve_retry_and_stashless();
+    test_workspace_prices_max_shape_but_reserves_once();
     std::puts("test-vbr-downward: OK");
     return 0;
 }

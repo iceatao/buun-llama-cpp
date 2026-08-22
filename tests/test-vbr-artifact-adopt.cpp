@@ -355,14 +355,14 @@ struct f42a_harness_target {
     }
 };
 
-static bool f42a_reserve_downward(
+static bool f42a_reserve_transform(
         void * context,
         const std::vector<vbr_validated_child_plan> & plans,
         llama_cache_acct_ledger & ledger,
         const llama_cache_budget_config & budget,
         vbr_downward_stage_reservation & output) noexcept {
     auto * memory = static_cast<llama_memory_i *>(context);
-    return memory && vbr_explicit_import_reserve_downward(
+    return memory && vbr_explicit_import_reserve_transform(
         *memory, plans, ledger, budget, output);
 }
 
@@ -733,7 +733,7 @@ static void test_closed_vocabularies() {
                   vbr_downward_reserve_status(i))) != "invalid");
     }
     vbr_adopt_stage_result native_stage_default;
-    CHECK(native_stage_default.downward_status ==
+    CHECK(native_stage_default.transform_status ==
           vbr_downward_reserve_status::not_attempted);
     CHECK(std::string(vbr_adopt_phase_name(vbr_adopt_phase::_count)) ==
           "invalid");
@@ -1096,6 +1096,9 @@ struct seam final : vbr_adopt_test_seam {
     uint32_t downward_stashes = 0;
     uint32_t downward_syncs = 0;
     bool downward_synced = false;
+    uint32_t upward_zero_inits = 0;
+    uint32_t upward_transforms = 0;
+    uint32_t upward_syncs = 0;
 
     seam() {
         for (uint32_t i = 0; i < children.size(); ++i) {
@@ -1278,7 +1281,8 @@ struct seam final : vbr_adopt_test_seam {
         stash_valid = 0;
         edge_reached = UINT32_MAX;
         if (child_id >= children.size() || !children[child_id].armed ||
-            !plan.downward || plan.transcode_recipe.n_edges == 0) {
+            plan.transform_kind != vbr_import_transform_kind::downward ||
+            plan.transcode_recipe.n_edges == 0) {
             return vbr_downward_transform_status::invalid_recipe;
         }
         struct driver_state {
@@ -1329,10 +1333,37 @@ struct seam final : vbr_adopt_test_seam {
             uint32_t child_id,
             const vbr_validated_child_plan & plan) noexcept override {
         if (child_id >= children.size() || !children[child_id].armed ||
-            !plan.downward || plan.descriptor.wm_cells == 0) {
+            plan.transform_kind != vbr_import_transform_kind::downward ||
+            plan.descriptor.wm_cells == 0) {
             return false;
         }
         ++downward_zero_inits;
+        return true;
+    }
+
+    bool session_initialize_upward_backing(
+            uint32_t child_id,
+            const vbr_validated_child_plan & plan) noexcept override {
+        if (child_id >= children.size() || !children[child_id].armed ||
+            plan.transform_kind !=
+                vbr_import_transform_kind::upward_same_domain ||
+            plan.descriptor.wm_cells == 0) {
+            return false;
+        }
+        ++upward_zero_inits;
+        return true;
+    }
+
+    bool session_transform_upward(
+            uint32_t child_id,
+            const vbr_validated_child_plan & plan) noexcept override {
+        if (child_id >= children.size() || !children[child_id].armed ||
+            plan.transform_kind !=
+                vbr_import_transform_kind::upward_same_domain ||
+            plan.upward_recipe.n_edges != 1) {
+            return false;
+        }
+        ++upward_transforms;
         return true;
     }
 
@@ -1347,10 +1378,26 @@ struct seam final : vbr_adopt_test_seam {
         return true;
     }
 
+    bool session_synchronize_upward(
+            uint32_t child_id,
+            const std::vector<const vbr_validated_child_plan *> & plans)
+            noexcept override {
+        if (child_id >= children.size() || plans.empty() ||
+            std::none_of(plans.begin(), plans.end(), [](const auto * plan) {
+                return plan && plan->transform_kind ==
+                    vbr_import_transform_kind::upward_same_domain;
+            })) {
+            return false;
+        }
+        ++upward_syncs;
+        return true;
+    }
+
     bool session_trim_downward(
             uint32_t child_id, const vbr_validated_child_plan & plan,
             uint32_t) noexcept override {
-        return downward_synced && child_id < children.size() && plan.downward;
+        return downward_synced && child_id < children.size() &&
+            plan.transform_kind == vbr_import_transform_kind::downward;
     }
 
     bool session_build_live_image(uint32_t child_id,
@@ -1617,6 +1664,16 @@ static vbr_verified_segment segment(
     return out;
 }
 
+static bool measure_upward_destination(
+        void *, const std::vector<std::vector<ggml_type>> &,
+        const llama_vbr_policy::selection *,
+        vbr_import_destination_evidence & evidence) noexcept {
+    evidence.active = true;
+    evidence.fits = true;
+    evidence.pools = 2;
+    return true;
+}
+
 struct fixture {
     storage bytes;
     vbr_artifact_package source;
@@ -1639,14 +1696,20 @@ struct fixture {
     uint64_t catalog_live_ops = 0;
     bool with_companion = false;
     bool downward = false;
+    bool upward = false;
     vbr_downward_policy_projection downward_projection;
+    vbr_import_destination_projection upward_destination;
+    vbr_import_schedule_quote schedule_quote;
     llama_cache_budget_plan downward_plan;
     vbr_downward_reserve_status downward_reserve_status =
         vbr_downward_reserve_status::reserved;
 
-    explicit fixture(bool companion = false, bool downward_import = false)
+    explicit fixture(bool companion = false, bool downward_import = false,
+                     bool upward_import = false)
         : source(package(bytes, companion)), catalog(ledger),
-          with_companion(companion), downward(downward_import) {
+          with_companion(companion), downward(downward_import),
+          upward(upward_import) {
+        CHECK(!(downward && upward));
         if (downward) {
             for (auto & controller : source.manifest.controller_policy) {
                 controller.floor_type = GGML_TYPE_TURBO1_TCQ;
@@ -1930,6 +1993,80 @@ struct fixture {
             }
             validation.downward_tree_digest = downward_projection.tree_digest;
         }
+        if (upward) {
+            std::vector<vbr_import_destination_child> destination_children;
+            destination_children.reserve(snapshot.children.size());
+            for (auto & child : snapshot.children) {
+                CHECK(child.units.size() == 1);
+                auto & unit = child.units[0];
+                const auto source_type = static_cast<ggml_type>(
+                    view.units()[child.child_id].descriptor.current_type);
+                const auto target_type = GGML_TYPE_F16;
+                CHECK(source_type == GGML_TYPE_TURBO8_0);
+                unit.current_type = target_type;
+                unit.current_domain = vbr_repr_domain::full;
+                unit.upward_supported = true;
+                unit.upward_type = target_type;
+                unit.upward_domain = vbr_repr_domain::full;
+                unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
+                unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
+                unit.upward_meansub_model_id = 7;
+                CHECK(vbr_upward_resolve_recipe(
+                    source_type, target_type, unit.upward_recipe) ==
+                    vbr_upward_recipe_status::resolved);
+                uint64_t mapped = 0;
+                uint64_t transfer = 0;
+                for (auto & shard : unit.shards) {
+                    const uint64_t row = ggml_row_size(
+                        target_type, int64_t(unit.dimensions[0]));
+                    CHECK(row != 0 &&
+                          unit.wm_cells <= UINT64_MAX/row);
+                    shard.row_bytes = row;
+                    shard.mapped_bytes = unit.wm_cells*row;
+                    mapped += shard.mapped_bytes;
+                }
+                for (const auto & shard :
+                        view.units()[child.child_id].descriptor.shards) {
+                    transfer += shard.payload_bytes;
+                }
+                unit.upward_row_bytes = unit.shards.front().row_bytes;
+                unit.upward_mapped_bytes = mapped;
+                unit.upward_transfer_bytes = transfer;
+                unit.upward_codec_workspace_bytes = 64;
+
+                vbr_import_destination_child destination;
+                destination.initial_types = { target_type };
+                destination.initial_cursor =
+                    view.manifest().controller_policy[child.child_id].cursor;
+                destination.watermark_cells = uint32_t(unit.wm_cells);
+                destination_children.push_back(std::move(destination));
+            }
+            upward_destination = vbr_select_import_destination(
+                destination_children, nullptr, measure_upward_destination);
+            CHECK(upward_destination.status ==
+                  vbr_import_destination_status::feasible_current);
+            CHECK(vbr_digest_nonzero(upward_destination.tree_digest));
+            for (auto & child : snapshot.children) {
+                child.controller_policy.current_type_vector_digest =
+                    upward_destination.child_type_digests[child.child_id];
+                child.controller_policy.cursor =
+                    upward_destination.final_cursors[child.child_id];
+                auto & unit = child.units[0];
+                unit.upward_build_identity_digest = vbr_upward_build_identity(
+                    unit.upward_recipe, unit.upward_meansub_model_id,
+                    unit.meansub_digest,
+                    upward_destination.child_type_digests[child.child_id],
+                    upward_destination.tree_digest);
+            }
+            CHECK(vbr_quote_import_schedule(snapshot, view, schedule_quote));
+            CHECK(schedule_quote.status() ==
+                  vbr_import_schedule_status::upward_same_domain);
+            CHECK(vbr_rebind_import_schedule_quote(
+                snapshot, view, upward_destination, schedule_quote));
+            CHECK(schedule_quote.status() ==
+                  vbr_import_schedule_status::upward_same_domain);
+            validation.downward_tree_digest = upward_destination.tree_digest;
+        }
         if (with_companion) {
             const auto & descriptor = view.companions()[0].descriptor;
             snapshot.companions.push_back({
@@ -1971,9 +2108,15 @@ struct fixture {
         policy.read_policy_epoch = validation_context::read_policy;
         if (downward) {
             downward_plan.accounting_serial = snapshot_accounting.serial;
-            policy.downward_budget_plan = &downward_plan;
+            policy.transform_budget_plan = &downward_plan;
             policy.downward_projection = &downward_projection;
-            policy.read_downward_tree_digest =
+            policy.read_transform_tree_digest =
+                validation_context::read_downward_tree;
+        } else if (upward) {
+            downward_plan.accounting_serial = snapshot_accounting.serial;
+            policy.transform_budget_plan = &downward_plan;
+            policy.schedule_quote = &schedule_quote;
+            policy.read_transform_tree_digest =
                 validation_context::read_downward_tree;
         }
     }
@@ -1984,7 +2127,7 @@ struct fixture {
         snapshot_accounting = ledger.snapshot();
         snapshot.accounting_serial = snapshot_accounting.serial;
         policy.accounting_snapshot = &snapshot_accounting;
-        if (downward) {
+        if (downward || upward) {
             downward_plan.accounting_serial = snapshot_accounting.serial;
         }
     }
@@ -2009,25 +2152,35 @@ struct fixture {
                 binding.domain, nullptr, nullptr, false,
             });
         }
-        if (downward) {
-            stage_policy.downward_context = this;
-            stage_policy.reserve_downward = [](
+        if (downward || upward) {
+            stage_policy.transform_context = this;
+            stage_policy.reserve_transform = [](
                     void * context,
                     const std::vector<vbr_validated_child_plan> & plans,
                     llama_cache_acct_ledger &,
                     const llama_cache_budget_config &,
                     vbr_downward_stage_reservation & output) noexcept {
                 auto & self = *static_cast<fixture *>(context);
+                const auto expected = self.downward
+                    ? vbr_import_transform_kind::downward
+                    : vbr_import_transform_kind::upward_same_domain;
                 if (plans.empty() || std::any_of(
                         plans.begin(), plans.end(),
-                        [](const vbr_validated_child_plan & plan) {
-                            return !plan.downward ||
-                                   plan.transcode_recipe.n_edges == 0;
+                        [&](const vbr_validated_child_plan & plan) {
+                            if (plan.transform_kind ==
+                                    vbr_import_transform_kind::none) {
+                                return false;
+                            }
+                            return plan.transform_kind != expected ||
+                                (expected ==
+                                     vbr_import_transform_kind::downward
+                                    ? plan.transcode_recipe.n_edges == 0
+                                    : plan.upward_recipe.n_edges != 1);
                         })) {
                     return false;
                 }
                 output.status = self.downward_reserve_status;
-                if (output.status ==
+                if (self.downward && output.status ==
                         vbr_downward_reserve_status::reserved_stashless) {
                     output.stashless_units.push_back(
                         vbr_downward_unit_key(
@@ -2401,11 +2554,49 @@ static void test_g2_downward_subphase_matrix() {
         f.downward_reserve_status = status;
         auto staged = f.stage();
         CHECK(staged.status ==
-              vbr_adopt_stage_status::downward_reserve_failed);
-        CHECK(staged.downward_status == status);
+              vbr_adopt_stage_status::transform_reserve_failed);
+        CHECK(staged.transform_status == status);
         CHECK(!staged.staged);
         CHECK(f.target.construction_empty());
         CHECK(f.ledger.snapshot().live_ops == baseline);
+    }
+}
+
+static void test_g2_upward_reconstruction() {
+    {
+        fixture f(false, false, true);
+        uint64_t compact_bytes = 0;
+        for (const auto & unit : f.view.units()) {
+            for (const auto & shard : unit.descriptor.shards) {
+                compact_bytes += shard.payload_bytes;
+            }
+        }
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.decision == vbr_import_decision::upward_reconstruct);
+        CHECK(result.consistency ==
+              vbr_artifact_consistency_kind::live_rebased);
+        CHECK(result.h2d_bytes == compact_bytes);
+        CHECK(f.target.upward_zero_inits == f.view.units().size());
+        CHECK(f.target.upward_transforms == f.view.units().size());
+        CHECK(f.target.upward_syncs == 2);
+        CHECK(f.target.downward_edges == 0);
+        CHECK(f.target.downward_stashes == 0);
+        CHECK(f.target.downward_syncs == 0);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::none);
+        CHECK(result.downward_edge == UINT32_MAX);
+    }
+    {
+        fixture f(false, false, true);
+        vbr_adopt_fault fault;
+        fault.fail_after = vbr_adopt_phase::unit_h2d;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+        CHECK(f.target.upward_transforms == f.view.units().size());
+        CHECK(f.target.upward_syncs == 2);
+        check_failed_transaction(f, result);
     }
 }
 
@@ -3194,9 +3385,9 @@ static bool f42a_model_backed_adoption(
         if (downward_mode) {
             downward_budget_plan.accounting_serial =
                 accounting_snapshot.serial;
-            policy.downward_budget_plan = &downward_budget_plan;
+            policy.transform_budget_plan = &downward_budget_plan;
             policy.downward_projection = &downward_projection;
-            policy.read_downward_tree_digest =
+            policy.read_transform_tree_digest =
                 f42a_harness_target::downward_tree;
         }
 
@@ -3273,8 +3464,8 @@ static bool f42a_model_backed_adoption(
             false,
         });
         if (downward_mode) {
-            stage_policy.downward_context = target_memory;
-            stage_policy.reserve_downward = f42a_reserve_downward;
+            stage_policy.transform_context = target_memory;
+            stage_policy.reserve_transform = f42a_reserve_transform;
         }
         auto staged = vbr_stage_validated_manifest(
             std::move(validated.proof), stage_policy);
@@ -3515,6 +3706,7 @@ int main(int argc, char ** argv) {
     g2::test_g2_complete_tree_barrier_matrix();
     g2::test_g2_serial_and_admission_faults();
     g2::test_g2_downward_subphase_matrix();
+    g2::test_g2_upward_reconstruction();
     test_final_recheck_excludes_only_own_reservation();
     test_native_tracker_image_preserves_lineage_and_runtime();
     test_real_tracker_import_settle_and_teardown();

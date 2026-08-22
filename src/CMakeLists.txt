@@ -52,6 +52,7 @@ add_library(llama
             llama-vbr-artifact-stage.cpp
             llama-vbr-artifact-adopt.cpp
             llama-vbr-downward.cpp
+            llama-vbr-upward.cpp
             llama-vbr-explicit-capture.cpp
             llama-vbr-controller-id.cpp
             llama-vbr-generation.cpp

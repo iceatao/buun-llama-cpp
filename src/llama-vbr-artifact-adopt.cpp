@@ -84,6 +84,8 @@ const char * vbr_adopt_status_name(vbr_adopt_status status) noexcept {
         case vbr_adopt_status::downward_recipe_invalid: return "downward_recipe_invalid";
         case vbr_adopt_status::downward_transform_failed: return "downward_transform_failed";
         case vbr_adopt_status::downward_stash_unavailable: return "downward_stash_unavailable";
+        case vbr_adopt_status::upward_recipe_invalid: return "upward_recipe_invalid";
+        case vbr_adopt_status::upward_transform_failed: return "upward_transform_failed";
         case vbr_adopt_status::target_drift: return "target_drift";
         case vbr_adopt_status::operation_unavailable: return "operation_unavailable";
         case vbr_adopt_status::recovery_unavailable: return "recovery_unavailable";
@@ -256,9 +258,9 @@ class vbr_kv_import_session {
     struct extent_prefix {
         llama_kv_cache::vbr_pool * pool = nullptr;
         llama_kv_cache::vbr_extent * extent = nullptr;
-        // Downward adoption must first map enough private backing for the
-        // source-tier H2D image.  The phase-12 invariant is the (possibly
-        // smaller) target-tier prefix left after the fallible transform.
+        // A transform maps the larger of source and target before H2D.  The
+        // phase-12 invariant is the target-tier prefix left after the
+        // fallible transform (and downward-only tail trim).
         uint64_t mapped_row_bytes = 0;
         uint64_t final_row_bytes = 0;
     };
@@ -368,6 +370,7 @@ class vbr_kv_import_session {
             pool_indices_.clear();
             unit_by_pool_.clear();
             final_unit_indices_.clear();
+            transform_backends_.clear();
             for (size_t i = 0; i < cache_->vbr_pools_.size(); ++i) {
                 pool_indices_[&cache_->vbr_pools_[i]] = i;
             }
@@ -412,55 +415,56 @@ class vbr_kv_import_session {
                         return false;
                     }
                 }
-                if (plan->shards.size() !=
-                        cache_->vbr_units_of(ikv, is_v).size()) {
+                const auto & units = cache_->vbr_units_of(ikv, is_v);
+                if (plan->shards.size() != units.size()) {
                     return false;
                 }
-                for (const auto & unit : cache_->vbr_units_of(ikv, is_v)) {
+                for (const auto & unit : units) {
                     unit_by_pool_[{ plan->logical_unit_id, unit.first }] =
                         unit.second;
                 }
                 for (const auto & shard : plan->shards) {
                     auto * pool = static_cast<llama_kv_cache::vbr_pool *>(
                         const_cast<void *>(shard.target_pool_cookie));
-                    auto pool_it = std::find_if(
-                        cache_->vbr_pools_.begin(), cache_->vbr_pools_.end(),
-                        [&](llama_kv_cache::vbr_pool & value) {
-                            return &value == pool;
-                        });
-                    if (pool_it == cache_->vbr_pools_.end() ||
-                        shard.shard_index >= cache_->vbr_units_of(ikv, is_v).size()) {
+                    const auto pool_index = pool_indices_.find(pool);
+                    if (pool_index == pool_indices_.end() ||
+                        shard.shard_index >= units.size()) {
                         return false;
                     }
-                    const auto & units = cache_->vbr_units_of(ikv, is_v);
-                    auto unit_it = std::find_if(
-                        units.begin(), units.end(),
-                        [&](const auto & value) { return value.first == pool; });
-                    if (unit_it == units.end() || !unit_it->second ||
-                        unit_it->second->t == nullptr || pool->vmm == nullptr ||
+                    const auto & unit = units[shard.shard_index];
+                    if (unit.first != pool || !unit.second ||
+                        unit.second->t == nullptr || pool->vmm == nullptr ||
                         pool->be == nullptr || pool->backend == nullptr ||
                         uint64_t(ggml_row_size(
                             source_type,
-                            unit_it->second->t->ne[0])) != shard.row_bytes ||
+                            unit.second->t->ne[0])) != shard.row_bytes ||
                         uint64_t(ggml_row_size(
                             target_type,
-                            unit_it->second->t->ne[0])) !=
+                            unit.second->t->ne[0])) !=
                             shard.target_row_bytes) {
                         return false;
+                    }
+                    if (plan->transform_kind !=
+                            vbr_import_transform_kind::none &&
+                        std::find(
+                            transform_backends_.begin(),
+                            transform_backends_.end(), pool->backend) ==
+                                transform_backends_.end()) {
+                        transform_backends_.push_back(pool->backend);
                     }
                     if (std::none_of(extent_prefixes_.begin(), extent_prefixes_.end(),
                             [&](const extent_prefix & value) {
                                 return value.pool == pool &&
-                                       value.extent == unit_it->second;
+                                       value.extent == unit.second;
                             })) {
                         extent_prefixes_.push_back({
-                            pool, unit_it->second,
-                            shard.row_bytes,
+                            pool, unit.second,
+                            std::max(
+                                shard.row_bytes,
+                                shard.target_row_bytes),
                             shard.target_row_bytes,
                         });
                     }
-                    const size_t pool_index = size_t(
-                        pool_it-cache_->vbr_pools_.begin());
                     if (plan->descriptor.wm_cells > UINT32_MAX) {
                         return false;
                     }
@@ -473,11 +477,11 @@ class vbr_kv_import_session {
                     // a falsely-short published watermark.
                     const uint32_t descriptor_watermark =
                         uint32_t(plan->descriptor.wm_cells);
-                    backing_watermarks[pool_index] = std::max(
-                        backing_watermarks[pool_index],
+                    backing_watermarks[pool_index->second] = std::max(
+                        backing_watermarks[pool_index->second],
                         descriptor_watermark);
-                    final_watermarks_[pool_index] = std::max(
-                        final_watermarks_[pool_index],
+                    final_watermarks_[pool_index->second] = std::max(
+                        final_watermarks_[pool_index->second],
                         descriptor_watermark);
                     for (const auto & run : plan->authorized_runs) {
                         if (run.cell_count == 0 ||
@@ -494,14 +498,13 @@ class vbr_kv_import_session {
                             uint64_t(run.cell_count)*shard.row_bytes;
                         if (relative > shard.payload_bytes ||
                             bytes > shard.payload_bytes-relative ||
-                            unit_it->second->byte_off > pool->size ||
-                            relative > pool->size-unit_it->second->byte_off ||
-                            bytes > pool->size-unit_it->second->byte_off-relative) {
+                            unit.second->byte_off > pool->size ||
+                            relative > pool->size-unit.second->byte_off ||
+                            bytes > pool->size-unit.second->byte_off-relative) {
                             return false;
                         }
-                        const size_t pool_index = size_t(pool_it-cache_->vbr_pools_.begin());
-                        final_watermarks_[pool_index] = std::max(
-                            final_watermarks_[pool_index],
+                        final_watermarks_[pool_index->second] = std::max(
+                            final_watermarks_[pool_index->second],
                             run.first_physical_cell+run.cell_count);
                     }
                 }
@@ -659,14 +662,23 @@ class vbr_kv_import_session {
         return true;
     }
 
-    bool initialize_downward_backing(
+    bool initialize_transform_backing(
             const vbr_validated_child_plan & plan) noexcept {
         if (test_seam_) {
-            return armed_ && plan.downward &&
-                test_seam_->session_initialize_downward_backing(
-                    child_id_, plan);
+            if (!armed_) {
+                return false;
+            }
+            return plan.transform_kind ==
+                    vbr_import_transform_kind::downward
+                ? test_seam_->session_initialize_downward_backing(
+                    child_id_, plan)
+                : plan.transform_kind ==
+                        vbr_import_transform_kind::upward_same_domain &&
+                    test_seam_->session_initialize_upward_backing(
+                        child_id_, plan);
         }
-        if (!armed_ || !plan.downward ||
+        if (!armed_ || plan.transform_kind ==
+                vbr_import_transform_kind::none ||
             plan.logical_unit_id/2 >= cache_->layers.size()) {
             return false;
         }
@@ -690,7 +702,8 @@ class vbr_kv_import_session {
             ggml_tensor source_alias;
             if (bytes == 0 || bytes > SIZE_MAX ||
                 !cache_->vbr_import_source_alias(
-                    *extent->t, plan.transcode_recipe.source_type,
+                    *extent->t,
+                    static_cast<ggml_type>(plan.descriptor.current_type),
                     source_alias)) {
                 return false;
             }
@@ -712,7 +725,8 @@ class vbr_kv_import_session {
                 child_id_, plan, stashless, fail_edge, fail_stash,
                 stash_valid, edge_reached);
         }
-        if (!armed_ || !plan.downward || fail_stash) {
+        if (!armed_ || plan.transform_kind !=
+                vbr_import_transform_kind::downward || fail_stash) {
             return fail_stash
                 ? vbr_downward_transform_status::stash_unavailable
                 : vbr_downward_transform_status::invalid_recipe;
@@ -725,33 +739,55 @@ class vbr_kv_import_session {
             plan, stashless, stash_valid, edge_reached);
     }
 
-    bool synchronize_downward(
-            const std::vector<const vbr_validated_child_plan *> & plans) noexcept {
+    bool transform_upward(
+            const vbr_validated_child_plan & plan) noexcept {
         if (test_seam_) {
-            return test_seam_->session_synchronize_downward(child_id_, plans);
+            return test_seam_->session_transform_upward(child_id_, plan);
         }
-        try {
-            std::set<ggml_backend_t> backends;
-            for (const auto * plan : plans) {
-                if (!plan || !plan->downward) {
-                    return false;
-                }
-                for (const auto & shard : plan->shards) {
-                    auto * pool = static_cast<llama_kv_cache::vbr_pool *>(
-                        const_cast<void *>(shard.target_pool_cookie));
-                    if (!pool || !pool->backend) {
-                        return false;
-                    }
-                    backends.insert(pool->backend);
-                }
-            }
-            for (ggml_backend_t backend : backends) {
-                ggml_backend_synchronize(backend);
-            }
-            return true;
-        } catch (...) {
+        const auto metadata = final_unit_indices_.find(plan.logical_unit_id);
+        if (!armed_ || plan.transform_kind !=
+                vbr_import_transform_kind::upward_same_domain ||
+            metadata == final_unit_indices_.end() ||
+            !cache_->vbr_upward_transform_import(plan)) {
             return false;
         }
+        final_units_[metadata->second].stash_valid = 0;
+        final_units_[metadata->second].promote_hops = 0;
+        return true;
+    }
+
+    bool synchronize_transform(
+            const std::vector<const vbr_validated_child_plan *> & plans) noexcept {
+        if (test_seam_) {
+            const auto first = std::find_if(
+                plans.begin(), plans.end(), [](const auto * plan) {
+                    return plan && plan->transform_kind !=
+                        vbr_import_transform_kind::none;
+                });
+            const auto kind = first == plans.end()
+                ? vbr_import_transform_kind::none
+                : (*first)->transform_kind;
+            if (kind == vbr_import_transform_kind::downward) {
+                return test_seam_->session_synchronize_downward(
+                    child_id_, plans);
+            }
+            return kind == vbr_import_transform_kind::upward_same_domain &&
+                test_seam_->session_synchronize_upward(child_id_, plans);
+        }
+        if (!armed_ || plans.empty() ||
+            std::any_of(plans.begin(), plans.end(), [](const auto * plan) {
+                return plan == nullptr;
+            }) ||
+            std::none_of(plans.begin(), plans.end(), [](const auto * plan) {
+                return plan->transform_kind !=
+                    vbr_import_transform_kind::none;
+            })) {
+            return false;
+        }
+        for (ggml_backend_t backend : transform_backends_) {
+            ggml_backend_synchronize(backend);
+        }
+        return !transform_backends_.empty();
     }
 
     bool trim_source_tier_tail(
@@ -761,7 +797,8 @@ class vbr_kv_import_session {
             return test_seam_->session_trim_downward(
                 child_id_, plan, stash_valid);
         }
-        if (!armed_ || !plan.downward) {
+        if (!armed_ || plan.transform_kind !=
+                vbr_import_transform_kind::downward) {
             return false;
         }
         // Trim the source-tier tail after the side stream has completed. Keep
@@ -1193,6 +1230,7 @@ class vbr_kv_import_session {
              llama_kv_cache::vbr_extent *> unit_by_pool_;
     std::map<uint32_t, size_t> final_unit_indices_;
     std::map<uint32_t, ggml_type> source_types_;
+    std::vector<ggml_backend_t> transform_backends_;
     std::vector<uint32_t> final_watermarks_;
     std::vector<llama_kv_cells> final_cells_;
     std::vector<uint32_t> final_heads_;
@@ -1436,42 +1474,56 @@ vbr_adopt_status transaction_status(
     return vbr_adopt_status::accounting_unavailable;
 }
 
-vbr_adopt_status downward_source_h2d(
+vbr_adopt_status transform_source_h2d(
         std::map<uint32_t, vbr_adopt_child_work> & children,
         const vbr_validated_manifest & manifest) noexcept {
     for (const auto & plan : manifest.children()) {
-        if (!plan.downward) {
+        if (plan.transform_kind == vbr_import_transform_kind::none) {
             continue;
         }
         const auto child = children.find(plan.child_id);
         if (child == children.end() ||
-            !child->second.session->initialize_downward_backing(plan)) {
+            !child->second.session->initialize_transform_backing(plan)) {
             return vbr_adopt_status::transfer_failed;
         }
     }
     return vbr_adopt_status::adopted;
 }
 
-vbr_adopt_status downward_transform_all(
+vbr_adopt_status transform_all(
         std::map<uint32_t, vbr_adopt_child_work> & children,
         const vbr_validated_manifest & manifest,
         const vbr_staged_payloads & staged,
         const vbr_composite_publish_hooks & hooks,
+        std::vector<uint32_t> & stash_valid,
         vbr_adopt_result & out) noexcept {
-    const std::set<uint64_t> stashless(
-        staged.downward_stashless_units().begin(),
-        staged.downward_stashless_units().end());
-    std::map<std::pair<uint32_t, uint32_t>, uint32_t> stash_valid;
-    for (const auto & plan : manifest.children()) {
-        if (!plan.downward) {
+    const auto & stashless = staged.transform_stashless_units();
+    if (stash_valid.size() != manifest.children().size()) {
+        return vbr_adopt_status::internal_error;
+    }
+    for (size_t i = 0; i < manifest.children().size(); ++i) {
+        const auto & plan = manifest.children()[i];
+        if (plan.transform_kind == vbr_import_transform_kind::none) {
             continue;
         }
         const auto child = children.find(plan.child_id);
         if (child == children.end()) {
-            return vbr_adopt_status::downward_recipe_invalid;
+            return plan.transform_kind ==
+                    vbr_import_transform_kind::downward
+                ? vbr_adopt_status::downward_recipe_invalid
+                : vbr_adopt_status::upward_recipe_invalid;
         }
-        const bool omit_stash = stashless.count(vbr_downward_unit_key(
-            plan.child_id, plan.logical_unit_id)) != 0;
+        if (plan.transform_kind ==
+                vbr_import_transform_kind::upward_same_domain) {
+            if (!child->second.session->transform_upward(plan)) {
+                return vbr_adopt_status::upward_transform_failed;
+            }
+            continue;
+        }
+        const uint64_t unit_key = vbr_downward_unit_key(
+            plan.child_id, plan.logical_unit_id);
+        const bool omit_stash = std::binary_search(
+            stashless.begin(), stashless.end(), unit_key);
         uint32_t valid = 0;
         uint32_t edge = UINT32_MAX;
         out.downward_subphase = vbr_downward_adopt_subphase::edge_transcode;
@@ -1483,7 +1535,7 @@ vbr_adopt_status downward_transform_all(
         out.downward_edge = edge;
         switch (status) {
             case vbr_downward_transform_status::transformed:
-                stash_valid[{ plan.child_id, plan.logical_unit_id }] = valid;
+                stash_valid[i] = valid;
                 break;
             case vbr_downward_transform_status::invalid_recipe:
                 return vbr_adopt_status::downward_recipe_invalid;
@@ -1500,31 +1552,37 @@ vbr_adopt_status downward_transform_all(
     // Every edge is now enqueued. Synchronize each distinct side backend once
     // before the completion fault seam or any destructive tail trim.
     for (auto & child : children) {
-        std::vector<const vbr_validated_child_plan *> downward_plans;
-        for (const auto * plan : child.second.plans) {
-            if (plan && plan->downward) {
-                downward_plans.push_back(plan);
-            }
+        const auto transformed = std::find_if(
+            child.second.plans.begin(), child.second.plans.end(),
+            [](const auto * plan) {
+                return plan && plan->transform_kind !=
+                    vbr_import_transform_kind::none;
+            });
+        if (transformed != child.second.plans.end() &&
+            !child.second.session->synchronize_transform(
+                child.second.plans)) {
+            return (*transformed)->transform_kind ==
+                    vbr_import_transform_kind::downward
+                ? vbr_adopt_status::downward_transform_failed
+                : vbr_adopt_status::upward_transform_failed;
         }
-        if (!downward_plans.empty() &&
-            !child.second.session->synchronize_downward(downward_plans)) {
+    }
+    if (manifest.decision() == vbr_import_decision::downward_rebase) {
+        out.downward_subphase =
+            vbr_downward_adopt_subphase::edge_completion;
+        if (hooks.test && hooks.test->fault.fail_downward_completion) {
             return vbr_adopt_status::downward_transform_failed;
         }
     }
-    out.downward_subphase = vbr_downward_adopt_subphase::edge_completion;
-    if (hooks.test && hooks.test->fault.fail_downward_completion) {
-        return vbr_adopt_status::downward_transform_failed;
-    }
-    for (const auto & plan : manifest.children()) {
-        if (!plan.downward) {
+    for (size_t i = 0; i < manifest.children().size(); ++i) {
+        const auto & plan = manifest.children()[i];
+        if (plan.transform_kind != vbr_import_transform_kind::downward) {
             continue;
         }
         const auto child = children.find(plan.child_id);
-        const auto valid = stash_valid.find({
-            plan.child_id, plan.logical_unit_id });
-        if (child == children.end() || valid == stash_valid.end() ||
+        if (child == children.end() ||
             !child->second.session->trim_source_tier_tail(
-                plan, valid->second)) {
+                plan, stash_valid[i])) {
             return vbr_adopt_status::downward_transform_failed;
         }
     }
@@ -1548,6 +1606,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
     std::vector<std::pair<const vbr_companion_adoption_provider *,
                           std::unique_ptr<vbr_prepared_companion_image>>>
         companions;
+    std::vector<uint32_t> transform_stash_valid;
     bool claims_committed = false;
     bool published = false;
     uint64_t post_commit_serial = 0;
@@ -1611,16 +1670,22 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             return fail(vbr_adopt_status::invalid_capability_pair);
         }
         out.decision = manifest->decision();
+        if (out.decision == vbr_import_decision::downward_rebase ||
+            out.decision == vbr_import_decision::upward_reconstruct) {
+            transform_stash_valid.assign(manifest->children().size(), 0);
+        }
         out.consistency = manifest->decision() == vbr_import_decision::native_import
             ? vbr_artifact_consistency_kind::capture_exact
             : vbr_artifact_consistency_kind::live_rebased;
         if (out.decision != vbr_import_decision::native_import &&
             out.decision != vbr_import_decision::live_rebased &&
-            out.decision != vbr_import_decision::downward_rebase) {
+            out.decision != vbr_import_decision::downward_rebase &&
+            out.decision != vbr_import_decision::upward_reconstruct) {
             return fail(vbr_adopt_status::unsupported_decision);
         }
-        if (out.decision == vbr_import_decision::downward_rebase &&
-            !staged->downward_resources_ready()) {
+        if ((out.decision == vbr_import_decision::downward_rebase ||
+             out.decision == vbr_import_decision::upward_reconstruct) &&
+            !staged->transform_resources_ready()) {
             return fail(vbr_adopt_status::accounting_unavailable);
         }
         if (fault_after(server_hooks, out.phase)) {
@@ -1772,8 +1837,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         std::map<std::pair<uint32_t, uint32_t>, uint32_t> transferred_units;
         uint64_t completion = 0;
-        if (out.decision == vbr_import_decision::downward_rebase) {
-            const auto status = downward_source_h2d(children, *manifest);
+        if (out.decision == vbr_import_decision::downward_rebase ||
+            out.decision == vbr_import_decision::upward_reconstruct) {
+            const auto status = transform_source_h2d(children, *manifest);
             if (status != vbr_adopt_status::adopted) {
                 return fail(status);
             }
@@ -1810,9 +1876,11 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         // Projection owns the shared transport only across its selected H2D
         // bytes; all later validation and publication work is CPU-local.
         projection_operation = {};
-        if (out.decision == vbr_import_decision::downward_rebase) {
-            const auto status = downward_transform_all(
-                children, *manifest, *staged, server_hooks, out);
+        if (out.decision == vbr_import_decision::downward_rebase ||
+            out.decision == vbr_import_decision::upward_reconstruct) {
+            const auto status = transform_all(
+                children, *manifest, *staged, server_hooks,
+                transform_stash_valid, out);
             if (status != vbr_adopt_status::adopted) {
                 return fail(status);
             }
@@ -1928,18 +1996,20 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         auto barrier_fingerprint = manifest->target();
         barrier_fingerprint.accounting_serial = post_commit_serial;
-        std::array<uint8_t, 32> downward_tree_digest = {};
-        const bool downward_projection_stable =
-            out.decision != vbr_import_decision::downward_rebase ||
-            (manifest->read_downward_tree_digest_ != nullptr &&
-             manifest->read_downward_tree_digest_(
-                manifest->recheck_context_, downward_tree_digest) &&
+        std::array<uint8_t, 32> transform_tree_digest = {};
+        const bool transform_projection_stable =
+            (out.decision != vbr_import_decision::downward_rebase &&
+             out.decision != vbr_import_decision::upward_reconstruct) ||
+            (manifest->read_transform_tree_digest_ != nullptr &&
+             manifest->read_transform_tree_digest_(
+                manifest->recheck_context_, transform_tree_digest) &&
              std::all_of(
                 manifest->children().begin(), manifest->children().end(),
                 [&](const vbr_validated_child_plan & plan) {
-                    return !plan.downward ||
+                    return plan.transform_kind ==
+                               vbr_import_transform_kind::none ||
                            plan.transcode_tree_digest ==
-                               downward_tree_digest;
+                               transform_tree_digest;
                 }));
         if (accounting.snapshot().serial != post_commit_serial ||
             !manifest->recheck_target_empty_(
@@ -1948,7 +2018,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 post_commit_serial ||
             manifest->read_policy_epoch_(manifest->recheck_context_) !=
                 manifest->target().policy_epoch ||
-            !downward_projection_stable ||
+            !transform_projection_stable ||
             !operation_quiescent(operation, server_hooks) ||
             (manifest->is_prefix_projection()
                 ? !manifest->projection_transfer_ready()

@@ -169,7 +169,7 @@ bool import_target_recheck(
             *context->memory, context->destination, expected);
 }
 
-bool import_downward_digest(
+bool import_transform_digest(
         const void * opaque,
         std::array<uint8_t, 32> & output) noexcept {
     const auto * context = static_cast<const live_import_context *>(opaque);
@@ -177,7 +177,7 @@ bool import_downward_digest(
         !context->bindings || !context->schedule_quote) {
         return false;
     }
-    return vbr_explicit_import_downward_projection_recheck(
+    return vbr_explicit_import_transform_projection_recheck(
             *context->memory, context->destination,
             *context->package, *context->bindings,
             *context->schedule_quote, output);
@@ -197,7 +197,7 @@ bool import_parse_companion(
         opaque, descriptor, source, target, output);
 }
 
-bool import_reserve_downward(
+bool import_reserve_transform(
         void * opaque,
         const std::vector<vbr_validated_child_plan> & plans,
         llama_cache_acct_ledger & ledger,
@@ -205,7 +205,7 @@ bool import_reserve_downward(
         vbr_downward_stage_reservation & output) noexcept {
     auto * context = static_cast<live_import_context *>(opaque);
     return context && context->memory &&
-        vbr_explicit_import_reserve_downward(
+        vbr_explicit_import_reserve_transform(
             *context->memory, plans, ledger, budget, output);
 }
 
@@ -279,6 +279,7 @@ server_vbr_artifact_import_validation_disposition(
         case vbr_import_decision::native_import:
         case vbr_import_decision::live_rebased:
         case vbr_import_decision::downward_rebase:
+        case vbr_import_decision::upward_reconstruct:
             return server_vbr_artifact_import_status::ok;
         case vbr_import_decision::rebuild:
         case vbr_import_decision::cold:
@@ -2087,7 +2088,9 @@ server_vbr_artifact_store::complete_validated_import(
         auto staged = vbr_stage_validated_manifest(
             std::move(validated.proof), stage_policy);
         output.stage_status = staged.status;
-        output.downward_reserve_status = staged.downward_status;
+        // The server result field retains its route/API spelling, but the
+        // value now reports the one shared downward/upward transform reserve.
+        output.downward_reserve_status = staged.transform_status;
         if (staged.status != vbr_adopt_stage_status::staged ||
             !staged.manifest || !staged.staged) {
             return fail(server_vbr_artifact_import_status::stage_failed,
@@ -2379,8 +2382,8 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         // the store vouches for it here on the snapshot the validator consumes.
         context.snapshot.scheduler_idle = true;
 
-        llama_cache_budget_plan downward_budget;
-        downward_budget.accounting_serial = accounting_snapshot.serial;
+        llama_cache_budget_plan transform_budget;
+        transform_budget.accounting_serial = accounting_snapshot.serial;
         vbr_adopt_policy policy;
         policy.authorized = true;
         policy.identity = {
@@ -2399,6 +2402,8 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         policy.domain_bindings = impl_->policy_bindings;
         policy.accounting_snapshot = &accounting_snapshot;
         policy.budget_config = &budget;
+        policy.transform_budget_plan = &transform_budget;
+        policy.allow_upward = true;
         policy.schedule_quote = &schedule_quote;
         policy.context = &context;
         policy.inspect_target = import_inspect_target;
@@ -2406,17 +2411,18 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         policy.recheck_target_empty = import_target_recheck;
         policy.read_accounting_serial = import_accounting_serial;
         policy.read_policy_epoch = import_policy_epoch;
+        if (schedule_quote.status() != vbr_import_schedule_status::exact) {
+            policy.read_transform_tree_digest = import_transform_digest;
+        }
         if (downward) {
-            policy.downward_budget_plan = &downward_budget;
             policy.downward_projection = &downward_projection;
-            policy.read_downward_tree_digest = import_downward_digest;
         }
         auto validated = vbr_validate_unit_manifest(
             *request.memory, package, policy);
         vbr_adopt_stage_policy stage_policy;
         stage_policy.budget = &budget;
-        stage_policy.downward_context = &context;
-        stage_policy.reserve_downward = import_reserve_downward;
+        stage_policy.transform_context = &context;
+        stage_policy.reserve_transform = import_reserve_transform;
         return complete_validated_import(
             std::move(request), std::move(validated), stage_policy,
             std::move(output));

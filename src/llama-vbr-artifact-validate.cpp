@@ -260,6 +260,7 @@ bool downward_recipe_complete(
         target.downward_movable, resolved);
     return target.downward_supported &&
            target.downward_type == target.current_type &&
+           target.downward_domain == target.current_domain &&
            target.downward_recipe_id == VBR_DOWNWARD_RECIPE_ID &&
            target.downward_recipe_version == VBR_DOWNWARD_RECIPE_VERSION &&
            status == vbr_downward_recipe_status::resolved &&
@@ -272,6 +273,31 @@ bool downward_recipe_complete(
            target.downward_meansub_model_id >= 0 &&
            !(source_domain == vbr_repr_domain::tapped &&
              target.downward_domain == vbr_repr_domain::full);
+}
+
+bool upward_recipe_complete(
+        const vbr_artifact_unit_descriptor & source,
+        vbr_repr_domain source_domain,
+        const vbr_target_unit_snapshot & target) {
+    vbr_upward_recipe resolved;
+    const auto status = vbr_upward_resolve_recipe(
+        static_cast<ggml_type>(source.current_type),
+        static_cast<ggml_type>(target.current_type), resolved);
+    return target.upward_supported &&
+           target.upward_type == target.current_type &&
+           target.upward_domain == target.current_domain &&
+           target.upward_recipe_id == VBR_UPWARD_RECIPE_ID &&
+           target.upward_recipe_version == VBR_UPWARD_RECIPE_VERSION &&
+           status == vbr_upward_recipe_status::resolved &&
+           resolved == target.upward_recipe &&
+           digest_nonzero(target.upward_build_identity_digest) &&
+           target.upward_row_bytes != 0 &&
+           target.upward_mapped_bytes != 0 &&
+           target.upward_transfer_bytes != 0 &&
+           target.upward_codec_workspace_bytes != 0 &&
+           target.upward_meansub_model_id >= 0 &&
+           source_domain == vbr_repr_domain::full &&
+           target.current_domain == vbr_repr_domain::full;
 }
 
 bool same_representation(
@@ -852,7 +878,7 @@ vbr_validated_manifest & vbr_validated_manifest::operator=(
     recheck_target_empty_ = other.recheck_target_empty_;
     read_accounting_serial_ = other.read_accounting_serial_;
     read_policy_epoch_ = other.read_policy_epoch_;
-    read_downward_tree_digest_ = other.read_downward_tree_digest_;
+    read_transform_tree_digest_ = other.read_transform_tree_digest_;
     return *this;
 }
 vbr_validated_manifest::~vbr_validated_manifest() = default;
@@ -876,8 +902,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             switch (policy.schedule_quote->status()) {
                 case vbr_import_schedule_status::exact:
                 case vbr_import_schedule_status::downward:
-                    break;
                 case vbr_import_schedule_status::upward_same_domain:
+                    break;
                 case vbr_import_schedule_status::upward_cross_domain:
                 case vbr_import_schedule_status::mixed_direction_unsupported:
                     return terminal_result(
@@ -986,6 +1012,7 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             manifest.consistency.kind ==
                 vbr_artifact_consistency_kind::live_rebased;
         bool needs_downward = false;
+        bool needs_upward = false;
         for (size_t controller_index = 0;
              controller_index < manifest.generation.controllers.size();
              ++controller_index) {
@@ -1134,7 +1161,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                         vbr_manifest_validation_status::topology_mismatch);
                 }
             }
-            bool downward = false;
+            vbr_import_transform_kind transform_kind =
+                vbr_import_transform_kind::none;
             const auto & controller =
                 manifest.generation.controllers[descriptor.child_id];
             if (descriptor.logical_unit_id >= controller.units.size()) {
@@ -1164,19 +1192,36 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                         vbr_manifest_validation_status::codebook_mismatch :
                         vbr_manifest_validation_status::representation_mismatch);
                 }
-                if (!policy.allow_downward ||
-                    descriptor.codebook_digest != target_unit->codebook_digest ||
+                if (descriptor.codebook_digest != target_unit->codebook_digest ||
                     descriptor.rotation_digest != target_unit->rotation_digest ||
-                    descriptor.meansub_digest != target_unit->meansub_digest ||
-                    !downward_recipe_complete(
-                        descriptor, source_domain, *target_unit)) {
+                    descriptor.meansub_digest != target_unit->meansub_digest) {
                     return terminal_result(
-                        vbr_manifest_validation_status::representation_mismatch);
+                        vbr_manifest_validation_status::codebook_mismatch);
                 }
-                downward = true;
-                needs_downward = true;
+                if (policy.schedule_quote != nullptr &&
+                    policy.schedule_quote->status() ==
+                        vbr_import_schedule_status::upward_same_domain) {
+                    if (!policy.allow_upward ||
+                        !upward_recipe_complete(
+                            descriptor, source_domain, *target_unit)) {
+                        return terminal_result(
+                            vbr_manifest_validation_status::representation_mismatch);
+                    }
+                    transform_kind =
+                        vbr_import_transform_kind::upward_same_domain;
+                    needs_upward = true;
+                } else {
+                    if (!policy.allow_downward ||
+                        !downward_recipe_complete(
+                            descriptor, source_domain, *target_unit)) {
+                        return terminal_result(
+                            vbr_manifest_validation_status::representation_mismatch);
+                    }
+                    transform_kind = vbr_import_transform_kind::downward;
+                    needs_downward = true;
+                }
             }
-            if (!downward) {
+            if (transform_kind == vbr_import_transform_kind::none) {
                 for (size_t i = 0; i < descriptor.shards.size(); ++i) {
                     if (target_unit->shards[i].row_bytes !=
                             descriptor.shards[i].row_bytes ||
@@ -1257,21 +1302,27 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             plan.placements = std::move(placements);
             plan.selected_target_type = target_unit->current_type;
             plan.source_domain = source_domain;
-            plan.selected_target_domain = downward ?
-                target_unit->downward_domain : target_unit->current_domain;
-            plan.transcode_recipe_id = downward ?
-                target_unit->downward_recipe_id : 0;
-            plan.transcode_recipe_version = downward ?
-                target_unit->downward_recipe_version : 0;
-            plan.transcode_build_identity_digest = downward ?
-                target_unit->downward_build_identity_digest :
-                std::array<uint8_t, 32> {};
+            plan.selected_target_domain = target_unit->current_domain;
+            if (transform_kind == vbr_import_transform_kind::downward) {
+                plan.transcode_recipe_id = target_unit->downward_recipe_id;
+                plan.transcode_recipe_version =
+                    target_unit->downward_recipe_version;
+                plan.transcode_build_identity_digest =
+                    target_unit->downward_build_identity_digest;
+            } else if (transform_kind ==
+                    vbr_import_transform_kind::upward_same_domain) {
+                plan.transcode_recipe_id = target_unit->upward_recipe_id;
+                plan.transcode_recipe_version =
+                    target_unit->upward_recipe_version;
+                plan.transcode_build_identity_digest =
+                    target_unit->upward_build_identity_digest;
+            }
             // The degrade cursor is controller-wide. A mixed projection may
             // transcode only some units, but every unit publishes under the
             // same projected cursor.
             plan.target_controller_cursor =
                 target_child->controller_policy.cursor;
-            if (downward) {
+            if (transform_kind == vbr_import_transform_kind::downward) {
                 if (policy.downward_projection == nullptr ||
                     descriptor.child_id >=
                         policy.downward_projection->final_types.size() ||
@@ -1306,24 +1357,70 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                     return terminal_result(
                         vbr_manifest_validation_status::codebook_mismatch);
                 }
+            } else if (transform_kind ==
+                    vbr_import_transform_kind::upward_same_domain) {
+                const auto & destination =
+                    policy.schedule_quote->destination();
+                if (!destination.feasible() ||
+                    descriptor.child_id >=
+                        destination.child_type_digests.size() ||
+                    descriptor.child_id >= destination.final_types.size() ||
+                    descriptor.logical_unit_id >=
+                        destination.final_types[descriptor.child_id].size() ||
+                    destination.final_types[descriptor.child_id]
+                        [descriptor.logical_unit_id] !=
+                            static_cast<ggml_type>(target_unit->current_type) ||
+                    !digest_nonzero(destination.tree_digest)) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::policy_mismatch);
+                }
+                plan.upward_recipe = target_unit->upward_recipe;
+                plan.transcode_policy_digest =
+                    destination.child_type_digests[descriptor.child_id];
+                plan.transcode_tree_digest = destination.tree_digest;
+                plan.transcode_meansub_model_id =
+                    target_unit->upward_meansub_model_id;
+                const auto build_identity = vbr_upward_build_identity(
+                    target_unit->upward_recipe,
+                    target_unit->upward_meansub_model_id,
+                    target_unit->meansub_digest,
+                    plan.transcode_policy_digest,
+                    plan.transcode_tree_digest);
+                if (!digest_nonzero(build_identity) ||
+                    build_identity !=
+                        target_unit->upward_build_identity_digest) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::codebook_mismatch);
+                }
             }
-            plan.downward = downward;
+            plan.transform_kind = transform_kind;
             // Downward import regenerates the target-tier sink stash before
             // the canonical outgoing tapped edge. A source-tier stash is not a
             // target-tier byte image and must never be copied as if exact.
-            plan.stash_action = downward
+            plan.stash_action = transform_kind !=
+                    vbr_import_transform_kind::none
                 ? vbr_validated_stash_action::omit_live_rebased
                 : stash_action;
-            plan.target_row_bytes = downward ?
-                target_unit->downward_row_bytes :
-                target_unit->shards[0].row_bytes;
-            plan.target_mapped_bytes = downward ?
-                target_unit->downward_mapped_bytes :
-                target_unit->shards[0].mapped_bytes;
-            plan.transfer_bytes = downward ?
-                target_unit->downward_transfer_bytes : 0;
-            plan.codec_workspace_bytes = downward ?
-                target_unit->downward_codec_workspace_bytes : 0;
+            if (transform_kind == vbr_import_transform_kind::downward) {
+                plan.target_row_bytes = target_unit->downward_row_bytes;
+                plan.target_mapped_bytes =
+                    target_unit->downward_mapped_bytes;
+                plan.transfer_bytes = target_unit->downward_transfer_bytes;
+                plan.codec_workspace_bytes =
+                    target_unit->downward_codec_workspace_bytes;
+            } else if (transform_kind ==
+                    vbr_import_transform_kind::upward_same_domain) {
+                plan.target_row_bytes = target_unit->upward_row_bytes;
+                plan.target_mapped_bytes =
+                    target_unit->upward_mapped_bytes;
+                plan.transfer_bytes = target_unit->upward_transfer_bytes;
+                plan.codec_workspace_bytes =
+                    target_unit->upward_codec_workspace_bytes;
+            } else {
+                plan.target_row_bytes = target_unit->shards[0].row_bytes;
+                plan.target_mapped_bytes =
+                    target_unit->shards[0].mapped_bytes;
+            }
             plan.unit_reference = *reference;
             plan.controller_policy =
                 manifest.controller_policy[descriptor.child_id];
@@ -1446,31 +1543,49 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             return terminal_result(
                 vbr_manifest_validation_status::budget_unavailable);
         }
-        if (needs_downward) {
-            if (policy.downward_budget_plan == nullptr ||
-                policy.downward_projection == nullptr ||
-                policy.read_downward_tree_digest == nullptr ||
-                !digest_nonzero(policy.downward_projection->tree_digest)) {
+        if (needs_downward && needs_upward) {
+            return terminal_result(
+                vbr_manifest_validation_status::representation_mismatch);
+        }
+        const bool needs_transform = needs_downward || needs_upward;
+        if (needs_transform) {
+            const auto * transform_tree = needs_downward &&
+                    policy.downward_projection != nullptr
+                ? &policy.downward_projection->tree_digest
+                : policy.schedule_quote != nullptr
+                    ? &policy.schedule_quote->destination().tree_digest
+                    : nullptr;
+            if (policy.transform_budget_plan == nullptr ||
+                policy.read_transform_tree_digest == nullptr ||
+                transform_tree == nullptr || !digest_nonzero(*transform_tree) ||
+                (needs_downward && policy.downward_projection == nullptr)) {
                 return terminal_result(
                     vbr_manifest_validation_status::budget_unavailable);
             }
-            // An empty downward projection is only acceptable through the
-            // already-priced native plan. It is conservative (source bytes
-            // are never smaller than the declared downward target) and keeps
-            // an empty caller projection from making admission vacuous.
-            llama_cache_budget_fit_state downward_fit = native_fit;
-            if (policy.downward_budget_plan->accounting_serial !=
+            std::array<uint8_t, 32> live_transform_tree = {};
+            if (!policy.read_transform_tree_digest(
+                    policy.context, live_transform_tree) ||
+                live_transform_tree != *transform_tree) {
+                return terminal_result(
+                    vbr_manifest_validation_status::budget_unavailable);
+            }
+            // An empty transform plan uses the already-priced native claim as
+            // its classification citation. The authenticated destination quote
+            // owns current physical feasibility; stage's transform reservation
+            // remains the final exact growth/workspace admission before H2D.
+            llama_cache_budget_fit_state transform_fit = native_fit;
+            if (policy.transform_budget_plan->accounting_serial !=
                     target.accounting_serial ||
-                (!policy.downward_budget_plan->entries.empty() &&
+                (!policy.transform_budget_plan->entries.empty() &&
                  !price_plan(
                      *policy.accounting_snapshot, *policy.budget_config,
-                     *policy.downward_budget_plan, downward_fit)) ||
-                downward_fit ==
+                     *policy.transform_budget_plan, transform_fit)) ||
+                transform_fit ==
                     llama_cache_budget_fit_state::unavailable) {
                 return terminal_result(
                     vbr_manifest_validation_status::budget_unavailable);
             }
-            if (downward_fit == llama_cache_budget_fit_state::exceeds) {
+            if (transform_fit == llama_cache_budget_fit_state::exceeds) {
                 return terminal_result(
                     vbr_manifest_validation_status::validated,
                     fallback_decision(policy));
@@ -1485,13 +1600,17 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         if (policy.schedule_quote != nullptr &&
             ((needs_downward && policy.schedule_quote->status() !=
                                   vbr_import_schedule_status::downward) ||
-             (!needs_downward && policy.schedule_quote->status() !=
+             (needs_upward && policy.schedule_quote->status() !=
+                                  vbr_import_schedule_status::upward_same_domain) ||
+             (!needs_transform && policy.schedule_quote->status() !=
                                    vbr_import_schedule_status::exact))) {
             return terminal_result(
                 vbr_manifest_validation_status::unavailable);
         }
         if (needs_downward) {
             decision = vbr_import_decision::downward_rebase;
+        } else if (needs_upward) {
+            decision = vbr_import_decision::upward_reconstruct;
         } else if (needs_live_rebase || !policy.allow_native) {
             if (!policy.allow_live_rebased) {
                 decision = fallback_decision(policy);
@@ -1602,8 +1721,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         proof->recheck_target_empty_ = policy.recheck_target_empty;
         proof->read_accounting_serial_ = policy.read_accounting_serial;
         proof->read_policy_epoch_ = policy.read_policy_epoch;
-        proof->read_downward_tree_digest_ =
-            policy.read_downward_tree_digest;
+        proof->read_transform_tree_digest_ =
+            policy.read_transform_tree_digest;
 
         vbr_manifest_validation_result result;
         result.status = vbr_manifest_validation_status::validated;
@@ -1903,7 +2022,7 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
             plan.source_domain = source_domain;
             plan.selected_target_domain = target_unit.current_domain;
             plan.target_controller_cursor = target_policy.cursor;
-            plan.downward = false;
+            plan.transform_kind = vbr_import_transform_kind::none;
             plan.stash_action =
                 vbr_validated_stash_action::none_at_source;
             plan.unit_reference = *reference;
@@ -2289,6 +2408,8 @@ const char * vbr_import_decision_name(
         case vbr_import_decision::native_import: return "native_import";
         case vbr_import_decision::live_rebased: return "live_rebased";
         case vbr_import_decision::downward_rebase: return "downward_rebase";
+        case vbr_import_decision::upward_reconstruct:
+            return "upward_reconstruct";
         case vbr_import_decision::rebuild: return "rebuild";
         case vbr_import_decision::cold: return "cold";
         case vbr_import_decision::reject: return "reject";

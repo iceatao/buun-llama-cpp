@@ -7,6 +7,7 @@
 #include "llama-vbr-artifact-stage.h"
 #include "llama-vbr-artifact-validate.h"
 #include "llama-vbr-downward.h"
+#include "llama-vbr-upward.h"
 #include "llama-vbr-identity-digest.h"
 #include "llama-sha256.h"
 
@@ -3210,7 +3211,7 @@ struct validator_serials {
     uint64_t accounting = 0;
     uint64_t policy = 0;
     bool target_stable = true;
-    std::array<uint8_t, 32> downward_tree_digest = {};
+    std::array<uint8_t, 32> transform_tree_digest = {};
 
     static uint64_t read_accounting(const void * context) noexcept {
         return static_cast<const validator_serials *>(context)->accounting;
@@ -3223,11 +3224,11 @@ struct validator_serials {
             const vbr_target_empty_fingerprint &) noexcept {
         return static_cast<const validator_serials *>(context)->target_stable;
     }
-    static bool read_downward_tree(
+    static bool read_transform_tree(
             const void * context,
             std::array<uint8_t, 32> & output) noexcept {
         output = static_cast<const validator_serials *>(context)
-            ->downward_tree_digest;
+            ->transform_tree_digest;
         return std::any_of(output.begin(), output.end(),
             [](uint8_t value) { return value != 0; });
     }
@@ -3697,15 +3698,16 @@ static void test_manifest_validator_matrix() {
     downward_plan.accounting_serial = f.accounting.serial;
     auto downward_policy = f.policy;
     downward_policy.adoption_nonce = first_nonce + 4;
-    downward_policy.downward_budget_plan = &downward_plan;
+    downward_policy.transform_budget_plan = &downward_plan;
     downward_policy.downward_projection = &projection;
-    f.serials.downward_tree_digest = projection.tree_digest;
-    downward_policy.read_downward_tree_digest =
-        validator_serials::read_downward_tree;
+    f.serials.transform_tree_digest = projection.tree_digest;
+    downward_policy.read_transform_tree_digest =
+        validator_serials::read_transform_tree;
     auto downward = validate(f, downward_target, downward_policy);
     CHECK(downward.status == vbr_manifest_validation_status::validated);
     CHECK(downward.decision == vbr_import_decision::downward_rebase);
-    CHECK(downward.proof && downward.proof->children()[0].downward);
+    CHECK(downward.proof && downward.proof->children()[0].transform_kind ==
+          vbr_import_transform_kind::downward);
     CHECK(downward.proof->tracker_install().children[0].transition ==
           vbr_tracker_install_transition::whole_import);
     CHECK(downward.proof->tracker_install().children[0].units[0].repr_gen == 1);
@@ -3726,6 +3728,190 @@ static void test_manifest_validator_matrix() {
         same_domain_target, same_domain_source.view, same_domain_upward));
     CHECK(same_domain_upward.status() ==
           vbr_import_schedule_status::upward_same_domain);
+
+    vbr_upward_recipe upward_recipe;
+    CHECK(vbr_upward_resolve_recipe(
+              GGML_TYPE_TURBO8_0, GGML_TYPE_F16, upward_recipe) ==
+          vbr_upward_recipe_status::resolved);
+    CHECK(upward_recipe.n_edges == 1);
+    CHECK(upward_recipe.edges[0].source_domain == vbr_repr_domain::full);
+    CHECK(upward_recipe.edges[0].target_domain == vbr_repr_domain::full);
+    vbr_upward_recipe equal_recipe;
+    CHECK(vbr_upward_resolve_recipe(
+              GGML_TYPE_F16, GGML_TYPE_F16, equal_recipe) ==
+          vbr_upward_recipe_status::equal_tier);
+    vbr_upward_recipe unsupported_recipe;
+    CHECK(vbr_upward_resolve_recipe(
+              GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_TCQ,
+              unsupported_recipe) ==
+          vbr_upward_recipe_status::tapped_domain_unsupported);
+    CHECK(vbr_upward_resolve_recipe(
+              GGML_TYPE_TURBO4_0, GGML_TYPE_F16,
+              unsupported_recipe) ==
+          vbr_upward_recipe_status::cross_domain_unsupported);
+    CHECK(vbr_classify_import_schedule_units({
+        { 0, 0, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+          vbr_repr_domain::full, vbr_repr_domain::full },
+        { 0, 1, GGML_TYPE_F16, GGML_TYPE_F16,
+          vbr_repr_domain::full, vbr_repr_domain::full },
+    }) == vbr_import_schedule_status::upward_same_domain);
+
+    const ggml_type upward_types[] = { GGML_TYPE_F16 };
+    auto & upward_child = same_domain_target.children[0];
+    auto & upward_unit = upward_child.units[0];
+    upward_child.controller_policy.current_type_vector_digest =
+        vbr_type_vector_digest(upward_types, 1);
+    upward_unit.upward_supported = true;
+    upward_unit.upward_type = GGML_TYPE_F16;
+    upward_unit.upward_domain = vbr_repr_domain::full;
+    upward_unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
+    upward_unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
+    upward_unit.upward_recipe = upward_recipe;
+    upward_unit.upward_meansub_model_id = 7;
+    upward_unit.upward_row_bytes = 4;
+    upward_unit.upward_mapped_bytes = 4;
+    upward_unit.upward_transfer_bytes =
+        same_domain_source.view.units()[0].descriptor.shards[0].payload_bytes;
+    upward_unit.upward_codec_workspace_bytes = 4;
+    upward_unit.shards[0].row_bytes = 4;
+    upward_unit.shards[0].mapped_bytes = 4;
+
+    vbr_import_destination_projection upward_destination;
+    upward_destination.status =
+        vbr_import_destination_status::feasible_current;
+    upward_destination.initial_types = { { GGML_TYPE_F16 } };
+    upward_destination.final_types = upward_destination.initial_types;
+    upward_destination.initial_cursors = {
+        upward_child.controller_policy.cursor,
+    };
+    upward_destination.final_cursors =
+        upward_destination.initial_cursors;
+    upward_destination.child_type_digests = {
+        upward_child.controller_policy.current_type_vector_digest,
+    };
+    upward_destination.tree_digest = vbr_type_tree_digest(
+        upward_destination.child_type_digests,
+        VBR_DOWNWARD_RECIPE_VERSION);
+    CHECK(vbr_rebind_import_schedule_quote(
+        same_domain_target, same_domain_source.view,
+        upward_destination, same_domain_upward));
+    CHECK(same_domain_upward.status() ==
+          vbr_import_schedule_status::upward_same_domain);
+    upward_unit.upward_build_identity_digest = vbr_upward_build_identity(
+        upward_recipe, upward_unit.upward_meansub_model_id,
+        upward_unit.meansub_digest,
+        upward_destination.child_type_digests[0],
+        upward_destination.tree_digest);
+    CHECK(std::any_of(
+        upward_unit.upward_build_identity_digest.begin(),
+        upward_unit.upward_build_identity_digest.end(),
+        [](uint8_t value) { return value != 0; }));
+
+    llama_cache_budget_plan upward_plan;
+    upward_plan.accounting_serial = same_domain_source.accounting.serial;
+    upward_plan.entries.push_back({
+        upward_unit.shards[0].domain,
+        upward_unit.upward_mapped_bytes +
+            upward_unit.upward_codec_workspace_bytes,
+        0,
+    });
+    auto upward_policy = same_domain_source.policy;
+    upward_policy.adoption_nonce = first_nonce + 5;
+    upward_policy.schedule_quote = &same_domain_upward;
+    upward_policy.transform_budget_plan = &upward_plan;
+    same_domain_source.serials.transform_tree_digest =
+        upward_destination.tree_digest;
+    upward_policy.read_transform_tree_digest =
+        validator_serials::read_transform_tree;
+    auto upward = validate(
+        same_domain_source, same_domain_target, upward_policy);
+    CHECK(upward.status == vbr_manifest_validation_status::validated);
+    CHECK(upward.decision == vbr_import_decision::upward_reconstruct);
+    CHECK(upward.proof && upward.proof->children().size() == 1);
+    if (upward.proof && upward.proof->children().size() == 1) {
+        const auto & plan = upward.proof->children()[0];
+        CHECK(plan.transform_kind ==
+              vbr_import_transform_kind::upward_same_domain);
+        CHECK(plan.upward_recipe == upward_recipe);
+        CHECK(plan.transcode_build_identity_digest ==
+              upward_unit.upward_build_identity_digest);
+        CHECK(plan.target_row_bytes == upward_unit.upward_row_bytes);
+        CHECK(plan.target_mapped_bytes == upward_unit.upward_mapped_bytes);
+        CHECK(plan.transfer_bytes == upward_unit.upward_transfer_bytes);
+        CHECK(plan.codec_workspace_bytes ==
+              upward_unit.upward_codec_workspace_bytes);
+        CHECK(plan.stash_action ==
+              vbr_validated_stash_action::omit_live_rebased);
+    }
+
+    auto no_upward_quote = upward_policy;
+    no_upward_quote.schedule_quote = nullptr;
+    CHECK(validate(
+              same_domain_source, same_domain_target, no_upward_quote).status ==
+          vbr_manifest_validation_status::policy_mismatch);
+
+    auto no_upward_policy = upward_policy;
+    no_upward_policy.allow_upward = false;
+    CHECK(validate(
+              same_domain_source, same_domain_target, no_upward_policy).status ==
+          vbr_manifest_validation_status::representation_mismatch);
+    auto missing_upward_budget = upward_policy;
+    missing_upward_budget.transform_budget_plan = nullptr;
+    CHECK(validate(
+              same_domain_source, same_domain_target,
+              missing_upward_budget).status ==
+          vbr_manifest_validation_status::budget_unavailable);
+    llama_cache_budget_plan empty_upward_plan;
+    empty_upward_plan.accounting_serial = same_domain_source.accounting.serial;
+    auto empty_upward_budget = upward_policy;
+    empty_upward_budget.transform_budget_plan = &empty_upward_plan;
+    const auto empty_upward = validate(
+        same_domain_source, same_domain_target, empty_upward_budget);
+    CHECK(empty_upward.status == vbr_manifest_validation_status::validated);
+    CHECK(empty_upward.decision ==
+          vbr_import_decision::upward_reconstruct);
+    auto stale_upward_plan = upward_plan;
+    stale_upward_plan.accounting_serial++;
+    auto stale_upward_budget = upward_policy;
+    stale_upward_budget.transform_budget_plan = &stale_upward_plan;
+    CHECK(validate(
+              same_domain_source, same_domain_target,
+              stale_upward_budget).status ==
+          vbr_manifest_validation_status::budget_unavailable);
+
+    auto bad_upward_identity = same_domain_target;
+    bad_upward_identity.children[0].units[0]
+        .upward_build_identity_digest[0] ^= 1;
+    CHECK(validate(
+              same_domain_source, bad_upward_identity, upward_policy).status ==
+          vbr_manifest_validation_status::codebook_mismatch);
+    auto bad_upward_codebook = same_domain_target;
+    bad_upward_codebook.children[0].units[0].codebook_digest[0] ^= 1;
+    CHECK(validate(
+              same_domain_source, bad_upward_codebook, upward_policy).status ==
+          vbr_manifest_validation_status::codebook_mismatch);
+    auto bad_upward_rotation = same_domain_target;
+    bad_upward_rotation.children[0].units[0].rotation_digest[0] ^= 1;
+    CHECK(validate(
+              same_domain_source, bad_upward_rotation, upward_policy).status ==
+          vbr_manifest_validation_status::codebook_mismatch);
+    auto bad_upward_meansub = same_domain_target;
+    bad_upward_meansub.children[0].units[0].meansub_digest[0] ^= 1;
+    CHECK(validate(
+              same_domain_source, bad_upward_meansub, upward_policy).status ==
+          vbr_manifest_validation_status::codebook_mismatch);
+    auto bad_upward_recipe = same_domain_target;
+    bad_upward_recipe.children[0].units[0].upward_recipe.edges[0].source_type =
+        GGML_TYPE_TURBO4_0;
+    CHECK(validate(
+              same_domain_source, bad_upward_recipe, upward_policy).status ==
+          vbr_manifest_validation_status::representation_mismatch);
+    same_domain_source.serials.transform_tree_digest[0] ^= 1;
+    CHECK(validate(
+              same_domain_source, same_domain_target, upward_policy).status ==
+          vbr_manifest_validation_status::budget_unavailable);
+    same_domain_source.serials.transform_tree_digest =
+        upward_destination.tree_digest;
 
     validator_fixture cross_domain_source(false, 4);
     auto cross_domain_target = cross_domain_source.target;
@@ -3753,13 +3939,14 @@ static void test_manifest_validator_matrix() {
     unsupported_policy.schedule_quote = &same_domain_upward;
     auto unsupported = validate(
         same_domain_source, same_domain_target, unsupported_policy);
-    CHECK(unsupported.status == vbr_manifest_validation_status::unavailable);
+    CHECK(unsupported.status ==
+          vbr_manifest_validation_status::budget_unavailable);
     CHECK(!unsupported.proof);
     unsupported_policy.authorized = false;
     auto unauthorized_upward = validate(
         same_domain_source, same_domain_target, unsupported_policy);
     CHECK(unauthorized_upward.status ==
-          vbr_manifest_validation_status::unavailable);
+          vbr_manifest_validation_status::unauthorized);
     CHECK(unauthorized_upward.decision == vbr_import_decision::reject);
     unsupported_policy = same_domain_source.policy;
     unsupported_policy.identity.execution_identity += ":wrong";
@@ -3767,12 +3954,17 @@ static void test_manifest_validator_matrix() {
     auto wrong_identity_upward = validate(
         same_domain_source, same_domain_target, unsupported_policy);
     CHECK(wrong_identity_upward.status ==
-          vbr_manifest_validation_status::unavailable);
+          vbr_manifest_validation_status::identity_mismatch);
     CHECK(!wrong_identity_upward.proof);
     for (uint8_t i = 0;
          i < uint8_t(vbr_import_schedule_status::_count); ++i) {
         CHECK(strcmp(vbr_import_schedule_status_name(
                   vbr_import_schedule_status(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0;
+         i < uint8_t(vbr_upward_recipe_status::_count); ++i) {
+        CHECK(strcmp(vbr_upward_recipe_status_name(
+                  vbr_upward_recipe_status(i)), "invalid") != 0);
     }
 
     auto restrictive = f.base.budget;
