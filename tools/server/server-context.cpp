@@ -10439,6 +10439,7 @@ private:
             uint64_t tier_epoch = 0;
             uint64_t tier_epoch_swa = 0;
             bool refresh = false;
+            server_prompt_cache_vbr_publication_metadata publication;
         };
         std::vector<candidate> candidates;
         std::vector<vbr_projected_capture_manifest_request> manifests;
@@ -10686,6 +10687,15 @@ private:
                  ggml_time_ms() < idle.vbr_idle_capture_retry_after_ms)) {
                 continue;
             }
+            server_prompt_cache_vbr_publication_metadata publication;
+            if (!representation_changed &&
+                !prompt_cache->prepare_vbr_publication_metadata(
+                    idle.prompt,
+                    manifest.identity.execution_identity,
+                    manifest.identity.adapter_config_identity,
+                    idle.id, publication)) {
+                continue;
+            }
             manifest.token_block.reserve(
                 size_t(manifest.identity.token_count));
             for (int64_t i = 0; i < manifest.identity.token_count; ++i) {
@@ -10699,6 +10709,7 @@ private:
                     representation.tier_epoch,
                     representation.tier_epoch_swa,
                     representation_changed,
+                    std::move(publication),
                 });
                 total_token_references += token_references;
                 refresh_selected |= representation_changed;
@@ -10926,24 +10937,13 @@ private:
                     ggml_time_ms() + 5000;
                 continue;
             }
-            auto staged = prompt_cache->stage_vbr(
-                source.prompt,
-                server_prompt_cache_payload::from_vbr(
-                    std::move(row.payload)),
-                frontier_execution_identity, adapter_key);
-            if (staged.empty()) {
-                source.vbr_idle_capture_attempt_identity =
-                    found->attempt_identity;
-                source.vbr_idle_capture_terminal = false;
-                source.vbr_idle_capture_retry_after_ms =
-                    ggml_time_ms() + 5000;
-                continue;
-            }
-            server_prompt_cache_apply_family(
-                staged.front(), source.cache_family,
-                !source.task || !source.task->is_child());
-            if (!prompt_cache->publish(
-                    std::move(staged), &source.prompt, source.id)) {
+            if (!found->publication.ready() ||
+                !prompt_cache->publish_vbr(
+                    found->publication,
+                    server_prompt_cache_payload::from_vbr(
+                        std::move(row.payload)),
+                    source.cache_family,
+                    !source.task || !source.task->is_child())) {
                 source.vbr_idle_capture_attempt_identity =
                     found->attempt_identity;
                 source.vbr_idle_capture_terminal = false;

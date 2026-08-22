@@ -2312,6 +2312,59 @@ bool server_prompt_cache::mark_vbr_frontiers(
     }
 }
 
+server_prompt_cache_vbr_publication_metadata::
+~server_prompt_cache_vbr_publication_metadata() {
+    if (cache_) {
+        cache_->abandon_vbr_publication_metadata(*this);
+    }
+}
+
+server_prompt_cache_vbr_publication_metadata::
+server_prompt_cache_vbr_publication_metadata(
+        server_prompt_cache_vbr_publication_metadata && other) noexcept
+    : cache_(other.cache_),
+      source_(other.source_),
+      source_slot_(other.source_slot_),
+      source_artifact_(other.source_artifact_),
+      destination_artifact_(other.destination_artifact_) {
+    entry_.splice(entry_.end(), other.entry_);
+    other.clear();
+}
+
+server_prompt_cache_vbr_publication_metadata &
+server_prompt_cache_vbr_publication_metadata::operator=(
+        server_prompt_cache_vbr_publication_metadata && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (cache_) {
+        cache_->abandon_vbr_publication_metadata(*this);
+    }
+    cache_ = other.cache_;
+    source_ = other.source_;
+    source_slot_ = other.source_slot_;
+    source_artifact_ = other.source_artifact_;
+    destination_artifact_ = other.destination_artifact_;
+    entry_.splice(entry_.end(), other.entry_);
+    other.clear();
+    return *this;
+}
+
+bool server_prompt_cache_vbr_publication_metadata::ready() const noexcept {
+    return cache_ && source_ && source_slot_ >= 0 &&
+        source_artifact_.v != 0 && destination_artifact_.v != 0 &&
+        entry_.size() == 1;
+}
+
+void server_prompt_cache_vbr_publication_metadata::clear() noexcept {
+    cache_ = nullptr;
+    source_ = nullptr;
+    source_slot_ = -1;
+    source_artifact_ = {};
+    destination_artifact_ = {};
+    entry_.clear();
+}
+
 server_prompt_cache_vbr_refresh_status
 server_prompt_cache::refresh_vbr_compact(
         const server_prompt & source_prompt,
@@ -3054,6 +3107,130 @@ static bool server_prompt_cache_mirror_artifact_clone(
         cache, indexed, &source, destination, prompt,
         adapter_identity, coverage_tokens);
     return indexed;
+}
+
+bool server_prompt_cache::prepare_vbr_publication_metadata(
+        const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
+    if (prepared.ready() || !acct || !retention_obs || source_slot < 0 ||
+        execution_identity.empty() || adapter_config_key.empty() ||
+        source_prompt.tokens.empty() ||
+        !retention_obs->prefix_tracking_enabled() ||
+        !retention_obs->prefix_tracking_available() ||
+        !vbr_retention_source_available(source_slot)) {
+        return false;
+    }
+    std::list<server_prompt_cache_state> entry;
+    try {
+        entry.emplace_back();
+        auto & state = entry.front();
+        state.prompt.tokens = source_prompt.tokens.clone();
+        state.prompt.sequence_epoch = source_prompt.sequence_epoch;
+        state.adapter_config_key = std::move(adapter_config_key);
+        state.vbr_execution_identity = execution_identity;
+    } catch (...) {
+        return false;
+    }
+    auto & state = entry.front();
+    const auto source_key =
+        server_retention_instance_key::for_slot(source_slot);
+    const auto destination_key =
+        server_retention_instance_key::for_host_entry(&state);
+    const bool mirrored =
+        !server_fault("vbr_prompt_cache_prefix_fail") &&
+        server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::live_slot,
+            source_slot,
+            destination_key, common_retention_artifact_kind::host_entry,
+            -1,
+            state.prompt, state.adapter_config_key,
+            state.prompt.n_tokens(),
+            server_prompt_cache_prefix_clone_mode::share_source);
+    if (!mirrored) {
+        retention_obs->retire(destination_key);
+        return false;
+    }
+    const auto source_artifact = retention_obs->artifact_id(source_key);
+    const auto destination_artifact =
+        retention_obs->artifact_id(destination_key);
+    if (source_artifact.v == 0 || destination_artifact.v == 0) {
+        retention_obs->retire(destination_key);
+        return false;
+    }
+    prepared.cache_ = this;
+    prepared.source_ = &source_prompt;
+    prepared.source_slot_ = source_slot;
+    prepared.source_artifact_ = source_artifact;
+    prepared.destination_artifact_ = destination_artifact;
+    prepared.entry_.splice(prepared.entry_.end(), entry);
+    return true;
+}
+
+void server_prompt_cache::abandon_vbr_publication_metadata(
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
+    if (prepared.cache_ != this) {
+        return;
+    }
+    if (retention_obs && prepared.entry_.size() == 1) {
+        retention_obs->retire(
+            server_retention_instance_key::for_host_entry(
+                &prepared.entry_.front()));
+    }
+    prepared.clear();
+}
+
+bool server_prompt_cache::publish_vbr(
+        server_prompt_cache_vbr_publication_metadata & prepared,
+        server_prompt_cache_payload payload,
+        common_cache_family_binding family,
+        bool automatic_main_family,
+        iterator * published) noexcept {
+    if (published) {
+        *published = states.end();
+    }
+    if (!prepared.ready() || prepared.cache_ != this ||
+        payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
+        !payload.publishable()) {
+        return false;
+    }
+    auto & staged = prepared.entry_.front();
+    const auto source_key =
+        server_retention_instance_key::for_slot(prepared.source_slot_);
+    const auto destination_key =
+        server_retention_instance_key::for_host_entry(&staged);
+    if (!retention_obs ||
+        retention_obs->artifact_id(source_key) !=
+            prepared.source_artifact_ ||
+        retention_obs->artifact_id(destination_key) !=
+            prepared.destination_artifact_) {
+        return false;
+    }
+    staged.payload = std::move(payload);
+    server_prompt_cache_apply_family(
+        staged, family, automatic_main_family);
+    const auto * source = prepared.source_;
+    const int32_t source_slot = prepared.source_slot_;
+    std::list<server_prompt_cache_state> entry;
+    entry.splice(entry.end(), prepared.entry_);
+    prepared.clear();
+    try {
+        if (publish_impl(
+                std::move(entry), source, source_slot, published, true)) {
+            return true;
+        }
+    } catch (...) {
+    }
+    if (retention_obs) {
+        retention_obs->retire(destination_key);
+    }
+    if (published) {
+        *published = states.end();
+    }
+    return false;
 }
 
 static server_cache_destruction_admission server_prompt_cache_observe_drop(
@@ -6124,6 +6301,16 @@ bool server_prompt_cache::publish(
         const server_prompt * source_prompt,
         int32_t source_slot,
         iterator * published) {
+    return publish_impl(
+        std::move(entry), source_prompt, source_slot, published, false);
+}
+
+bool server_prompt_cache::publish_impl(
+        std::list<server_prompt_cache_state> entry,
+        const server_prompt * source_prompt,
+        int32_t source_slot,
+        iterator * published,
+        bool vbr_retention_prepared) {
     if (published) {
         *published = states.end();
     }
@@ -6373,7 +6560,7 @@ bool server_prompt_cache::publish(
     // retire the provisional destination; the live source and sealed catalog
     // capability remain valid. The shared prefix index may separately latch
     // unavailable under its canonical fail-closed contract.
-    if (is_vbr) {
+    if (is_vbr && !vbr_retention_prepared) {
         const auto source_key =
             server_retention_instance_key::for_slot(source_slot);
         const auto destination_key =
@@ -6406,6 +6593,16 @@ bool server_prompt_cache::publish(
         server_prompt_cache_mirror_lease(
             *this, true, &source, destination, staged.prompt,
             staged.adapter_config_key, staged.prompt.n_tokens());
+    } else if (is_vbr) {
+        // The move-only metadata capability installed this exact association
+        // and prefix before D2H. Its detached std::list node retains the same
+        // address through this by-value move and the final splice.
+        const auto destination_key =
+            server_retention_instance_key::for_host_entry(&staged);
+        if (!retention_obs ||
+            retention_obs->artifact_id(destination_key).v == 0) {
+            return false;
+        }
     }
 
     // Splice the pre-allocated node in FIRST (no allocation, no throw) so the new entry is durably

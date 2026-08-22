@@ -4099,6 +4099,12 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_restore_candidate>);
     static_assert(std::is_nothrow_move_assignable_v<
         server_prompt_cache_vbr_restore_candidate>);
+    static_assert(!std::is_copy_constructible_v<
+        server_prompt_cache_vbr_publication_metadata>);
+    static_assert(std::is_nothrow_move_constructible_v<
+        server_prompt_cache_vbr_publication_metadata>);
+    static_assert(std::is_nothrow_move_assignable_v<
+        server_prompt_cache_vbr_publication_metadata>);
     catalog_fixture fixture;
 
     server_prompt prompt;
@@ -4158,17 +4164,22 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(!staged.front().payload.restorable());
     CHECK(staged.front().payload.accounted_by(&fixture.ledger));
     CHECK(staged.front().payload.size() == owner->resident_bytes());
+    staged.clear();
 
+    const uint64_t live_ops_before =
+        fixture.ledger.snapshot().live_ops;
     if (server_fault("vbr_prompt_cache_prefix_fail")) {
-        const auto destination_key =
-            server_retention_instance_key::for_host_entry(&staged.front());
         const auto source_artifact = retention.artifact_id(source_key);
         const auto ledger_before = fixture.ledger.snapshot();
-        CHECK(!cache.publish(
-            std::move(staged), &prompt, source_slot));
+        server_prompt_cache_vbr_publication_metadata refused;
+        CHECK(!cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, refused));
+        CHECK(!refused.ready());
         const auto ledger_after = fixture.ledger.snapshot();
         CHECK(cache.states.empty());
-        CHECK(retention.artifact_id(destination_key).v == 0);
         CHECK(retention.artifact_id(source_key) == source_artifact);
         CHECK(retention.prefix_tracking_available());
         CHECK(ledger_after.live_ops == ledger_before.live_ops);
@@ -4176,11 +4187,91 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         return;
     }
 
-    const uint64_t live_ops_before =
-        fixture.ledger.snapshot().live_ops;
+    {
+        server_prompt_cache_vbr_publication_metadata prepared;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, prepared));
+        CHECK(prepared.ready());
+        CHECK(fixture.ledger.snapshot().live_ops == live_ops_before + 1);
+        server_prompt_cache_vbr_publication_metadata moved(
+            std::move(prepared));
+        CHECK(!prepared.ready());
+        CHECK(moved.ready());
+        server_prompt_cache foreign(0, 0);
+        CHECK(!foreign.publish_vbr(
+            moved, payload, {}, false));
+        CHECK(moved.ready());
+    }
+    CHECK(cache.states.empty());
+    CHECK(fixture.ledger.snapshot().live_ops == live_ops_before);
+
+    // Move assignment first abandons the overwritten provisional host
+    // association, then transfers the remaining one exactly once.
+    {
+        server_prompt_cache_vbr_publication_metadata first;
+        server_prompt_cache_vbr_publication_metadata second;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, first));
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, second));
+        CHECK(fixture.ledger.snapshot().live_ops == live_ops_before + 2);
+        first = std::move(second);
+        CHECK(first.ready());
+        CHECK(!second.ready());
+        CHECK(fixture.ledger.snapshot().live_ops == live_ops_before + 1);
+    }
+    CHECK(fixture.ledger.snapshot().live_ops == live_ops_before);
+
+    // A live-slot association may retire and reuse the same scheduler key
+    // while D2H is in flight. The prepared metadata binds the exact source
+    // artifact, not merely that key, and remains independently releasable
+    // after refusing the ABA-shaped publication.
+    {
+        server_prompt_cache_vbr_publication_metadata aba;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, aba));
+        const auto old_source = retention.artifact_id(source_key);
+        CHECK(old_source.v != 0);
+        retention.retire(source_key);
+        CHECK(retention.publish(
+            source_key, common_retention_pool::attention,
+            spans, true, prompt.n_tokens(), prompt.n_tokens(), true));
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            retention, source_key, prompt,
+            fixture.package.manifest.identity.adapter_config_identity,
+            prompt.n_tokens()));
+        CHECK(retention.artifact_id(source_key).v != 0);
+        CHECK(retention.artifact_id(source_key) != old_source);
+        CHECK(!cache.publish_vbr(aba, payload, {}, false));
+        CHECK(aba.ready());
+        CHECK(cache.states.empty());
+    }
+    CHECK(fixture.ledger.snapshot().live_ops == live_ops_before);
+
+    server_prompt_cache_vbr_publication_metadata prepared;
+    CHECK(cache.prepare_vbr_publication_metadata(
+        prompt,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        source_slot, prepared));
+    CHECK(prepared.ready());
+    CHECK(fixture.ledger.snapshot().live_ops == live_ops_before + 1);
     server_prompt_cache::iterator logical;
-    CHECK(cache.publish(
-        std::move(staged), &prompt, source_slot, &logical));
+    CHECK(cache.publish_vbr(
+        prepared, payload, {}, false, &logical));
+    CHECK(!prepared.ready());
     CHECK(logical != cache.states.end());
     CHECK(cache.states.size() == 1);
     CHECK(!cache.contains(
@@ -4413,6 +4504,15 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         fixture.package.manifest.identity.adapter_config_identity);
     CHECK(checkpoint_stage.size() == 1);
     CHECK(checkpoint_stage.front().prompt.checkpoints.empty());
+    {
+        server_prompt_cache_vbr_publication_metadata checkpoint_metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            checkpoint_source,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, checkpoint_metadata));
+        CHECK(checkpoint_metadata.ready());
+    }
 
     // Mixed fixed/VBR sizing must preserve the fixed cache's physical-union
     // accounting. The host checkpoint aliases an independently accounted
@@ -4624,6 +4724,43 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         std::move(would_displace), &prompt, source_slot));
     CHECK(bounded.states.size() == 1);
     CHECK(bounded.states.front().payload.restorable());
+
+    // Prepared host aliases share the live source's immutable prefix block.
+    // Eight maximum-frontier aliases must not multiply the 4 MiB token owner
+    // into the prefix index's 16 MiB global source budget.
+    server_prompt maximum_prompt;
+    maximum_prompt.tokens = server_tokens(
+        llama_tokens(1000000, llama_token(7)), false);
+    maximum_prompt.sequence_epoch = 17;
+    constexpr int32_t maximum_source_slot = 12;
+    const auto maximum_source_key =
+        server_retention_instance_key::for_slot(maximum_source_slot);
+    common_chat_msg_spans maximum_spans;
+    maximum_spans.add(
+        COMMON_CHAT_ROLE_USER, 0, maximum_prompt.n_tokens());
+    CHECK(retention.publish(
+        maximum_source_key, common_retention_pool::attention,
+        maximum_spans, true, maximum_prompt.n_tokens(),
+        maximum_prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        retention, maximum_source_key, maximum_prompt,
+        fixture.package.manifest.identity.adapter_config_identity,
+        maximum_prompt.n_tokens()));
+    {
+        std::vector<server_prompt_cache_vbr_publication_metadata> aliases;
+        aliases.reserve(8);
+        for (size_t i = 0; i < 8; ++i) {
+            aliases.emplace_back();
+            CHECK(cache.prepare_vbr_publication_metadata(
+                maximum_prompt,
+                fixture.package.manifest.identity.execution_identity,
+                fixture.package.manifest.identity.adapter_config_identity,
+                maximum_source_slot, aliases.back()));
+        }
+        CHECK(retention.prefix_tracking_available());
+    }
+    CHECK(retention.prefix_tracking_available());
+    retention.retire(maximum_source_key);
 }
 
 static vbr_artifact_package prompt_cache_quality_anchor_package(

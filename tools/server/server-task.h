@@ -860,6 +860,37 @@ enum class server_prompt_cache_vbr_refresh_status : uint8_t {
     _count,
 };
 
+// Move-only preparation of the logical metadata for one fresh VBR host
+// publication. It owns the detached list node, cloned token frontier, and
+// provisional retention/prefix association before artifact D2H begins.
+// This is deliberately not a cache-capacity claim: final payload union and
+// victim authority remain with server_prompt_cache::publish().
+class server_prompt_cache_vbr_publication_metadata {
+public:
+    server_prompt_cache_vbr_publication_metadata() = default;
+    ~server_prompt_cache_vbr_publication_metadata();
+    server_prompt_cache_vbr_publication_metadata(
+        const server_prompt_cache_vbr_publication_metadata &) = delete;
+    server_prompt_cache_vbr_publication_metadata & operator=(
+        const server_prompt_cache_vbr_publication_metadata &) = delete;
+    server_prompt_cache_vbr_publication_metadata(
+        server_prompt_cache_vbr_publication_metadata && other) noexcept;
+    server_prompt_cache_vbr_publication_metadata & operator=(
+        server_prompt_cache_vbr_publication_metadata && other) noexcept;
+
+    bool ready() const noexcept;
+
+private:
+    void clear() noexcept;
+    server_prompt_cache * cache_ = nullptr;
+    const server_prompt * source_ = nullptr;
+    int32_t source_slot_ = -1;
+    llama_cache_acct_artifact_id source_artifact_;
+    llama_cache_acct_artifact_id destination_artifact_;
+    std::list<server_prompt_cache_state> entry_;
+    friend struct server_prompt_cache;
+};
+
 // Move-only, non-consuming citation of one immutable VBR host entry. The
 // highest-quality same-frontier owner is preferred; compact current remains
 // available as a bounded fallback when destination negotiation refuses it.
@@ -1186,6 +1217,24 @@ struct server_prompt_cache {
         const std::string & adapter_config_key,
         int32_t source_slot) noexcept;
 
+    // Preallocate and provisionally index one fresh logical VBR host node.
+    // Dropping the move-only metadata rolls back its retention association.
+    bool prepare_vbr_publication_metadata(
+        const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
+    // Attach the sealed catalog payload and enter the ordinary cache-capacity
+    // publication terminal. All node/token/prefix allocations were completed
+    // by prepare; a refusal still preserves the live source.
+    bool publish_vbr(
+        server_prompt_cache_vbr_publication_metadata & prepared,
+        server_prompt_cache_payload payload,
+        common_cache_family_binding family,
+        bool automatic_main_family,
+        iterator * published = nullptr) noexcept;
+
     // Select and pin the longest VBR artifact whose complete token block is an
     // exact prefix of the incoming text-only request and whose execution and
     // adapter identities match. At an equal frontier, prefer a quality anchor
@@ -1309,8 +1358,17 @@ struct server_prompt_cache {
             server_cache_destruction_reason reason);
 
 private:
+    void abandon_vbr_publication_metadata(
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
+    bool publish_impl(
+        std::list<server_prompt_cache_state> entry,
+        const server_prompt * source_prompt,
+        int32_t source_slot,
+        iterator * published,
+        bool vbr_retention_prepared);
     void release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
+    friend class server_prompt_cache_vbr_publication_metadata;
     friend class server_prompt_cache_vbr_restore_candidate;
 
 public:
