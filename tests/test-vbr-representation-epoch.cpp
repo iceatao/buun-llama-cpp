@@ -1120,6 +1120,19 @@ static bool h2_projected_capture_batch_exact(
         captured.transfer.submitted_chunks != captured.transfer.chunks) {
         return false;
     }
+    uint64_t staging_bytes = 0;
+    for (const auto & row : admission.quote.staging) {
+        if (row.bytes == 0 ||
+            row.bytes > UINT64_MAX - staging_bytes ||
+            row.domain.residency ==
+                llama_cache_acct_residency::not_applicable) {
+            return false;
+        }
+        staging_bytes += row.bytes;
+    }
+    if (staging_bytes != captured.planned_packed_bytes) {
+        return false;
+    }
     uint32_t identity_keys = 0;
     for (const auto & type : identity_counts.calls) {
         for (const uint32_t calls : type) {

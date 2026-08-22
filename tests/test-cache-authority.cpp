@@ -483,6 +483,55 @@ static void test_prepared_transaction_split_phase() {
     CHECK(ledger.snapshot().live_ops == 0);
 }
 
+static void test_atomic_reservation_sets() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    const auto before = ledger.snapshot();
+    llama_cache_acct_resource_domain unknown_device;
+    unknown_device.residency = llama_cache_acct_residency::device;
+    unknown_device.kind = llama_cache_acct_domain_kind::device_topology;
+    unknown_device.device_ordinal = { 0 };
+    unknown_device.topology = { 999 };
+    const llama_cache_conditional_reserve_request requests[] = {
+        { PAYLOAD, HOST, {}, 32, 32 },
+        { PAYLOAD, unknown_device, {}, 16, 16 },
+    };
+    llama_cache_acct_op_id output[] = { { 91 }, { 92 } };
+    const auto refused = ledger.reserve_set_if_serial(
+        before.serial, requests, 2, output);
+    CHECK(refused.status ==
+          llama_cache_conditional_reserve_status::ledger_fault);
+    CHECK(refused.failed_request == 1);
+    CHECK(!output[0] && !output[1]);
+    CHECK(ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(ledger) == 0);
+
+    const auto first = ledger.reserve(PAYLOAD, HOST, {}, 32, 32);
+    const auto second = ledger.reserve(PAYLOAD, HOST, {}, 16, 16);
+    CHECK(first && second && first.v < second.v);
+    const llama_cache_acct_op_id invalid_set[] = {
+        first, { second.v + 1000 },
+    };
+    CHECK(!ledger.abort_set(invalid_set, 2));
+    CHECK(ledger.snapshot().live_ops == 2);
+    CHECK(host_reserved(ledger) == 48);
+
+    const llama_cache_acct_op_id valid_set[] = { first, second };
+    const uint64_t invalid_shrink[] = { 24, 17 };
+    CHECK(!ledger.shrink_reservation_set(
+        valid_set, invalid_shrink, 2));
+    CHECK(ledger.snapshot().live_ops == 2);
+    CHECK(host_reserved(ledger) == 48);
+    const uint64_t valid_shrink[] = { 24, 8 };
+    CHECK(ledger.shrink_reservation_set(
+        valid_set, valid_shrink, 2));
+    CHECK(ledger.snapshot().live_ops == 2);
+    CHECK(host_reserved(ledger) == 32);
+    CHECK(ledger.abort_set(valid_set, 2));
+    CHECK(ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(ledger) == 0);
+}
+
 static llama_cache_acct_op_id commit_host_leaf(
         llama_cache_acct_ledger & ledger,
         uint64_t bytes) {
@@ -578,6 +627,7 @@ int main() {
     test_transaction_fault_rollback();
     test_transaction_after_admit_failure();
     test_prepared_transaction_split_phase();
+    test_atomic_reservation_sets();
     test_prepared_release_set();
     test_status_names();
 

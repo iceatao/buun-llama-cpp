@@ -1879,9 +1879,31 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
         }
         result.union_cells = projection->union_cell_count;
 
+        std::vector<vbr_projected_capture_batch_request::
+            pretransfer_quote::staging_row> staging_rows;
+        const auto portable_domain_less = [](
+                const vbr_artifact_portable_domain & lhs,
+                const vbr_artifact_portable_domain & rhs) {
+            if (lhs.residency != rhs.residency) {
+                return lhs.residency < rhs.residency;
+            }
+            if (lhs.kind != rhs.kind) {
+                return lhs.kind < rhs.kind;
+            }
+            if (lhs.topology_index != rhs.topology_index) {
+                return lhs.topology_index < rhs.topology_index;
+            }
+            return lhs.device_ordinal < rhs.device_ordinal;
+        };
         const auto preflight_projection_bytes = [&]() {
             result.planned_packed_bytes = 0;
-            const auto add_planned_bytes = [&](uint64_t bytes) {
+            staging_rows.clear();
+            const auto add_planned_bytes = [&] (
+                    const vbr_artifact_portable_domain & domain,
+                    uint64_t bytes) {
+                if (bytes == 0) {
+                    return true;
+                }
                 if (bytes > UINT64_MAX - result.planned_packed_bytes) {
                     result.status =
                         vbr_explicit_capture_status::size_overflow;
@@ -1892,6 +1914,24 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                     result.status =
                         vbr_explicit_capture_status::accounting_failed;
                     return false;
+                }
+                const auto found = std::lower_bound(
+                    staging_rows.begin(), staging_rows.end(), domain,
+                    [&](const auto & row, const auto & key) {
+                        return portable_domain_less(row.domain, key);
+                    });
+                if (found != staging_rows.end()) {
+                    if (found->domain != domain) {
+                        staging_rows.insert(found, { domain, bytes });
+                    } else if (bytes > UINT64_MAX - found->bytes) {
+                        result.status =
+                            vbr_explicit_capture_status::size_overflow;
+                        return false;
+                    } else {
+                        found->bytes += bytes;
+                    }
+                } else {
+                    staging_rows.push_back({ domain, bytes });
                 }
                 return true;
             };
@@ -1922,7 +1962,14 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                                 vbr_explicit_capture_status::size_overflow;
                             return false;
                         }
+                        const vbr_artifact_portable_domain domain {
+                            llama_cache_acct_residency::device,
+                            llama_cache_acct_domain_kind::device_topology,
+                            shard.topology_index,
+                            shard.device_ordinal,
+                        };
                         if (!add_planned_bytes(
+                                domain,
                                 projected_rows*shard.row_bytes)) {
                             return false;
                         }
@@ -1937,6 +1984,7 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 for (const auto & companion :
                      recurrent_plans[manifest_index]) {
                     if (!add_planned_bytes(
+                            companion.descriptor.domain,
                             companion.descriptor.payload_bytes)) {
                         return false;
                     }
@@ -1948,8 +1996,10 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             return result;
         }
 
-        if (request.pretransfer_admit) {
-            vbr_projected_capture_batch_request::pretransfer_quote quote;
+        const auto build_pretransfer_quote = [&] (
+                vbr_projected_capture_batch_request::pretransfer_quote &
+                    quote) {
+            quote = {};
             quote.planned_packed_bytes = result.planned_packed_bytes;
             quote.union_cells = result.union_cells;
             quote.manifests = uint32_t(std::count(
@@ -1966,9 +2016,17 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                     child.units.size() > UINT32_MAX - quote.projected_units) {
                     result.status =
                         vbr_explicit_capture_status::size_overflow;
-                    return result;
+                    return false;
                 }
                 quote.projected_units += uint32_t(child.units.size());
+            }
+            quote.staging = staging_rows;
+            return true;
+        };
+        if (request.pretransfer_admit) {
+            vbr_projected_capture_batch_request::pretransfer_quote quote;
+            if (!build_pretransfer_quote(quote)) {
+                return result;
             }
             result.phase =
                 vbr_explicit_capture_phase::reservation_preparation;
@@ -2060,6 +2118,20 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             result.union_cells = projection->union_cell_count;
             if (!preflight_projection_bytes()) {
                 return result;
+            }
+            if (request.pretransfer_shrink) {
+                vbr_projected_capture_batch_request::pretransfer_quote quote;
+                if (!build_pretransfer_quote(quote)) {
+                    return result;
+                }
+                result.phase =
+                    vbr_explicit_capture_phase::reservation_preparation;
+                if (!request.pretransfer_shrink(
+                        request.pretransfer_context, quote)) {
+                    result.status =
+                        vbr_explicit_capture_status::admission_refused;
+                    return result;
+                }
             }
         }
 

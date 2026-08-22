@@ -603,6 +603,72 @@ llama_cache_conditional_reserve_result llama_cache_acct_ledger::reserve_if_seria
                 : llama_cache_conditional_reserve_status::ledger_fault, op };
 }
 
+llama_cache_conditional_reserve_set_result
+llama_cache_acct_ledger::reserve_set_if_serial(
+        uint64_t expected_serial,
+        const llama_cache_conditional_reserve_request * requests,
+        size_t n_requests,
+        llama_cache_acct_op_id * output_ops) noexcept {
+    if (!requests || n_requests == 0 || !output_ops) {
+        return {};
+    }
+    std::fill(output_ops, output_ops + n_requests,
+              llama_cache_acct_op_id{});
+    std::lock_guard<std::mutex> lock(mtx);
+    if (state.serial != expected_serial) {
+        serial_conflicts_++;
+        return {
+            llama_cache_conditional_reserve_status::serial_conflict,
+            SIZE_MAX,
+        };
+    }
+    if (n_requests >
+            std::numeric_limits<uint64_t>::max() - next_op.v) {
+        state.faults_overflow++;
+        bump_serial();
+        return {
+            llama_cache_conditional_reserve_status::ledger_fault, 0,
+        };
+    }
+    try {
+        ops.reserve(ops.size() + n_requests);
+    } catch (...) {
+        state.faults_allocation++;
+        bump_serial();
+        return {
+            llama_cache_conditional_reserve_status::ledger_fault, 0,
+        };
+    }
+
+    for (size_t i = 0; i < n_requests; ++i) {
+        const auto & request = requests[i];
+        const auto op = reserve_locked(
+            request.category, request.domain, request.attribution,
+            request.expected_logical, request.expected_resident);
+        if (op) {
+            output_ops[i] = op;
+            continue;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            const auto found = ops.find(output_ops[j]);
+            if (found != ops.end()) {
+                cell_sub(found->second.category, found->second.domain,
+                         llama_cache_acct_measure::reserved,
+                         found->second.reserved_bytes);
+                ops.erase(found);
+            }
+            output_ops[j] = {};
+        }
+        bump_serial();
+        return {
+            llama_cache_conditional_reserve_status::ledger_fault, i,
+        };
+    }
+    return {
+        llama_cache_conditional_reserve_status::admitted, SIZE_MAX,
+    };
+}
+
 uint64_t llama_cache_acct_ledger::serial_conflicts() const noexcept {
     std::lock_guard<std::mutex> lock(mtx);
     return serial_conflicts_;
@@ -830,6 +896,89 @@ bool llama_cache_acct_ledger::abort(llama_cache_acct_op_id op) {
     ops.erase(it);
     if (staged_alloc) {
         maybe_retire(staged_alloc);
+    }
+    bump_serial();
+    return true;
+}
+
+bool llama_cache_acct_ledger::abort_set(
+        const llama_cache_acct_op_id * selected,
+        size_t n_selected) noexcept {
+    if (!selected || n_selected == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    llama_cache_acct_op_id previous;
+    for (size_t i = 0; i < n_selected; ++i) {
+        const auto op = selected[i];
+        const auto found = ops.find(op);
+        if (!op || (previous && op.v <= previous.v) ||
+            found == ops.end() ||
+            (found->second.state != llama_cache_acct_txn_state::reserved &&
+             found->second.state != llama_cache_acct_txn_state::staged)) {
+            state.faults_invalid_transition++;
+            bump_serial();
+            return false;
+        }
+        previous = op;
+    }
+    for (size_t i = 0; i < n_selected; ++i) {
+        const auto found = ops.find(selected[i]);
+        GGML_ASSERT(found != ops.end());
+        cell_sub(found->second.category, found->second.domain,
+                 llama_cache_acct_measure::reserved,
+                 found->second.reserved_bytes);
+        llama_cache_acct_alloc_id staged_alloc;
+        if (found->second.state == llama_cache_acct_txn_state::staged) {
+            staged_sub(found->second.category, found->second.domain,
+                       found->second.resident_bytes);
+            const auto allocation = allocs.find(found->second.alloc);
+            if (allocation != allocs.end() &&
+                allocation->second.staged_refs > 0) {
+                staged_alloc = found->second.alloc;
+                allocation->second.staged_refs--;
+            }
+        }
+        ops.erase(found);
+        if (staged_alloc) {
+            maybe_retire(staged_alloc);
+        }
+    }
+    bump_serial();
+    return true;
+}
+
+bool llama_cache_acct_ledger::shrink_reservation_set(
+        const llama_cache_acct_op_id * selected,
+        const uint64_t * resident_bytes,
+        size_t n_selected) noexcept {
+    if (!selected || !resident_bytes || n_selected == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    llama_cache_acct_op_id previous;
+    for (size_t i = 0; i < n_selected; ++i) {
+        const auto op = selected[i];
+        const auto found = ops.find(op);
+        if (!op || (previous && op.v <= previous.v) ||
+            found == ops.end() ||
+            found->second.state != llama_cache_acct_txn_state::reserved ||
+            resident_bytes[i] > found->second.reserved_bytes) {
+            state.faults_invalid_transition++;
+            bump_serial();
+            return false;
+        }
+        previous = op;
+    }
+    for (size_t i = 0; i < n_selected; ++i) {
+        auto & transaction = ops.find(selected[i])->second;
+        const uint64_t released =
+            transaction.reserved_bytes - resident_bytes[i];
+        if (released != 0) {
+            cell_sub(transaction.category, transaction.domain,
+                     llama_cache_acct_measure::reserved, released);
+            transaction.reserved_bytes = resident_bytes[i];
+        }
     }
     bump_serial();
     return true;

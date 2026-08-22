@@ -2413,6 +2413,125 @@ static void test_projected_host_batch_store_adapter() {
     }
 
     const uint64_t baseline_ops = ledger.snapshot().live_ops;
+    vbr_projected_capture_batch_request::pretransfer_quote staging_quote;
+    staging_quote.planned_packed_bytes = 48;
+    staging_quote.staging = {
+        {
+            {
+                llama_cache_acct_residency::device,
+                llama_cache_acct_domain_kind::device_topology,
+                0, 0,
+            },
+            32,
+        },
+        {
+            {
+                llama_cache_acct_residency::pageable_host,
+                llama_cache_acct_domain_kind::not_applicable,
+                UINT32_MAX, UINT16_MAX,
+            },
+            16,
+        },
+    };
+    llama_cache_budget_config staging_budget;
+    CHECK(sample_projected_store_budget(
+        &budget_context, staging_budget));
+    staging_budget.devices.front().configured_cache_cap = 32;
+    staging_budget.devices.front().cache_cap_state =
+        llama_cache_budget_capacity_state::known;
+    staging_budget.host.pageable_cap = 16;
+    staging_budget.host.pageable_state =
+        llama_cache_budget_capacity_state::known;
+    const std::vector<llama_vbr_artifact_domain_binding> staging_bindings {
+        { 0, 0, device },
+    };
+    const auto reserved = [&](
+            const llama_cache_acct_snapshot & snapshot,
+            const llama_cache_acct_resource_domain & domain) {
+        const auto found = std::find_if(
+            snapshot.cells.begin(), snapshot.cells.end(),
+            [&](const auto & row) {
+                return row.category ==
+                           llama_cache_acct_category::transfer_staging &&
+                       row.domain == domain;
+            });
+        return found == snapshot.cells.end() ? UINT64_MAX :
+            found->cell.measures[size_t(
+                llama_cache_acct_measure::reserved)].value;
+    };
+    auto shrink_quote = staging_quote;
+    shrink_quote.planned_packed_bytes = 24;
+    shrink_quote.staging[0].bytes = 16;
+    shrink_quote.staging[1].bytes = 8;
+    auto growth_quote = staging_quote;
+    growth_quote.planned_packed_bytes = 49;
+    growth_quote.staging[0].bytes = 33;
+    server_vbr_artifact_store_test_door::
+        projected_staging_lifecycle_result lifecycle;
+    CHECK(server_vbr_artifact_store_test_door::
+        projected_staging_lifecycle(
+            ledger, staging_budget, staging_bindings,
+            staging_quote, shrink_quote, growth_quote, lifecycle));
+    CHECK(lifecycle.scheduler_calls == 1);
+    CHECK(lifecycle.preparation.status ==
+          llama_cache_prepare_status::prepared);
+    CHECK(reserved(lifecycle.initial, device) == 32);
+    CHECK(reserved(lifecycle.initial, pageable) == 16);
+    CHECK(lifecycle.initial.live_ops == baseline_ops + 2);
+    CHECK(reserved(lifecycle.shrunk, device) == 16);
+    CHECK(reserved(lifecycle.shrunk, pageable) == 8);
+    CHECK(lifecycle.shrunk.live_ops == baseline_ops + 2);
+    CHECK(reserved(lifecycle.publication, device) == 16);
+    CHECK(reserved(lifecycle.publication, pageable) == 8);
+    CHECK(lifecycle.after.live_ops == baseline_ops);
+    CHECK(reserved(lifecycle.after, device) == 0);
+    CHECK(reserved(lifecycle.after, pageable) == 0);
+    {
+        vbr_projected_capture_batch_request::pretransfer_quote zero;
+        server_vbr_artifact_store_test_door::
+            projected_staging_lifecycle_result no_work;
+        CHECK(server_vbr_artifact_store_test_door::
+            projected_staging_initial(
+                ledger, staging_budget, staging_bindings,
+                zero, true, no_work));
+        CHECK(no_work.staging ==
+              server_vbr_projected_host_capture_diagnostics::
+                  staging_status::zero_work_admitted);
+        CHECK(no_work.scheduler_calls == 0);
+        CHECK(no_work.budget_samples == 0);
+        CHECK(no_work.after.live_ops == baseline_ops);
+    }
+    {
+        server_vbr_artifact_store_test_door::
+            projected_staging_lifecycle_result refused;
+        CHECK(!server_vbr_artifact_store_test_door::
+            projected_staging_initial(
+                ledger, staging_budget, staging_bindings,
+                staging_quote, false, refused));
+        CHECK(refused.staging ==
+              server_vbr_projected_host_capture_diagnostics::
+                  staging_status::scheduler_refused);
+        CHECK(refused.scheduler_calls == 1);
+        CHECK(refused.budget_samples == 0);
+        CHECK(refused.after.live_ops == baseline_ops);
+    }
+    {
+        auto refused_budget = staging_budget;
+        refused_budget.devices.front().configured_cache_cap = 31;
+        server_vbr_artifact_store_test_door::
+            projected_staging_lifecycle_result refused;
+        CHECK(!server_vbr_artifact_store_test_door::
+            projected_staging_lifecycle(
+                ledger, refused_budget, staging_bindings,
+                staging_quote, shrink_quote, growth_quote, refused));
+        CHECK(!refused.initial_admitted);
+        CHECK(refused.preparation.status ==
+              llama_cache_prepare_status::admission_refused);
+        CHECK(refused.preparation.admission_status ==
+              llama_cache_admission_status::exceeds_budget);
+    }
+    CHECK(ledger.snapshot().live_ops == baseline_ops);
+
     std::vector<server_vbr_projected_host_publish_result> results;
     server_vbr_projected_host_publish_diagnostics diagnostics;
     CHECK(store->publish_projected_host_batch(

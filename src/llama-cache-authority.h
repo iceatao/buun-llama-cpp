@@ -55,6 +55,8 @@ enum class llama_cache_admission_status : uint8_t {
 const char * llama_cache_admission_status_name(llama_cache_admission_status status) noexcept;
 
 struct llama_cache_admission_result;
+struct llama_cache_transaction_leaf;
+class llama_cache_prepared_claim_group;
 
 // Move-only handle to an admitted-but-not-yet-committed reservation. If it is destroyed while still
 // holding a live op (an exception or early return before F0b's stage/commit), it aborts that op so a
@@ -95,6 +97,12 @@ private:
     friend llama_cache_admission_result llama_cache_admit_reservation(
             llama_cache_acct_ledger &, const llama_cache_budget_config &,
             const llama_cache_authority_request &) noexcept;
+    friend class llama_cache_prepared_claim_group;
+    friend llama_cache_prepared_claim_group
+    llama_cache_prepare_reservation_transaction(
+            llama_cache_acct_ledger &,
+            const llama_cache_budget_config &,
+            const std::vector<llama_cache_transaction_leaf> &) noexcept;
 };
 
 // The composer's result: a status plus, when admitted, the move-only claim that owns the reserved
@@ -280,6 +288,13 @@ public:
     bool ready() const noexcept;
     const llama_cache_prepare_result & preparation() const noexcept;
 
+    // Downward-only staging reprice. Every prepared leaf must have equal
+    // logical/reserve/stage bytes. The admitted claims remain the same, so a
+    // dependency-local shrink cannot fail due to a second capacity sample or
+    // competing reservation.
+    bool shrink_equal_reservations(
+        const std::vector<uint64_t> & resident_bytes) noexcept;
+
     // Single terminal. The optional hook remains after all claims are admitted
     // and before the first stage. Re-entry or a failed preparation returns a
     // typed invalid/internal result and never exposes success outputs.
@@ -302,6 +317,8 @@ private:
         std::unique_ptr<impl> state) noexcept;
 
     std::unique_ptr<impl> impl_;
+
+    void abort_if_live() noexcept;
 
     friend llama_cache_prepared_claim_group
     llama_cache_prepare_reservation_transaction(

@@ -330,12 +330,23 @@ struct vbr_projected_capture_batch_request {
         vbr_explicit_capture_request::representation_identity_fn;
 
     struct pretransfer_quote {
+        struct staging_row {
+            vbr_artifact_portable_domain domain;
+            uint64_t bytes = 0;
+        };
+
         uint64_t planned_packed_bytes = 0;
         uint64_t union_cells = 0;
         uint32_t manifests = 0;
         uint32_t projected_units = 0;
+        // Exact physical transport payload grouped by accounting domain.
+        // The synchronous store converts these rows into one split-phase
+        // transfer-staging reservation before companion/attention D2H.
+        std::vector<staging_row> staging;
     };
     using pretransfer_admit_fn = bool (*)(
+        void * context, const pretransfer_quote & quote) noexcept;
+    using pretransfer_shrink_fn = bool (*)(
         void * context, const pretransfer_quote & quote) noexcept;
     using continue_transfer_fn = bool (*)(void * context) noexcept;
 
@@ -357,6 +368,11 @@ struct vbr_projected_capture_batch_request {
     // Refusal returns admission_refused with zero unit transfers.
     void * pretransfer_context = nullptr;
     pretransfer_admit_fn pretransfer_admit = nullptr;
+    // Optional store-owned reservation shrink after a dependency-local
+    // companion failure removes rows from the admitted union. It may only
+    // replace the original claim with a smaller one and never re-enters the
+    // scheduler policy callback.
+    pretransfer_shrink_fn pretransfer_shrink = nullptr;
     // Optional cancellation probe used only after pretransfer admission. It
     // is checked between recurrent <=1 MiB writes and attention ring chunks.
     // False aborts the complete batch without publication.

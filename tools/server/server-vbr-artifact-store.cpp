@@ -408,6 +408,274 @@ server_vbr_artifact_store::server_vbr_artifact_store(
 
 server_vbr_artifact_store::~server_vbr_artifact_store() = default;
 
+namespace {
+
+class projected_capture_staging_session {
+public:
+    using quote =
+        vbr_projected_capture_batch_request::pretransfer_quote;
+
+    projected_capture_staging_session(
+            llama_cache_acct_ledger & ledger,
+            const std::vector<llama_vbr_artifact_domain_binding> & bindings)
+        : ledger_(ledger), bindings_(bindings) {
+    }
+
+    bool admit_initial(
+            const llama_cache_budget_config & budget,
+            const quote & value) noexcept {
+        if (initialized_) {
+            return false;
+        }
+        initialized_ = true;
+        if (value.planned_packed_bytes == 0) {
+            return value.staging.empty();
+        }
+        preparation_attempted_ = true;
+        try {
+            uint64_t total = 0;
+            portable_domains_.reserve(value.staging.size());
+            leaves_.resize(value.staging.size());
+            committed_ops_.resize(value.staging.size());
+            current_bytes_.resize(value.staging.size());
+            shrink_bytes_.resize(value.staging.size());
+            for (size_t i = 0; i < value.staging.size(); ++i) {
+                const auto & row = value.staging[i];
+                if (row.bytes == 0 || row.bytes > UINT64_MAX - total ||
+                    (i != 0 &&
+                     !portable_domain_less(
+                         value.staging[i - 1].domain, row.domain))) {
+                    return false;
+                }
+                total += row.bytes;
+                llama_cache_acct_resource_domain domain;
+                if (!resolve(row.domain, domain)) {
+                    return false;
+                }
+                portable_domains_.push_back(row.domain);
+                current_bytes_[i] = row.bytes;
+                auto & leaf = leaves_[i];
+                leaf.category =
+                    llama_cache_acct_category::transfer_staging;
+                leaf.domain = domain;
+                leaf.attribution = {
+                    llama_cache_acct_attr_kind::server, -1, {},
+                };
+                leaf.expected_logical = row.bytes;
+                leaf.reserve_resident = row.bytes;
+                leaf.stage_resident = row.bytes;
+                leaf.committed_op = &committed_ops_[i];
+            }
+            if (total != value.planned_packed_bytes) {
+                return false;
+            }
+            prepared_ = llama_cache_prepare_reservation_transaction(
+                ledger_, budget, leaves_);
+            if (!prepared_.ready()) {
+                return false;
+            }
+            bytes_ = total;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool shrink(const quote & value) noexcept {
+        if (!initialized_ || value.planned_packed_bytes > bytes_) {
+            return false;
+        }
+        if (!preparation_attempted_) {
+            return value.planned_packed_bytes == 0 && value.staging.empty();
+        }
+        try {
+            std::fill(shrink_bytes_.begin(), shrink_bytes_.end(), 0);
+            uint64_t total = 0;
+            for (const auto & row : value.staging) {
+                if (row.bytes == 0 || row.bytes > UINT64_MAX - total) {
+                    return false;
+                }
+                total += row.bytes;
+                const auto found = std::lower_bound(
+                    portable_domains_.begin(), portable_domains_.end(),
+                    row.domain, portable_domain_less);
+                if (found == portable_domains_.end() ||
+                    *found != row.domain) {
+                    return false;
+                }
+                const size_t index = size_t(found - portable_domains_.begin());
+                if (shrink_bytes_[index] != 0 ||
+                    row.bytes > current_bytes_[index]) {
+                    return false;
+                }
+                shrink_bytes_[index] = row.bytes;
+            }
+            if (total != value.planned_packed_bytes ||
+                !prepared_.shrink_equal_reservations(shrink_bytes_)) {
+                return false;
+            }
+            current_bytes_ = shrink_bytes_;
+            bytes_ = total;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    uint64_t bytes() const noexcept { return bytes_; }
+    bool reserved() const noexcept {
+        return preparation_attempted_ && prepared_.ready();
+    }
+    bool preparation_required() const noexcept {
+        return preparation_attempted_;
+    }
+    const llama_cache_prepare_result & preparation() const noexcept {
+        return prepared_.preparation();
+    }
+
+private:
+    static bool portable_domain_less(
+            const vbr_artifact_portable_domain & lhs,
+            const vbr_artifact_portable_domain & rhs) noexcept {
+        if (lhs.residency != rhs.residency) {
+            return lhs.residency < rhs.residency;
+        }
+        if (lhs.kind != rhs.kind) {
+            return lhs.kind < rhs.kind;
+        }
+        if (lhs.topology_index != rhs.topology_index) {
+            return lhs.topology_index < rhs.topology_index;
+        }
+        return lhs.device_ordinal < rhs.device_ordinal;
+    }
+
+    bool resolve(
+            const vbr_artifact_portable_domain & portable,
+            llama_cache_acct_resource_domain & domain) const noexcept {
+        if (portable.residency ==
+                llama_cache_acct_residency::device) {
+            const auto found = std::find_if(
+                bindings_.begin(), bindings_.end(),
+                [&](const auto & binding) {
+                    return binding.topology_index ==
+                               portable.topology_index &&
+                           binding.device_ordinal ==
+                               portable.device_ordinal;
+                });
+            if (portable.kind !=
+                    llama_cache_acct_domain_kind::device_topology ||
+                found == bindings_.end()) {
+                return false;
+            }
+            domain = found->domain;
+            return true;
+        }
+        if (portable.kind !=
+                llama_cache_acct_domain_kind::not_applicable ||
+            portable.topology_index != UINT32_MAX ||
+            portable.device_ordinal != UINT16_MAX ||
+            portable.residency ==
+                llama_cache_acct_residency::not_applicable ||
+            portable.residency >= llama_cache_acct_residency::_count) {
+            return false;
+        }
+        domain = llama_cache_acct_resource_domain::non_device(
+            portable.residency);
+        return true;
+    }
+
+    llama_cache_acct_ledger & ledger_;
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings_;
+    std::vector<vbr_artifact_portable_domain> portable_domains_;
+    std::vector<llama_cache_transaction_leaf> leaves_;
+    std::vector<llama_cache_acct_op_id> committed_ops_;
+    std::vector<uint64_t> current_bytes_;
+    std::vector<uint64_t> shrink_bytes_;
+    llama_cache_prepared_claim_group prepared_;
+    uint64_t bytes_ = 0;
+    bool initialized_ = false;
+    bool preparation_attempted_ = false;
+};
+
+class projected_capture_staging_admission {
+public:
+    using quote = projected_capture_staging_session::quote;
+    using status =
+        server_vbr_projected_host_capture_diagnostics::staging_status;
+
+    projected_capture_staging_admission(
+            llama_cache_acct_ledger & ledger,
+            void * budget_context,
+            server_vbr_artifact_store_config::sample_budget_fn sample_budget,
+            const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+            const server_vbr_projected_capture_admission * scheduler)
+        : budget_context_(budget_context),
+          sample_budget_(sample_budget),
+          scheduler_(scheduler),
+          session_(ledger, bindings) {
+    }
+
+    bool admit(const quote & value) noexcept {
+        if (!sample_budget_) {
+            status_ = status::budget_failed;
+            return false;
+        }
+        if (!scheduler_checked_) {
+            if (value.planned_packed_bytes == 0) {
+                scheduler_checked_ = true;
+                if (!value.staging.empty()) {
+                    status_ = status::invalid_quote;
+                    return false;
+                }
+                const llama_cache_budget_config unused;
+                const bool accepted = session_.admit_initial(unused, value);
+                status_ = accepted
+                    ? status::zero_work_admitted
+                    : status::invalid_quote;
+                return accepted;
+            }
+            if (scheduler_ && scheduler_->admit &&
+                !scheduler_->admit(scheduler_->context, value)) {
+                status_ = status::scheduler_refused;
+                return false;
+            }
+            scheduler_checked_ = true;
+            try {
+                llama_cache_budget_config budget;
+                if (!sample_budget_(budget_context_, budget)) {
+                    status_ = status::budget_failed;
+                    return false;
+                }
+                const bool accepted = session_.admit_initial(budget, value);
+                status_ = accepted
+                    ? status::prepared
+                    : status::preparation_refused;
+                return accepted;
+            } catch (...) {
+                status_ = status::preparation_refused;
+                return false;
+            }
+        }
+        return session_.shrink(value);
+    }
+
+    projected_capture_staging_session & session() noexcept {
+        return session_;
+    }
+    status terminal() const noexcept { return status_; }
+
+private:
+    void * budget_context_ = nullptr;
+    server_vbr_artifact_store_config::sample_budget_fn sample_budget_ =
+        nullptr;
+    const server_vbr_projected_capture_admission * scheduler_ = nullptr;
+    projected_capture_staging_session session_;
+    bool scheduler_checked_ = false;
+    status status_ = status::not_called;
+};
+
+} // namespace
+
 bool server_vbr_artifact_store_test_door::import_transport_policy(
         const server_vbr_artifact_store & store,
         vbr_adopt_stage_policy & policy) noexcept {
@@ -420,6 +688,144 @@ fail_projected_host_adoption_once(
         server_vbr_artifact_store & store) noexcept {
     if (store.impl_) {
         store.impl_->fail_projected_host_adoption_once = true;
+    }
+}
+
+bool server_vbr_artifact_store_test_door::projected_staging_lifecycle(
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        const vbr_projected_capture_batch_request::pretransfer_quote & initial,
+        const vbr_projected_capture_batch_request::pretransfer_quote & shrink,
+        const vbr_projected_capture_batch_request::pretransfer_quote & growth,
+        projected_staging_lifecycle_result & result) noexcept {
+    result = {};
+    try {
+        const uint64_t baseline = ledger.snapshot().live_ops;
+        struct fixed_budget_context {
+            const llama_cache_budget_config * budget = nullptr;
+            uint32_t * samples = nullptr;
+        } budget_context { &budget, &result.budget_samples };
+        struct scheduler_context {
+            uint32_t calls = 0;
+        } scheduler_state;
+        server_vbr_projected_capture_admission scheduler;
+        scheduler.context = &scheduler_state;
+        scheduler.admit = +[](
+                void * opaque,
+                const vbr_projected_capture_batch_request::
+                    pretransfer_quote &) noexcept {
+            auto * state = static_cast<scheduler_context *>(opaque);
+            if (!state) {
+                return false;
+            }
+            state->calls++;
+            return true;
+        };
+        {
+            projected_capture_staging_admission admission(
+                ledger, &budget_context,
+                +[](void * opaque,
+                    llama_cache_budget_config & output) noexcept {
+                    const auto * state =
+                        static_cast<const fixed_budget_context *>(opaque);
+                    if (!state || !state->budget) {
+                        return false;
+                    }
+                    (*state->samples)++;
+                    output = *state->budget;
+                    return true;
+                },
+                bindings, &scheduler);
+            result.initial_admitted = admission.admit(initial);
+            result.initial = ledger.snapshot();
+            if (!result.initial_admitted) {
+                result.preparation = admission.session().preparation();
+                result.scheduler_calls = scheduler_state.calls;
+                result.staging = admission.terminal();
+                return false;
+            }
+            result.shrink_admitted = admission.admit(shrink);
+            result.shrunk = ledger.snapshot();
+            result.growth_refused = !admission.admit(growth);
+            result.publication = ledger.snapshot();
+            result.live_at_publication =
+                admission.session().reserved() &&
+                result.publication.live_ops > baseline;
+            result.preparation = admission.session().preparation();
+            result.staging = admission.terminal();
+        }
+        result.scheduler_calls = scheduler_state.calls;
+        result.after = ledger.snapshot();
+        return result.initial_admitted && result.shrink_admitted &&
+               result.growth_refused && result.live_at_publication &&
+               result.scheduler_calls == 1 &&
+               result.after.live_ops == baseline;
+    } catch (...) {
+        result.after = ledger.snapshot();
+        return false;
+    }
+}
+
+bool server_vbr_artifact_store_test_door::projected_staging_initial(
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        const vbr_projected_capture_batch_request::pretransfer_quote & quote,
+        bool scheduler_accept,
+        projected_staging_lifecycle_result & result) noexcept {
+    result = {};
+    try {
+        const uint64_t baseline = ledger.snapshot().live_ops;
+        struct fixed_budget_context {
+            const llama_cache_budget_config * budget = nullptr;
+            uint32_t * samples = nullptr;
+        } budget_context { &budget, &result.budget_samples };
+        struct scheduler_context {
+            bool accept = false;
+            uint32_t calls = 0;
+        } scheduler_state { scheduler_accept, 0 };
+        server_vbr_projected_capture_admission scheduler;
+        scheduler.context = &scheduler_state;
+        scheduler.admit = +[](
+                void * opaque,
+                const vbr_projected_capture_batch_request::
+                    pretransfer_quote &) noexcept {
+            auto * state = static_cast<scheduler_context *>(opaque);
+            if (!state) {
+                return false;
+            }
+            state->calls++;
+            return state->accept;
+        };
+        bool accepted = false;
+        {
+            projected_capture_staging_admission admission(
+                ledger, &budget_context,
+                +[](void * opaque,
+                    llama_cache_budget_config & output) noexcept {
+                    auto * state =
+                        static_cast<fixed_budget_context *>(opaque);
+                    if (!state || !state->budget || !state->samples) {
+                        return false;
+                    }
+                    (*state->samples)++;
+                    output = *state->budget;
+                    return true;
+                },
+                bindings, &scheduler);
+            accepted = admission.admit(quote);
+            result.initial_admitted = accepted;
+            result.initial = ledger.snapshot();
+            result.preparation = admission.session().preparation();
+            result.staging = admission.terminal();
+        }
+        result.scheduler_calls = scheduler_state.calls;
+        result.after = ledger.snapshot();
+        return accepted && result.after.live_ops == baseline;
+    } catch (...) {
+        result.after = ledger.snapshot();
+        return false;
     }
 }
 
@@ -1128,6 +1534,9 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
     }
 
     try {
+        projected_capture_staging_admission staging(
+            *impl_->ledger, impl_->budget_context, impl_->sample_budget,
+            impl_->domain_bindings, admission);
         vbr_projected_capture_batch_request request;
         request.idle_decode_thread = true;
         request.max_packed_bytes = max_packed_bytes;
@@ -1143,10 +1552,16 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         request.representation_context = &representation_policy;
         request.representation_identity =
             vbr_explicit_capture_representation_identity;
-        if (admission && admission->admit) {
-            request.pretransfer_context = admission->context;
-            request.pretransfer_admit = admission->admit;
-        }
+        request.pretransfer_context = &staging;
+        request.pretransfer_admit = +[](
+                void * opaque,
+                const vbr_projected_capture_batch_request::
+                    pretransfer_quote & quote) noexcept {
+            auto * state =
+                static_cast<projected_capture_staging_admission *>(opaque);
+            return state && state->admit(quote);
+        };
+        request.pretransfer_shrink = request.pretransfer_admit;
         if (admission && admission->continue_transfer) {
             request.continue_context = admission->context;
             request.continue_transfer = admission->continue_transfer;
@@ -1166,6 +1581,24 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         measured.transferred_units = captured.transferred_units;
         measured.companion_d2h_bytes = captured.companion_d2h_bytes;
         measured.companion_d2h_reads = captured.companion_d2h_reads;
+        measured.staging = staging.terminal();
+        auto & staging_reservation = staging.session();
+        if (staging_reservation.preparation_required()) {
+            measured.staging_prepare_status =
+                staging_reservation.preparation().status;
+            measured.staging_admission_status =
+                staging_reservation.preparation().admission_status;
+            measured.staging_failed_leaf =
+                staging_reservation.preparation().failed_leaf;
+            measured.staging_reserved = staging_reservation.reserved();
+        } else {
+            measured.staging_prepare_status =
+                llama_cache_prepare_status::prepared;
+            measured.staging_admission_status =
+                llama_cache_admission_status::admitted;
+            measured.staging_failed_leaf = SIZE_MAX;
+            measured.staging_reserved = false;
+        }
         measured.transfer = captured.transfer;
         if (captured.status != vbr_explicit_capture_status::ok ||
             !captured.assembly ||

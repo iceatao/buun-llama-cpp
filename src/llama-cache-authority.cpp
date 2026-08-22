@@ -235,12 +235,15 @@ struct llama_cache_prepared_claim_group::impl {
     llama_cache_acct_ledger * ledger = nullptr;
     std::vector<llama_cache_transaction_leaf> leaves;
     std::vector<llama_cache_admission_result> admissions;
+    std::vector<llama_cache_acct_op_id> reserved_ops;
     llama_cache_prepare_result preparation;
     bool consumed = false;
 };
 
 llama_cache_prepared_claim_group::llama_cache_prepared_claim_group() = default;
-llama_cache_prepared_claim_group::~llama_cache_prepared_claim_group() = default;
+llama_cache_prepared_claim_group::~llama_cache_prepared_claim_group() {
+    abort_if_live();
+}
 
 llama_cache_prepared_claim_group::llama_cache_prepared_claim_group(
         std::unique_ptr<impl> state) noexcept
@@ -251,7 +254,28 @@ llama_cache_prepared_claim_group::llama_cache_prepared_claim_group(
 
 llama_cache_prepared_claim_group &
 llama_cache_prepared_claim_group::operator=(
-        llama_cache_prepared_claim_group &&) noexcept = default;
+        llama_cache_prepared_claim_group && other) noexcept {
+    if (this != &other) {
+        abort_if_live();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+
+void llama_cache_prepared_claim_group::abort_if_live() noexcept {
+    if (!impl_ || impl_->consumed || impl_->reserved_ops.empty() ||
+        !impl_->ledger) {
+        return;
+    }
+    if (!impl_->ledger->abort_set(
+            impl_->reserved_ops.data(), impl_->reserved_ops.size())) {
+        return;
+    }
+    for (auto & admission : impl_->admissions) {
+        admission.claim.release();
+    }
+    impl_->reserved_ops.clear();
+}
 
 bool llama_cache_prepared_claim_group::ready() const noexcept {
     return impl_ &&
@@ -264,6 +288,33 @@ const llama_cache_prepare_result &
 llama_cache_prepared_claim_group::preparation() const noexcept {
     static const llama_cache_prepare_result invalid;
     return impl_ ? impl_->preparation : invalid;
+}
+
+bool llama_cache_prepared_claim_group::shrink_equal_reservations(
+        const std::vector<uint64_t> & resident_bytes) noexcept {
+    if (!ready() || resident_bytes.size() != impl_->leaves.size() ||
+        impl_->reserved_ops.size() != impl_->leaves.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < resident_bytes.size(); ++i) {
+        const auto & leaf = impl_->leaves[i];
+        if (leaf.expected_logical != leaf.reserve_resident ||
+            leaf.reserve_resident != leaf.stage_resident ||
+            resident_bytes[i] > leaf.reserve_resident) {
+            return false;
+        }
+    }
+    if (!impl_->ledger->shrink_reservation_set(
+            impl_->reserved_ops.data(), resident_bytes.data(),
+            resident_bytes.size())) {
+        return false;
+    }
+    for (size_t i = 0; i < resident_bytes.size(); ++i) {
+        impl_->leaves[i].expected_logical = resident_bytes[i];
+        impl_->leaves[i].reserve_resident = resident_bytes[i];
+        impl_->leaves[i].stage_resident = resident_bytes[i];
+    }
+    return true;
 }
 
 llama_cache_prepared_claim_group
@@ -312,51 +363,119 @@ llama_cache_prepare_reservation_transaction(
         }
 
         state->admissions.resize(leaves.size());
-        static constexpr uint32_t MAX_ATTEMPTS = 3;
-        for (size_t i = 0; i < leaves.size(); ++i) {
-            llama_cache_admission_status last =
-                llama_cache_admission_status::serial_conflict;
-            uint32_t attempts = 0;
-            for (; attempts < MAX_ATTEMPTS; ++attempts) {
-                const auto & leaf = leaves[i];
-                llama_cache_authority_request request;
-                request.category = leaf.category;
-                request.domain = leaf.domain;
-                request.attribution = leaf.attribution;
-                request.expected_logical =
-                    leaf.expected_logical;
-                request.expected_resident =
-                    leaf.reserve_resident;
-                state->admissions[i] =
-                    llama_cache_admit_reservation(
-                        ledger, budget_config, request);
-                last = state->admissions[i].status;
-                if (last !=
-                        llama_cache_admission_status::
-                            serial_conflict) {
-                    attempts++;
-                    break;
-                }
-                state->preparation.serial_retries++;
+        std::vector<llama_cache_conditional_reserve_request> requests(
+            leaves.size());
+        std::vector<llama_cache_acct_op_id> operations(leaves.size());
+        llama_cache_budget_plan plan;
+        plan.entries.reserve(leaves.size());
+        const auto domain_less = [](
+                const llama_cache_acct_resource_domain & lhs,
+                const llama_cache_acct_resource_domain & rhs) {
+            if (lhs.residency != rhs.residency) {
+                return lhs.residency < rhs.residency;
             }
-            if (last !=
-                    llama_cache_admission_status::admitted) {
-                state->preparation.status =
-                    llama_cache_prepare_status::
-                        admission_refused;
-                state->preparation.admission_status = last;
-                state->preparation.failed_leaf = i;
-                state->preparation.attempts = attempts;
-                return llama_cache_prepared_claim_group(
-                    std::move(state));
+            if (lhs.kind != rhs.kind) {
+                return lhs.kind < rhs.kind;
+            }
+            if (lhs.topology.v != rhs.topology.v) {
+                return lhs.topology.v < rhs.topology.v;
+            }
+            return lhs.device_ordinal.v < rhs.device_ordinal.v;
+        };
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            const auto & leaf = leaves[i];
+            requests[i] = {
+                leaf.category, leaf.domain, leaf.attribution,
+                leaf.expected_logical, leaf.reserve_resident,
+            };
+            const auto position = std::lower_bound(
+                plan.entries.begin(), plan.entries.end(), leaf.domain,
+                [&](const auto & entry, const auto & domain) {
+                    return domain_less(entry.domain, domain);
+                });
+            if (position != plan.entries.end() &&
+                position->domain == leaf.domain) {
+                if (leaf.reserve_resident >
+                        UINT64_MAX - position->reserve_bytes) {
+                    state->preparation.status =
+                        llama_cache_prepare_status::invalid_argument;
+                    state->preparation.failed_leaf = i;
+                    return llama_cache_prepared_claim_group(
+                        std::move(state));
+                }
+                position->reserve_bytes += leaf.reserve_resident;
+            } else {
+                plan.entries.insert(position, {
+                    leaf.domain, leaf.reserve_resident, 0,
+                });
             }
         }
+        static constexpr uint32_t MAX_ATTEMPTS = 3;
+        for (uint32_t attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
+            auto snapshot = ledger.snapshot();
+            state->preparation.attempts = attempt + 1;
+            if (snapshot.completeness_manifest !=
+                    llama_cache_acct_known::known) {
+                state->preparation.status =
+                    llama_cache_prepare_status::admission_refused;
+                state->preparation.admission_status =
+                    llama_cache_admission_status::incomplete_evidence;
+                return llama_cache_prepared_claim_group(std::move(state));
+            }
+            const uint64_t serial = snapshot.serial;
+            llama_cache_budget_coordinator coordinator;
+            if (!coordinator.reset(std::move(snapshot), budget_config)) {
+                state->preparation.status =
+                    llama_cache_prepare_status::admission_refused;
+                state->preparation.admission_status =
+                    llama_cache_admission_status::budget_unavailable;
+                return llama_cache_prepared_claim_group(std::move(state));
+            }
+            plan.accounting_serial = serial;
+            const auto fit = coordinator.fits(plan);
+            if (fit.state != llama_cache_budget_fit_state::fits) {
+                state->preparation.status =
+                    llama_cache_prepare_status::admission_refused;
+                state->preparation.admission_status =
+                    fit.state == llama_cache_budget_fit_state::exceeds
+                        ? llama_cache_admission_status::exceeds_budget
+                        : llama_cache_admission_status::budget_unavailable;
+                return llama_cache_prepared_claim_group(std::move(state));
+            }
+            const auto reserved = ledger.reserve_set_if_serial(
+                serial, requests.data(), requests.size(), operations.data());
+            if (reserved.status ==
+                    llama_cache_conditional_reserve_status::serial_conflict) {
+                state->preparation.serial_retries++;
+                continue;
+            }
+            if (reserved.status !=
+                    llama_cache_conditional_reserve_status::admitted) {
+                state->preparation.status =
+                    llama_cache_prepare_status::admission_refused;
+                state->preparation.admission_status =
+                    llama_cache_admission_status::ledger_fault;
+                state->preparation.failed_leaf = reserved.failed_request;
+                return llama_cache_prepared_claim_group(std::move(state));
+            }
+            for (size_t i = 0; i < operations.size(); ++i) {
+                state->admissions[i].status =
+                    llama_cache_admission_status::admitted;
+                state->admissions[i].claim =
+                    llama_cache_reservation_claim(&ledger, operations[i]);
+            }
+            state->reserved_ops = operations;
+            state->preparation.status =
+                llama_cache_prepare_status::prepared;
+            state->preparation.admission_status =
+                llama_cache_admission_status::admitted;
+            return llama_cache_prepared_claim_group(std::move(state));
+        }
         state->preparation.status =
-            llama_cache_prepare_status::prepared;
+            llama_cache_prepare_status::admission_refused;
         state->preparation.admission_status =
-            llama_cache_admission_status::admitted;
-        return llama_cache_prepared_claim_group(
-            std::move(state));
+            llama_cache_admission_status::serial_conflict;
+        return llama_cache_prepared_claim_group(std::move(state));
     } catch (...) {
         if (!state) {
             try {

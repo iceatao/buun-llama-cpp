@@ -583,6 +583,21 @@ struct llama_cache_conditional_reserve_result {
     llama_cache_acct_op_id                  op     = {};
 };
 
+struct llama_cache_conditional_reserve_request {
+    llama_cache_acct_category category =
+        llama_cache_acct_category::container_overhead;
+    llama_cache_acct_resource_domain domain;
+    llama_cache_acct_attribution attribution;
+    uint64_t expected_logical = 0;
+    uint64_t expected_resident = 0;
+};
+
+struct llama_cache_conditional_reserve_set_result {
+    llama_cache_conditional_reserve_status status =
+        llama_cache_conditional_reserve_status::ledger_fault;
+    size_t failed_request = SIZE_MAX;
+};
+
 // Mutation-boundary release outcome. serial_conflict is optimistic concurrency
 // drift and mutates nothing; ledger_fault means at least one operation was no
 // longer a live committed reference (also no partial release). `released`
@@ -640,6 +655,15 @@ struct llama_cache_acct_ledger {
             uint64_t                       expected_logical,
             uint64_t                       expected_resident);
 
+    // Atomic multi-domain form used by the shared authority transaction. The
+    // caller owns fixed-size request/output arenas; one ledger lock either
+    // mints every reservation or leaves no reservation live.
+    llama_cache_conditional_reserve_set_result reserve_set_if_serial(
+            uint64_t expected_serial,
+            const llama_cache_conditional_reserve_request * requests,
+            size_t n_requests,
+            llama_cache_acct_op_id * output_ops) noexcept;
+
     // Process-local count of reserve_if_serial() drift refusals. Deliberately OUTSIDE the
     // serialized snapshot (adding it there would bump accounting schema 2) — it is authority
     // telemetry, not versioned accounting state.
@@ -671,6 +695,20 @@ struct llama_cache_acct_ledger {
 
     // Zero durable gauge delta; the observed transient peak is retained. The op is erased.
     bool abort(llama_cache_acct_op_id op);
+
+    // Validate and abort a complete reservation/staging set under one lock.
+    // No partial mutation is visible on an invalid member.
+    bool abort_set(
+            const llama_cache_acct_op_id * selected,
+            size_t n_selected) noexcept;
+
+    // Downward-only repricing for equal logical/resident staging claims. This
+    // preserves the original serially admitted claims and cannot consume new
+    // capacity. Every selected op must still be reserved.
+    bool shrink_reservation_set(
+            const llama_cache_acct_op_id * selected,
+            const uint64_t * resident_bytes,
+            size_t n_selected) noexcept;
 
     // Drop the op's reference; discharges durable bytes when the allocation loses its last
     // reference. Exactly-once per reference — a second release is a fault.

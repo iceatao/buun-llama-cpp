@@ -208,6 +208,22 @@ struct server_vbr_projected_host_capture_diagnostics {
     uint32_t transferred_units = 0;
     uint64_t companion_d2h_bytes = 0;
     uint64_t companion_d2h_reads = 0;
+    enum class staging_status : uint8_t {
+        not_called,
+        zero_work_admitted,
+        scheduler_refused,
+        budget_failed,
+        preparation_refused,
+        prepared,
+        invalid_quote,
+        _count,
+    } staging = staging_status::not_called;
+    llama_cache_prepare_status staging_prepare_status =
+        llama_cache_prepare_status::invalid_argument;
+    llama_cache_admission_status staging_admission_status =
+        llama_cache_admission_status::internal_fault;
+    size_t staging_failed_leaf = SIZE_MAX;
+    bool staging_reserved = false;
     vbr_capture_stream_stats transfer;
     server_vbr_projected_host_publish_diagnostics publication;
 };
@@ -430,9 +446,41 @@ private:
 // of the same stage policy used by import(), without publishing a second raw
 // core or transport construction API.
 struct server_vbr_artifact_store_test_door {
+    struct projected_staging_lifecycle_result {
+        bool initial_admitted = false;
+        bool shrink_admitted = false;
+        bool growth_refused = false;
+        bool live_at_publication = false;
+        uint32_t scheduler_calls = 0;
+        uint32_t budget_samples = 0;
+        server_vbr_projected_host_capture_diagnostics::staging_status
+            staging = server_vbr_projected_host_capture_diagnostics::
+                staging_status::not_called;
+        llama_cache_prepare_result preparation;
+        llama_cache_acct_snapshot initial;
+        llama_cache_acct_snapshot shrunk;
+        llama_cache_acct_snapshot publication;
+        llama_cache_acct_snapshot after;
+    };
+
     static bool import_transport_policy(
         const server_vbr_artifact_store & store,
         vbr_adopt_stage_policy & policy) noexcept;
     static void fail_projected_host_adoption_once(
         server_vbr_artifact_store & store) noexcept;
+    static bool projected_staging_lifecycle(
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        const vbr_projected_capture_batch_request::pretransfer_quote & initial,
+        const vbr_projected_capture_batch_request::pretransfer_quote & shrink,
+        const vbr_projected_capture_batch_request::pretransfer_quote & growth,
+        projected_staging_lifecycle_result & result) noexcept;
+    static bool projected_staging_initial(
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        const vbr_projected_capture_batch_request::pretransfer_quote & quote,
+        bool scheduler_accept,
+        projected_staging_lifecycle_result & result) noexcept;
 };
