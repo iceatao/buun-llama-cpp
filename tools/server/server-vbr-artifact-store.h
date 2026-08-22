@@ -211,30 +211,34 @@ struct server_vbr_projected_host_capture_diagnostics {
     uint32_t ring_operation_attempts = 0;
     uint32_t ring_operation_acquires = 0;
     uint32_t ring_operation_refusals = 0;
-    enum class staging_status : uint8_t {
+    enum class resource_status : uint8_t {
         not_called,
         zero_work_admitted,
         scheduler_refused,
         budget_failed,
         preparation_refused,
+        durable_preparation_refused,
         prepared,
         invalid_quote,
         _count,
-    } staging = staging_status::not_called;
+    } resources = resource_status::not_called;
     llama_cache_prepare_status staging_prepare_status =
         llama_cache_prepare_status::invalid_argument;
     llama_cache_admission_status staging_admission_status =
         llama_cache_admission_status::internal_fault;
     size_t staging_failed_leaf = SIZE_MAX;
     bool staging_reserved = false;
+    uint32_t durable_claims = 0;
+    bool durable_reserved = false;
     vbr_capture_stream_stats transfer;
     server_vbr_projected_host_publish_diagnostics publication;
 };
 
 // Scheduler-owned last-mile admission at the exact pre-D2H boundary. The
-// store holds the exact transfer-staging claim while this callback runs; the
-// callback can only accept or refuse the immutable scalar quote. It must not
-// retain the quote or mutate source memory.
+// store holds both the exact transfer-staging claim and every conservative
+// durable-publication claim while this callback runs. The callback can only
+// accept or refuse the immutable quote; it must not retain it or mutate source
+// memory.
 struct server_vbr_projected_capture_admission {
     using quote = vbr_projected_capture_batch_request::pretransfer_quote;
     void * context = nullptr;
@@ -438,9 +442,17 @@ public:
     uint32_t attention_children() const noexcept;
 
 private:
+    bool publish_projected_host_batch_impl(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        std::vector<llama_vbr_projected_publication_claim> && claims,
+        llama_vbr_projected_publication_batch_claim && batch_claim,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        server_vbr_projected_host_publish_diagnostics * diagnostics) noexcept;
     bool publish_captured_projected_host_batch(
         const vbr_capture_manifest_assembly & assembly,
         std::vector<vbr_projected_manifest_publication> && publications,
+        llama_vbr_projected_publication_batch_claim && claim,
         std::vector<server_vbr_projected_host_publish_result> & output,
         const server_vbr_projected_capture_admission * admission,
         server_vbr_projected_host_capture_diagnostics & diagnostics) noexcept;
@@ -462,11 +474,12 @@ struct server_vbr_artifact_store_test_door {
         bool shrink_admitted = false;
         bool growth_refused = false;
         bool live_at_publication = false;
+        size_t durable_claims = 0;
         uint32_t scheduler_calls = 0;
         uint32_t budget_samples = 0;
-        server_vbr_projected_host_capture_diagnostics::staging_status
-            staging = server_vbr_projected_host_capture_diagnostics::
-                staging_status::not_called;
+        server_vbr_projected_host_capture_diagnostics::resource_status
+            resources = server_vbr_projected_host_capture_diagnostics::
+                resource_status::not_called;
         llama_cache_prepare_result preparation;
         llama_cache_acct_snapshot initial;
         llama_cache_acct_snapshot scheduler;
@@ -492,6 +505,11 @@ struct server_vbr_artifact_store_test_door {
         llama_cache_acct_ledger & ledger,
         const llama_cache_budget_config & budget,
         const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        const vbr_projected_capture_batch_request::pretransfer_quote & quote,
+        bool scheduler_accept,
+        projected_staging_lifecycle_result & result) noexcept;
+    static bool projected_resource_initial(
+        server_vbr_artifact_store & store,
         const vbr_projected_capture_batch_request::pretransfer_quote & quote,
         bool scheduler_accept,
         projected_staging_lifecycle_result & result) noexcept;

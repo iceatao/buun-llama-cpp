@@ -55,6 +55,16 @@ struct llama_vbr_artifact_reference_tokens {
     llama_cache_acct_lineage_id lineage;
 };
 
+struct llama_vbr_projected_publication_request {
+    uint64_t manifest_id = 0;
+    std::vector<vbr_artifact_portable_accounting_row> accounting;
+    // Subset of unit_payload bytes this manifest must be able to materialize
+    // freshly. Other unit rows are zero-reserve placeholders that bind to a
+    // preceding manifest's immutable allocation at publication.
+    std::vector<vbr_artifact_portable_accounting_row> reserve_accounting;
+    bool reserve_accounting_explicit = false;
+};
+
 // Catalog-owned split-phase durable-publication fence. Preparation resolves
 // portable accounting through this catalog and admits the complete bounded
 // row set before projected D2H. The opaque move-only owner is later
@@ -74,11 +84,43 @@ public:
         llama_vbr_projected_publication_claim &&) noexcept;
 
     bool ready() const noexcept;
+    uint64_t manifest_id() const noexcept;
     const llama_cache_prepare_result & preparation() const noexcept;
 
 private:
     struct impl;
     explicit llama_vbr_projected_publication_claim(
+        std::unique_ptr<impl> state) noexcept;
+    std::unique_ptr<impl> impl_;
+
+    friend class llama_vbr_artifact_catalog;
+};
+
+// One pre-D2H fence for a complete projected batch. Physical unit rows are
+// reserved once for the batch while every manifest retains its own metadata
+// and zero-reserve reference leaves. Dependency shrink repartitions this
+// owner in place; only the final sealed assembly partitions it into the
+// manifest-local claims consumed by publication.
+class llama_vbr_projected_publication_batch_claim {
+public:
+    llama_vbr_projected_publication_batch_claim() noexcept;
+    ~llama_vbr_projected_publication_batch_claim();
+    llama_vbr_projected_publication_batch_claim(
+        const llama_vbr_projected_publication_batch_claim &) = delete;
+    llama_vbr_projected_publication_batch_claim & operator=(
+        const llama_vbr_projected_publication_batch_claim &) = delete;
+    llama_vbr_projected_publication_batch_claim(
+        llama_vbr_projected_publication_batch_claim &&) noexcept;
+    llama_vbr_projected_publication_batch_claim & operator=(
+        llama_vbr_projected_publication_batch_claim &&) noexcept;
+
+    bool ready() const noexcept;
+    uint32_t manifests() const noexcept;
+    const llama_cache_prepare_result & preparation() const noexcept;
+
+private:
+    struct impl;
+    explicit llama_vbr_projected_publication_batch_claim(
         std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;
 
@@ -306,8 +348,34 @@ public:
     // content dedup later may only repartition the fence downward.
     llama_vbr_projected_publication_claim
     prepare_projected_publication_claim(
+        uint64_t manifest_id,
         const std::vector<vbr_artifact_portable_accounting_row> & rows,
         const llama_cache_budget_config & budget) noexcept;
+
+    // Batch form used by automatic capture. The physical unit union is
+    // reserved exactly once; later manifest groups carry zero-reserve
+    // reference placeholders until the first publication materializes the
+    // shared allocations. No second ledger snapshot or capacity decision is
+    // permitted after this call succeeds.
+    llama_vbr_projected_publication_batch_claim
+    prepare_projected_publication_claims(
+        const std::vector<llama_vbr_projected_publication_request> & requests,
+        const llama_cache_budget_config & budget) noexcept;
+
+    // Replace the admitted batch inventory with an ordered dependency-local
+    // subset. Aggregate reserved bytes may only decrease; the claim remains
+    // one owner and the scheduler is not re-entered.
+    bool shrink_projected_publication_claims(
+        llama_vbr_projected_publication_batch_claim & claim,
+        const std::vector<llama_vbr_projected_publication_request> & requests)
+        noexcept;
+
+    // Final ownership handoff after assembly. Counts and manifest identities
+    // are taken from the batch claim, so partial or swapped output is
+    // unrepresentable.
+    bool partition_projected_publication_claims(
+        llama_vbr_projected_publication_batch_claim && claim,
+        std::vector<llama_vbr_projected_publication_claim> & output) noexcept;
 
     // F3.1 streaming path and the abstract F3.2 capture sink entry point.
     std::unique_ptr<vbr_capture_build> begin_capture(
@@ -327,6 +395,30 @@ public:
         const vbr_capture_manifest_assembly & assembly,
         std::vector<vbr_projected_manifest_publication> && publications,
         const llama_cache_budget_config & budget,
+        std::vector<vbr_projected_manifest_publish_result> & output,
+        vbr_projected_batch_publish_diagnostics * diagnostics = nullptr,
+        const llama_cache_transaction_fault & fault = {})
+        noexcept;
+
+    // Prepared-capacity counterpart used only by the automatic store path.
+    // Claims are consumed per ready manifest; no capacity sample or second
+    // durable admission occurs after D2H.
+    bool publish_projected_batch_claimed(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        std::vector<llama_vbr_projected_publication_claim> && claims,
+        std::vector<vbr_projected_manifest_publish_result> & output,
+        vbr_projected_batch_publish_diagnostics * diagnostics = nullptr,
+        const llama_cache_transaction_fault & fault = {})
+        noexcept;
+
+    // Automatic-capture form. The intact batch fence reaches catalog
+    // normalization so a dependency-local invalid row cannot strand the
+    // shared physical reserve in an unusable manifest claim.
+    bool publish_projected_batch_claimed(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        llama_vbr_projected_publication_batch_claim && claim,
         std::vector<vbr_projected_manifest_publish_result> & output,
         vbr_projected_batch_publish_diagnostics * diagnostics = nullptr,
         const llama_cache_transaction_fault & fault = {}) noexcept;
@@ -384,7 +476,19 @@ private:
         bool sealed_projected = false,
         const std::vector<vbr_artifact_projected_range_view> *
             projected_ranges = nullptr,
-        uint64_t * payload_bytes_rehashed = nullptr) noexcept;
+        uint64_t * payload_bytes_rehashed = nullptr,
+        llama_vbr_projected_publication_claim * projected_claim = nullptr)
+        noexcept;
+
+    bool publish_projected_batch_impl(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        const llama_cache_budget_config & budget,
+        std::vector<vbr_projected_manifest_publish_result> & output,
+        vbr_projected_batch_publish_diagnostics * diagnostics,
+        const llama_cache_transaction_fault & fault,
+        std::vector<llama_vbr_projected_publication_claim> * claims,
+        llama_vbr_projected_publication_batch_claim * batch_claim) noexcept;
 
     std::unique_ptr<vbr_capture_build> begin_capture_impl(
         const vbr_artifact_package & package,

@@ -334,6 +334,19 @@ struct vbr_projected_capture_batch_request {
             vbr_artifact_portable_domain domain;
             uint64_t bytes = 0;
         };
+        struct durable_manifest {
+            uint64_t manifest_id = 0;
+            // Conservative complete catalog rows for this manifest at the
+            // currently projected physical union. Content-addressed dedup
+            // may repartition these rows downward after D2H, never upward.
+            std::vector<vbr_artifact_portable_accounting_row> accounting;
+            // Unit-payload subset whose first immutable allocation is owned
+            // by this manifest. The complete accounting above remains the
+            // conservative final shape; unlisted unit bytes are reference
+            // placeholders and reserve no duplicate physical capacity.
+            std::vector<vbr_artifact_portable_accounting_row>
+                reserve_accounting;
+        };
 
         uint64_t planned_packed_bytes = 0;
         uint64_t union_cells = 0;
@@ -343,6 +356,10 @@ struct vbr_projected_capture_batch_request {
         // The synchronous store converts these rows into one split-phase
         // transfer-staging reservation before companion/attention D2H.
         std::vector<staging_row> staging;
+        // Final manifest shapes plus first-allocation ownership for one
+        // batch-level durable fence. Dependency-local shrink repartitions
+        // this inventory; final assembly partitions independent terminals.
+        std::vector<durable_manifest> durable;
     };
     using pretransfer_admit_fn = bool (*)(
         void * context, const pretransfer_quote & quote) noexcept;

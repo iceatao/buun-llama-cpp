@@ -1883,9 +1883,19 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
 
         std::vector<vbr_projected_capture_batch_request::
             pretransfer_quote::staging_row> staging_rows;
+        std::vector<vbr_artifact_portable_accounting_row>
+            attention_accounting;
+        std::vector<std::vector<vbr_artifact_portable_accounting_row>>
+            attention_reserve_accounting(request.manifests.size());
+        uint32_t projected_unit_count = 0;
         const auto preflight_projection_bytes = [&]() {
             result.planned_packed_bytes = 0;
             staging_rows.clear();
+            attention_accounting.clear();
+            for (auto & rows : attention_reserve_accounting) {
+                rows.clear();
+            }
+            projected_unit_count = 0;
             const auto add_planned_bytes = [&] (
                     const vbr_artifact_portable_domain & domain,
                     uint64_t bytes) {
@@ -1934,7 +1944,15 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 if (stream == projection->streams.end()) {
                     continue;
                 }
+                if (child.units.size() >
+                        UINT32_MAX - projected_unit_count) {
+                    result.status =
+                        vbr_explicit_capture_status::size_overflow;
+                    return false;
+                }
+                projected_unit_count += uint32_t(child.units.size());
                 uint64_t projected_rows = 0;
+                uint64_t owner_manifest = UINT64_MAX;
                 for (const auto & segment : stream->segments) {
                     if (segment.cell_count > UINT64_MAX - projected_rows) {
                         result.status =
@@ -1942,7 +1960,35 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                         return false;
                     }
                     projected_rows += segment.cell_count;
+                    if (segment.first_dependency >
+                            projection->dependent_manifest_ids.size() ||
+                        segment.dependency_count >
+                            projection->dependent_manifest_ids.size() -
+                                segment.first_dependency) {
+                        result.status =
+                            vbr_explicit_capture_status::internal_error;
+                        return false;
+                    }
+                    for (uint32_t dependency = 0;
+                         dependency < segment.dependency_count;
+                         ++dependency) {
+                        owner_manifest = std::min(
+                            owner_manifest,
+                            projection->dependent_manifest_ids[
+                                segment.first_dependency + dependency]);
+                    }
                 }
+                const auto owner = std::lower_bound(
+                    manifest_ids.begin(), manifest_ids.end(),
+                    owner_manifest);
+                if (owner_manifest == UINT64_MAX ||
+                    owner == manifest_ids.end() ||
+                    *owner != owner_manifest) {
+                    result.status =
+                        vbr_explicit_capture_status::internal_error;
+                    return false;
+                }
+                const size_t owner_index = size_t(owner - manifest_ids.begin());
                 for (const auto & unit : child.units) {
                     for (const auto & shard : unit.shards) {
                         if (shard.row_bytes != 0 &&
@@ -1962,6 +2008,16 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                                 projected_rows*shard.row_bytes)) {
                             return false;
                         }
+                        add_accounting(
+                            attention_accounting,
+                            vbr_artifact_accounting_role::unit_payload,
+                            domain,
+                            projected_rows*shard.row_bytes);
+                        add_accounting(
+                            attention_reserve_accounting[owner_index],
+                            vbr_artifact_accounting_role::unit_payload,
+                            domain,
+                            projected_rows*shard.row_bytes);
                     }
                 }
             }
@@ -1994,33 +2050,62 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             quote.manifests = uint32_t(std::count(
                 manifest_dependency_available.begin(),
                 manifest_dependency_available.end(), true));
-            for (const auto & child : children) {
-                const bool projected_child = std::any_of(
-                    projection->streams.begin(), projection->streams.end(),
-                    [&](const auto & stream) {
-                        return stream.child_id == child.child_id &&
-                            stream.stream_index == 0;
-                    });
-                if (!projected_child ||
-                    child.units.size() > UINT32_MAX - quote.projected_units) {
-                    result.status =
-                        vbr_explicit_capture_status::size_overflow;
-                    return false;
-                }
-                quote.projected_units += uint32_t(child.units.size());
-            }
+            quote.projected_units = projected_unit_count;
             quote.staging = staging_rows;
+            const auto host_domain = vbr_artifact_portable_domain {
+                llama_cache_acct_residency::pageable_host,
+                llama_cache_acct_domain_kind::not_applicable,
+                UINT32_MAX, UINT16_MAX,
+            };
+            for (size_t manifest_index = 0;
+                 manifest_index < manifest_ids.size(); ++manifest_index) {
+                if (!manifest_dependency_available[manifest_index]) {
+                    continue;
+                }
+                vbr_projected_capture_batch_request::pretransfer_quote::
+                    durable_manifest durable;
+                durable.manifest_id = manifest_ids[manifest_index];
+                durable.accounting = attention_accounting;
+                durable.reserve_accounting =
+                    attention_reserve_accounting[manifest_index];
+                add_accounting(
+                    durable.accounting,
+                    vbr_artifact_accounting_role::descriptor_metadata,
+                    host_domain,
+                    std::max<uint64_t>(
+                        1, uint64_t(quote.projected_units)*256));
+                add_accounting(
+                    durable.accounting,
+                    vbr_artifact_accounting_role::reference_metadata,
+                    host_domain,
+                    std::max<uint64_t>(
+                        1, uint64_t(quote.projected_units)*128));
+                for (const auto & companion :
+                     recurrent_plans[manifest_index]) {
+                    add_accounting(
+                        durable.accounting,
+                        vbr_artifact_accounting_role::recurrent_payload,
+                        host_domain,
+                        companion.descriptor.payload_bytes);
+                }
+                quote.durable.push_back(std::move(durable));
+            }
+            std::sort(
+                quote.durable.begin(), quote.durable.end(),
+                [](const auto & lhs, const auto & rhs) {
+                    return lhs.manifest_id < rhs.manifest_id;
+                });
             return true;
         };
+        vbr_projected_capture_batch_request::pretransfer_quote current_quote;
+        if (!build_pretransfer_quote(current_quote)) {
+            return result;
+        }
         if (request.pretransfer_admit) {
-            vbr_projected_capture_batch_request::pretransfer_quote quote;
-            if (!build_pretransfer_quote(quote)) {
-                return result;
-            }
             result.phase =
                 vbr_explicit_capture_phase::reservation_preparation;
             if (!request.pretransfer_admit(
-                    request.pretransfer_context, quote)) {
+                    request.pretransfer_context, current_quote)) {
                 result.status =
                     vbr_explicit_capture_status::admission_refused;
                 return result;
@@ -2122,15 +2207,14 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             if (!preflight_projection_bytes()) {
                 return result;
             }
+            if (!build_pretransfer_quote(current_quote)) {
+                return result;
+            }
             if (request.pretransfer_shrink) {
-                vbr_projected_capture_batch_request::pretransfer_quote quote;
-                if (!build_pretransfer_quote(quote)) {
-                    return result;
-                }
                 result.phase =
                     vbr_explicit_capture_phase::reservation_preparation;
                 if (!request.pretransfer_shrink(
-                        request.pretransfer_context, quote)) {
+                        request.pretransfer_context, current_quote)) {
                     result.status =
                         vbr_explicit_capture_status::admission_refused;
                     return result;
@@ -2319,11 +2403,6 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
         }
 
         result.publications.reserve(result.assembly.manifests().size());
-        const auto host_domain = vbr_artifact_portable_domain {
-            llama_cache_acct_residency::pageable_host,
-            llama_cache_acct_domain_kind::not_applicable,
-            UINT32_MAX, UINT16_MAX,
-        };
         for (const auto & manifest : result.assembly.manifests()) {
             vbr_projected_manifest_publication publication;
             publication.manifest_id = manifest.manifest_id;
@@ -2340,78 +2419,23 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             const size_t manifest_index = size_t(
                 requested - manifest_ids.begin());
             if (manifest.state == vbr_capture_manifest_state::ready) {
-                std::map<uint32_t,
-                    const vbr_capture_controller_target *> target_by_child;
-                for (uint32_t i = 0; i < manifest.controller_count; ++i) {
-                    const uint32_t target_index =
-                        result.assembly.controller_references()[
-                            manifest.first_controller + i];
-                    const auto & target =
-                        result.assembly.controller_targets()[target_index];
-                    target_by_child.emplace(target.child_id, &target);
+                const auto durable = std::lower_bound(
+                    current_quote.durable.begin(),
+                    current_quote.durable.end(), manifest.manifest_id,
+                    [](const auto & lhs, uint64_t id) {
+                        return lhs.manifest_id < id;
+                    });
+                if (durable == current_quote.durable.end() ||
+                    durable->manifest_id != manifest.manifest_id ||
+                    manifest.unit_count != current_quote.projected_units) {
+                    result.status =
+                        vbr_explicit_capture_status::internal_error;
+                    result.assembly = {};
+                    result.publications.clear();
+                    return result;
                 }
-                for (uint32_t i = 0; i < manifest.unit_count; ++i) {
-                    const uint32_t unit_index =
-                        result.assembly.unit_references()[
-                            manifest.first_unit + i];
-                    const auto & captured =
-                        result.assembly.projected_units()[unit_index];
-                    const auto target = target_by_child.find(
-                        captured.child_id());
-                    if (target == target_by_child.end() ||
-                        captured.logical_unit_id() >=
-                            target->second->unit_descriptors.size()) {
-                        result.status =
-                            vbr_explicit_capture_status::internal_error;
-                        result.assembly = {};
-                        result.publications.clear();
-                        return result;
-                    }
-                    const auto & descriptor =
-                        target->second->unit_descriptors[
-                            captured.logical_unit_id()];
-                    if (descriptor.shards.size() !=
-                            captured.shards().size()) {
-                        result.status =
-                            vbr_explicit_capture_status::internal_error;
-                        result.assembly = {};
-                        result.publications.clear();
-                        return result;
-                    }
-                    for (size_t shard = 0;
-                         shard < captured.shards().size(); ++shard) {
-                        add_accounting(
-                            publication.accounting,
-                            vbr_artifact_accounting_role::unit_payload,
-                            portable_domain(
-                                descriptor.shards[shard].topology_index,
-                                descriptor.shards[shard].device_ordinal),
-                            captured.shards()[shard].bytes->size());
-                    }
-                }
-                add_accounting(
-                    publication.accounting,
-                    vbr_artifact_accounting_role::descriptor_metadata,
-                    host_domain,
-                    std::max<uint64_t>(
-                        1, uint64_t(manifest.unit_count)*256));
-                add_accounting(
-                    publication.accounting,
-                    vbr_artifact_accounting_role::reference_metadata,
-                    host_domain,
-                    std::max<uint64_t>(
-                        1, uint64_t(manifest.unit_count)*128));
-                for (size_t companion_index = 0;
-                     companion_index <
-                        recurrent_plans[manifest_index].size();
-                     ++companion_index) {
-                    add_accounting(
-                        publication.accounting,
-                        vbr_artifact_accounting_role::recurrent_payload,
-                        host_domain,
-                        recurrent_plans[manifest_index][companion_index].
-                            descriptor.payload_bytes);
-                }
+                publication.accounting =
+                    std::move(durable->accounting);
                 publication.companions = std::move(
                     sealed_companions[manifest_index]);
             }

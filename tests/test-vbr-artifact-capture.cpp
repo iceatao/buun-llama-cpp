@@ -1310,7 +1310,7 @@ static void test_projected_publication_claim_preparation() {
     input.cache_cap_state = llama_cache_budget_capacity_state::unbounded;
     budget.devices.push_back(input);
     const auto baseline = ledger.snapshot().live_ops;
-    auto claim = catalog.prepare_projected_publication_claim(rows, budget);
+    auto claim = catalog.prepare_projected_publication_claim(1, rows, budget);
     CHECK(claim.ready());
     CHECK(claim.preparation().status ==
           llama_cache_prepare_status::prepared);
@@ -1322,10 +1322,85 @@ static void test_projected_publication_claim_preparation() {
     moved = {};
     CHECK(ledger.snapshot().live_ops == baseline);
 
+    std::vector<llama_vbr_projected_publication_request> batch_requests;
+    for (uint64_t manifest_id = 1; manifest_id <= 4; ++manifest_id) {
+        batch_requests.push_back({ manifest_id, rows, {}, false });
+    }
+    auto batch = catalog.prepare_projected_publication_claims(
+        batch_requests, budget);
+    CHECK(batch.ready());
+    CHECK(batch.manifests() == 4);
+    CHECK(ledger.snapshot().live_ops == baseline + rows.size()*4);
+    const auto reserved_total = [&] (
+            llama_cache_acct_category category,
+            const llama_cache_acct_resource_domain & domain) {
+        const auto snapshot = ledger.snapshot();
+        const auto found = std::find_if(
+            snapshot.cells.begin(), snapshot.cells.end(),
+            [&](const auto & cell) {
+                return cell.category == category && cell.domain == domain;
+            });
+        return found == snapshot.cells.end() ? UINT64_MAX :
+            found->cell.measures[size_t(
+                llama_cache_acct_measure::reserved)].value;
+    };
+    CHECK(reserved_total(
+              llama_cache_acct_category::unit_version_payload,
+              device) == 64);
+    CHECK(reserved_total(
+              llama_cache_acct_category::artifact_descriptor_metadata,
+              host) == 16*4);
+
+    std::vector<llama_vbr_projected_publication_request> survivors {
+        batch_requests[1], batch_requests[3],
+    };
+    CHECK(catalog.shrink_projected_publication_claims(batch, survivors));
+    CHECK(batch.ready());
+    CHECK(batch.manifests() == 2);
+    CHECK(ledger.snapshot().live_ops == baseline + rows.size()*2);
+    CHECK(reserved_total(
+              llama_cache_acct_category::unit_version_payload,
+              device) == 64);
+    CHECK(reserved_total(
+              llama_cache_acct_category::artifact_descriptor_metadata,
+              host) == 16*2);
+    std::vector<llama_vbr_projected_publication_claim> split;
+    CHECK(catalog.partition_projected_publication_claims(
+        std::move(batch), split));
+    CHECK(!batch.ready());
+    CHECK(split.size() == 2);
+    CHECK(split[0].manifest_id() == 2);
+    CHECK(split[1].manifest_id() == 4);
+    CHECK(split[0].ready());
+    CHECK(split[1].ready());
+    split.clear();
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    auto under_reserved = batch_requests;
+    for (auto & request : under_reserved) {
+        request.reserve_accounting_explicit = true;
+    }
+    auto under_reserved_claim =
+        catalog.prepare_projected_publication_claims(
+            under_reserved, budget);
+    CHECK(!under_reserved_claim.ready());
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    auto over_reserved = batch_requests;
+    over_reserved.front().reserve_accounting = { rows.front() };
+    over_reserved.front().reserve_accounting.front().logical_bytes++;
+    over_reserved.front().reserve_accounting.front().resident_bytes++;
+    over_reserved.front().reserve_accounting_explicit = true;
+    auto over_reserved_claim =
+        catalog.prepare_projected_publication_claims(
+            over_reserved, budget);
+    CHECK(!over_reserved_claim.ready());
+    CHECK(ledger.snapshot().live_ops == baseline);
+
     auto duplicate_rows = rows;
     duplicate_rows.push_back(rows.front());
     auto duplicate = catalog.prepare_projected_publication_claim(
-        duplicate_rows, budget);
+        1, duplicate_rows, budget);
     CHECK(!duplicate.ready());
     CHECK(duplicate.preparation().status ==
           llama_cache_prepare_status::invalid_argument);
@@ -1335,7 +1410,7 @@ static void test_projected_publication_claim_preparation() {
         16384, rows.front());
     auto duplicate_scale_claim =
         catalog.prepare_projected_publication_claim(
-            duplicate_scale, budget);
+            1, duplicate_scale, budget);
     CHECK(!duplicate_scale_claim.ready());
     CHECK(duplicate_scale_claim.preparation().status ==
           llama_cache_prepare_status::invalid_argument);
@@ -1344,7 +1419,7 @@ static void test_projected_publication_claim_preparation() {
     auto mismatched_rows = rows;
     mismatched_rows.front().resident_bytes--;
     auto mismatched = catalog.prepare_projected_publication_claim(
-        mismatched_rows, budget);
+        1, mismatched_rows, budget);
     CHECK(!mismatched.ready());
     CHECK(mismatched.preparation().status ==
           llama_cache_prepare_status::invalid_argument);
@@ -1354,7 +1429,7 @@ static void test_projected_publication_claim_preparation() {
     wrong_kind_rows.front().domain.kind =
         llama_cache_acct_domain_kind::not_applicable;
     auto wrong_kind = catalog.prepare_projected_publication_claim(
-        wrong_kind_rows, budget);
+        1, wrong_kind_rows, budget);
     CHECK(!wrong_kind.ready());
     CHECK(wrong_kind.preparation().status ==
           llama_cache_prepare_status::invalid_argument);
@@ -1363,7 +1438,7 @@ static void test_projected_publication_claim_preparation() {
     auto wrong_topology_rows = rows;
     wrong_topology_rows.front().domain.topology_index = 1;
     auto wrong_topology = catalog.prepare_projected_publication_claim(
-        wrong_topology_rows, budget);
+        1, wrong_topology_rows, budget);
     CHECK(!wrong_topology.ready());
     CHECK(wrong_topology.preparation().status ==
           llama_cache_prepare_status::invalid_argument);
@@ -1372,7 +1447,7 @@ static void test_projected_publication_claim_preparation() {
     auto malformed_host_rows = rows;
     malformed_host_rows[1].domain.topology_index = 0;
     auto malformed_host = catalog.prepare_projected_publication_claim(
-        malformed_host_rows, budget);
+        1, malformed_host_rows, budget);
     CHECK(!malformed_host.ready());
     CHECK(malformed_host.preparation().status ==
           llama_cache_prepare_status::invalid_argument);
@@ -1382,7 +1457,7 @@ static void test_projected_publication_claim_preparation() {
     overflow_rows[1].logical_bytes = UINT64_MAX;
     overflow_rows[1].resident_bytes = UINT64_MAX;
     auto overflow = catalog.prepare_projected_publication_claim(
-        overflow_rows, budget);
+        1, overflow_rows, budget);
     CHECK(!overflow.ready());
     CHECK(overflow.preparation().status ==
           llama_cache_prepare_status::invalid_argument);
@@ -1555,10 +1630,24 @@ static void test_dependency_scoped_projected_catalog_publication() {
         llama_cache_budget_capacity_state::unbounded;
     budget.global_cap_state =
         llama_cache_budget_capacity_state::unbounded;
+    std::vector<llama_vbr_projected_publication_claim> publication_claims;
+    for (size_t i = 0; i < assembly.manifests().size(); ++i) {
+        if (assembly.manifests()[i].state !=
+                vbr_capture_manifest_state::ready) {
+            continue;
+        }
+        auto claim = catalog.prepare_projected_publication_claim(
+            assembly.manifests()[i].manifest_id,
+            publications[i].accounting, budget);
+        CHECK(claim.ready());
+        publication_claims.push_back(std::move(claim));
+    }
+    CHECK(publication_claims.size() == 7);
     std::vector<vbr_projected_manifest_publish_result> results;
     vbr_projected_batch_publish_diagnostics diagnostics;
-    CHECK(catalog.publish_projected_batch(
-        assembly, std::move(publications), budget, results, &diagnostics));
+    CHECK(catalog.publish_projected_batch_claimed(
+        assembly, std::move(publications), std::move(publication_claims),
+        results, &diagnostics));
     CHECK(results.size() == 8);
     CHECK(diagnostics.ready_manifests == 7);
     CHECK(diagnostics.published_manifests == 6);
@@ -1598,6 +1687,71 @@ static void test_dependency_scoped_projected_catalog_publication() {
     for (const auto reference : references) {
         CHECK(catalog.retire(reference) == vbr_artifact_retire_status::retired);
     }
+    CHECK(catalog.snapshot().references == 0);
+    CHECK(catalog.snapshot().blobs == 0);
+    CHECK(ledger.snapshot().live_ops == 0);
+
+    // Keep the shared batch fence intact until catalog validation chooses a
+    // runnable physical owner. The original lower-ID owner is deliberately
+    // malformed; its sibling must inherit the one fresh-unit reservation.
+    vbr_capture_projection_manifest shared_first;
+    shared_first.manifest_id = 101;
+    shared_first.placements.push_back(
+        projected_placement(101, 101, { 0 }));
+    vbr_capture_projection_manifest shared_second;
+    shared_second.manifest_id = 102;
+    shared_second.placements.push_back(
+        projected_placement(102, 102, { 0 }));
+    auto shared_target_first = projected_target(
+        101, 0, 1111, projected_generation(44));
+    auto shared_target_second = shared_target_first;
+    shared_target_second.manifest_id = 102;
+    bind_projected_manifest_metadata(shared_first, shared_target_first);
+    bind_projected_manifest_metadata(shared_second, shared_target_second);
+    vbr_capture_projection shared_projection;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, { shared_first, shared_second } }, {}, shared_projection));
+    auto shared_unit = capture_projected_unit_for_target(
+        shared_projection, shared_target_first);
+    vbr_capture_manifest_assembly shared_assembly;
+    projected_controller_fixture shared_controller;
+    CHECK(assemble_projected_test_batch(
+        shared_projection,
+        { shared_target_first, shared_target_second },
+        { shared_unit }, shared_controller.provider(), {}, shared_assembly));
+    std::vector<vbr_projected_manifest_publication> shared_publications;
+    shared_publications.push_back(
+        projected_publication(101, shared_assembly, topology));
+    shared_publications.push_back(
+        projected_publication(102, shared_assembly, topology));
+    auto unexpected_companion =
+        std::make_unique<artifact_segment_chain>();
+    const uint8_t unexpected_byte = 0x7c;
+    CHECK(unexpected_companion->append(&unexpected_byte, 1));
+    vbr_capture_sealed_companion unexpected_sealed;
+    CHECK(vbr_capture_seal_companion(
+        0, std::move(unexpected_companion), unexpected_sealed));
+    shared_publications.front().companions.push_back(
+        std::move(unexpected_sealed));
+    std::vector<llama_vbr_projected_publication_request> shared_requests {
+        { 101, shared_publications[0].accounting, {}, false },
+        { 102, shared_publications[1].accounting, {}, false },
+    };
+    auto shared_claim = catalog.prepare_projected_publication_claims(
+        shared_requests, budget);
+    CHECK(shared_claim.ready());
+    std::vector<vbr_projected_manifest_publish_result> shared_results;
+    CHECK(catalog.publish_projected_batch_claimed(
+        shared_assembly, std::move(shared_publications),
+        std::move(shared_claim), shared_results));
+    CHECK(shared_results.size() == 2);
+    CHECK(shared_results[0].status ==
+          vbr_projected_manifest_publish_status::companion_unavailable);
+    CHECK(shared_results[1].status ==
+          vbr_projected_manifest_publish_status::published);
+    CHECK(catalog.retire(
+              shared_results[1].publication.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
     CHECK(catalog.snapshot().references == 0);
     CHECK(catalog.snapshot().blobs == 0);
     CHECK(ledger.snapshot().live_ops == 0);
@@ -1650,7 +1804,27 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(sparse_view.units()[0].descriptor.wm_cells == 8);
     CHECK(sparse_view.units()[0].descriptor.shards[0].row_count == 2);
     sparse_view.reset();
+    const auto first_sparse_reference =
+        results[0].publication.reference_artifact;
+    auto adopted_publication = projected_publication(
+        90, sparse_assembly, topology);
+    std::vector<llama_vbr_projected_publication_claim> adopted_claims;
+    auto adopted_claim = catalog.prepare_projected_publication_claim(
+        90, adopted_publication.accounting, budget);
+    CHECK(adopted_claim.ready());
+    adopted_claims.push_back(std::move(adopted_claim));
+    std::vector<vbr_projected_manifest_publication> adopted_publications;
+    adopted_publications.push_back(std::move(adopted_publication));
+    results.clear();
+    CHECK(catalog.publish_projected_batch_claimed(
+        sparse_assembly, std::move(adopted_publications),
+        std::move(adopted_claims), results, &diagnostics));
+    CHECK(results.size() == 1);
+    CHECK(results[0].status ==
+          vbr_projected_manifest_publish_status::adopted);
     CHECK(catalog.retire(results[0].publication.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(catalog.retire(first_sparse_reference) ==
           vbr_artifact_retire_status::retired);
     CHECK(ledger.snapshot().live_ops == 0);
 }
@@ -2685,6 +2859,111 @@ static void test_projected_host_batch_store_adapter() {
     auto growth_quote = staging_quote;
     growth_quote.planned_packed_bytes = 49;
     growth_quote.staging[0].bytes = 33;
+    auto resource_quote = staging_quote;
+    resource_quote.union_cells = 1;
+    resource_quote.manifests = 1;
+    resource_quote.projected_units = 1;
+    auto resource_publications = make_publications(assembly);
+    std::vector<vbr_artifact_portable_accounting_row>
+        resource_reserve_accounting;
+    std::copy_if(
+        resource_publications.front().accounting.begin(),
+        resource_publications.front().accounting.end(),
+        std::back_inserter(resource_reserve_accounting),
+        [](const auto & row) {
+            return row.role ==
+                vbr_artifact_accounting_role::unit_payload;
+        });
+    resource_quote.durable.push_back({
+        1, resource_publications.front().accounting,
+        resource_reserve_accounting,
+    });
+    {
+        server_vbr_artifact_store_test_door::
+            projected_staging_lifecycle_result resources;
+        CHECK(server_vbr_artifact_store_test_door::
+            projected_resource_initial(
+                *store, resource_quote, true, resources));
+        CHECK(resources.scheduler_calls == 1);
+        CHECK(resources.budget_samples == 1);
+        CHECK(resources.durable_claims == 1);
+        CHECK(resources.live_at_publication);
+        CHECK(resources.scheduler.live_ops ==
+              baseline_ops + resource_quote.staging.size() +
+                  resource_quote.durable.front().accounting.size());
+        CHECK(resources.after.live_ops == baseline_ops);
+    }
+    {
+        auto shared_quote = resource_quote;
+        shared_quote.manifests = 4;
+        shared_quote.durable.clear();
+        for (uint64_t manifest_id = 1; manifest_id <= 4; ++manifest_id) {
+            shared_quote.durable.push_back({
+                manifest_id,
+                resource_publications.front().accounting,
+                manifest_id == 1
+                    ? resource_reserve_accounting
+                    : std::vector<
+                          vbr_artifact_portable_accounting_row> {},
+            });
+        }
+        server_vbr_artifact_store_test_door::
+            projected_staging_lifecycle_result shared;
+        CHECK(server_vbr_artifact_store_test_door::
+            projected_resource_initial(
+                *store, shared_quote, true, shared));
+        CHECK(shared.scheduler_calls == 1);
+        CHECK(shared.budget_samples == 1);
+        CHECK(shared.durable_claims == 4);
+        CHECK(shared.scheduler.live_ops ==
+              baseline_ops + shared_quote.staging.size() +
+                  shared_quote.durable.size() *
+                      shared_quote.durable.front().accounting.size());
+        const auto reserved_for = [&] (
+                vbr_artifact_accounting_role role) {
+            const auto category = vbr_artifact_accounting_category(role);
+            uint64_t bytes = 0;
+            for (const auto & row : shared.scheduler.cells) {
+                if (row.category == category) {
+                    bytes += row.cell.measures[size_t(
+                        llama_cache_acct_measure::reserved)].value;
+                }
+            }
+            return bytes;
+        };
+        const auto expected_for = [&] (
+                vbr_artifact_accounting_role role) {
+            uint64_t bytes = 0;
+            for (const auto & row :
+                 shared_quote.durable.front().accounting) {
+                if (row.role == role) {
+                    bytes += row.resident_bytes;
+                }
+            }
+            return bytes;
+        };
+        CHECK(reserved_for(
+                  vbr_artifact_accounting_role::unit_payload) ==
+              expected_for(vbr_artifact_accounting_role::unit_payload));
+        CHECK(reserved_for(
+                  vbr_artifact_accounting_role::descriptor_metadata) ==
+              expected_for(
+                  vbr_artifact_accounting_role::descriptor_metadata) * 4);
+        CHECK(shared.after.live_ops == baseline_ops);
+    }
+    {
+        server_vbr_artifact_store_test_door::
+            projected_staging_lifecycle_result refused_resources;
+        CHECK(!server_vbr_artifact_store_test_door::
+            projected_resource_initial(
+                *store, resource_quote, false, refused_resources));
+        CHECK(refused_resources.scheduler_calls == 1);
+        CHECK(refused_resources.budget_samples == 1);
+        CHECK(refused_resources.scheduler.live_ops ==
+              baseline_ops + resource_quote.staging.size() +
+                  resource_quote.durable.front().accounting.size());
+        CHECK(refused_resources.after.live_ops == baseline_ops);
+    }
     server_vbr_artifact_store_test_door::
         projected_staging_lifecycle_result lifecycle;
     CHECK(server_vbr_artifact_store_test_door::
@@ -2717,9 +2996,9 @@ static void test_projected_host_batch_store_adapter() {
             projected_staging_initial(
                 ledger, staging_budget, staging_bindings,
                 zero, true, no_work));
-        CHECK(no_work.staging ==
+        CHECK(no_work.resources ==
               server_vbr_projected_host_capture_diagnostics::
-                  staging_status::zero_work_admitted);
+                  resource_status::zero_work_admitted);
         CHECK(no_work.scheduler_calls == 0);
         CHECK(no_work.budget_samples == 0);
         CHECK(no_work.after.live_ops == baseline_ops);
@@ -2731,9 +3010,9 @@ static void test_projected_host_batch_store_adapter() {
             projected_staging_initial(
                 ledger, staging_budget, staging_bindings,
                 staging_quote, false, refused));
-        CHECK(refused.staging ==
+        CHECK(refused.resources ==
               server_vbr_projected_host_capture_diagnostics::
-                  staging_status::scheduler_refused);
+                  resource_status::scheduler_refused);
         CHECK(refused.scheduler_calls == 1);
         CHECK(refused.budget_samples == 1);
         CHECK(refused.preparation.status ==

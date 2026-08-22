@@ -1112,6 +1112,7 @@ static bool h2_projected_capture_batch_exact(
             captured.planned_packed_bytes ||
         admission.quote.union_cells != captured.union_cells ||
         admission.quote.manifests != manifest_count ||
+        admission.quote.durable.size() != manifest_count ||
         admission.quote.projected_units == 0 ||
         admission.continuation_calls == 0 ||
         captured.ring_operation_attempts != 1 ||
@@ -1162,6 +1163,25 @@ static bool h2_projected_capture_batch_exact(
         if (publication.companions.size() != 1 ||
             publication.accounting.empty()) {
             return false;
+        }
+        const auto quoted = std::find_if(
+            admission.quote.durable.begin(), admission.quote.durable.end(),
+            [&](const auto & value) {
+                return value.manifest_id == publication.manifest_id;
+            });
+        if (quoted == admission.quote.durable.end() ||
+            quoted->accounting.size() != publication.accounting.size()) {
+            return false;
+        }
+        for (size_t row = 0; row < publication.accounting.size(); ++row) {
+            const auto & lhs = quoted->accounting[row];
+            const auto & rhs = publication.accounting[row];
+            if (lhs.role != rhs.role || lhs.domain != rhs.domain ||
+                lhs.logical_bytes != rhs.logical_bytes ||
+                lhs.resident_bytes != rhs.resident_bytes ||
+                lhs.attribution != rhs.attribution) {
+                return false;
+            }
         }
     }
     if (manifest_count == 1) {
