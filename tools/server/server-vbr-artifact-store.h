@@ -239,9 +239,11 @@ struct server_vbr_projected_capture_admission {
     using quote = vbr_projected_capture_batch_request::pretransfer_quote;
     void * context = nullptr;
     bool (*admit)(void * context, const quote & quote) noexcept = nullptr;
-    // Optional continuation probe after admission. False cancels the batch
-    // between bounded recurrent writes or attention ring chunks.
-    bool (*continue_transfer)(void * context) noexcept = nullptr;
+    // Optional whole-capture checkpoint. It bounds recurrent/ring transfer
+    // cancellation and is checked once more before catalog publication.
+    // A later arrival may race that last check, but the scheduler still
+    // preserves the live source.
+    bool (*continue_capture)(void * context) noexcept = nullptr;
 };
 
 struct server_vbr_artifact_store_counters {
@@ -436,6 +438,12 @@ public:
     uint32_t attention_children() const noexcept;
 
 private:
+    bool publish_captured_projected_host_batch(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        const server_vbr_projected_capture_admission * admission,
+        server_vbr_projected_host_capture_diagnostics & diagnostics) noexcept;
     server_vbr_artifact_import_output import_package(
         server_vbr_artifact_import_target request,
         const vbr_artifact_package_view & package) noexcept;
@@ -487,4 +495,11 @@ struct server_vbr_artifact_store_test_door {
         const vbr_projected_capture_batch_request::pretransfer_quote & quote,
         bool scheduler_accept,
         projected_staging_lifecycle_result & result) noexcept;
+    static bool publish_after_capture_checkpoint(
+        server_vbr_artifact_store & store,
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        const server_vbr_projected_capture_admission & admission,
+        server_vbr_projected_host_capture_diagnostics & diagnostics) noexcept;
 };

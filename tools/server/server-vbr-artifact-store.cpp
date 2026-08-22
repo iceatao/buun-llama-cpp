@@ -850,6 +850,17 @@ bool server_vbr_artifact_store_test_door::projected_staging_initial(
     }
 }
 
+bool server_vbr_artifact_store_test_door::publish_after_capture_checkpoint(
+        server_vbr_artifact_store & store,
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        const server_vbr_projected_capture_admission & admission,
+        server_vbr_projected_host_capture_diagnostics & diagnostics) noexcept {
+    return store.publish_captured_projected_host_batch(
+        assembly, std::move(publications), output, &admission, diagnostics);
+}
+
 bool server_vbr_artifact_store_observe_empty_accounting(
         llama_cache_acct_ledger & ledger,
         const llama_cache_acct_resource_domain & domain) noexcept {
@@ -1583,9 +1594,9 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
             return state && state->admit(quote);
         };
         request.pretransfer_shrink = request.pretransfer_admit;
-        if (admission && admission->continue_transfer) {
+        if (admission && admission->continue_capture) {
             request.continue_context = admission->context;
-            request.continue_transfer = admission->continue_transfer;
+            request.continue_transfer = admission->continue_capture;
         }
 
         auto captured = vbr_capture_projected_batch(memory, request);
@@ -1636,10 +1647,9 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
             }
             return false;
         }
-
-        const bool published = publish_projected_host_batch(
+        const bool published = publish_captured_projected_host_batch(
             captured.assembly, std::move(captured.publications), output,
-            &measured.publication);
+            admission, measured);
         if (diagnostics) {
             *diagnostics = measured;
         }
@@ -1648,6 +1658,30 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         output.clear();
         return false;
     }
+}
+
+bool server_vbr_artifact_store::publish_captured_projected_host_batch(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        const server_vbr_projected_capture_admission * admission,
+        server_vbr_projected_host_capture_diagnostics & diagnostics) noexcept {
+    // The final D2H checkpoint is not the publication linearization point.
+    // Recheck the scheduler-owned session after assembly and immediately
+    // before the catalog transaction. An arrival observed at this checkpoint
+    // prevents host rows; a later racing arrival still preserves the live
+    // source at scheduler publication.
+    if (admission && admission->continue_capture &&
+        !admission->continue_capture(admission->context)) {
+        output.clear();
+        diagnostics.capture_status = vbr_explicit_capture_status::cancelled;
+        diagnostics.capture_phase = vbr_explicit_capture_phase::publication;
+        diagnostics.inner_stream_status =
+            vbr_capture_stream_status::cancelled;
+        return false;
+    }
+    return publish_projected_host_batch(
+        assembly, std::move(publications), output, &diagnostics.publication);
 }
 
 server_vbr_artifact_import_output server_vbr_artifact_store::import(

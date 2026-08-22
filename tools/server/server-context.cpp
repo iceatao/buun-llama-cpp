@@ -7191,9 +7191,11 @@ private:
             // allow_vbr=false, so those contexts can never have anything to breathe
             SRV_TRC("%s", "idle tick: memory breathe\n");
             llama_memory_breathe(llama_get_memory(ctx_tgt));
-            if (params_base.vbr_prompt_cache &&
-                !queue_tasks.has_pending_tasks()) {
-                (void) publish_idle_vbr_batch();
+            if (params_base.vbr_prompt_cache) {
+                auto capture = queue_tasks.try_begin_idle_capture();
+                if (capture) {
+                    (void) publish_idle_vbr_batch(capture);
+                }
             }
         });
 
@@ -10314,9 +10316,11 @@ private:
         return true;
     }
 
-    size_t publish_idle_vbr_batch() noexcept {
+    size_t publish_idle_vbr_batch(
+            server_queue::idle_capture_session & capture_session) noexcept {
         if (!params_base.vbr_prompt_cache || !prompt_cache ||
-            !vbr_artifact_store || ctx_dft) {
+            !vbr_artifact_store || ctx_dft ||
+            !capture_session.continue_capture()) {
             return 0;
         }
 
@@ -10398,7 +10402,7 @@ private:
                 // frontier merely to get another chance to clear it.
                 if (automatic_vbr_restore_supported(
                         idle.prompt.tokens, idle.lora) &&
-                    !queue_tasks.has_pending_tasks()) {
+                    capture_session.continue_capture()) {
                     ++displacement_attempts;
                     if (idle.prompt_clear_after_vbr_publication()) {
                         ++displaced_existing;
@@ -10451,31 +10455,31 @@ private:
         static constexpr uint64_t MAX_IDLE_CAPTURE_BYTES =
             64ull*1024ull*1024ull;
         uint64_t runway = MAX_IDLE_CAPTURE_BYTES;
-        if (runway == 0 || queue_tasks.has_pending_tasks()) {
+        if (runway == 0 || !capture_session.continue_capture()) {
             return 0;
         }
 
         std::vector<server_vbr_projected_host_publish_result> captured;
         server_vbr_projected_host_capture_diagnostics diagnostics;
         server_vbr_projected_capture_admission admission;
-        admission.context = this;
+        admission.context = &capture_session;
         admission.admit = [](
                 void * opaque,
                 const server_vbr_projected_capture_admission::quote &)
                 noexcept {
-            auto * self =
-                static_cast<server_context_impl *>(opaque);
+            auto * session = static_cast<
+                server_queue::idle_capture_session *>(opaque);
             // Planning can include controller settlement, projection and
             // recurrent sizing. The store now holds the exact transfer-
             // staging claim while this final queue check runs, so capture
             // cannot begin behind work already queued. Later arrivals cancel
             // between bounded recurrent writes or attention ring chunks.
-            return self && !self->queue_tasks.has_pending_tasks();
+            return session && session->continue_capture();
         };
-        admission.continue_transfer = [](void * opaque) noexcept {
-            auto * self =
-                static_cast<server_context_impl *>(opaque);
-            return self && !self->queue_tasks.has_pending_tasks();
+        admission.continue_capture = [](void * opaque) noexcept {
+            auto * session = static_cast<
+                server_queue::idle_capture_session *>(opaque);
+            return session && session->continue_capture();
         };
         const int64_t started = ggml_time_us();
         if (!vbr_artifact_store->capture_projected_host_batch(
@@ -10525,6 +10529,9 @@ private:
         const auto representation_after =
             memory->vbr_representation_identity();
         for (auto & row : captured) {
+            if (!capture_session.continue_capture()) {
+                break;
+            }
             if (!row.payload ||
                 (row.status !=
                      vbr_projected_manifest_publish_status::published &&
@@ -10651,7 +10658,7 @@ private:
                     source.prompt.tokens, source.lora) ||
                 source.hard_lease_blocks_live_prefix() ||
                 source.cache_plan_destruction_recovery_pin.valid() ||
-                queue_tasks.has_pending_tasks() ||
+                !capture_session.continue_capture() ||
                 queue_tasks.has_deferred_for_slot(source.id) ||
                 !prompt_cache->contains_vbr_frontier(
                     source.prompt, frontier_execution_identity,

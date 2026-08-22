@@ -3,14 +3,47 @@
 #include "server-task.h"
 
 #include <condition_variable>
+#include <atomic>
+#include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <unordered_set>
 
+struct server_queue_idle_capture_state;
+
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
 struct server_queue {
+public:
+    // Move-only cancellation session for one synchronous idle capture. Task
+    // arrivals cancel it; they never wait for or reject normal queue work.
+    class idle_capture_session {
+    public:
+        idle_capture_session() noexcept = default;
+        idle_capture_session(idle_capture_session && other) noexcept;
+        idle_capture_session & operator=(
+            idle_capture_session && other) noexcept;
+        ~idle_capture_session();
+
+        idle_capture_session(const idle_capture_session &) = delete;
+        idle_capture_session & operator=(
+            const idle_capture_session &) = delete;
+
+        explicit operator bool() const noexcept;
+        bool continue_capture() const noexcept;
+
+    private:
+        std::shared_ptr<server_queue_idle_capture_state> state_;
+        uint64_t generation_ = 0;
+        idle_capture_session(
+            std::shared_ptr<server_queue_idle_capture_state> state,
+            uint64_t generation) noexcept;
+        void reset() noexcept;
+        friend struct server_queue;
+    };
+
 private:
     int id = 0;
     bool running  = false;
@@ -24,6 +57,9 @@ private:
 
     std::mutex mutex_tasks;
     std::condition_variable condition_tasks;
+    std::shared_ptr<server_queue_idle_capture_state> idle_capture_state;
+    uint64_t idle_capture_generation = 0;
+    bool idle_capture_stopped = false;
 
     // callback functions
     std::function<void(server_task &&)> callback_new_task;
@@ -32,6 +68,8 @@ private:
     std::function<void(void)>           callback_idle;
 
 public:
+    ~server_queue();
+
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
 
@@ -99,6 +137,10 @@ public:
         return !queue_tasks.empty() || !queue_tasks_deferred.empty();
     }
 
+    // Acquires only while both queues are empty and no prior session is live.
+    // Allocation occurs only on the first enabled automatic-capture attempt.
+    idle_capture_session try_begin_idle_capture() noexcept;
+
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //
@@ -135,6 +177,7 @@ public:
     }
 
 private:
+    void cancel_idle_capture_locked() noexcept;
     void cleanup_pending_task(int id_target);
 };
 

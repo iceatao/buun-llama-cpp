@@ -2444,6 +2444,38 @@ static void test_projected_host_batch_store_adapter() {
     }
 
     const uint64_t baseline_ops = ledger.snapshot().live_ops;
+    {
+        struct checkpoint_context {
+            uint32_t calls = 0;
+        } checkpoint;
+        server_vbr_projected_capture_admission admission;
+        admission.context = &checkpoint;
+        admission.continue_capture = +[](void * opaque) noexcept {
+            auto * state = static_cast<checkpoint_context *>(opaque);
+            if (state) {
+                state->calls++;
+            }
+            return false;
+        };
+        std::vector<server_vbr_projected_host_publish_result> cancelled;
+        server_vbr_projected_host_capture_diagnostics diagnostics;
+        diagnostics.capture_status = vbr_explicit_capture_status::ok;
+        diagnostics.capture_phase =
+            vbr_explicit_capture_phase::post_transfer_stability;
+        CHECK(!server_vbr_artifact_store_test_door::
+            publish_after_capture_checkpoint(
+                *store, assembly, make_publications(assembly), cancelled,
+                admission, diagnostics));
+        CHECK(checkpoint.calls == 1);
+        CHECK(cancelled.empty());
+        CHECK(diagnostics.capture_status ==
+              vbr_explicit_capture_status::cancelled);
+        CHECK(diagnostics.capture_phase ==
+              vbr_explicit_capture_phase::publication);
+        CHECK(diagnostics.inner_stream_status ==
+              vbr_capture_stream_status::cancelled);
+        CHECK(ledger.snapshot().live_ops == baseline_ops);
+    }
     vbr_projected_capture_batch_request::pretransfer_quote staging_quote;
     staging_quote.planned_packed_bytes = 48;
     staging_quote.staging = {

@@ -2,6 +2,7 @@
 #include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
 #include "server-context.h"
+#include "server-queue.h"
 #include "server-task.h"
 
 #include "llama.h"
@@ -31,6 +32,74 @@ int failures = 0;
         failures++;                                                             \
     }                                                                           \
 } while (0)
+
+server_task idle_capture_test_task(int id) {
+    server_task task;
+    task.id = id;
+    task.type = SERVER_TASK_TYPE_COMPLETION;
+    return task;
+}
+
+void test_idle_capture_session_cancellation() {
+    {
+        server_queue queue;
+        auto first = queue.try_begin_idle_capture();
+        CHECK(first);
+        CHECK(first.continue_capture());
+        CHECK(!queue.try_begin_idle_capture());
+        auto moved = std::move(first);
+        CHECK(!first);
+        CHECK(moved.continue_capture());
+        moved = {};
+        auto second = queue.try_begin_idle_capture();
+        CHECK(second);
+        CHECK(second.continue_capture());
+    }
+    {
+        server_queue queue;
+        auto capture = queue.try_begin_idle_capture();
+        CHECK(capture);
+        CHECK(queue.post(idle_capture_test_task(1)) == 1);
+        CHECK(!capture.continue_capture());
+        CHECK(!queue.try_begin_idle_capture());
+    }
+    {
+        server_queue queue;
+        auto capture = queue.try_begin_idle_capture();
+        CHECK(capture);
+        std::vector<server_task> tasks;
+        tasks.push_back(idle_capture_test_task(2));
+        CHECK(queue.post(std::move(tasks)) == 0);
+        CHECK(!capture.continue_capture());
+    }
+    {
+        server_queue queue;
+        auto capture = queue.try_begin_idle_capture();
+        CHECK(capture);
+        queue.defer(idle_capture_test_task(3));
+        CHECK(!capture.continue_capture());
+        CHECK(!queue.try_begin_idle_capture());
+    }
+    {
+        server_queue queue;
+        auto capture = queue.try_begin_idle_capture();
+        CHECK(capture);
+        queue.terminate();
+        CHECK(!capture.continue_capture());
+    }
+    {
+        server_queue queue;
+        queue.terminate();
+        CHECK(!queue.try_begin_idle_capture());
+    }
+    server_queue::idle_capture_session escaped;
+    {
+        server_queue queue;
+        escaped = queue.try_begin_idle_capture();
+        CHECK(escaped.continue_capture());
+    }
+    CHECK(!escaped.continue_capture());
+}
 
 void fill_checkpoint_bytes(
         common_shared_byte_buffer & buffer,
@@ -5033,6 +5102,7 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
     test_lifecycle_full_cache_rotates();
+    test_idle_capture_session_cancellation();
     test_fixed_host_pressure_shadow_records_counterfactual();
     test_fixed_host_shadow_uses_exact_cross_lineage_prefix();
     test_typed_host_payload_boundary();

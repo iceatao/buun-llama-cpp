@@ -19,8 +19,106 @@
 // server_queue
 //
 
+struct server_queue_idle_capture_state {
+    std::atomic<uint64_t> active_generation { 0 };
+    std::atomic<bool> cancelled { false };
+};
+
+server_queue::idle_capture_session::idle_capture_session(
+        std::shared_ptr<server_queue_idle_capture_state> state,
+        uint64_t generation) noexcept
+    : state_(std::move(state)), generation_(generation) {
+}
+
+server_queue::idle_capture_session::idle_capture_session(
+        idle_capture_session && other) noexcept
+    : state_(std::move(other.state_)), generation_(other.generation_) {
+    other.generation_ = 0;
+}
+
+server_queue::idle_capture_session &
+server_queue::idle_capture_session::operator=(
+        idle_capture_session && other) noexcept {
+    if (this != &other) {
+        reset();
+        state_ = std::move(other.state_);
+        generation_ = other.generation_;
+        other.generation_ = 0;
+    }
+    return *this;
+}
+
+server_queue::idle_capture_session::~idle_capture_session() {
+    reset();
+}
+
+server_queue::idle_capture_session::operator bool() const noexcept {
+    return state_ && generation_ != 0 &&
+        state_->active_generation.load(std::memory_order_acquire) ==
+            generation_;
+}
+
+bool server_queue::idle_capture_session::continue_capture() const noexcept {
+    return bool(*this) &&
+        !state_->cancelled.load(std::memory_order_acquire);
+}
+
+void server_queue::idle_capture_session::reset() noexcept {
+    if (state_ && generation_ != 0) {
+        uint64_t expected = generation_;
+        (void) state_->active_generation.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+    generation_ = 0;
+    state_.reset();
+}
+
+server_queue::~server_queue() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    idle_capture_stopped = true;
+    cancel_idle_capture_locked();
+}
+
+void server_queue::cancel_idle_capture_locked() noexcept {
+    if (idle_capture_state) {
+        idle_capture_state->cancelled.store(true, std::memory_order_release);
+    }
+}
+
+server_queue::idle_capture_session
+server_queue::try_begin_idle_capture() noexcept {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (idle_capture_stopped || !queue_tasks.empty() ||
+        !queue_tasks_deferred.empty()) {
+        return {};
+    }
+    try {
+        if (!idle_capture_state) {
+            idle_capture_state =
+                std::make_shared<server_queue_idle_capture_state>();
+        }
+        if (idle_capture_state->active_generation.load(
+                std::memory_order_acquire) != 0) {
+            return {};
+        }
+        if (++idle_capture_generation == 0) {
+            ++idle_capture_generation;
+        }
+        idle_capture_state->cancelled.store(
+            false, std::memory_order_relaxed);
+        idle_capture_state->active_generation.store(
+            idle_capture_generation, std::memory_order_release);
+        return idle_capture_session(
+            idle_capture_state, idle_capture_generation);
+    } catch (...) {
+        return {};
+    }
+}
+
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    cancel_idle_capture_locked();
     GGML_ASSERT(task.id != -1);
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
@@ -40,6 +138,9 @@ int server_queue::post(server_task && task, bool front) {
 
 int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (!tasks.empty()) {
+        cancel_idle_capture_locked();
+    }
     for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
@@ -62,6 +163,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    cancel_idle_capture_locked();
     QUE_DBG("defer task, id = %d\n", task.id);
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
@@ -118,13 +220,21 @@ void server_queue::wait_until_no_sleep() {
 
 void server_queue::terminate() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    idle_capture_stopped = true;
+    cancel_idle_capture_locked();
     running = false;
     condition_tasks.notify_all();
 }
 
 void server_queue::start_loop(int64_t idle_sleep_ms) {
-    running = true;
-    time_last_task = ggml_time_ms();
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        if (idle_capture_stopped) {
+            return;
+        }
+        running = true;
+        time_last_task = ggml_time_ms();
+    }
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
