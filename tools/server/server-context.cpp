@@ -10457,10 +10457,27 @@ private:
 
         std::vector<server_vbr_projected_host_publish_result> captured;
         server_vbr_projected_host_capture_diagnostics diagnostics;
+        server_vbr_projected_capture_admission admission;
+        admission.context = this;
+        admission.admit = [](
+                void * opaque,
+                const server_vbr_projected_capture_admission::quote &)
+                noexcept {
+            auto * self =
+                static_cast<server_context_impl *>(opaque);
+            // Planning can include controller settlement, projection and
+            // recurrent sizing. Recheck the scheduler queue at the exact
+            // pre-D2H boundary so a request arriving during that work never
+            // does not begin behind work that is already queued. Arrivals
+            // after this synchronous gate are covered by the deliberately
+            // bounded transfer ceiling until cancellable/background capture
+            // owns the following slice.
+            return self && !self->queue_tasks.has_pending_tasks();
+        };
         const int64_t started = ggml_time_us();
         if (!vbr_artifact_store->capture_projected_host_batch(
                 *memory, std::move(manifests), runway,
-                captured, &diagnostics)) {
+                captured, &admission, &diagnostics)) {
             SRV_DBG(
                 "VBR_IDLE_CAPTURE refused status=%s phase=%s planned=%" PRIu64
                 " duration_ms=%.3f\n",

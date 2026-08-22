@@ -209,6 +209,16 @@ struct server_vbr_projected_host_capture_diagnostics {
     server_vbr_projected_host_publish_diagnostics publication;
 };
 
+// Scheduler-owned last-mile admission at the exact pre-D2H boundary. The
+// store/core retain all topology and byte-authority details; this callback
+// can only accept or refuse the immutable scalar quote. It must not retain
+// the quote or mutate source memory.
+struct server_vbr_projected_capture_admission {
+    using quote = vbr_projected_capture_batch_request::pretransfer_quote;
+    void * context = nullptr;
+    bool (*admit)(void * context, const quote & quote) noexcept = nullptr;
+};
+
 struct server_vbr_artifact_store_counters {
     uint64_t requested = 0;
     uint64_t exact_published = 0;
@@ -364,6 +374,7 @@ public:
         std::vector<vbr_projected_capture_manifest_request> manifests,
         uint64_t max_packed_bytes,
         std::vector<server_vbr_projected_host_publish_result> & output,
+        const server_vbr_projected_capture_admission * admission = nullptr,
         server_vbr_projected_host_capture_diagnostics * diagnostics = nullptr)
         noexcept;
 

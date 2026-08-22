@@ -328,6 +328,15 @@ struct vbr_projected_capture_batch_request {
     using representation_identity_fn =
         vbr_explicit_capture_request::representation_identity_fn;
 
+    struct pretransfer_quote {
+        uint64_t planned_packed_bytes = 0;
+        uint64_t union_cells = 0;
+        uint32_t manifests = 0;
+        uint32_t projected_units = 0;
+    };
+    using pretransfer_admit_fn = bool (*)(
+        void * context, const pretransfer_quote & quote) noexcept;
+
     bool idle_decode_thread = false;
     // Scheduler-admitted aggregate pageable payload runway for this batch.
     // Required and checked before the first D2H byte.
@@ -338,6 +347,14 @@ struct vbr_projected_capture_batch_request {
     std::vector<vbr_explicit_capture_pool_binding> pool_bindings;
     const void * representation_context = nullptr;
     representation_identity_fn representation_identity = nullptr;
+    // Invoked exactly once after the initial bounded projection is priced and
+    // before companion or attention D2H begins. The synchronous caller may
+    // refuse when queued work or a scheduler-owned reservation changed while
+    // planning. Dependency-local companion failures may later shrink the
+    // admitted union; they never grow it or invoke this callback again.
+    // Refusal returns admission_refused with zero unit transfers.
+    void * pretransfer_context = nullptr;
+    pretransfer_admit_fn pretransfer_admit = nullptr;
 };
 
 struct vbr_projected_capture_batch_result {

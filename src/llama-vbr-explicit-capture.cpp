@@ -1875,6 +1875,38 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             return result;
         }
 
+        if (request.pretransfer_admit) {
+            vbr_projected_capture_batch_request::pretransfer_quote quote;
+            quote.planned_packed_bytes = result.planned_packed_bytes;
+            quote.union_cells = result.union_cells;
+            quote.manifests = uint32_t(std::count(
+                manifest_dependency_available.begin(),
+                manifest_dependency_available.end(), true));
+            for (const auto & child : children) {
+                const bool projected_child = std::any_of(
+                    projection->streams.begin(), projection->streams.end(),
+                    [&](const auto & stream) {
+                        return stream.child_id == child.child_id &&
+                            stream.stream_index == 0;
+                    });
+                if (!projected_child ||
+                    child.units.size() > UINT32_MAX - quote.projected_units) {
+                    result.status =
+                        vbr_explicit_capture_status::size_overflow;
+                    return result;
+                }
+                quote.projected_units += uint32_t(child.units.size());
+            }
+            result.phase =
+                vbr_explicit_capture_phase::reservation_preparation;
+            if (!request.pretransfer_admit(
+                    request.pretransfer_context, quote)) {
+                result.status =
+                    vbr_explicit_capture_status::admission_refused;
+                return result;
+            }
+        }
+
         // Payload runway is proven before the first companion D2H byte. A
         // locally stale/failed companion removes only its manifest; rebuild
         // the physical union and re-cap it before attention transfer.

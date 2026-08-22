@@ -995,6 +995,25 @@ static bool h2_test_representation_identity(
     return true;
 }
 
+struct h2_pretransfer_admission {
+    uint32_t calls = 0;
+    bool accept = true;
+    vbr_projected_capture_batch_request::pretransfer_quote quote;
+};
+
+static bool h2_pretransfer_admit(
+        void * opaque,
+        const vbr_projected_capture_batch_request::pretransfer_quote & quote)
+        noexcept {
+    auto * state = static_cast<h2_pretransfer_admission *>(opaque);
+    if (!state) {
+        return false;
+    }
+    ++state->calls;
+    state->quote = quote;
+    return state->accept;
+}
+
 static bool h2_projected_capture_batch_exact(
         llama_memory_i & memory, uint32_t manifest_count,
         uint32_t & expected_transfers) {
@@ -1052,6 +1071,9 @@ static bool h2_projected_capture_batch_exact(
     h2_representation_identity_counts identity_counts;
     request.representation_context = &identity_counts;
     request.representation_identity = h2_test_representation_identity;
+    h2_pretransfer_admission admission;
+    request.pretransfer_context = &admission;
+    request.pretransfer_admit = h2_pretransfer_admit;
     for (uint32_t i = 0; i < manifest_count; ++i) {
         vbr_projected_capture_manifest_request manifest;
         manifest.manifest_id = 100 + i;
@@ -1075,6 +1097,12 @@ static bool h2_projected_capture_batch_exact(
         captured.projection_calls != 1 || captured.union_cells != 1 ||
         captured.planned_packed_bytes == 0 ||
         captured.planned_packed_bytes > request.max_packed_bytes ||
+        admission.calls != 1 || !admission.accept ||
+        admission.quote.planned_packed_bytes !=
+            captured.planned_packed_bytes ||
+        admission.quote.union_cells != captured.union_cells ||
+        admission.quote.manifests != manifest_count ||
+        admission.quote.projected_units == 0 ||
         captured.unit_transfer_calls == 0 ||
         captured.transferred_units != captured.unit_transfer_calls) {
         return false;
@@ -1108,13 +1136,35 @@ static bool h2_projected_capture_batch_exact(
         }
     }
     if (manifest_count == 1) {
+        auto admission_refused_request = request;
+        h2_pretransfer_admission refused_admission;
+        refused_admission.accept = false;
+        admission_refused_request.pretransfer_context = &refused_admission;
+        const auto admission_refused = vbr_capture_projected_batch(
+            memory, admission_refused_request);
+        if (admission_refused.status !=
+                vbr_explicit_capture_status::admission_refused ||
+            admission_refused.phase !=
+                vbr_explicit_capture_phase::reservation_preparation ||
+            refused_admission.calls != 1 ||
+            refused_admission.quote.planned_packed_bytes == 0 ||
+            admission_refused.unit_transfer_calls != 0 ||
+            admission_refused.transferred_units != 0 ||
+            admission_refused.transfer.bytes != 0 ||
+            admission_refused.assembly ||
+            !admission_refused.publications.empty()) {
+            return false;
+        }
         auto refused_request = request;
         refused_request.max_packed_bytes =
             captured.planned_packed_bytes - 1;
+        h2_pretransfer_admission over_cap_admission;
+        refused_request.pretransfer_context = &over_cap_admission;
         const auto refused = vbr_capture_projected_batch(
             memory, refused_request);
         if (refused.status !=
                 vbr_explicit_capture_status::accounting_failed ||
+            over_cap_admission.calls != 0 ||
             refused.unit_transfer_calls != 0 || refused.assembly ||
             !refused.publications.empty()) {
             return false;

@@ -1114,6 +1114,7 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         std::vector<vbr_projected_capture_manifest_request> manifests,
         uint64_t max_packed_bytes,
         std::vector<server_vbr_projected_host_publish_result> & output,
+        const server_vbr_projected_capture_admission * admission,
         server_vbr_projected_host_capture_diagnostics * diagnostics) noexcept {
     output.clear();
     if (diagnostics) {
@@ -1140,6 +1141,10 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         request.representation_context = &representation_policy;
         request.representation_identity =
             vbr_explicit_capture_representation_identity;
+        if (admission && admission->admit) {
+            request.pretransfer_context = admission->context;
+            request.pretransfer_admit = admission->admit;
+        }
 
         auto captured = vbr_capture_projected_batch(memory, request);
         server_vbr_projected_host_capture_diagnostics measured;
