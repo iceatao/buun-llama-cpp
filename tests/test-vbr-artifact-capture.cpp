@@ -2413,6 +2413,18 @@ static void test_projected_host_batch_store_adapter() {
     CHECK(diagnostics.host_payloads_retained == 1);
     CHECK(diagnostics.postpublish_retirements == 0);
     CHECK(ledger.snapshot().live_ops > baseline_ops);
+    // The typed host door accepts this store-owned capability without a
+    // tenant reference and reaches the shared import kernel. The intentionally
+    // empty target request then fails at kernel validation, not authorization.
+    const auto authenticated_before =
+        store->counters().host_imports_authenticated;
+    server_vbr_artifact_import_target empty_import;
+    const auto host_import = store->import_host_payload(
+        std::move(empty_import), results[0].payload);
+    CHECK(host_import.status ==
+          server_vbr_artifact_import_status::unavailable);
+    CHECK(store->counters().host_imports_authenticated ==
+          authenticated_before + 1);
     results.clear();
     CHECK(ledger.snapshot().live_ops == baseline_ops);
 
@@ -2509,6 +2521,53 @@ static void test_projected_host_batch_store_adapter() {
         assembly, make_publications(assembly), results, &diagnostics));
     CHECK(results.empty());
     CHECK(diagnostics.catalog.ready_manifests == 0);
+    CHECK(ledger.snapshot().live_ops == baseline_ops);
+
+    // Two stores may share the global ledger, but a host owner remains bound
+    // to the catalog that minted it. Exercise the store gate itself rather
+    // than only its catalog predicate.
+    budget_context.available = true;
+    llama_vbr_artifact_catalog foreign_catalog(ledger);
+    std::vector<llama_vbr_artifact_domain_binding> foreign_bindings;
+    CHECK(foreign_catalog.bind_topologies(
+        { topology }, foreign_bindings));
+    llama_cache_budget_config foreign_budget;
+    CHECK(sample_projected_store_budget(
+        &budget_context, foreign_budget));
+    std::vector<vbr_projected_manifest_publish_result> foreign_results;
+    CHECK(foreign_catalog.publish_projected_batch(
+        ready_assembly, make_publications(ready_assembly), foreign_budget,
+        foreign_results));
+    std::vector<llama_cache_acct_artifact_id> foreign_references;
+    for (const auto & row : foreign_results) {
+        if (row.status == vbr_projected_manifest_publish_status::published ||
+            row.status == vbr_projected_manifest_publish_status::adopted) {
+            foreign_references.push_back(
+                row.publication.reference_artifact);
+        }
+    }
+    std::vector<vbr_artifact_package_view> foreign_packages;
+    CHECK(foreign_catalog.claim_fresh_host_batch(
+        foreign_references, foreign_packages));
+    CHECK(foreign_packages.size() == 2);
+    if (!foreign_packages.empty()) {
+        auto foreign_payload =
+            server_prompt_cache_vbr_payload::adopt(
+                std::move(foreign_packages.front()));
+        CHECK(foreign_payload);
+        if (foreign_payload) {
+            const auto authenticated =
+                store->counters().host_imports_authenticated;
+            server_vbr_artifact_import_target foreign_import;
+            const auto rejected = store->import_host_payload(
+                std::move(foreign_import), foreign_payload);
+            CHECK(rejected.status ==
+                  server_vbr_artifact_import_status::not_found);
+            CHECK(store->counters().host_imports_authenticated ==
+                  authenticated);
+        }
+    }
+    foreign_packages.clear();
     CHECK(ledger.snapshot().live_ops == baseline_ops);
 }
 

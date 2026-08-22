@@ -5,6 +5,7 @@
 #include "llama-cache-authority.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <list>
@@ -101,6 +102,42 @@ static void test_exact_prefix_index() {
     CHECK(index.external_shared_coverage(child_a_id, coverage));
     CHECK(coverage == child_a.size());
 
+    const llama_cache_acct_artifact_id true_prefix_id { 6 };
+    const llama_tokens true_prefix(main.begin(), main.begin() + 80);
+    CHECK(index.publish(true_prefix_id, 50, true_prefix));
+    struct visited_prefix {
+        llama_cache_acct_artifact_id artifact;
+        uint64_t tokens = 0;
+    };
+    struct visit_log {
+        std::array<visited_prefix, 4> rows;
+        size_t size = 0;
+    } visited;
+    CHECK(index.visit_prefixes(
+        main, &visited,
+        [](void * context, llama_cache_acct_artifact_id artifact,
+           uint64_t tokens) noexcept {
+            auto & log = *static_cast<visit_log *>(context);
+            if (log.size == log.rows.size()) {
+                return false;
+            }
+            log.rows[log.size++] = { artifact, tokens };
+            return true;
+        }));
+    CHECK(visited.size == 2);
+    CHECK(std::count_if(
+        visited.rows.begin(), visited.rows.begin() + visited.size,
+        [&](const auto & row) {
+            return row.artifact == main_id && row.tokens == main.size();
+        }) == 1);
+    CHECK(std::count_if(
+        visited.rows.begin(), visited.rows.begin() + visited.size,
+        [&](const auto & row) {
+            return row.artifact == true_prefix_id &&
+                row.tokens == true_prefix.size();
+        }) == 1);
+    index.retire(true_prefix_id);
+
     CHECK(index.publish(child_b_id, 30, child_b));
     CHECK(index.external_shared_coverage(main_id, coverage));
     CHECK(coverage == 80);
@@ -163,6 +200,59 @@ static void test_prefix_index_cap_fail_closed() {
     CHECK(!index.external_shared_coverage(
         llama_cache_acct_artifact_id { 1 }, coverage));
     CHECK(coverage == 0);
+}
+
+static void test_prefix_index_identical_terminal_cleanup() {
+    server_retention_prefix_index index;
+    const llama_tokens tokens { 42 };
+    for (size_t i = 0; i < SERVER_RETENTION_MAX_CANDIDATES; ++i) {
+        CHECK(index.publish(
+            llama_cache_acct_artifact_id { i + 1 }, i + 1, tokens));
+    }
+    struct count_context {
+        size_t count = 0;
+    } count;
+    CHECK(index.visit_prefixes(
+        tokens, &count,
+        [](void * opaque, llama_cache_acct_artifact_id, uint64_t prefix)
+                noexcept {
+            auto & current = *static_cast<count_context *>(opaque);
+            CHECK(prefix == 1);
+            current.count++;
+            return true;
+        }));
+    CHECK(count.count == SERVER_RETENTION_MAX_CANDIDATES);
+
+    // Retire in insertion order, the worst shape for the historical singly
+    // linked terminal list. Each unlink is now direct through the record's
+    // node/prev/next citation.
+    for (size_t i = 0; i < SERVER_RETENTION_MAX_CANDIDATES; ++i) {
+        index.retire(llama_cache_acct_artifact_id { i + 1 });
+    }
+    CHECK(index.available());
+    CHECK(index.size() == 0);
+    CHECK(index.token_bytes() == 0);
+
+    server_retention_prefix_index fanout;
+    llama_tokens long_prefix(1000000, llama_token(7));
+    const llama_cache_acct_artifact_id host { 1 };
+    CHECK(fanout.publish(host, 1, long_prefix));
+    const uint64_t one_owner_bytes = fanout.source_token_bytes();
+    CHECK(one_owner_bytes >=
+          uint64_t(long_prefix.size())*sizeof(llama_token));
+    for (uint64_t i = 0; i < 8; ++i) {
+        CHECK(fanout.clone(
+            host, llama_cache_acct_artifact_id { i + 2 }, 1));
+        CHECK(fanout.source_token_bytes() == one_owner_bytes);
+    }
+    fanout.retire(host);
+    CHECK(fanout.source_token_bytes() == one_owner_bytes);
+    for (uint64_t i = 0; i < 8; ++i) {
+        fanout.retire(llama_cache_acct_artifact_id { i + 2 });
+    }
+    CHECK(fanout.available());
+    CHECK(fanout.size() == 0);
+    CHECK(fanout.source_token_bytes() == 0);
 }
 
 static void test_prefix_index_oversized_input_fail_closed() {
@@ -1227,6 +1317,7 @@ static void test_observer_store_accounting() {
 int main() {
     test_exact_prefix_index();
     test_prefix_index_cap_fail_closed();
+    test_prefix_index_identical_terminal_cleanup();
     test_prefix_index_oversized_input_fail_closed();
     test_prefix_index_matches_exhaustive_oracle();
     test_prefix_index_large_node_oracle();

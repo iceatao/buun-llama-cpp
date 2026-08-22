@@ -601,6 +601,12 @@ server_prompt_cache_payload::vbr_artifact() const noexcept {
         : nullptr;
 }
 
+server_prompt_cache_payload::vbr_owner
+server_prompt_cache_payload::vbr_compact_owner() const noexcept {
+    const auto * variants = vbr_variants();
+    return variants ? variants->compact_current() : vbr_owner {};
+}
+
 const server_prompt_cache_vbr_variant_set *
 server_prompt_cache_payload::vbr_variants() const noexcept {
     const auto * owner = std::get_if<vbr_variant_owner>(&storage_);

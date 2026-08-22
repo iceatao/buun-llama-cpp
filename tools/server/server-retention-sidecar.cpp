@@ -37,13 +37,22 @@ struct server_retention_prefix_index::impl {
     struct node {
         uint32_t total_refs = 0;
         uint32_t terminal_refs = 0;
+        uint64_t terminal_head = 0;
         std::unordered_map<uint64_t, uint32_t> lineage_refs;
         std::unordered_map<llama_token, edge> edges;
     };
 
+    struct token_block {
+        std::vector<llama_token> values;
+    };
+
     struct artifact_record {
+        uint64_t artifact = 0;
         uint64_t lineage_id = 0;
-        std::vector<llama_token> tokens;
+        node * terminal_node = nullptr;
+        uint64_t terminal_prev = 0;
+        uint64_t terminal_next = 0;
+        std::shared_ptr<const token_block> tokens;
     };
 
     node root;
@@ -84,7 +93,13 @@ struct server_retention_prefix_index::impl {
         return true;
     }
 
-    bool insert(uint64_t lineage_id, const std::vector<llama_token> & tokens) {
+    bool insert(
+            uint64_t artifact,
+            uint64_t lineage_id,
+            const std::vector<llama_token> & tokens,
+            node * & terminal_node,
+            uint64_t & terminal_prev,
+            uint64_t & terminal_next) {
         node * cur = &root;
         size_t pos = 0;
         if (!add_ref(*cur, lineage_id)) {
@@ -104,6 +119,10 @@ struct server_retention_prefix_index::impl {
                     return false;
                 }
                 added.child->terminal_refs = 1;
+                added.child->terminal_head = artifact;
+                terminal_node = added.child.get();
+                terminal_prev = 0;
+                terminal_next = 0;
                 const uint64_t added_bytes =
                     uint64_t(added.label.capacity())*sizeof(llama_token);
                 if (added_bytes > MAX_PREFIX_INDEX_EDGE_BYTES - edge_token_bytes) {
@@ -165,8 +184,16 @@ struct server_retention_prefix_index::impl {
                     return false;
                 }
                 new_suffix.child->terminal_refs = 1;
+                new_suffix.child->terminal_head = artifact;
+                terminal_node = new_suffix.child.get();
+                terminal_prev = 0;
+                terminal_next = 0;
             } else {
                 middle->terminal_refs = 1;
+                middle->terminal_head = artifact;
+                terminal_node = middle.get();
+                terminal_prev = 0;
+                terminal_next = 0;
             }
 
             middle->edges.reserve(ends_at_split ? 1 : 2);
@@ -209,6 +236,19 @@ struct server_retention_prefix_index::impl {
         if (cur->terminal_refs == UINT32_MAX) {
             return false;
         }
+        terminal_node = cur;
+        terminal_prev = 0;
+        terminal_next = cur->terminal_head;
+        if (terminal_next != 0) {
+            const auto old_head = artifacts.find(terminal_next);
+            if (old_head == artifacts.end() ||
+                old_head->second.terminal_node != cur ||
+                old_head->second.terminal_prev != 0) {
+                return false;
+            }
+            old_head->second.terminal_prev = artifact;
+        }
+        cur->terminal_head = artifact;
         cur->terminal_refs++;
         return true;
     }
@@ -239,9 +279,13 @@ struct server_retention_prefix_index::impl {
             llama_token edge_key;
             node * child;
         };
+        if (!record.tokens) {
+            return false;
+        }
+        const auto & tokens = record.tokens->values;
         std::vector<path_entry> path;
         try {
-            path.reserve(std::min(record.tokens.size(), nodes));
+            path.reserve(std::min(tokens.size(), nodes));
         } catch (...) {
             return false;
         }
@@ -250,13 +294,13 @@ struct server_retention_prefix_index::impl {
         if (!remove_ref(*cur, record.lineage_id)) {
             return false;
         }
-        while (pos < record.tokens.size()) {
-            auto found = cur->edges.find(record.tokens[pos]);
+        while (pos < tokens.size()) {
+            auto found = cur->edges.find(tokens[pos]);
             if (found == cur->edges.end() || !found->second.child ||
-                found->second.label.size() > record.tokens.size() - pos ||
+                found->second.label.size() > tokens.size() - pos ||
                 !std::equal(
                     found->second.label.begin(), found->second.label.end(),
-                    record.tokens.begin() + pos)) {
+                    tokens.begin() + pos)) {
                 return false;
             }
             node * child = found->second.child.get();
@@ -267,8 +311,32 @@ struct server_retention_prefix_index::impl {
             pos += found->second.label.size();
             cur = child;
         }
-        if (cur->terminal_refs == 0) {
+        if (cur->terminal_refs == 0 || record.artifact == 0 ||
+            record.terminal_node != cur) {
             return false;
+        }
+        if (record.terminal_prev == 0) {
+            if (cur->terminal_head != record.artifact) {
+                return false;
+            }
+            cur->terminal_head = record.terminal_next;
+        } else {
+            const auto previous = artifacts.find(record.terminal_prev);
+            if (previous == artifacts.end() ||
+                previous->second.terminal_node != cur ||
+                previous->second.terminal_next != record.artifact) {
+                return false;
+            }
+            previous->second.terminal_next = record.terminal_next;
+        }
+        if (record.terminal_next != 0) {
+            const auto next = artifacts.find(record.terminal_next);
+            if (next == artifacts.end() ||
+                next->second.terminal_node != cur ||
+                next->second.terminal_prev != record.artifact) {
+                return false;
+            }
+            next->second.terminal_prev = record.terminal_prev;
         }
         cur->terminal_refs--;
 
@@ -280,7 +348,8 @@ struct server_retention_prefix_index::impl {
             }
             if (it->child->total_refs == 0) {
                 if (!it->child->edges.empty() || !it->child->lineage_refs.empty() ||
-                    it->child->terminal_refs != 0) {
+                    it->child->terminal_refs != 0 ||
+                    it->child->terminal_head != 0) {
                     return false;
                 }
                 edge_token_bytes -=
@@ -295,6 +364,7 @@ struct server_retention_prefix_index::impl {
             // branch churn cannot consume the live-cardinality node bound.
             while (edge_it->second.child &&
                    edge_it->second.child->terminal_refs == 0 &&
+                   edge_it->second.child->terminal_head == 0 &&
                    edge_it->second.child->edges.size() == 1) {
                 auto * unary = edge_it->second.child.get();
                 auto only = unary->edges.begin();
@@ -374,12 +444,18 @@ bool server_retention_prefix_index::publish(
     }
     try {
         impl::artifact_record record;
+        record.artifact = artifact.v;
         record.lineage_id = lineage_id;
-        record.tokens = tokens;
+        auto block = std::make_shared<impl::token_block>();
+        block->values = tokens;
+        record.tokens = std::move(block);
         const uint64_t bytes =
-            uint64_t(record.tokens.capacity())*sizeof(llama_token);
+            uint64_t(record.tokens->values.capacity())*sizeof(llama_token);
         if (bytes > MAX_PREFIX_INDEX_TOKEN_BYTES - pimpl->artifact_token_bytes ||
-            !pimpl->insert(lineage_id, record.tokens)) {
+            !pimpl->insert(
+                artifact.v, lineage_id, record.tokens->values,
+                record.terminal_node, record.terminal_prev,
+                record.terminal_next)) {
             pimpl->poison();
             return false;
         }
@@ -392,6 +468,88 @@ bool server_retention_prefix_index::publish(
     }
 }
 
+bool server_retention_prefix_index::clone(
+        llama_cache_acct_artifact_id source,
+        llama_cache_acct_artifact_id destination,
+        uint64_t lineage_id) noexcept {
+    if (!pimpl || !pimpl->healthy || source.v == 0 || destination.v == 0 ||
+        lineage_id == 0 || source == destination ||
+        pimpl->artifacts.count(destination.v) != 0 ||
+        pimpl->artifacts.size() == SERVER_RETENTION_MAX_CANDIDATES) {
+        return false;
+    }
+    const auto found = pimpl->artifacts.find(source.v);
+    if (found == pimpl->artifacts.end() || !found->second.tokens) {
+        return false;
+    }
+    try {
+        impl::artifact_record record;
+        record.artifact = destination.v;
+        record.lineage_id = lineage_id;
+        record.tokens = found->second.tokens;
+        if (!pimpl->insert(
+                destination.v, lineage_id, record.tokens->values,
+                record.terminal_node, record.terminal_prev,
+                record.terminal_next) ||
+            !pimpl->artifacts.emplace(
+                destination.v, std::move(record)).second) {
+            pimpl->poison();
+            return false;
+        }
+        return true;
+    } catch (...) {
+        pimpl->poison();
+        return false;
+    }
+}
+
+bool server_retention_prefix_index::visit_prefixes(
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_visitor visitor) const noexcept {
+    if (!pimpl || !pimpl->healthy || tokens.empty() || !visitor) {
+        return false;
+    }
+    const impl::node * cur = &pimpl->root;
+    size_t pos = 0;
+    while (pos < tokens.size()) {
+        const auto found = cur->edges.find(tokens[pos]);
+        if (found == cur->edges.end() || !found->second.child ||
+            found->second.label.size() > tokens.size() - pos ||
+            !std::equal(
+                found->second.label.begin(), found->second.label.end(),
+                tokens.begin() + pos)) {
+            break;
+        }
+        pos += found->second.label.size();
+        cur = found->second.child.get();
+        uint64_t artifact = cur->terminal_head;
+        uint64_t previous = 0;
+        uint32_t visited = 0;
+        while (artifact != 0) {
+            const auto record = pimpl->artifacts.find(artifact);
+            if (record == pimpl->artifacts.end() ||
+                !record->second.tokens ||
+                record->second.tokens->values.size() != pos ||
+                record->second.terminal_node != cur ||
+                record->second.terminal_prev != previous ||
+                ++visited > cur->terminal_refs) {
+                return false;
+            }
+            if (!visitor(
+                    context, llama_cache_acct_artifact_id { artifact }, pos)) {
+                return true;
+            }
+            previous = artifact;
+            artifact = record->second.terminal_next;
+        }
+        if (visited != cur->terminal_refs) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void server_retention_prefix_index::retire(
         llama_cache_acct_artifact_id artifact) noexcept {
     if (!pimpl || !pimpl->healthy || artifact.v == 0) {
@@ -401,15 +559,22 @@ void server_retention_prefix_index::retire(
     if (found == pimpl->artifacts.end()) {
         return;
     }
-    const uint64_t bytes =
-        uint64_t(found->second.tokens.capacity())*sizeof(llama_token);
-    if (!pimpl->retire_artifact(found->second) ||
-        bytes > pimpl->artifact_token_bytes) {
+    if (!found->second.tokens) {
         pimpl->poison();
         return;
     }
-    pimpl->artifact_token_bytes -= bytes;
+    const bool last_token_owner = found->second.tokens.use_count() == 1;
+    const uint64_t bytes = uint64_t(
+        found->second.tokens->values.capacity())*sizeof(llama_token);
+    if (!pimpl->retire_artifact(found->second) ||
+        (last_token_owner && bytes > pimpl->artifact_token_bytes)) {
+        pimpl->poison();
+        return;
+    }
     pimpl->artifacts.erase(found);
+    if (last_token_owner) {
+        pimpl->artifact_token_bytes -= bytes;
+    }
 }
 
 bool server_retention_prefix_index::external_shared_coverage(
@@ -426,13 +591,17 @@ bool server_retention_prefix_index::external_shared_coverage(
     const auto & record = found->second;
     const impl::node * cur = &pimpl->root;
     size_t pos = 0;
-    while (pos < record.tokens.size()) {
-        const auto edge = cur->edges.find(record.tokens[pos]);
+    if (!record.tokens) {
+        return false;
+    }
+    const auto & tokens = record.tokens->values;
+    while (pos < tokens.size()) {
+        const auto edge = cur->edges.find(tokens[pos]);
         if (edge == cur->edges.end() || !edge->second.child ||
-            edge->second.label.size() > record.tokens.size() - pos ||
+            edge->second.label.size() > tokens.size() - pos ||
             !std::equal(
                 edge->second.label.begin(), edge->second.label.end(),
-                record.tokens.begin() + pos)) {
+                tokens.begin() + pos)) {
             return false;
         }
         pos += edge->second.label.size();
@@ -462,6 +631,10 @@ uint64_t server_retention_prefix_index::token_bytes() const noexcept {
     return available() ? pimpl->artifact_token_bytes + pimpl->edge_token_bytes : 0;
 }
 
+uint64_t server_retention_prefix_index::source_token_bytes() const noexcept {
+    return available() ? pimpl->artifact_token_bytes : 0;
+}
+
 struct server_retention_sidecar_store::prefix_tracking {
     struct scope_entry {
         std::string exact_scope;
@@ -471,7 +644,7 @@ struct server_retention_sidecar_store::prefix_tracking {
 
     struct artifact_entry {
         scope_entry * scope = nullptr;
-        uint64_t token_bytes = 0;
+        server_retention_instance_key instance;
     };
 
     std::unordered_map<std::string, std::unique_ptr<scope_entry>> scopes;
@@ -492,6 +665,7 @@ struct server_retention_sidecar_store::prefix_tracking {
             llama_cache_acct_artifact_id artifact,
             common_retention_pool pool,
             uint64_t lineage_id,
+            const server_retention_instance_key & instance,
             const std::string & exact_scope,
             const std::vector<llama_token> & tokens) noexcept {
         if (!healthy) {
@@ -550,19 +724,64 @@ struct server_retention_sidecar_store::prefix_tracking {
                 scope_bytes += added_scope_bytes;
             }
             auto * owner = scope->second.get();
+            const uint64_t source_bytes_before =
+                owner ? owner->index.source_token_bytes() : 0;
             if (!owner || owner->refs == UINT32_MAX ||
                 !owner->index.publish(artifact, lineage_id, tokens)) {
                 poison();
                 return false;
             }
+            const uint64_t source_bytes_after =
+                owner->index.source_token_bytes();
+            if (source_bytes_after < source_bytes_before ||
+                source_bytes_after - source_bytes_before >
+                    MAX_PREFIX_INDEX_TOKEN_BYTES - source_token_bytes) {
+                poison();
+                return false;
+            }
             const auto inserted_artifact = artifacts.emplace(
-                artifact.v, artifact_entry { owner, token_bytes });
+                artifact.v, artifact_entry { owner, instance });
             if (!inserted_artifact.second) {
                 poison();
                 return false;
             }
             owner->refs++;
-            source_token_bytes += token_bytes;
+            source_token_bytes += source_bytes_after - source_bytes_before;
+            return true;
+        } catch (...) {
+            poison();
+            return false;
+        }
+    }
+
+    bool clone(
+            llama_cache_acct_artifact_id source,
+            llama_cache_acct_artifact_id destination,
+            uint64_t lineage_id,
+            const server_retention_instance_key & instance) noexcept {
+        if (!healthy || source.v == 0 || destination.v == 0 ||
+            lineage_id == 0 || artifacts.size() ==
+                SERVER_RETENTION_MAX_CANDIDATES ||
+            artifacts.count(destination.v) != 0) {
+            return false;
+        }
+        const auto found = artifacts.find(source.v);
+        if (found == artifacts.end() || !found->second.scope ||
+            found->second.scope->refs == UINT32_MAX) {
+            return false;
+        }
+        auto * owner = found->second.scope;
+        const uint64_t source_bytes_before =
+            owner->index.source_token_bytes();
+        try {
+            if (!owner->index.clone(source, destination, lineage_id) ||
+                owner->index.source_token_bytes() != source_bytes_before ||
+                !artifacts.emplace(
+                    destination.v, artifact_entry { owner, instance }).second) {
+                poison();
+                return false;
+            }
+            owner->refs++;
             return true;
         } catch (...) {
             poison();
@@ -580,19 +799,24 @@ struct server_retention_sidecar_store::prefix_tracking {
             return;
         }
         auto * owner = found->second.scope;
-        if (!owner || owner->refs == 0 ||
-            found->second.token_bytes > source_token_bytes) {
+        if (!owner || owner->refs == 0) {
             poison();
             return;
         }
+        const uint64_t source_bytes_before =
+            owner->index.source_token_bytes();
         const size_t indexed_before = owner->index.size();
         owner->index.retire(artifact);
+        const uint64_t source_bytes_after =
+            owner->index.source_token_bytes();
         if (!owner->index.available() || indexed_before == 0 ||
-            owner->index.size() + 1 != indexed_before) {
+            owner->index.size() + 1 != indexed_before ||
+            source_bytes_after > source_bytes_before ||
+            source_bytes_before - source_bytes_after > source_token_bytes) {
             poison();
             return;
         }
-        source_token_bytes -= found->second.token_bytes;
+        source_token_bytes -= source_bytes_before - source_bytes_after;
         artifacts.erase(found);
         owner->refs--;
         if (owner->refs == 0) {
@@ -632,6 +856,53 @@ struct server_retention_sidecar_store::prefix_tracking {
         }
         return found->second.scope->index.external_shared_coverage(
             artifact, out);
+    }
+
+    bool visit(
+            common_retention_pool pool,
+            const std::string & exact_scope,
+            const std::vector<llama_token> & tokens,
+            void * context,
+            server_retention_sidecar_store::prefix_instance_visitor visitor)
+            const noexcept {
+        if (!healthy || pool >= common_retention_pool::_count ||
+            exact_scope.empty() || tokens.empty() || !visitor) {
+            return false;
+        }
+        try {
+            std::string scope_key;
+            scope_key.reserve(1 + exact_scope.size());
+            scope_key.push_back(char(pool));
+            scope_key.append(exact_scope);
+            const auto scope = scopes.find(scope_key);
+            if (scope == scopes.end() || !scope->second) {
+                return true;
+            }
+            struct bridge {
+                const prefix_tracking * owner;
+                void * context;
+                server_retention_sidecar_store::prefix_instance_visitor visitor;
+                bool valid = true;
+            } state { this, context, visitor, true };
+            const bool walked = scope->second->index.visit_prefixes(
+                tokens, &state,
+                [](void * opaque, llama_cache_acct_artifact_id artifact,
+                   uint64_t prefix) noexcept {
+                    auto & bridge_state = *static_cast<bridge *>(opaque);
+                    const auto found =
+                        bridge_state.owner->artifacts.find(artifact.v);
+                    if (found == bridge_state.owner->artifacts.end()) {
+                        bridge_state.valid = false;
+                        return false;
+                    }
+                    return bridge_state.visitor(
+                        bridge_state.context,
+                        found->second.instance, prefix);
+                });
+            return walked && state.valid;
+        } catch (...) {
+            return false;
+        }
     }
 };
 
@@ -745,12 +1016,56 @@ bool server_retention_sidecar_store::publish_prefix(
         association->second,
         artifact->second.record.stamp.pool,
         artifact->second.record.stamp.lineage_id,
+        key,
         exact_scope,
         tokens)) {
         return false;
     }
     artifact->second.prefix_indexed = true;
     return true;
+}
+
+bool server_retention_sidecar_store::clone_prefix(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination) noexcept {
+    if (!prefixes) {
+        return !prefix_tracking_requested;
+    }
+    const auto source_assoc = associations.find(source);
+    const auto destination_assoc = associations.find(destination);
+    if (source_assoc == associations.end() ||
+        destination_assoc == associations.end()) {
+        prefixes->poison();
+        return false;
+    }
+    const auto source_artifact = catalog.find(source_assoc->second.v);
+    auto destination_artifact = catalog.find(destination_assoc->second.v);
+    if (source_artifact == catalog.end() ||
+        destination_artifact == catalog.end() ||
+        !source_artifact->second.prefix_indexed ||
+        destination_artifact->second.prefix_indexed ||
+        source_artifact->second.record.stamp.pool !=
+            destination_artifact->second.record.stamp.pool ||
+        source_artifact->second.record.stamp.coverage_tokens !=
+            destination_artifact->second.record.stamp.coverage_tokens ||
+        !prefixes->clone(
+            source_assoc->second, destination_assoc->second,
+            destination_artifact->second.record.stamp.lineage_id,
+            destination)) {
+        return false;
+    }
+    destination_artifact->second.prefix_indexed = true;
+    return true;
+}
+
+bool server_retention_sidecar_store::visit_prefix_instances(
+        common_retention_pool pool,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_instance_visitor visitor) const noexcept {
+    return prefixes && prefixes->visit(
+        pool, exact_scope, tokens, context, visitor);
 }
 
 bool server_retention_sidecar_store::prefix_tracking_available() const noexcept {

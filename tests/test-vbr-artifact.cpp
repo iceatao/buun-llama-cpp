@@ -4090,6 +4090,14 @@ static void test_validated_manifest_staging() {
 
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
 static void test_prompt_cache_vbr_atomic_logical_publication() {
+    static_assert(!std::is_copy_constructible_v<
+        server_prompt_cache_vbr_restore_candidate>);
+    static_assert(!std::is_copy_assignable_v<
+        server_prompt_cache_vbr_restore_candidate>);
+    static_assert(std::is_nothrow_move_constructible_v<
+        server_prompt_cache_vbr_restore_candidate>);
+    static_assert(std::is_nothrow_move_assignable_v<
+        server_prompt_cache_vbr_restore_candidate>);
     catalog_fixture fixture;
 
     server_prompt prompt;
@@ -4195,6 +4203,144 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     auto host_key =
         server_retention_instance_key::for_host_entry(&*logical);
     CHECK(retention.artifact_id(host_key).v != 0);
+
+    // Automatic VBR restore selection is a separate, non-consuming prepared
+    // capability: the complete artifact must prefix the request, the host
+    // node stays pinned through the transaction, moves transfer that pin
+    // exactly once, and commit authenticates the installed destination.
+    logical->cache_family = {
+        common_cache_family_id { 42 }, common_cache_family_role::main,
+    };
+    server_tokens extended(
+        llama_tokens { 101, 102, 103 }, false);
+    // Model multimodal capability is not media presence: text-only requests
+    // on an MTMD-capable server remain eligible for this first restore slice.
+    extended.has_mtmd = true;
+    const uint32_t pins_before = logical->recovery_pins;
+    server_prompt_cache_vbr_restore_candidate identity_mismatch;
+    CHECK(!cache.prepare_vbr_restore(
+        extended, "wrong-execution",
+        fixture.package.manifest.identity.adapter_config_identity,
+        identity_mismatch));
+    CHECK(!cache.prepare_vbr_restore(
+        extended,
+        fixture.package.manifest.identity.execution_identity,
+        "wrong-adapter", identity_mismatch));
+    CHECK(logical->recovery_pins == pins_before);
+    {
+        server_prompt_cache_vbr_restore_candidate prepared;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            prepared));
+        CHECK(prepared.ready());
+        CHECK(prepared.payload().get() == owner.get());
+        CHECK(prepared.prefix_tokens() == 2);
+        CHECK(logical->recovery_pins == pins_before + 1);
+        server_prompt_cache foreign_cache(0, 0);
+        server_prompt foreign_destination = prompt.clone();
+        common_cache_family_binding foreign_family;
+        CHECK(!foreign_cache.commit_vbr_restore(
+            prepared, foreign_destination, foreign_family, 9));
+        CHECK(prepared.ready());
+        CHECK(logical->recovery_pins == pins_before + 1);
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            prepared));
+        CHECK(logical->recovery_pins == pins_before + 1);
+        server_prompt_cache_vbr_restore_candidate moved(
+            std::move(prepared));
+        CHECK(!prepared.ready());
+        CHECK(moved.ready());
+        CHECK(logical->recovery_pins == pins_before + 1);
+        server_prompt prepared_destination;
+        CHECK(cache.prepare_vbr_restore_destination(
+            moved, prepared_destination, 7));
+        CHECK(retention.prepared_for_launch(
+            server_retention_instance_key::for_slot(7)));
+    }
+    CHECK(logical->recovery_pins == pins_before);
+    CHECK(retention.artifact_id(
+        server_retention_instance_key::for_slot(7)).v == 0);
+
+    // Destination preparation is construction-empty by authority, not merely
+    // by scheduler convention. Refusal must preserve an existing live
+    // association byte-for-byte and leave the candidate independently
+    // releasable.
+    const auto occupied_key =
+        server_retention_instance_key::for_slot(6);
+    CHECK(retention.clone(source_key, occupied_key));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        retention, occupied_key, prompt,
+        fixture.package.manifest.identity.adapter_config_identity,
+        prompt.n_tokens()));
+    const auto occupied_artifact = retention.artifact_id(occupied_key);
+    {
+        server_prompt_cache_vbr_restore_candidate occupied_candidate;
+        server_prompt occupied_destination;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            occupied_candidate));
+        CHECK(!cache.prepare_vbr_restore_destination(
+            occupied_candidate, occupied_destination, 6));
+        CHECK(retention.artifact_id(occupied_key) == occupied_artifact);
+    }
+    CHECK(retention.artifact_id(occupied_key) == occupied_artifact);
+    retention.retire(occupied_key);
+
+    server_prompt_cache_vbr_restore_candidate refused_restore;
+    CHECK(cache.prepare_vbr_restore(
+        extended,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        refused_restore));
+    server_prompt divergent_destination;
+    common_cache_family_binding refused_family;
+    CHECK(cache.prepare_vbr_restore_destination(
+        refused_restore, divergent_destination, 8));
+    divergent_destination.tokens = server_tokens(
+        llama_tokens { 101 }, false);
+    divergent_destination.sequence_epoch = prompt.sequence_epoch;
+    CHECK(!cache.publish_vbr_restore(refused_restore));
+    CHECK(!cache.commit_vbr_restore(
+        refused_restore, divergent_destination, refused_family, 8));
+    CHECK(refused_restore.ready());
+    CHECK(logical->recovery_pins == pins_before + 1);
+    refused_restore = {};
+    CHECK(logical->recovery_pins == pins_before);
+
+    server_prompt_cache_vbr_restore_candidate accepted_restore;
+    CHECK(cache.prepare_vbr_restore(
+        extended,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        accepted_restore));
+    server_prompt restored_destination;
+    common_cache_family_binding restored_family;
+    CHECK(cache.prepare_vbr_restore_destination(
+        accepted_restore, restored_destination, 8));
+    CHECK(cache.publish_vbr_restore(accepted_restore));
+    CHECK(restored_destination.tokens.retention_token_ids() ==
+        prompt.tokens.retention_token_ids());
+    CHECK(restored_destination.sequence_epoch == prompt.sequence_epoch);
+    CHECK(cache.commit_vbr_restore(
+        accepted_restore, restored_destination, restored_family, 8));
+    CHECK(!accepted_restore.ready());
+    CHECK(restored_family == logical->cache_family);
+    CHECK(logical->recovery_pins == pins_before);
+    CHECK(cache.states.size() == 1);
+    const auto restored_live_key =
+        server_retention_instance_key::for_slot(8);
+    CHECK(retention.artifact_id(restored_live_key).v != 0);
+    CHECK(retention.prepared_for_launch(restored_live_key));
+    CHECK(retention.artifact_id(host_key).v != 0);
+    retention.abandon_prepared_launch(restored_live_key);
+    retention.retire(restored_live_key);
 
     // Live rewind checkpoints are not part of the projected artifact. Their
     // presence must not exclude an ordinary-hybrid source, and the detached

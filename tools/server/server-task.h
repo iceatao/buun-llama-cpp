@@ -831,6 +831,46 @@ struct server_prompt_cache_state {
     }
 };
 
+struct server_prompt_cache;
+
+// Move-only, non-consuming citation of one immutable compact VBR host entry.
+// The source list node is pinned until commit or destruction; the shared
+// payload owner independently keeps catalog bytes alive. Raw node identity is
+// deliberately private so callers cannot forge or double-release a pin.
+class server_prompt_cache_vbr_restore_candidate {
+public:
+    server_prompt_cache_vbr_restore_candidate() = default;
+    ~server_prompt_cache_vbr_restore_candidate();
+    server_prompt_cache_vbr_restore_candidate(
+        const server_prompt_cache_vbr_restore_candidate &) = delete;
+    server_prompt_cache_vbr_restore_candidate & operator=(
+        const server_prompt_cache_vbr_restore_candidate &) = delete;
+    server_prompt_cache_vbr_restore_candidate(
+        server_prompt_cache_vbr_restore_candidate && other) noexcept;
+    server_prompt_cache_vbr_restore_candidate & operator=(
+        server_prompt_cache_vbr_restore_candidate && other) noexcept;
+
+    bool ready() const noexcept;
+    const server_prompt_cache_vbr_owner & payload() const noexcept;
+    const common_cache_family_binding & cache_family() const noexcept;
+    uint64_t prefix_tokens() const noexcept;
+    int32_t source_id() const noexcept;
+
+private:
+    void clear() noexcept;
+    server_prompt_cache * cache_ = nullptr;
+    server_prompt_cache_state * source_ = nullptr;
+    server_prompt_cache_vbr_owner payload_;
+    common_cache_family_binding cache_family_;
+    uint64_t prefix_tokens_ = 0;
+    int32_t source_id_ = -1;
+    int32_t prepared_slot_ = -1;
+    server_prompt * prepared_destination_ = nullptr;
+    server_prompt * adopted_destination_ = nullptr;
+    std::unique_ptr<server_prompt> prepared_prompt_;
+    friend struct server_prompt_cache;
+};
+
 inline void server_prompt_cache_apply_family(
         server_prompt_cache_state & state,
         common_cache_family_binding binding,
@@ -1095,6 +1135,40 @@ struct server_prompt_cache {
         const std::string & execution_identity,
         const std::string & adapter_config_key) const noexcept;
 
+    // Select and pin the longest compact VBR artifact whose complete token
+    // block is an exact prefix of the incoming text-only request and whose
+    // execution and adapter identities match. Media-bearing automatic restore
+    // is deliberately deferred until lookup owns a frontier-media authority.
+    // This is deliberately separate
+    // from fixed-state load()/contains(): VBR restoration is an adopt
+    // transaction, not a serialized state-image restore.
+    bool prepare_vbr_restore(
+        const server_tokens & request_tokens,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
+    // Fallible retention/lease preparation for a construction-empty live
+    // destination. Cancellation rolls this provisional association back;
+    // commit consumes it only after successful artifact adoption.
+    bool prepare_vbr_restore_destination(
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        server_prompt & destination,
+        int32_t id_slot) noexcept;
+    // The adopter's allocation-free final publish hook. Only this method can
+    // mint the receipt consumed by commit: it installs the cache-prepared
+    // exact source prompt into the construction-empty destination itself.
+    bool publish_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
+    // Scheduler metadata terminal after the store's atomic adopt transaction
+    // has returned success. This must never be used as the adopt publish hook:
+    // every fallible retention operation was completed by the destination
+    // preparation above, outside the library no-fail region.
+    bool commit_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        server_prompt & destination,
+        common_cache_family_binding & destination_family,
+        int32_t id_slot) noexcept;
+
     // Resolve the exact durable host state used by prompt_save's durability
     // predicate and pin its three-payload accounting source. D-A5 calls this
     // after the same-flow save and before preparing live-slot destruction.
@@ -1180,6 +1254,13 @@ struct server_prompt_cache {
     iterator destroy_entry(
             iterator it,
             server_cache_destruction_reason reason);
+
+private:
+    void release_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
+    friend class server_prompt_cache_vbr_restore_candidate;
+
+public:
 
     // Exact D-A2 proof over snapshot, checkpoint-ring, and typed accelerator
     // payloads. Token coverage is necessary but never sufficient.

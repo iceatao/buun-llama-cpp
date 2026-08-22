@@ -156,6 +156,7 @@ public:
     server_prompt_data * fixed_state() noexcept;
     const server_prompt_data * fixed_state() const noexcept;
     const server_prompt_cache_vbr_payload * vbr_artifact() const noexcept;
+    vbr_owner vbr_compact_owner() const noexcept;
     const server_prompt_cache_vbr_variant_set *
         vbr_variants() const noexcept;
 

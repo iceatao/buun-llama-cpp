@@ -229,6 +229,10 @@ struct server_vbr_artifact_store_counters {
     std::array<uint64_t,
         size_t(vbr_explicit_capture_status::_count)> capture_outcomes = {};
     uint64_t imports_requested = 0;
+    // Trusted cache owners that passed exact catalog/storage authentication
+    // and entered the common import kernel (even when target validation later
+    // refuses). This keeps the credential-free authority boundary observable.
+    uint64_t host_imports_authenticated = 0;
     uint64_t imports_succeeded = 0;
     uint64_t imports_report_only = 0;
     uint64_t imports_not_found = 0;
@@ -240,7 +244,7 @@ struct server_vbr_artifact_store_counters {
         validation_outcomes = {};
 };
 
-struct server_vbr_artifact_import_request {
+struct server_vbr_artifact_import_target {
     using prepare_publish_fn = bool (*)(
         void * context,
         const std::vector<llama_token> & tokens,
@@ -249,14 +253,17 @@ struct server_vbr_artifact_import_request {
 
     llama_memory_i * memory = nullptr;
     llama_seq_id destination = -1;
-    std::string reference;
-    std::string tenant_key;
     std::string execution_identity;
     std::string adapter_config_identity;
     bool previously_observed = false;
     void * publish_context = nullptr;
     prepare_publish_fn prepare_publish = nullptr;
     publish_fn publish = nullptr;
+};
+
+struct server_vbr_artifact_import_request : server_vbr_artifact_import_target {
+    std::string reference;
+    std::string tenant_key;
 };
 
 struct server_vbr_artifact_import_output {
@@ -354,6 +361,14 @@ public:
     server_vbr_artifact_import_output import(
         server_vbr_artifact_import_request request) noexcept;
 
+    // Trusted scheduler import of a cache-owned immutable package. The shared
+    // owner pins catalog storage for the complete validate/stage/adopt
+    // transaction; no tenant handle is minted or resolved.
+    server_vbr_artifact_import_output import_host_payload(
+        server_vbr_artifact_import_target request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> payload)
+        noexcept;
+
     // Scheduler-only E1 resolver. Authorization is identical to import and
     // the returned move-only package is the durable catalog pin. No raw
     // artifact lookup or tenant-agnostic enumeration is exposed.
@@ -376,6 +391,9 @@ public:
     uint32_t attention_children() const noexcept;
 
 private:
+    server_vbr_artifact_import_output import_package(
+        server_vbr_artifact_import_target request,
+        const vbr_artifact_package_view & package) noexcept;
     struct impl;
     explicit server_vbr_artifact_store(std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;

@@ -116,6 +116,9 @@ using server_retention_value_snapshot_visitor = bool (*)(
 // poisons the index so callers cannot consume a partially indexed view.
 class server_retention_prefix_index {
 public:
+    using prefix_visitor = bool (*)(
+        void *, llama_cache_acct_artifact_id, uint64_t) noexcept;
+
     server_retention_prefix_index() noexcept;
     ~server_retention_prefix_index();
 
@@ -126,15 +129,24 @@ public:
         llama_cache_acct_artifact_id artifact,
         uint64_t lineage_id,
         const std::vector<llama_token> & tokens) noexcept;
+    bool clone(
+        llama_cache_acct_artifact_id source,
+        llama_cache_acct_artifact_id destination,
+        uint64_t lineage_id) noexcept;
     void retire(llama_cache_acct_artifact_id artifact) noexcept;
     bool external_shared_coverage(
         llama_cache_acct_artifact_id artifact,
         uint64_t & coverage_tokens) const noexcept;
+    bool visit_prefixes(
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_visitor visitor) const noexcept;
 
     bool available() const noexcept;
     size_t size() const noexcept;
     size_t node_count() const noexcept;
     uint64_t token_bytes() const noexcept;
+    uint64_t source_token_bytes() const noexcept;
 
 private:
     struct impl;
@@ -184,6 +196,9 @@ llama_cache_acct_op_id server_cache_acct_charge_shadow(
 // the common codec remains a pure, serializable value format.
 class server_retention_sidecar_store {
 public:
+    using prefix_instance_visitor = bool (*)(
+        void *, const server_retention_instance_key &, uint64_t) noexcept;
+
     ~server_retention_sidecar_store();
 
     server_retention_sidecar_store();
@@ -201,6 +216,18 @@ public:
         const server_retention_instance_key & key,
         const std::string & exact_scope,
         const std::vector<llama_token> & tokens) noexcept;
+    // Clone the exact immutable token block already indexed for source into
+    // destination. The new terminal remains independently retireable, while
+    // large prefix storage is charged once across live/host aliases.
+    bool clone_prefix(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination) noexcept;
+    bool visit_prefix_instances(
+        common_retention_pool pool,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_instance_visitor visitor) const noexcept;
     bool prefix_tracking_enabled() const noexcept;
     bool prefix_tracking_available() const noexcept;
     bool publish(

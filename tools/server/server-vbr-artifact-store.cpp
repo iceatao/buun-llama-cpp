@@ -1187,6 +1187,53 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import(
                 ? fail(status, impl_->counters.imports_not_found)
                 : fail(status, impl_->counters.imports_unavailable);
         }
+        return import_package(std::move(request), package);
+    } catch (...) {
+        return fail(server_vbr_artifact_import_status::internal_error,
+                    impl_->counters.imports_unavailable);
+    }
+}
+
+server_vbr_artifact_import_output
+server_vbr_artifact_store::import_host_payload(
+        server_vbr_artifact_import_target request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> payload)
+        noexcept {
+    server_vbr_artifact_import_output output;
+    impl_->counters.imports_requested++;
+    if (!payload || !payload->retirement_owned() ||
+        !payload->accounted_by(impl_->ledger) || !payload->package()) {
+        output.status = server_vbr_artifact_import_status::unavailable;
+        impl_->counters.imports_unavailable++;
+        return output;
+    }
+    if (!impl_->catalog.owns_host_package(payload->package())) {
+        output.status = server_vbr_artifact_import_status::not_found;
+        impl_->counters.imports_not_found++;
+        return output;
+    }
+    impl_->counters.host_imports_authenticated++;
+    return import_package(std::move(request), payload->package());
+}
+
+server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
+        server_vbr_artifact_import_target request,
+        const vbr_artifact_package_view & package) noexcept {
+    server_vbr_artifact_import_output output;
+    const auto fail = [&](server_vbr_artifact_import_status status,
+                          uint64_t & counter) {
+        output.status = status;
+        ++counter;
+        return output;
+    };
+    try {
+        if (!request.memory || request.destination < 0 ||
+            request.execution_identity.empty() ||
+            request.adapter_config_identity.empty() ||
+            !request.prepare_publish || !request.publish || !package) {
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
         if (!package_bytes(
                 package, output.payload_bytes, output.companion_bytes)) {
             return fail(server_vbr_artifact_import_status::unavailable,
@@ -1303,14 +1350,14 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import(
         vbr_composite_publish_hooks hooks;
         hooks.publish = [](void * opaque) noexcept {
             auto * pair = static_cast<std::pair<
-                server_vbr_artifact_import_request::publish_fn,
+                server_vbr_artifact_import_target::publish_fn,
                 void *> *>(opaque);
             pair->first(pair->second);
         };
         // The publish hook needs both the immutable owner-token context and
         // the server metadata callback. Use a no-throw local adapter while
         // retaining the memory pointer as the validated capability token.
-        std::pair<server_vbr_artifact_import_request::publish_fn, void *>
+        std::pair<server_vbr_artifact_import_target::publish_fn, void *>
             publish { request.publish, request.publish_context };
         hooks.context = &publish;
         hooks.owner_token = request.memory;

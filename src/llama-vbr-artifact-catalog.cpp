@@ -3389,6 +3389,25 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
     }
 }
 
+bool llama_vbr_artifact_catalog::owns_host_package(
+        const vbr_artifact_package_view & package) const noexcept {
+    if (package.owner_ != this || !package.storage_ ||
+        !package.host_owned_) {
+        return false;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto found = impl_->references.find(
+            package.storage_->reference.v);
+        return found != impl_->references.end() &&
+               found->second.host_owned &&
+               !found->second.retire_pending &&
+               found->second.prepared_retire_token == 0;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool llama_vbr_artifact_catalog::claim_fresh_host_batch(
         const std::vector<llama_cache_acct_artifact_id> & references,
         std::vector<vbr_artifact_package_view> & output) noexcept {

@@ -297,6 +297,13 @@ public:
     vbr_artifact_resolve_status resolve_reference(
         llama_cache_acct_artifact_id reference,
         vbr_artifact_package_view & out) noexcept;
+
+    // O(1) authenticity check for an already host-owned immutable view. A
+    // host owner deliberately cannot be resolved into a second borrow; this
+    // predicate lets the trusted scheduler return that same capability to
+    // its originating catalog without reopening ownership.
+    bool owns_host_package(
+        const vbr_artifact_package_view & package) const noexcept;
     // Scheduler-only handoff for references returned by one just-completed
     // projected publication. The input must be nonempty and unique, and the
     // output must be empty. Allocation or structural failure leaves every
