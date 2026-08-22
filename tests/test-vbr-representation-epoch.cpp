@@ -2863,7 +2863,8 @@ int main(int argc, char ** argv) {
     // WS-6: the iSWA parent must acquire both child controllers coherently. Nested scopes
     // defer actual representation mutations, leave both ordered epochs unchanged, and arm
     // exactly one fresh boundary evaluation per child when the outer scope exits.
-    const auto preflight = llama_memory_vbr_retier_preflight(mem, 0);
+    std::vector<llama_memory_vbr_physical_growth> preflight_physical;
+    const auto preflight = mem->vbr_retier_preflight(0, &preflight_physical);
     if (!preflight.active) {
         fprintf(stderr, "scoped-freeze preflight did not observe an active VBR controller\n");
         return 1;
@@ -2883,6 +2884,24 @@ int main(int argc, char ** argv) {
     if (preflight.bytes_available == 0) {
         fprintf(stderr, "scoped-freeze preflight reported zero current-tier bytes available\n");
         return 1;
+    }
+    if (preflight_physical.empty()) {
+        fprintf(stderr, "scoped-freeze preflight lost per-device physical evidence through the memory tree\n");
+        return 1;
+    }
+    for (size_t i = 0; i < preflight_physical.size(); ++i) {
+        const auto & row = preflight_physical[i];
+        if (row.backend == nullptr || row.device < 0) {
+            fprintf(stderr, "scoped-freeze preflight returned a non-canonical physical row\n");
+            return 1;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (preflight_physical[j].backend == row.backend &&
+                preflight_physical[j].device == row.device) {
+                fprintf(stderr, "scoped-freeze preflight returned duplicate backend/device rows\n");
+                return 1;
+            }
+        }
     }
     const auto before_freeze = llama_memory_vbr_state(mem, 0, 0);
     const uint64_t outer = llama_memory_vbr_retier_freeze_begin(mem, "epoch_test_outer");

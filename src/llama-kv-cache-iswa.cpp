@@ -606,35 +606,105 @@ void llama_kv_cache_iswa::vbr_retier_freeze_end(
     vbr_retier_freeze_stack_[vbr_retier_freeze_depth_] = {};
 }
 
-llama_memory_vbr_preflight_data llama_kv_cache_iswa::vbr_retier_preflight(
-        uint32_t n_tokens_extra) const {
-    const auto b = kv_base->vbr_retier_preflight(n_tokens_extra);
-    const auto s = kv_swa ->vbr_retier_preflight(n_tokens_extra);
+llama_memory_vbr_preflight_data llama_memory_vbr_merge_preflight_children(
+        const llama_memory_vbr_preflight_data & b,
+        const std::vector<llama_memory_vbr_physical_growth> & b_physical,
+        const llama_memory_vbr_preflight_data & s,
+        const std::vector<llama_memory_vbr_physical_growth> & s_physical,
+        std::vector<llama_memory_vbr_physical_growth> * physical) {
+    const auto add_saturated = [](uint64_t lhs, uint64_t rhs) {
+        return rhs > UINT64_MAX - lhs ? UINT64_MAX : lhs + rhs;
+    };
     llama_memory_vbr_preflight_data r = {};
     r.active          = b.active || s.active;
     r.fits            = b.fits && s.fits;
-    r.pools           = b.pools + s.pools;
+    r.pools           = s.pools > UINT32_MAX - b.pools
+        ? UINT32_MAX : b.pools + s.pools;
     r.watermark_cells = std::max(b.watermark_cells, s.watermark_cells);
-    r.bytes_needed    = b.bytes_needed + s.bytes_needed;
-    r.bytes_available = b.bytes_available + s.bytes_available;
-    // iSWA children normally share the same device set. Charge both growth requirements against
-    // one copy of the live-free pool (min of the child totals), not two: summing availability would
-    // false-accept two individually fitting children whose combined growth does not fit. On a
-    // future asymmetric multi-device layout this remains conservative (possible false reject).
-    r.physical_growth_needed =
-        b.physical_growth_needed + s.physical_growth_needed;
-    r.physical_growth_available = b.active && s.active
-        ? std::min(b.physical_growth_available, s.physical_growth_available)
-        : b.physical_growth_available + s.physical_growth_available;
-    const int64_t physical_deficit =
-        r.physical_growth_needed > r.physical_growth_available
-            ? (int64_t) (r.physical_growth_needed -
-                         r.physical_growth_available)
+    r.bytes_needed    = add_saturated(b.bytes_needed, s.bytes_needed);
+    r.bytes_available = add_saturated(b.bytes_available, s.bytes_available);
+    // Preserve physical device identity until both children have contributed.
+    // Summing child totals loses tensor-split skew: [80,20]+[80,20] against
+    // [100,100] looks like 200/200 even though device 0 is short by 60.
+    std::vector<llama_memory_vbr_physical_growth> combined;
+    combined.reserve(b_physical.size() + s_physical.size());
+    bool device_needed_overflow = false;
+    const auto add_device_needed = [&](uint64_t lhs, uint64_t rhs) {
+        if (rhs > UINT64_MAX - lhs) {
+            device_needed_overflow = true;
+            return UINT64_MAX;
+        }
+        return lhs + rhs;
+    };
+    const auto merge = [&](const auto & rows) {
+        for (const auto & row : rows) {
+            auto found = std::find_if(
+                combined.begin(), combined.end(), [&](const auto & value) {
+                    return value.backend == row.backend &&
+                           value.device == row.device;
+                });
+            if (found == combined.end()) {
+                combined.push_back(row);
+            } else {
+                found->kv_needed = add_device_needed(
+                    found->kv_needed, row.kv_needed);
+                found->scratch_k_needed = std::max(
+                    found->scratch_k_needed, row.scratch_k_needed);
+                found->scratch_v_needed = std::max(
+                    found->scratch_v_needed, row.scratch_v_needed);
+                found->scratch_k_current = std::max(
+                    found->scratch_k_current, row.scratch_k_current);
+                found->scratch_v_current = std::max(
+                    found->scratch_v_current, row.scratch_v_current);
+                // Both children sampled the same live device. Keep one
+                // conservative observation rather than double-counting it.
+                found->available = std::min(
+                    found->available, row.available);
+            }
+        }
+    };
+    merge(b_physical);
+    merge(s_physical);
+    r.physical_growth_needed = 0;
+    r.physical_growth_available = 0;
+    int64_t physical_deficit = 0;
+    for (const auto & row : combined) {
+        const uint64_t scratch_k_growth =
+            row.scratch_k_needed > row.scratch_k_current
+                ? row.scratch_k_needed - row.scratch_k_current : 0;
+        const uint64_t scratch_v_growth =
+            row.scratch_v_needed > row.scratch_v_current
+                ? row.scratch_v_needed - row.scratch_v_current : 0;
+        uint64_t needed = add_device_needed(
+            row.kv_needed, scratch_k_growth);
+        needed = add_device_needed(needed, scratch_v_growth);
+        r.physical_growth_needed = add_saturated(
+            r.physical_growth_needed, needed);
+        r.physical_growth_available = add_saturated(
+            r.physical_growth_available, row.available);
+        const int64_t deficit = needed > row.available
+            ? needed - row.available > uint64_t(INT64_MAX)
+                ? INT64_MAX : int64_t(needed - row.available)
             : 0;
+        physical_deficit = std::max(physical_deficit, deficit);
+    }
+    if (device_needed_overflow) {
+        physical_deficit = INT64_MAX;
+    }
     r.max_deficit     = std::max(b.max_deficit, s.max_deficit);
     r.max_deficit     = std::max(r.max_deficit, physical_deficit);
     r.fits            = r.fits && physical_deficit == 0;
+    if (physical) {
+        *physical = std::move(combined);
+    }
     return r;
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache_iswa::vbr_retier_preflight(
+        uint32_t n_tokens_extra,
+        std::vector<llama_memory_vbr_physical_growth> * physical) const {
+    return llama_memory_vbr_preflight_children(
+        *kv_base, *kv_swa, n_tokens_extra, physical);
 }
 
 bool llama_kv_cache_iswa::get_can_shift() const {

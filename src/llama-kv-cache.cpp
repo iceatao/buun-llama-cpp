@@ -8646,9 +8646,13 @@ void llama_kv_cache::vbr_retier_freeze_end(
 }
 
 llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
-        uint32_t n_tokens_extra) const {
+        uint32_t n_tokens_extra,
+        std::vector<llama_memory_vbr_physical_growth> * physical) const {
+    if (physical) {
+        physical->clear();
+    }
     if (other) {
-        return other->vbr_retier_preflight(n_tokens_extra);
+        return other->vbr_retier_preflight(n_tokens_extra, physical);
     }
     llama_memory_vbr_preflight_data r = {};
     r.fits = true;
@@ -8659,11 +8663,29 @@ llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
     r.watermark_cells = vbr_watermark_cells(n_tokens_extra);
     struct device_growth {
         const ggml_vbr_backend_iface * be = nullptr;
-        size_t kv = 0;
-        size_t scratch_k_need = 0;
-        size_t scratch_v_need = 0;
-        size_t scratch_k_have = 0;
-        size_t scratch_v_have = 0;
+        uint64_t kv = 0;
+        uint64_t scratch_k_need = 0;
+        uint64_t scratch_v_need = 0;
+        uint64_t scratch_k_have = 0;
+        uint64_t scratch_v_have = 0;
+        bool needed_overflow = false;
+    };
+    const auto add_needed = [](uint64_t lhs, uint64_t rhs, bool & overflow) {
+        if (rhs > UINT64_MAX - lhs) {
+            overflow = true;
+            return UINT64_MAX;
+        }
+        return lhs + rhs;
+    };
+    const auto multiply_needed = [](uint64_t lhs, uint64_t rhs, bool & overflow) {
+        if (lhs != 0 && rhs > UINT64_MAX / lhs) {
+            overflow = true;
+            return UINT64_MAX;
+        }
+        return lhs * rhs;
+    };
+    const auto add_observed = [](uint64_t lhs, uint64_t rhs) {
+        return rhs > UINT64_MAX - lhs ? UINT64_MAX : lhs + rhs;
     };
     std::map<int, device_growth> growth;
     for (const auto & p : vbr_pools_) {
@@ -8687,7 +8709,9 @@ llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
         auto & g = growth[p.device];
         g.be = p.be;
         const size_t mapped = p.be->vmm_pool_mapped(p.vmm);
-        g.kv += needed > mapped ? needed - mapped : 0;
+        g.kv = add_needed(
+            g.kv, needed > mapped ? needed - mapped : 0,
+            g.needed_overflow);
         size_t k_row = 0;
         size_t v_row = 0;
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
@@ -8709,9 +8733,11 @@ llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
         }
         // The backend scratch is shared per device and sized by a max, not a sum.
         g.scratch_k_need = std::max(
-            g.scratch_k_need, k_row * (size_t) r.watermark_cells);
+            g.scratch_k_need, multiply_needed(
+                k_row, r.watermark_cells, g.needed_overflow));
         g.scratch_v_need = std::max(
-            g.scratch_v_need, v_row * (size_t) r.watermark_cells);
+            g.scratch_v_need, multiply_needed(
+                v_row, r.watermark_cells, g.needed_overflow));
         g.scratch_k_have = std::max(g.scratch_k_have, p.scratch_k_reserved);
         g.scratch_v_have = std::max(g.scratch_v_have, p.scratch_v_reserved);
     }
@@ -8719,17 +8745,34 @@ llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
         size_t free_b = 0;
         size_t total_b = 0;
         g.be->get_device_memory(device, &free_b, &total_b);
-        const size_t scratch_k_delta =
+        const uint64_t scratch_k_delta =
             g.scratch_k_need > g.scratch_k_have
                 ? g.scratch_k_need - g.scratch_k_have : 0;
-        const size_t scratch_v_delta =
+        const uint64_t scratch_v_delta =
             g.scratch_v_need > g.scratch_v_have
                 ? g.scratch_v_need - g.scratch_v_have : 0;
-        const size_t physical_need = g.kv + scratch_k_delta + scratch_v_delta;
-        const int64_t physical_deficit =
-            physical_need > free_b ? (int64_t) (physical_need - free_b) : 0;
-        r.physical_growth_needed += physical_need;
-        r.physical_growth_available += free_b;
+        bool physical_overflow = g.needed_overflow;
+        uint64_t physical_need = add_needed(
+            g.kv, scratch_k_delta, physical_overflow);
+        physical_need = add_needed(
+            physical_need, scratch_v_delta, physical_overflow);
+        const int64_t physical_deficit = physical_overflow
+            ? INT64_MAX
+            : physical_need > free_b
+                ? physical_need - free_b > uint64_t(INT64_MAX)
+                    ? INT64_MAX : int64_t(physical_need - free_b)
+                : 0;
+        r.physical_growth_needed = add_observed(
+            r.physical_growth_needed, physical_need);
+        r.physical_growth_available = add_observed(
+            r.physical_growth_available, free_b);
+        if (physical) {
+            physical->push_back({
+                g.be, device, g.kv,
+                g.scratch_k_need, g.scratch_v_need,
+                g.scratch_k_have, g.scratch_v_have,
+                free_b });
+        }
         r.max_deficit = std::max(r.max_deficit, physical_deficit);
         r.fits = r.fits && physical_deficit == 0;
     }

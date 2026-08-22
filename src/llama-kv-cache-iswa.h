@@ -12,6 +12,35 @@
 // utilizes two instances of llama_kv_cache
 //   the first instance is for the non-SWA layers of the model and the second instance is for the SWA layers
 
+// Pure two-child reduction used by iSWA and its model-free skew regression.
+// Logical pool totals remain additive; physical capacity is reduced only
+// after rows sharing the same backend/device have been combined.
+llama_memory_vbr_preflight_data llama_memory_vbr_merge_preflight_children(
+    const llama_memory_vbr_preflight_data & first,
+    const std::vector<llama_memory_vbr_physical_growth> & first_physical,
+    const llama_memory_vbr_preflight_data & second,
+    const std::vector<llama_memory_vbr_physical_growth> & second_physical,
+    std::vector<llama_memory_vbr_physical_growth> * physical = nullptr);
+
+// Keep collection and reduction in one production seam so model-free tests can
+// prove that child evidence is actually requested rather than only testing the
+// arithmetic reducer in isolation.
+template<typename First, typename Second>
+llama_memory_vbr_preflight_data llama_memory_vbr_preflight_children(
+        const First & first,
+        const Second & second,
+        uint32_t n_tokens_extra,
+        std::vector<llama_memory_vbr_physical_growth> * physical = nullptr) {
+    std::vector<llama_memory_vbr_physical_growth> first_physical;
+    std::vector<llama_memory_vbr_physical_growth> second_physical;
+    const auto first_result = first.vbr_retier_preflight(
+        n_tokens_extra, &first_physical);
+    const auto second_result = second.vbr_retier_preflight(
+        n_tokens_extra, &second_physical);
+    return llama_memory_vbr_merge_preflight_children(
+        first_result, first_physical, second_result, second_physical, physical);
+}
+
 class llama_kv_cache_iswa : public llama_memory_i {
 public:
     llama_kv_cache_iswa(
@@ -89,7 +118,9 @@ public:
     void vbr_decode_ops_finish(bool ok) override;
     void vbr_adopt_operation(vbr_operation_id operation_id) override;
     void vbr_release_adopted() override;
-    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
+    llama_memory_vbr_preflight_data vbr_retier_preflight(
+        uint32_t n_tokens_extra,
+        std::vector<llama_memory_vbr_physical_growth> * physical = nullptr) const override;
 
     // summed across both children: each context token holds one row in each cache, so the
     // per-token floor cost is additive (SWA rows recycle, but the fit's measured KV bytes

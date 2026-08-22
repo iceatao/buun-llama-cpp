@@ -101,8 +101,10 @@ public:
     void vbr_release_adopted() override {
         mem_attn->vbr_release_adopted();
     }
-    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override {
-        return mem_attn->vbr_retier_preflight(n_tokens_extra);
+    llama_memory_vbr_preflight_data vbr_retier_preflight(
+            uint32_t n_tokens_extra,
+            std::vector<llama_memory_vbr_physical_growth> * physical = nullptr) const override {
+        return mem_attn->vbr_retier_preflight(n_tokens_extra, physical);
     }
 
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override {

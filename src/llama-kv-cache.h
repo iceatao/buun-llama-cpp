@@ -245,7 +245,9 @@ public:
     bool vbr_recovery_service_pending() const;
     bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
     void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
-    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
+    llama_memory_vbr_preflight_data vbr_retier_preflight(
+        uint32_t n_tokens_extra,
+        std::vector<llama_memory_vbr_physical_growth> * physical = nullptr) const override;
     bool vbr_retier_freeze_active() const {
         return other ? other->vbr_retier_freeze_active() : vbr_retier_freeze_depth_ > 0;
     }

@@ -1,4 +1,5 @@
 #include "../src/llama-vbr-downward.h"
+#include "../src/llama-kv-cache-iswa.h"
 
 #include <algorithm>
 #include <cassert>
@@ -12,6 +13,142 @@ static constexpr ggml_type tiers[] = {
     GGML_TYPE_F16, GGML_TYPE_TURBO8_0, GGML_TYPE_TURBO4_0,
     GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ,
 };
+
+static const unsigned char VBR_TEST_BACKEND_IDENTITY = 0;
+static const unsigned char VBR_TEST_BACKEND_IDENTITY_SECOND = 0;
+
+struct fake_preflight_source {
+    llama_memory_vbr_preflight_data result = {};
+    std::vector<llama_memory_vbr_physical_growth> evidence;
+    mutable uint32_t calls = 0;
+    mutable uint32_t n_tokens_extra = 0;
+
+    llama_memory_vbr_preflight_data vbr_retier_preflight(
+            uint32_t requested,
+            std::vector<llama_memory_vbr_physical_growth> * physical) const {
+        calls++;
+        n_tokens_extra = requested;
+        assert(physical != nullptr);
+        *physical = evidence;
+        return result;
+    }
+};
+
+static void test_iswa_physical_preflight_preserves_device_skew() {
+    llama_memory_vbr_preflight_data first = {};
+    llama_memory_vbr_preflight_data second = {};
+    first.active = second.active = true;
+    first.fits = second.fits = true;
+    first.pools = second.pools = 2;
+    const void * backend = &VBR_TEST_BACKEND_IDENTITY;
+    const std::vector<llama_memory_vbr_physical_growth> first_rows {
+        { backend, 0, 80, 0, 0, 0, 0, 100 },
+        { backend, 1, 20, 0, 0, 0, 0, 100 },
+    };
+    const std::vector<llama_memory_vbr_physical_growth> second_rows {
+        { backend, 0, 80, 0, 0, 0, 0, 100 },
+        { backend, 1, 20, 0, 0, 0, 0, 100 },
+    };
+    std::vector<llama_memory_vbr_physical_growth> merged;
+    const auto skewed = llama_memory_vbr_merge_preflight_children(
+        first, first_rows, second, second_rows, &merged);
+    assert(!skewed.fits);
+    assert(skewed.physical_growth_needed == 200);
+    assert(skewed.physical_growth_available == 200);
+    assert(skewed.max_deficit == 60);
+    assert(merged.size() == 2);
+
+    const std::vector<llama_memory_vbr_physical_growth> balanced_second {
+        { backend, 0, 20, 0, 0, 0, 0, 100 },
+        { backend, 1, 80, 0, 0, 0, 0, 100 },
+    };
+    const auto balanced = llama_memory_vbr_merge_preflight_children(
+        first, first_rows, second, balanced_second);
+    assert(balanced.fits);
+    assert(balanced.physical_growth_needed == 200);
+    assert(balanced.physical_growth_available == 200);
+    assert(balanced.max_deficit == 0);
+
+    // Device ordinals are backend-local. Two backends' device 0 rows must stay
+    // independent rather than sharing availability or combining requirements.
+    const void * second_backend = &VBR_TEST_BACKEND_IDENTITY_SECOND;
+    const std::vector<llama_memory_vbr_physical_growth> first_backend_row {
+        { backend, 0, 80, 0, 0, 0, 0, 100 },
+    };
+    const std::vector<llama_memory_vbr_physical_growth> second_backend_row {
+        { second_backend, 0, 80, 0, 0, 0, 0, 100 },
+    };
+    const auto separate_backends = llama_memory_vbr_merge_preflight_children(
+        first, first_backend_row, second, second_backend_row, &merged);
+    assert(separate_backends.fits);
+    assert(separate_backends.physical_growth_needed == 160);
+    assert(separate_backends.physical_growth_available == 200);
+    assert(merged.size() == 2);
+    assert(merged[0].backend != merged[1].backend);
+    assert(merged[0].device == 0 && merged[1].device == 0);
+
+    // Exercise the same collection helper used by the production iSWA override.
+    // This pins both child calls, their output evidence, and the replay bound.
+    fake_preflight_source first_source { first, first_rows };
+    fake_preflight_source second_source { second, second_rows };
+    std::vector<llama_memory_vbr_physical_growth> forwarded;
+    const auto collected = llama_memory_vbr_preflight_children(
+        first_source, second_source, 7, &forwarded);
+    assert(!collected.fits);
+    assert(first_source.calls == 1 && second_source.calls == 1);
+    assert(first_source.n_tokens_extra == 7 && second_source.n_tokens_extra == 7);
+    assert(forwarded.size() == 2);
+}
+
+static void test_iswa_physical_preflight_shared_scratch_and_overflow() {
+    llama_memory_vbr_preflight_data first = {};
+    llama_memory_vbr_preflight_data second = {};
+    first.active = second.active = true;
+    first.fits = second.fits = true;
+    const void * backend = &VBR_TEST_BACKEND_IDENTITY;
+
+    // KV mappings are child-owned and additive. K/V materialization scratch is
+    // device-owned and each side is therefore reduced by max, not by sum.
+    const std::vector<llama_memory_vbr_physical_growth> first_scratch {
+        { backend, 0, 10, 100, 40, 20, 20, 150 },
+    };
+    const std::vector<llama_memory_vbr_physical_growth> second_scratch {
+        { backend, 0, 15, 80, 60, 50, 10, 150 },
+    };
+    std::vector<llama_memory_vbr_physical_growth> merged;
+    const auto shared = llama_memory_vbr_merge_preflight_children(
+        first, first_scratch, second, second_scratch, &merged);
+    assert(shared.fits);
+    assert(shared.physical_growth_needed == 115);
+    assert(shared.physical_growth_available == 150);
+    assert(merged.size() == 1);
+    assert(merged[0].kv_needed == 25);
+    assert(merged[0].scratch_k_needed == 100);
+    assert(merged[0].scratch_v_needed == 60);
+    assert(merged[0].scratch_k_current == 50);
+    assert(merged[0].scratch_v_current == 20);
+
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    const std::vector<llama_memory_vbr_physical_growth> maximum_row {
+        { backend, 0, maximum, 0, 0, 0, 0, maximum },
+    };
+    const std::vector<llama_memory_vbr_physical_growth> zero_row {
+        { backend, 0, 0, 0, 0, 0, 0, maximum },
+    };
+    const auto exact_boundary = llama_memory_vbr_merge_preflight_children(
+        first, maximum_row, second, zero_row);
+    assert(exact_boundary.fits);
+    assert(exact_boundary.physical_growth_needed == maximum);
+
+    const std::vector<llama_memory_vbr_physical_growth> overflowing_row {
+        { backend, 0, 1, 0, 0, 0, 0, maximum },
+    };
+    const auto overflow = llama_memory_vbr_merge_preflight_children(
+        first, maximum_row, second, overflowing_row);
+    assert(!overflow.fits);
+    assert(overflow.physical_growth_needed == maximum);
+    assert(overflow.max_deficit == std::numeric_limits<int64_t>::max());
+}
 
 static void test_all_recipes_and_rejections() {
     size_t pairs = 0;
@@ -339,6 +476,8 @@ static void test_projection_reserve_retry_and_stashless() {
 }
 
 int main() {
+    test_iswa_physical_preflight_preserves_device_skew();
+    test_iswa_physical_preflight_shared_scratch_and_overflow();
     test_all_recipes_and_rejections();
     test_policy_projection_tree_and_ordinary();
     test_edge_oracles_and_stash_boundaries();

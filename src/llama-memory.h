@@ -9,8 +9,27 @@
 #include <memory>
 #include <functional>
 #include <limits>
+#include <vector>
 
 struct llama_ubatch;
+// Internal physical-growth evidence retained across composite memory trees.
+// The public preflight remains scalar, but composites must not sum per-device
+// availability before checking the combined children that share that device.
+struct llama_memory_vbr_physical_growth {
+    // Process-local identity of the backend/device namespace. This is opaque on
+    // purpose: composites only compare it and must never dereference it.
+    const void * backend = nullptr;
+    int device = -1;
+    // KV mappings are distinct per child and add. Fattn scratch is shared by all
+    // children on a device: merge the absolute target/current endpoints by max,
+    // then charge their difference once per side.
+    uint64_t kv_needed = 0;
+    uint64_t scratch_k_needed = 0;
+    uint64_t scratch_v_needed = 0;
+    uint64_t scratch_k_current = 0;
+    uint64_t scratch_v_current = 0;
+    uint64_t available = 0;
+};
 
 class llama_batch_allocr;
 
@@ -208,7 +227,12 @@ struct llama_memory_i {
     // it into every armed child so children never mint divergent ids.
     virtual void vbr_adopt_operation(vbr_operation_id /*operation_id*/) {}
     virtual void vbr_release_adopted() {}
-    virtual llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t /*n_tokens_extra*/) const {
+    virtual llama_memory_vbr_preflight_data vbr_retier_preflight(
+            uint32_t /*n_tokens_extra*/,
+            std::vector<llama_memory_vbr_physical_growth> * physical = nullptr) const {
+        if (physical) {
+            physical->clear();
+        }
         llama_memory_vbr_preflight_data r = {};
         r.fits = true;
         return r;
