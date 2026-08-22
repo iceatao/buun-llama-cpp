@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cinttypes>
@@ -172,6 +173,15 @@ private: // disallow accessing these members directly, risking out-of-sync
     // note(2): for M-RoPE, an image can occupy different number of pos; do not assume 1-to-1 mapping tokens <-> pos
     llama_tokens tokens;
 
+    // Mutation-invalidated identity for scheduler/cache comparisons. The
+    // first read after a token edit is linear; unchanged reads are O(1).
+    mutable std::array<uint8_t, 32> retention_token_digest_cache = {};
+    mutable bool retention_token_digest_valid = false;
+
+    void invalidate_retention_token_digest() noexcept {
+        retention_token_digest_valid = false;
+    }
+
     // for ex. with input of 5 text tokens and 2 images (each image occupies 3 tokens and 2 pos):
     //      [0] [1] [2] [3] [4] [img0] [img0] [img0] [img1] [img1] [img1]
     // idx  0   1   2   3   4   5      6      7      8      9      10
@@ -239,6 +249,9 @@ public:
     // distinct media can never compare as reusable content.
     const llama_tokens & retention_token_ids() const;
 
+    bool retention_token_digest(
+        std::array<uint8_t, 32> & out) const noexcept;
+
     llama_tokens get_text_tokens() const;
 
     // for compatibility with speculative decoding
@@ -254,6 +267,7 @@ public:
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();
+        invalidate_retention_token_digest();
     }
 
     void keep_first(size_t n);

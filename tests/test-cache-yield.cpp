@@ -252,6 +252,16 @@ static void test_anchor_parent_values() {
     CHECK(server_anchor_parent_values_prepared(
         candidates.data(), candidates.size(), epoch, values));
     CHECK(values.size() == 2);
+    int32_t order[2] = { -1, -1 };
+    size_t order_size = 0;
+    CHECK(server_idle_durability_order(
+        values, order, 2, order_size));
+    CHECK(order_size == 2);
+    CHECK(order[0] == 0);
+    CHECK(order[1] == 1);
+    CHECK(!server_idle_durability_order(
+        values, order, 1, order_size));
+    CHECK(order_size == 0);
     auto find_value = [&](uint64_t artifact) -> const server_anchor_parent_rank & {
         const auto found = std::find_if(values.begin(), values.end(),
             [&](const auto & value) { return value.artifact_id.v == artifact; });
@@ -263,8 +273,8 @@ static void test_anchor_parent_values() {
 
     // Equal parent value and recency remain equal across different lineages;
     // stable lineage identity must not become part of the parent currency.
-    auto tie_low = live_candidate(2, 30, 30, 100, 4, 0);
-    auto tie_high = live_candidate(3, 31, 31, 100, 4, 0);
+    auto tie_low = live_candidate(2, 30, 31, 100, 4, 0);
+    auto tie_high = live_candidate(3, 31, 30, 100, 4, 0);
     candidates = { tie_low, tie_high };
     CHECK(server_live_retention_prepare(
         candidates.data(), candidates.size(), epoch));
@@ -275,6 +285,10 @@ static void test_anchor_parent_values() {
           find_value(31).parent_value.lost_value_q);
     CHECK(find_value(30).parent_value.recency_ordinal ==
           find_value(31).parent_value.recency_ordinal);
+    CHECK(server_idle_durability_order(
+        values, order, 2, order_size));
+    CHECK(order[0] == 2);
+    CHECK(order[1] == 3);
 
     // Protected rows remain retained-coverage evidence but never enter the
     // parent-value inventory. A compact-only row is marked ineligible by the
@@ -291,6 +305,34 @@ static void test_anchor_parent_values() {
         candidates.data(), candidates.size(), epoch, values));
     CHECK(values.size() == 1);
     CHECK(values[0].artifact_id.v == 41);
+}
+
+static void test_idle_durability_order_scale() {
+    constexpr uint64_t epoch = 19;
+    constexpr size_t count = SERVER_CACHE_YIELD_MAX_CANDIDATES;
+    std::vector<server_live_retention_candidate> candidates;
+    std::vector<server_anchor_parent_rank> values;
+    std::vector<int32_t> order(count, -1);
+    candidates.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        candidates.push_back(live_candidate(
+            int32_t(i), uint64_t(i + 1), uint64_t(i + 1),
+            uint64_t(i + 1), uint64_t(i + 1), 0));
+    }
+    std::reverse(candidates.begin(), candidates.end());
+    CHECK(server_live_retention_prepare(
+        candidates.data(), candidates.size(), epoch));
+    CHECK(server_anchor_parent_values_prepared(
+        candidates.data(), candidates.size(), epoch, values));
+    size_t order_size = 0;
+    CHECK(server_idle_durability_order(
+        values, order.data(), order.size(), order_size));
+    CHECK(order_size == count);
+    for (size_t i = 0; i < count; ++i) {
+        CHECK(order[i] == int32_t(i));
+    }
+    CHECK(order.front() == 0);
+    CHECK(order.back() == int32_t(count - 1));
 }
 
 // Rebuild yield candidates from a decoded sidecar snapshot (op == stable_id, the
@@ -1127,6 +1169,7 @@ static void test_exception_isolation() {
 int main() {
     test_live_retention_projection();
     test_anchor_parent_values();
+    test_idle_durability_order_scale();
     test_atomic_assembler_contract();
     test_status_names();
     test_lineage_shadow_projection();

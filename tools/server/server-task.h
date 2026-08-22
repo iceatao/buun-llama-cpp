@@ -10,6 +10,7 @@
 #include "server-cache-control.h"
 #include "server-prompt-cache-payload.h"
 #include "server-retention-sidecar.h"
+#include "../../src/llama-vbr-artifact.h"
 
 #include <array>
 #include <memory>
@@ -831,6 +832,18 @@ struct server_prompt_cache_state {
     }
 };
 
+// Caller-owned batch inventory for automatic durability classification. The
+// canonical artifact identity narrows the state-list search; `prompt` supplies
+// the exact token witness. The cache marks rows in one state-list pass.
+struct server_prompt_cache_vbr_frontier_query {
+    int32_t slot_id = -1;
+    vbr_artifact_identity_block identity;
+    const server_prompt * prompt = nullptr;
+    std::array<uint8_t, 32> token_identity_digest = {};
+    bool token_identity_ready = false;
+    bool durable = false;
+};
+
 struct server_prompt_cache;
 
 enum class server_prompt_cache_vbr_refresh_status : uint8_t {
@@ -1153,6 +1166,14 @@ struct server_prompt_cache {
         const server_prompt & prompt,
         const std::string & execution_identity,
         const std::string & adapter_config_key) const noexcept;
+
+    // Sorts the populated prefix of the caller-owned query arena and marks
+    // immutable identity matches in one bounded pass over host states. This
+    // is selection evidence, not permission to clear a live source.
+    bool mark_vbr_frontiers(
+        server_prompt_cache_vbr_frontier_query * queries,
+        size_t query_count)
+        const noexcept;
 
     // Replace one exact logical node's compact representation in place. A
     // lower-quality recapture preserves the prior best owner as an optional

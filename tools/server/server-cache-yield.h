@@ -86,6 +86,8 @@ struct server_anchor_parent_rank {
     common_retention_pool pool = common_retention_pool::attention;
     uint64_t lineage_id = 0;
     common_retention_shadow_value parent_value;
+    int32_t slot_id = -1;
+    uint64_t recency_ordinal = 0;
 };
 
 struct server_live_retention_projection {
@@ -143,6 +145,16 @@ bool server_anchor_parent_values_prepared(
     uint64_t competition_epoch,
     std::vector<server_anchor_parent_rank> & out,
     const common_retention_frequency_config & config = {}) noexcept;
+
+// Allocation-free bounded ordering for an idle durability wave. Parent rows
+// are sorted coldest-to-hottest; callers consume the reverse order for scarce
+// capture bandwidth and the forward order for already-durable displacement.
+// Ties follow the retention authority's stable recency and slot identity.
+bool server_idle_durability_order(
+    std::vector<server_anchor_parent_rank> & values,
+    int32_t * ordered_slot_ids,
+    size_t capacity,
+    size_t & output_size) noexcept;
 
 struct server_cache_yield_result {
     server_cache_yield_status status =

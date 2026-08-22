@@ -4196,6 +4196,61 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         wrong_vbr_frontier,
         fixture.package.manifest.identity.execution_identity,
         fixture.package.manifest.identity.adapter_config_identity));
+    std::vector<server_prompt_cache_vbr_frontier_query> batch_queries(4);
+    const auto fill_query = [&](auto & query) {
+        query.identity = fixture.package.manifest.identity;
+        query.prompt = &prompt;
+    };
+    batch_queries[0].slot_id = 9;
+    fill_query(batch_queries[0]);
+    batch_queries[1].slot_id = 7;
+    fill_query(batch_queries[1]);
+    batch_queries[1].identity.sequence_epoch++;
+    batch_queries[2].slot_id = 8;
+    fill_query(batch_queries[2]);
+    batch_queries[2].identity.execution_identity += "-other";
+    server_prompt divergent_vbr_frontier = prompt.clone();
+    divergent_vbr_frontier.tokens.set_token(
+        size_t(divergent_vbr_frontier.n_tokens() - 1),
+        divergent_vbr_frontier.tokens[
+            size_t(divergent_vbr_frontier.n_tokens() - 1)] + 1);
+    batch_queries[3].slot_id = 6;
+    fill_query(batch_queries[3]);
+    batch_queries[3].prompt = &divergent_vbr_frontier;
+    CHECK(cache.mark_vbr_frontiers(
+        batch_queries.data(), batch_queries.size()));
+    size_t durable_queries = 0;
+    for (const auto & query : batch_queries) {
+        durable_queries += query.durable ? 1 : 0;
+        CHECK(query.durable == (query.slot_id == 9));
+        CHECK(query.token_identity_ready ==
+              (query.slot_id == 9 || query.slot_id == 6));
+    }
+    CHECK(durable_queries == 1);
+    const std::string saved_adapter_key = logical->adapter_config_key;
+    logical->adapter_config_key += "-logical-mismatch";
+    server_prompt_cache_vbr_frontier_query logical_mismatch;
+    logical_mismatch.slot_id = 5;
+    fill_query(logical_mismatch);
+    CHECK(cache.mark_vbr_frontiers(&logical_mismatch, 1));
+    CHECK(!logical_mismatch.durable);
+    logical->adapter_config_key = saved_adapter_key;
+    std::vector<server_prompt_cache_vbr_frontier_query> scale_queries(8192);
+    for (size_t i = 0; i < scale_queries.size(); ++i) {
+        fill_query(scale_queries[i]);
+        scale_queries[i].slot_id = int32_t(i);
+        scale_queries[i].identity.sequence_epoch += i + 1;
+    }
+    scale_queries.back().identity.sequence_epoch =
+        fixture.package.manifest.identity.sequence_epoch;
+    CHECK(cache.mark_vbr_frontiers(
+        scale_queries.data(), scale_queries.size()));
+    CHECK(std::count_if(
+        scale_queries.begin(), scale_queries.end(),
+        [](const auto & query) { return query.durable; }) == 1);
+    CHECK(std::count_if(
+        scale_queries.begin(), scale_queries.end(),
+        [](const auto & query) { return query.token_identity_ready; }) == 1);
     CHECK(logical->payload.vbr_artifact() == owner.get());
     CHECK(logical->release_ops().empty());
     // The catalog already owns every physical VBR allocation. Logical host

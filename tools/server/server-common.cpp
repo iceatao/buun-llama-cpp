@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "../../src/llama-sha256.h"
 
 #include <random>
 #include <sstream>
@@ -467,6 +468,7 @@ void server_tokens::push_back(llama_token tok) {
         throw std::runtime_error("Invalid token");
     }
     tokens.emplace_back(tok);
+    invalidate_retention_token_digest();
 }
 
 void server_tokens::push_back(const mtmd_input_chunk * chunk) {
@@ -480,6 +482,7 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
         }
         mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
         map_idx_to_media[start_idx] = std::move(new_chunk);
+        invalidate_retention_token_digest();
     } else if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         size_t n_tokens;
         const auto * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
@@ -510,6 +513,7 @@ void server_tokens::push_back(server_tokens & tokens) {
 
 void server_tokens::insert(const llama_tokens & inp_tokens) {
     tokens.insert(tokens.end(), inp_tokens.begin(), inp_tokens.end());
+    invalidate_retention_token_digest();
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
@@ -519,6 +523,24 @@ const llama_tokens & server_tokens::get_tokens() const {
 
 const llama_tokens & server_tokens::retention_token_ids() const {
     return tokens;
+}
+
+bool server_tokens::retention_token_digest(
+        std::array<uint8_t, 32> & out) const noexcept {
+    if (!retention_token_digest_valid) {
+        llama_sha256_writer hash;
+        static constexpr char DOMAIN[] =
+            "buun.server.retention-token-identity/v1";
+        hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+        hash.u64(tokens.size());
+        for (llama_token token : tokens) {
+            hash.u32(uint32_t(token));
+        }
+        retention_token_digest_cache = hash.finish();
+        retention_token_digest_valid = true;
+    }
+    out = retention_token_digest_cache;
+    return true;
 }
 
 llama_tokens server_tokens::get_text_tokens() const {
@@ -535,6 +557,7 @@ llama_tokens server_tokens::get_text_tokens() const {
 void server_tokens::set_token(llama_pos pos, llama_token id) {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;
+    invalidate_retention_token_digest();
 }
 
 void server_tokens::keep_first(size_t n) {
@@ -567,7 +590,10 @@ void server_tokens::keep_first(size_t n) {
             }
         }
     }
-    tokens.resize(n);
+    if (tokens.size() != n) {
+        tokens.resize(n);
+        invalidate_retention_token_digest();
+    }
 }
 
 std::string server_tokens::detokenize(const llama_context * ctx, bool special) const {
@@ -672,6 +698,8 @@ server_tokens server_tokens::clone() const {
     server_tokens res;
     res.has_mtmd = has_mtmd;
     res.tokens   = tokens;
+    res.retention_token_digest_cache = retention_token_digest_cache;
+    res.retention_token_digest_valid = retention_token_digest_valid;
     for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
         size_t idx = it->first;
         const mtmd::input_chunk_ptr & chunk = it->second;

@@ -742,6 +742,8 @@ struct server_slot {
     bool vbr_idle_capture_terminal = false;
     std::array<uint8_t, 32> vbr_idle_capture_published_identity = {};
     bool vbr_idle_capture_representation_valid = false;
+    std::string vbr_adapter_config_identity;
+    bool vbr_adapter_config_identity_valid = false;
 
     // B0 shadow cache-plan record [P2]: in-flight (allocated per request only when the
     // observer is enabled — absence IS the disabled state) + this slot's last finalized
@@ -2611,6 +2613,12 @@ private:
     // Fixed-capacity live VBR pressure workspace. Sized once from n_parallel during startup;
     // reclaim preparation sorts it once and every victim re-projection is allocation-free.
     std::vector<server_live_retention_candidate> vbr_retention_candidates;
+    std::vector<int32_t> vbr_retention_candidate_by_seq;
+    std::vector<uint8_t> vbr_retention_seen_by_seq;
+    std::vector<server_anchor_parent_rank> vbr_idle_parent_values;
+    std::vector<int32_t> vbr_idle_durability_order;
+    std::vector<server_prompt_cache_vbr_frontier_query>
+        vbr_idle_frontier_queries;
     std::vector<uint32_t> vbr_exclusive_cells_by_seq;
     std::vector<uint8_t> vbr_durable_sources_by_seq;
     std::vector<uint8_t> vbr_reclaim_refused_by_seq;
@@ -4501,7 +4509,8 @@ private:
 
     bool vbr_prepare_retention_wave(
             const vbr_live_retention_filter & filter,
-            bool advance_epoch = true) noexcept {
+            bool advance_epoch = true,
+            bool sample_durability = true) noexcept {
         auto * owner = live_retention_owner();
         vbr_retention_candidate_count = 0;
         vbr_retention_projection_epoch = 0;
@@ -4512,17 +4521,25 @@ private:
             std::fill(
                 vbr_durable_sources_by_seq.begin(),
                 vbr_durable_sources_by_seq.end(), uint8_t(0));
-            for (const auto & slot : slots) {
-                if (slot.id >= 0 &&
-                    size_t(slot.id) < vbr_durable_sources_by_seq.size()) {
-                    vbr_durable_sources_by_seq[size_t(slot.id)] =
-                        vbr_idle_source_durable(slot) ? 1 : 0;
+            if (sample_durability) {
+                for (const auto & slot : slots) {
+                    if (slot.id >= 0 &&
+                        size_t(slot.id) <
+                            vbr_durable_sources_by_seq.size()) {
+                        vbr_durable_sources_by_seq[size_t(slot.id)] =
+                            vbr_idle_source_durable(slot) ? 1 : 0;
+                    }
                 }
             }
         }
-        if (!owner || vbr_retention_candidates.size() != slots.size()) {
+        if (!owner || vbr_retention_candidates.size() != slots.size() ||
+            vbr_retention_candidate_by_seq.size() != slots.size() ||
+            vbr_retention_seen_by_seq.size() != slots.size()) {
             return false;
         }
+        std::fill(
+            vbr_retention_seen_by_seq.begin(),
+            vbr_retention_seen_by_seq.end(), uint8_t(0));
         if (advance_epoch) {
             if (!owner->begin_competition_wave()) {
                 return false;
@@ -4540,15 +4557,24 @@ private:
         struct inventory_context {
             server_context_impl * self;
             const vbr_live_retention_filter * filter;
+            size_t observed = 0;
             bool complete = true;
-        } context { this, &filter, true };
+        } context { this, &filter, 0, true };
         const auto snapshot = owner->value_snapshots(
             &context,
             +[](void * opaque,
                 const server_retention_value_snapshot & row) noexcept {
                 auto & state = *static_cast<inventory_context *>(opaque);
-                if (row.kind != common_retention_artifact_kind::live_slot ||
-                    row.instance_key.kind !=
+                state.observed++;
+                // Host aliases are part of the complete retention snapshot
+                // and their coverage is already folded into each live row's
+                // external_shared_coverage_tokens. Validate and count them,
+                // but materialize only scheduler-owned live slots here.
+                if (row.instance_key.kind !=
+                        common_retention_artifact_kind::live_slot) {
+                    return true;
+                }
+                if (row.kind !=
                         common_retention_artifact_kind::live_slot ||
                     row.instance_key.owner_slot < 0 ||
                     state.self->vbr_retention_candidate_count >=
@@ -4556,12 +4582,21 @@ private:
                     state.complete = false;
                     return false;
                 }
-                auto * slot = state.self->find_slot_by_id(
-                    row.instance_key.owner_slot);
-                if (!slot || slot->prompt.n_tokens() == 0) {
+                const int32_t slot_id = row.instance_key.owner_slot;
+                if (size_t(slot_id) >= state.self->slots.size() ||
+                    state.self->slots[size_t(slot_id)].id != slot_id ||
+                    state.self->vbr_retention_seen_by_seq[
+                        size_t(slot_id)] != 0) {
                     state.complete = false;
                     return false;
                 }
+                auto * slot = &state.self->slots[size_t(slot_id)];
+                if (slot->prompt.n_tokens() == 0) {
+                    state.complete = false;
+                    return false;
+                }
+                state.self->vbr_retention_seen_by_seq[
+                    size_t(slot_id)] = 1;
                 auto & candidate = state.self->vbr_retention_candidates[
                     state.self->vbr_retention_candidate_count++];
                 candidate = {};
@@ -4579,29 +4614,40 @@ private:
         if (!context.complete ||
             snapshot.status !=
                 server_retention_value_snapshot_status::complete ||
-            snapshot.size != vbr_retention_candidate_count) {
+            snapshot.size != context.observed) {
             return false;
         }
         for (const auto & slot : slots) {
             if (slot.prompt.n_tokens() == 0) {
                 continue;
             }
-            const bool represented = std::any_of(
-                vbr_retention_candidates.begin(),
-                vbr_retention_candidates.begin() +
-                    vbr_retention_candidate_count,
-                [&](const server_live_retention_candidate & candidate) {
-                    return candidate.slot_id == slot.id;
-                });
-            if (!represented) {
+            if (slot.id < 0 || size_t(slot.id) >=
+                    vbr_retention_seen_by_seq.size() ||
+                vbr_retention_seen_by_seq[size_t(slot.id)] == 0) {
                 return false;
             }
         }
-        return vbr_retention_candidate_count > 0 &&
-            server_live_retention_prepare(
+        if (vbr_retention_candidate_count == 0 ||
+            !server_live_retention_prepare(
                 vbr_retention_candidates.data(),
                 vbr_retention_candidate_count,
-                vbr_retention_projection_epoch);
+                vbr_retention_projection_epoch)) {
+            return false;
+        }
+        std::fill(
+            vbr_retention_candidate_by_seq.begin(),
+            vbr_retention_candidate_by_seq.end(), int32_t(-1));
+        for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+            const int32_t slot_id = vbr_retention_candidates[i].slot_id;
+            if (slot_id < 0 || size_t(slot_id) >=
+                    vbr_retention_candidate_by_seq.size() ||
+                vbr_retention_candidate_by_seq[size_t(slot_id)] != -1 ||
+                i > size_t(INT32_MAX)) {
+                return false;
+            }
+            vbr_retention_candidate_by_seq[size_t(slot_id)] = int32_t(i);
+        }
+        return true;
     }
 
     bool vbr_refresh_retention_wave(
@@ -4613,10 +4659,12 @@ private:
         bool needs_exclusive_cells = false;
         for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
             auto & candidate = vbr_retention_candidates[i];
-            auto * slot = find_slot_by_id(candidate.slot_id);
-            if (!slot) {
+            if (candidate.slot_id < 0 || size_t(candidate.slot_id) >=
+                    slots.size() ||
+                slots[size_t(candidate.slot_id)].id != candidate.slot_id) {
                 return false;
             }
+            auto * slot = &slots[size_t(candidate.slot_id)];
             candidate.present = slot->prompt.n_tokens() > 0;
             candidate.eligible = candidate.present &&
                 vbr_idle_reclaim_eligible(*slot, filter);
@@ -4643,38 +4691,63 @@ private:
         }
         struct refresh_context {
             server_context_impl * self;
-            size_t rows = 0;
+            size_t observed = 0;
+            size_t live_rows = 0;
             bool complete = true;
-        } context { this, 0, true };
+        } context { this, 0, 0, true };
+        std::fill(
+            vbr_retention_seen_by_seq.begin(),
+            vbr_retention_seen_by_seq.end(), uint8_t(0));
         const auto snapshot = owner->value_snapshots(
             &context,
             +[](void * opaque,
                 const server_retention_value_snapshot & row) noexcept {
                 auto & state = *static_cast<refresh_context *>(opaque);
-                const auto end = state.self->vbr_retention_candidates.begin() +
-                    state.self->vbr_retention_candidate_count;
-                const auto found = std::find_if(
-                    state.self->vbr_retention_candidates.begin(), end,
-                    [&](const server_live_retention_candidate & candidate) {
-                        return candidate.present &&
-                            candidate.artifact_id == row.artifact_id;
-                    });
-                if (found == end || found->slot_id !=
-                        row.instance_key.owner_slot ||
-                    found->stamp.pool != row.stamp.pool ||
-                    found->stamp.stable_id != row.stamp.stable_id ||
-                    found->stamp.lineage_id != row.stamp.lineage_id ||
-                    found->stamp.recency_ordinal !=
-                        row.stamp.recency_ordinal ||
-                    found->stamp.coverage_tokens !=
-                        row.stamp.coverage_tokens ||
-                    found->lineage != row.lineage) {
+                state.observed++;
+                if (row.instance_key.kind !=
+                        common_retention_artifact_kind::live_slot) {
+                    return true;
+                }
+                if (row.kind != common_retention_artifact_kind::live_slot) {
                     state.complete = false;
                     return false;
                 }
-                found->external_shared_coverage_tokens =
+                const int32_t slot_id = row.instance_key.owner_slot;
+                if (slot_id < 0 || size_t(slot_id) >=
+                        state.self->vbr_retention_candidate_by_seq.size()) {
+                    state.complete = false;
+                    return false;
+                }
+                const int32_t candidate_index =
+                    state.self->vbr_retention_candidate_by_seq[
+                        size_t(slot_id)];
+                if (candidate_index < 0 || size_t(candidate_index) >=
+                        state.self->vbr_retention_candidate_count ||
+                    state.self->vbr_retention_seen_by_seq[
+                        size_t(slot_id)] != 0) {
+                    state.complete = false;
+                    return false;
+                }
+                auto & found = state.self->vbr_retention_candidates[
+                    size_t(candidate_index)];
+                if (!found.present || found.slot_id != slot_id ||
+                    found.artifact_id != row.artifact_id ||
+                    found.stamp.pool != row.stamp.pool ||
+                    found.stamp.stable_id != row.stamp.stable_id ||
+                    found.stamp.lineage_id != row.stamp.lineage_id ||
+                    found.stamp.recency_ordinal !=
+                        row.stamp.recency_ordinal ||
+                    found.stamp.coverage_tokens !=
+                        row.stamp.coverage_tokens ||
+                    found.lineage != row.lineage) {
+                    state.complete = false;
+                    return false;
+                }
+                found.external_shared_coverage_tokens =
                     row.external_shared_coverage_tokens;
-                state.rows++;
+                state.self->vbr_retention_seen_by_seq[
+                    size_t(slot_id)] = 1;
+                state.live_rows++;
                 return true;
             });
         size_t present = 0;
@@ -4682,7 +4755,11 @@ private:
             const auto & candidate = vbr_retention_candidates[i];
             if (candidate.present) {
                 present++;
-                if (candidate.external_shared_coverage_tokens == UINT64_MAX) {
+                if (candidate.slot_id < 0 || size_t(candidate.slot_id) >=
+                        vbr_retention_seen_by_seq.size() ||
+                    vbr_retention_seen_by_seq[
+                        size_t(candidate.slot_id)] == 0 ||
+                    candidate.external_shared_coverage_tokens == UINT64_MAX) {
                     return false;
                 }
             }
@@ -4690,7 +4767,8 @@ private:
         return context.complete &&
             snapshot.status ==
                 server_retention_value_snapshot_status::complete &&
-            snapshot.size == present && context.rows == present;
+            snapshot.size == context.observed &&
+            context.live_rows == present;
     }
 
     server_slot * vbr_oldest_idle_slot(
@@ -6299,10 +6377,16 @@ private:
         }
         if (server_vbr_dynamic_active(params_base)) {
             vbr_retention_candidates.resize(slots.size());
+            vbr_retention_candidate_by_seq.resize(slots.size());
+            vbr_retention_seen_by_seq.resize(slots.size());
             vbr_exclusive_cells_by_seq.resize(slots.size());
             if (params_base.vbr_prompt_cache) {
                 vbr_durable_sources_by_seq.resize(slots.size());
                 vbr_reclaim_refused_by_seq.resize(slots.size());
+                vbr_idle_parent_values.resize(slots.size());
+                vbr_idle_parent_values.clear();
+                vbr_idle_durability_order.resize(slots.size());
+                vbr_idle_frontier_queries.resize(slots.size());
             }
         }
 
@@ -9186,6 +9270,7 @@ private:
                 SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
             }
             slot.lora = task_loras;
+            slot.vbr_adapter_config_identity_valid = false;
         }
 
         // if using alora, make sure it's only a single one requested and active
@@ -10102,24 +10187,26 @@ private:
             server_vbr_artifact_capture_status & status) {
         const int64_t token_count = slot.prompt.n_tokens();
         const llama_pos next_position = slot.prompt.tokens.pos_next();
-        std::string media_identity;
+        identity.media_content_identity.clear();
         if (token_count <= 0 || next_position <= 0 ||
             !slot.prompt.tokens.media_content_identity(
-                token_count, media_identity)) {
+                token_count, identity.media_content_identity)) {
             status =
                 server_vbr_artifact_capture_status::identity_unavailable;
             return false;
         }
         const uint64_t sequence_epoch =
             ensure_frontier_sequence_epoch(slot.prompt);
-        identity = {
-            frontier_execution_identity,
-            lora_config_identity(slot.lora),
-            std::move(media_identity),
-            sequence_epoch,
-            token_count,
-            next_position,
-        };
+        if (!slot.vbr_adapter_config_identity_valid) {
+            slot.vbr_adapter_config_identity =
+                lora_config_identity(slot.lora);
+            slot.vbr_adapter_config_identity_valid = true;
+        }
+        identity.execution_identity = frontier_execution_identity;
+        identity.adapter_config_identity = slot.vbr_adapter_config_identity;
+        identity.sequence_epoch = sequence_epoch;
+        identity.token_count = token_count;
+        identity.next_position = next_position;
         status = server_vbr_artifact_capture_status::ok;
         return true;
     }
@@ -10148,6 +10235,7 @@ private:
 
     static std::array<uint8_t, 32> vbr_idle_capture_attempt_digest(
             const vbr_artifact_identity_block & identity,
+            const std::array<uint8_t, 32> & token_identity_digest,
             uint64_t tier_epoch,
             uint64_t tier_epoch_swa) {
         llama_sha256_writer attempt_hash;
@@ -10167,9 +10255,27 @@ private:
         attempt_hash.u64(identity.sequence_epoch);
         attempt_hash.u64(uint64_t(identity.token_count));
         attempt_hash.u64(uint64_t(identity.next_position));
+        attempt_hash.bytes(
+            token_identity_digest.data(), token_identity_digest.size());
         attempt_hash.u64(tier_epoch);
         attempt_hash.u64(tier_epoch_swa);
         return attempt_hash.finish();
+    }
+
+    static std::array<uint8_t, 32> vbr_idle_publication_identity(
+            const std::array<uint8_t, 32> & token_identity_digest,
+            uint64_t tier_epoch,
+            uint64_t tier_epoch_swa) {
+        llama_sha256_writer published_hash;
+        static constexpr char PUBLISHED_DOMAIN[] =
+            "buun.vbr.idle-capture-published/v1";
+        published_hash.string(
+            PUBLISHED_DOMAIN, sizeof(PUBLISHED_DOMAIN) - 1);
+        published_hash.bytes(
+            token_identity_digest.data(), token_identity_digest.size());
+        published_hash.u64(tier_epoch);
+        published_hash.u64(tier_epoch_swa);
+        return published_hash.finish();
     }
 
     static bool automatic_vbr_restore_supported(
@@ -10338,13 +10444,8 @@ private:
         std::vector<vbr_projected_capture_manifest_request> manifests;
         size_t displaced_existing = 0;
         size_t displacement_attempts = 0;
+        size_t capture_attempts = 0;
         bool refresh_selected = false;
-        try {
-            candidates.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
-            manifests.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
-        } catch (...) {
-            return 0;
-        }
 
         uint64_t total_token_references = 0;
         static constexpr uint64_t MAX_IDLE_TOKEN_REFERENCES = 1024ull*1024;
@@ -10354,20 +10455,217 @@ private:
         }
         const auto representation =
             memory->vbr_representation_identity();
-        for (auto & idle : slots) {
-            if (candidates.size() + displacement_attempts ==
+        const auto slot_by_id = [&](int32_t id) -> server_slot * {
+            return id >= 0 && size_t(id) < slots.size() &&
+                    slots[size_t(id)].id == id
+                ? &slots[size_t(id)] : nullptr;
+        };
+        const auto base_eligible = [&](const server_slot & idle) {
+            return !idle.is_processing() &&
+                idle.state == SLOT_STATE_IDLE &&
+                idle.prompt.n_tokens() > 0 && !idle.can_speculate() &&
+                !idle.hard_lease_blocks_live_prefix() &&
+                !idle.cache_plan_destruction_recovery_pin.valid() &&
+                prompt_cache->vbr_retention_source_available(idle.id);
+        };
+
+        // A host-only cache is a normal steady state after successful
+        // displacement. Avoid walking its complete retention catalog on every
+        // idle tick when no live source can produce capture work.
+        bool any_live_source = false;
+        for (const auto & idle : slots) {
+            if (!capture_session.continue_capture()) {
+                return 0;
+            }
+            if (base_eligible(idle)) {
+                any_live_source = true;
+                break;
+            }
+        }
+        if (!any_live_source) {
+            return 0;
+        }
+        try {
+            candidates.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
+            manifests.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
+        } catch (...) {
+            return 0;
+        }
+
+        // The bounded wave is a retention decision, not a slot-number
+        // lottery. Snapshot the current competition epoch without aging it,
+        // then rank all eligible live parents from coldest to hottest. The
+        // reverse order feeds scarce capture bandwidth; the forward order is
+        // retained for cheap displacement of already-durable sources after
+        // capture completes. No token vectors are copied until selection.
+        const vbr_live_retention_filter retention_filter { -1, -1, nullptr };
+        bool ranked = vbr_prepare_retention_wave(
+            retention_filter, false, false);
+        if (ranked) {
+            for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+                auto & value = vbr_retention_candidates[i];
+                const auto * slot = slot_by_id(value.slot_id);
+                value.eligible = slot && base_eligible(*slot);
+            }
+            ranked = server_anchor_parent_values_prepared(
+                vbr_retention_candidates.data(),
+                vbr_retention_candidate_count,
+                vbr_retention_projection_epoch,
+                vbr_idle_parent_values);
+        }
+        size_t durability_order_count = 0;
+        if (ranked) {
+            ranked = server_idle_durability_order(
+                vbr_idle_parent_values,
+                vbr_idle_durability_order.data(),
+                vbr_idle_durability_order.size(),
+                durability_order_count);
+            if (ranked) {
+                for (size_t i = 0; i < durability_order_count; ++i) {
+                    if (!slot_by_id(vbr_idle_durability_order[i])) {
+                        ranked = false;
+                        break;
+                    }
+                }
+            }
+            if (!ranked) {
+                durability_order_count = 0;
+            }
+        }
+        if (!ranked) {
+            durability_order_count = 0;
+            for (const auto & idle : slots) {
+                if (!base_eligible(idle)) {
+                    continue;
+                }
+                if (durability_order_count >=
+                        vbr_idle_durability_order.size()) {
+                    return 0;
+                }
+                vbr_idle_durability_order[durability_order_count++] = idle.id;
+            }
+            std::sort(
+                vbr_idle_durability_order.begin(),
+                vbr_idle_durability_order.begin() +
+                    durability_order_count,
+                [&](int32_t lhs, int32_t rhs) {
+                    const auto * left = slot_by_id(lhs);
+                    const auto * right = slot_by_id(rhs);
+                    return left && right
+                        ? std::tie(left->t_last_used, left->id) <
+                              std::tie(right->t_last_used, right->id)
+                        : lhs < rhs;
+                });
+        }
+
+        // Classify every ranked live frontier in one host-cache pass. Canonical
+        // artifact identities narrow the scan; the cache then authenticates
+        // the complete token block before calling a row durable.
+        size_t frontier_query_count = 0;
+        try {
+            for (size_t order = 0; order < durability_order_count; ++order) {
+                if (!capture_session.continue_capture()) {
+                    return 0;
+                }
+                auto * selected = slot_by_id(
+                    vbr_idle_durability_order[order]);
+                if (!selected || !base_eligible(*selected)) {
+                    continue;
+                }
+                if (frontier_query_count >=
+                        vbr_idle_frontier_queries.size()) {
+                    return 0;
+                }
+                auto & query =
+                    vbr_idle_frontier_queries[frontier_query_count];
+                query.slot_id = selected->id;
+                query.prompt = &selected->prompt;
+                server_vbr_artifact_capture_status identity_status;
+                if (!build_capture_identity_fields(
+                        *selected, query.identity, identity_status)) {
+                    continue;
+                }
+                query.durable = false;
+                frontier_query_count++;
+            }
+            if (!prompt_cache->mark_vbr_frontiers(
+                    vbr_idle_frontier_queries.data(),
+                    frontier_query_count) ||
+                !capture_session.continue_capture()) {
+                return 0;
+            }
+            for (size_t i = 0; i < frontier_query_count; ++i) {
+                const auto & query = vbr_idle_frontier_queries[i];
+                if (query.slot_id < 0 || size_t(query.slot_id) >=
+                        vbr_durable_sources_by_seq.size()) {
+                    return 0;
+                }
+                vbr_durable_sources_by_seq[size_t(query.slot_id)] =
+                    query.durable ? 1 : 0;
+            }
+        } catch (...) {
+            return 0;
+        }
+
+        const auto durable_at_snapshot = [&](const server_slot & idle) {
+            return idle.id >= 0 &&
+                size_t(idle.id) < vbr_durable_sources_by_seq.size() &&
+                vbr_durable_sources_by_seq[size_t(idle.id)] != 0;
+        };
+        for (size_t order = durability_order_count; order > 0; --order) {
+            auto * selected = slot_by_id(
+                vbr_idle_durability_order[order - 1]);
+            if (!selected || !base_eligible(*selected)) {
+                continue;
+            }
+            auto & idle = *selected;
+            if (capture_attempts + displacement_attempts ==
                     VBR_PROJECTED_CAPTURE_MAX_MANIFESTS) {
                 break;
             }
-            if (idle.is_processing() || idle.state != SLOT_STATE_IDLE ||
-                idle.prompt.n_tokens() <= 0 || idle.can_speculate() ||
-                idle.hard_lease_blocks_live_prefix() ||
-                idle.cache_plan_destruction_recovery_pin.valid() ||
-                queue_tasks.has_deferred_for_slot(idle.id) ||
-                !prompt_cache->vbr_retention_source_available(idle.id)) {
+            const bool durable = durable_at_snapshot(idle);
+            std::array<uint8_t, 32> token_identity_digest = {};
+            if (durable &&
+                !idle.prompt.tokens.retention_token_digest(
+                    token_identity_digest)) {
                 continue;
             }
-            const std::string adapter_key = lora_config_identity(idle.lora);
+            const auto durable_identity = durable
+                ? vbr_idle_publication_identity(
+                    token_identity_digest,
+                    representation.tier_epoch,
+                    representation.tier_epoch_swa)
+                : std::array<uint8_t, 32> {};
+            const bool representation_changed = durable &&
+                (!idle.vbr_idle_capture_representation_valid ||
+                 idle.vbr_idle_capture_published_identity !=
+                    durable_identity);
+            // Scalar refresh performs one exact physical-union admission.
+            // Bound that global work to one row per synchronous idle wave;
+            // remaining durable sources drain on later quiet ticks. Initial
+            // publications still share the normal <=8-manifest projection.
+            if (representation_changed && refresh_selected) {
+                continue;
+            }
+            if (durable && !representation_changed) {
+                // Existing durable rows are displaced only after the capture
+                // wave, in ascending retention value. Clearing them here
+                // would mutate the shared pool before the selected high-value
+                // projections have transferred.
+                continue;
+            }
+            const uint64_t token_references =
+                uint64_t(idle.prompt.n_tokens());
+            if (token_references > MAX_IDLE_TOKEN_REFERENCES -
+                    total_token_references) {
+                continue;
+            }
+            ++capture_attempts;
+            if (!durable &&
+                !idle.prompt.tokens.retention_token_digest(
+                    token_identity_digest)) {
+                continue;
+            }
             vbr_projected_capture_manifest_request manifest;
             manifest.manifest_id = uint64_t(idle.id) + 1;
             manifest.sequence = idle.id;
@@ -10379,45 +10677,9 @@ private:
             const auto attempt_identity =
                 vbr_idle_capture_attempt_digest(
                     manifest.identity,
+                    token_identity_digest,
                     representation.tier_epoch,
                     representation.tier_epoch_swa);
-            const bool durable = prompt_cache->contains_vbr_frontier(
-                    idle.prompt, frontier_execution_identity,
-                    adapter_key);
-            const bool representation_changed = durable &&
-                (!idle.vbr_idle_capture_representation_valid ||
-                 idle.vbr_idle_capture_published_identity !=
-                    attempt_identity);
-            // Scalar refresh performs one exact physical-union admission.
-            // Bound that global work to one row per synchronous idle wave;
-            // remaining durable sources drain on later quiet ticks. Initial
-            // publications still share the normal <=8-manifest projection.
-            if (representation_changed && refresh_selected) {
-                continue;
-            }
-            if (durable && !representation_changed) {
-                // A prior publication can outlive an arrival race that kept
-                // its live source. Retry only the cheap displacement terminal
-                // on later idle ticks; never recapture an already durable
-                // frontier merely to get another chance to clear it.
-                if (automatic_vbr_restore_supported(
-                        idle.prompt.tokens, idle.lora) &&
-                    capture_session.continue_capture()) {
-                    ++displacement_attempts;
-                    if (idle.prompt_clear_after_vbr_publication()) {
-                        ++displaced_existing;
-                        SLT_DBG(idle, "%s",
-                                "__TEST_TAG_VBR_IDLE_DISPLACED__\n");
-                    }
-                }
-                continue;
-            }
-            const uint64_t token_references =
-                uint64_t(idle.prompt.n_tokens());
-            if (token_references > MAX_IDLE_TOKEN_REFERENCES -
-                    total_token_references) {
-                continue;
-            }
 
             if (idle.vbr_idle_capture_attempt_identity == attempt_identity &&
                 (idle.vbr_idle_capture_terminal ||
@@ -10444,8 +10706,58 @@ private:
                 return 0;
             }
         }
-        if (manifests.empty() || !cache_plan_observe_live_memory(false)) {
+        const auto displace_existing_sources = [&]() {
+            for (size_t order = 0;
+                 order < durability_order_count &&
+                 capture_attempts + displacement_attempts <
+                    VBR_PROJECTED_CAPTURE_MAX_MANIFESTS;
+                 ++order) {
+                auto * selected = slot_by_id(
+                    vbr_idle_durability_order[order]);
+                if (!selected || !base_eligible(*selected) ||
+                    !durable_at_snapshot(*selected)) {
+                    continue;
+                }
+                auto & idle = *selected;
+                const std::string & adapter_key =
+                    idle.vbr_adapter_config_identity;
+                std::array<uint8_t, 32> token_identity_digest = {};
+                if (!idle.prompt.tokens.retention_token_digest(
+                        token_identity_digest)) {
+                    continue;
+                }
+                const auto current_publication_identity =
+                    vbr_idle_publication_identity(
+                        token_identity_digest,
+                        representation.tier_epoch,
+                        representation.tier_epoch_swa);
+                const bool representation_changed =
+                    !idle.vbr_idle_capture_representation_valid ||
+                    idle.vbr_idle_capture_published_identity !=
+                        current_publication_identity;
+                if (representation_changed ||
+                    !automatic_vbr_restore_supported(
+                        idle.prompt.tokens, idle.lora) ||
+                    !capture_session.continue_capture() ||
+                    !prompt_cache->contains_vbr_frontier(
+                        idle.prompt, frontier_execution_identity,
+                        adapter_key)) {
+                    continue;
+                }
+                ++displacement_attempts;
+                if (idle.prompt_clear_after_vbr_publication()) {
+                    ++displaced_existing;
+                    SLT_DBG(idle, "%s",
+                            "__TEST_TAG_VBR_IDLE_DISPLACED__\n");
+                }
+            }
+        };
+        if (manifests.empty()) {
+            displace_existing_sources();
             return displaced_existing;
+        }
+        if (!cache_plan_observe_live_memory(false)) {
+            return 0;
         }
 
         // This first synchronous scheduler slice is deliberately smaller than
@@ -10572,6 +10884,15 @@ private:
             const auto adapter_key =
                 row.payload->package().manifest().identity.
                     adapter_config_identity;
+            std::array<uint8_t, 32> publication_token_identity = {};
+            if (!source.prompt.tokens.retention_token_digest(
+                    publication_token_identity)) {
+                continue;
+            }
+            const auto publication_identity =
+                vbr_idle_publication_identity(
+                    publication_token_identity,
+                    found->tier_epoch, found->tier_epoch_swa);
             if (found->refresh) {
                 const auto refresh = prompt_cache->refresh_vbr_compact(
                     source.prompt, std::move(row.payload),
@@ -10585,7 +10906,7 @@ private:
                     refresh ==
                         server_prompt_cache_vbr_refresh_status::unchanged) {
                     source.vbr_idle_capture_published_identity =
-                        found->attempt_identity;
+                        publication_identity;
                     source.vbr_idle_capture_representation_valid =
                         representation_stable;
                     if (refresh !=
@@ -10631,7 +10952,7 @@ private:
             }
             ++published_count;
             source.vbr_idle_capture_published_identity =
-                found->attempt_identity;
+                publication_identity;
             source.vbr_idle_capture_representation_valid =
                 representation_stable;
             SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_PUBLISHED__\n");
@@ -10643,12 +10964,16 @@ private:
             // A refusal intentionally retains both the host artifact and the
             // live source; a later pressure wave may reconsider the latter.
             vbr_artifact_identity_block current_identity;
+            std::array<uint8_t, 32> current_token_identity = {};
             server_vbr_artifact_capture_status identity_status;
             const bool source_unchanged =
                 build_capture_identity_fields(
                     source, current_identity, identity_status) &&
+                source.prompt.tokens.retention_token_digest(
+                    current_token_identity) &&
                 vbr_idle_capture_attempt_digest(
                     current_identity,
+                    current_token_identity,
                     found->tier_epoch,
                     found->tier_epoch_swa) ==
                     found->attempt_identity && representation_stable;
@@ -10671,6 +10996,12 @@ private:
             ++displaced_count;
             SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_DISPLACED__\n");
         }
+
+        // Spend any remaining per-wave operation budget on the coldest
+        // already-durable live aliases only after the selected capture batch
+        // has completed. This preserves the source geometry of hotter rows
+        // throughout projection and D2H.
+        displace_existing_sources();
 
         SRV_INF(
             "VBR_IDLE_CAPTURE manifests=%zu published=%zu refreshed=%zu displaced=%zu "
@@ -15427,9 +15758,30 @@ server_vbr_retention_wiring_for_test() {
 server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test() {
     server_vbr_reclaim_policy_result result;
+    {
+        vbr_artifact_identity_block identity {
+            "vbr-attempt-test", "adapter", "media", 1, 3, 3,
+        };
+        const server_tokens first(
+            llama_tokens { 1, 2, 3 }, false);
+        const server_tokens divergent(
+            llama_tokens { 1, 2, 4 }, false);
+        std::array<uint8_t, 32> first_digest = {};
+        std::array<uint8_t, 32> divergent_digest = {};
+        const bool digests_ready =
+            first.retention_token_digest(first_digest) &&
+            divergent.retention_token_digest(divergent_digest);
+        result.token_identity_distinguishes_attempt =
+            digests_ready &&
+            server_context_impl::vbr_idle_capture_attempt_digest(
+                identity, first_digest, 7, 11) !=
+            server_context_impl::vbr_idle_capture_attempt_digest(
+                identity, divergent_digest, 7, 11);
+    }
     const auto run = [](
             bool complete_evidence, bool zero_yield = false,
-            bool require_durable_vbr = false) {
+            bool require_durable_vbr = false,
+            bool add_host_alias = false) {
         server_context_impl context;
         context.sleeping = true;
         context.params_base.vbr_prompt_cache = require_durable_vbr;
@@ -15455,6 +15807,7 @@ server_vbr_reclaim_policy_for_test() {
         const auto hot = server_retention_instance_key::for_slot(0);
         const auto cold_a = server_retention_instance_key::for_slot(1);
         const auto cold_b = server_retention_instance_key::for_slot(2);
+        server_prompt_cache_state host_alias;
         bool published = context.cache_retention_metadata->publish(
             hot, common_retention_pool::attention, spans,
             true, 3, 3, true);
@@ -15479,8 +15832,20 @@ server_vbr_reclaim_policy_for_test() {
                 context.cache_retention_metadata->publish_prefix(
                     cold_b, "vbr-reclaim-test", llama_tokens { 1, 2, 5 });
         }
+        if (add_host_alias) {
+            const auto host_key =
+                server_retention_instance_key::for_host_entry(&host_alias);
+            published = published &&
+                context.cache_retention_metadata->clone(
+                    cold_a, host_key) &&
+                context.cache_retention_metadata->publish_prefix(
+                    host_key, "vbr-reclaim-test",
+                    llama_tokens { 1, 2, 4 });
+        }
 
         context.vbr_retention_candidates.resize(context.slots.size());
+        context.vbr_retention_candidate_by_seq.resize(context.slots.size());
+        context.vbr_retention_seen_by_seq.resize(context.slots.size());
         context.vbr_exclusive_cells_by_seq.resize(context.slots.size());
         context.vbr_durable_sources_by_seq.resize(context.slots.size());
         const std::vector<uint32_t> exclusive {
@@ -15523,6 +15888,10 @@ server_vbr_reclaim_policy_for_test() {
     const auto undurable = run(true, false, true);
     result.automatic_cache_preserved_undurable =
         undurable[0] && undurable[1] && undurable[2] && undurable[3];
+    const auto mixed_host = run(true, false, false, true);
+    result.mixed_host_kept_hot = mixed_host[0] && mixed_host[1];
+    result.mixed_host_removed_cold =
+        mixed_host[0] && !mixed_host[2] && !mixed_host[3];
     return result;
 }
 
@@ -15654,6 +16023,8 @@ server_vbr_slot_selection_for_test(
         }
 
         context.vbr_retention_candidates.resize(context.slots.size());
+        context.vbr_retention_candidate_by_seq.resize(context.slots.size());
+        context.vbr_retention_seen_by_seq.resize(context.slots.size());
         context.vbr_exclusive_cells_by_seq.resize(context.slots.size());
         context.vbr_durable_sources_by_seq.resize(context.slots.size());
         const std::vector<uint32_t> exclusive { 100, 100, 100 };

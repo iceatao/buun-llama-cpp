@@ -2213,6 +2213,105 @@ bool server_prompt_cache::contains_vbr_frontier(
     return false;
 }
 
+bool server_prompt_cache::mark_vbr_frontiers(
+        server_prompt_cache_vbr_frontier_query * queries,
+        size_t query_count)
+        const noexcept {
+    const auto identity_less = [](const auto & lhs, const auto & rhs) {
+        return std::tie(
+                   lhs.sequence_epoch, lhs.token_count, lhs.next_position,
+                   lhs.execution_identity, lhs.adapter_config_identity,
+                   lhs.media_content_identity) <
+               std::tie(
+                   rhs.sequence_epoch, rhs.token_count, rhs.next_position,
+                   rhs.execution_identity, rhs.adapter_config_identity,
+                   rhs.media_content_identity);
+    };
+    try {
+        if ((query_count != 0 && !queries) ||
+            query_count > SERVER_RETENTION_MAX_CANDIDATES) {
+            return false;
+        }
+        if (query_count == 0) {
+            return true;
+        }
+        for (size_t i = 0; i < query_count; ++i) {
+            auto & query = queries[i];
+            query.durable = false;
+            query.token_identity_digest = {};
+            query.token_identity_ready = false;
+            const auto & identity = query.identity;
+            if (query.slot_id < 0 ||
+                !query.prompt ||
+                identity.execution_identity.empty() ||
+                identity.adapter_config_identity.empty() ||
+                identity.media_content_identity.empty() ||
+                identity.sequence_epoch == 0 ||
+                identity.token_count <= 0 ||
+                identity.next_position <= 0) {
+                return false;
+            }
+        }
+        std::sort(queries, queries + query_count, [&](const auto & lhs,
+                                                      const auto & rhs) {
+            if (identity_less(lhs.identity, rhs.identity)) {
+                return true;
+            }
+            if (identity_less(rhs.identity, lhs.identity)) {
+                return false;
+            }
+            return lhs.slot_id < rhs.slot_id;
+        });
+        for (const auto & state : states) {
+            if (state.payload.kind() !=
+                    server_prompt_cache_payload_kind::vbr_artifact) {
+                continue;
+            }
+            const auto * artifact = state.payload.vbr_artifact();
+            if (!artifact || !artifact->package()) {
+                return false;
+            }
+            const auto & identity = artifact->package().manifest().identity;
+            std::array<uint8_t, 32> host_token_identity = {};
+            auto current = std::lower_bound(
+                queries, queries + query_count, identity,
+                [&](const auto & query, const auto & key) {
+                    return identity_less(query.identity, key);
+                });
+            for (; current != queries + query_count &&
+                    !identity_less(identity, current->identity) &&
+                    !identity_less(current->identity, identity);
+                 ++current) {
+                if (!current->token_identity_ready) {
+                    if (!current->prompt->tokens.retention_token_digest(
+                            current->token_identity_digest)) {
+                        return false;
+                    }
+                    current->token_identity_ready = true;
+                }
+                if (!state.prompt.tokens.retention_token_digest(
+                        host_token_identity)) {
+                    return false;
+                }
+                if (state.adapter_config_key ==
+                        current->identity.adapter_config_identity &&
+                    state.vbr_execution_identity ==
+                        current->identity.execution_identity &&
+                    host_token_identity ==
+                        current->token_identity_digest) {
+                    current->durable = true;
+                }
+            }
+        }
+        return true;
+    } catch (...) {
+        for (size_t i = 0; i < query_count; ++i) {
+            queries[i].durable = false;
+        }
+        return false;
+    }
+}
+
 server_prompt_cache_vbr_refresh_status
 server_prompt_cache::refresh_vbr_compact(
         const server_prompt & source_prompt,
@@ -2617,6 +2716,10 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage_vbr(
         return {};
     }
 
+    std::array<uint8_t, 32> token_identity_digest = {};
+    if (!prompt.tokens.retention_token_digest(token_identity_digest)) {
+        return {};
+    }
     std::list<server_prompt_cache_state> staged;
     try {
         staged.emplace_back();

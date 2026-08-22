@@ -65,6 +65,9 @@ struct server_vbr_reclaim_policy_result {
     bool fallback_removed_oldest = false;
     bool zero_yield_fell_back = false;
     bool automatic_cache_preserved_undurable = false;
+    bool mixed_host_kept_hot = false;
+    bool mixed_host_removed_cold = false;
+    bool token_identity_distinguishes_attempt = false;
 };
 
 server_vbr_reclaim_policy_result

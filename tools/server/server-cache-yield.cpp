@@ -372,6 +372,8 @@ bool server_anchor_parent_values_prepared(
                     candidate.stamp.pool,
                     candidate.stamp.lineage_id,
                     quote.value,
+                    candidate.slot_id,
+                    candidate.stamp.recency_ordinal,
                 });
             }
             first = last;
@@ -385,6 +387,46 @@ bool server_anchor_parent_values_prepared(
         out.clear();
         return false;
     }
+}
+
+bool server_idle_durability_order(
+        std::vector<server_anchor_parent_rank> & values,
+        int32_t * ordered_slot_ids,
+        size_t capacity,
+        size_t & output_size) noexcept {
+    output_size = 0;
+    if ((values.size() != 0 && !ordered_slot_ids) ||
+        values.size() > capacity) {
+        return false;
+    }
+    for (const auto & value : values) {
+        if (value.slot_id < 0 || value.artifact_id.v == 0 ||
+            value.recency_ordinal == 0) {
+            return false;
+        }
+    }
+    std::sort(values.begin(), values.end(), [](const auto & lhs,
+                                               const auto & rhs) {
+        auto lhs_value = lhs.parent_value;
+        auto rhs_value = rhs.parent_value;
+        // Lineage identity is a deterministic catalog tie-break for generic
+        // retention projections, not durability currency. Idle scheduling
+        // uses the already-certified density/recency value and then the
+        // canonical slot ordinal so physical iteration order cannot leak in.
+        lhs_value.lineage_id = 0;
+        rhs_value.lineage_id = 0;
+        const int comparison = common_retention_shadow_compare(
+            lhs_value, rhs_value);
+        if (comparison != 0) {
+            return comparison < 0;
+        }
+        return std::tie(lhs.recency_ordinal, lhs.slot_id) <
+            std::tie(rhs.recency_ordinal, rhs.slot_id);
+    });
+    for (const auto & value : values) {
+        ordered_slot_ids[output_size++] = value.slot_id;
+    }
+    return true;
 }
 
 server_retention_shadow_projection server_retention_shadow_project(
