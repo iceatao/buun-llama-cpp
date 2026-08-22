@@ -740,6 +740,8 @@ struct server_slot {
     std::array<uint8_t, 32> vbr_idle_capture_attempt_identity = {};
     int64_t vbr_idle_capture_retry_after_ms = 0;
     bool vbr_idle_capture_terminal = false;
+    std::array<uint8_t, 32> vbr_idle_capture_published_identity = {};
+    bool vbr_idle_capture_representation_valid = false;
 
     // B0 shadow cache-plan record [P2]: in-flight (allocated per request only when the
     // observer is enabled — absence IS the disabled state) + this slot's last finalized
@@ -6504,6 +6506,19 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            if (params_base.vbr_prompt_cache &&
+                params_base.vbr_anchor_cache_mib > 0) {
+                const uint64_t anchor_bytes =
+                    uint64_t(params_base.vbr_anchor_cache_mib)*1024*1024;
+                if (anchor_bytes > SIZE_MAX) {
+                    SRV_ERR("%s", "--vbr-anchor-cache-mib exceeds this platform's addressable size\n");
+                    return false;
+                }
+                prompt_cache->quality_anchor_budget_enabled = true;
+                prompt_cache->limit_anchor_size = size_t(anchor_bytes);
+                SRV_INF("VBR quality-anchor cache enabled, size limit: %d MiB\n",
+                        params_base.vbr_anchor_cache_mib);
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -7207,6 +7222,11 @@ private:
              !params_base.cache_idle_slots || !prompt_cache ||
              !vbr_artifact_store)) {
             SRV_ERR("%s", "--vbr-prompt-cache requires armed dynamic VBR, --cache-idle-slots, --cache-ram, and the artifact store\n");
+            return false;
+        }
+        if (!params_base.vbr_prompt_cache &&
+            params_base.vbr_anchor_cache_mib > 0) {
+            SRV_ERR("%s", "--vbr-anchor-cache-mib requires --vbr-prompt-cache\n");
             return false;
         }
 
@@ -10125,10 +10145,12 @@ private:
     }
 
     static std::array<uint8_t, 32> vbr_idle_capture_attempt_digest(
-            const vbr_artifact_identity_block & identity) {
+            const vbr_artifact_identity_block & identity,
+            uint64_t tier_epoch,
+            uint64_t tier_epoch_swa) {
         llama_sha256_writer attempt_hash;
         static constexpr char ATTEMPT_DOMAIN[] =
-            "buun.vbr.idle-capture-attempt/v1";
+            "buun.vbr.idle-capture-attempt/v2";
         attempt_hash.string(
             ATTEMPT_DOMAIN, sizeof(ATTEMPT_DOMAIN) - 1);
         attempt_hash.string(
@@ -10143,6 +10165,8 @@ private:
         attempt_hash.u64(identity.sequence_epoch);
         attempt_hash.u64(uint64_t(identity.token_count));
         attempt_hash.u64(uint64_t(identity.next_position));
+        attempt_hash.u64(tier_epoch);
+        attempt_hash.u64(tier_epoch_swa);
         return attempt_hash.finish();
     }
 
@@ -10302,11 +10326,15 @@ private:
             server_slot * slot = nullptr;
             uint64_t manifest_id = 0;
             std::array<uint8_t, 32> attempt_identity = {};
+            uint64_t tier_epoch = 0;
+            uint64_t tier_epoch_swa = 0;
+            bool refresh = false;
         };
         std::vector<candidate> candidates;
         std::vector<vbr_projected_capture_manifest_request> manifests;
         size_t displaced_existing = 0;
         size_t displacement_attempts = 0;
+        bool refresh_selected = false;
         try {
             candidates.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
             manifests.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
@@ -10316,6 +10344,12 @@ private:
 
         uint64_t total_token_references = 0;
         static constexpr uint64_t MAX_IDLE_TOKEN_REFERENCES = 1024ull*1024;
+        auto * memory = llama_get_memory(ctx_tgt);
+        if (!memory) {
+            return 0;
+        }
+        const auto representation =
+            memory->vbr_representation_identity();
         for (auto & idle : slots) {
             if (candidates.size() + displacement_attempts ==
                     VBR_PROJECTED_CAPTURE_MAX_MANIFESTS) {
@@ -10330,9 +10364,34 @@ private:
                 continue;
             }
             const std::string adapter_key = lora_config_identity(idle.lora);
-            if (prompt_cache->contains_vbr_frontier(
+            vbr_projected_capture_manifest_request manifest;
+            manifest.manifest_id = uint64_t(idle.id) + 1;
+            manifest.sequence = idle.id;
+            server_vbr_artifact_capture_status identity_status;
+            if (!build_capture_identity_fields(
+                    idle, manifest.identity, identity_status)) {
+                continue;
+            }
+            const auto attempt_identity =
+                vbr_idle_capture_attempt_digest(
+                    manifest.identity,
+                    representation.tier_epoch,
+                    representation.tier_epoch_swa);
+            const bool durable = prompt_cache->contains_vbr_frontier(
                     idle.prompt, frontier_execution_identity,
-                    adapter_key)) {
+                    adapter_key);
+            const bool representation_changed = durable &&
+                (!idle.vbr_idle_capture_representation_valid ||
+                 idle.vbr_idle_capture_published_identity !=
+                    attempt_identity);
+            // Scalar refresh performs one exact physical-union admission.
+            // Bound that global work to one row per synchronous idle wave;
+            // remaining durable sources drain on later quiet ticks. Initial
+            // publications still share the normal <=8-manifest projection.
+            if (representation_changed && refresh_selected) {
+                continue;
+            }
+            if (durable && !representation_changed) {
                 // A prior publication can outlive an arrival race that kept
                 // its live source. Retry only the cheap displacement terminal
                 // on later idle ticks; never recapture an already durable
@@ -10356,16 +10415,6 @@ private:
                 continue;
             }
 
-            vbr_projected_capture_manifest_request manifest;
-            manifest.manifest_id = uint64_t(idle.id) + 1;
-            manifest.sequence = idle.id;
-            server_vbr_artifact_capture_status identity_status;
-            if (!build_capture_identity_fields(
-                    idle, manifest.identity, identity_status)) {
-                continue;
-            }
-            const auto attempt_identity =
-                vbr_idle_capture_attempt_digest(manifest.identity);
             if (idle.vbr_idle_capture_attempt_identity == attempt_identity &&
                 (idle.vbr_idle_capture_terminal ||
                  ggml_time_ms() < idle.vbr_idle_capture_retry_after_ms)) {
@@ -10381,8 +10430,12 @@ private:
                 manifests.push_back(std::move(manifest));
                 candidates.push_back({
                     &idle, uint64_t(idle.id) + 1, attempt_identity,
+                    representation.tier_epoch,
+                    representation.tier_epoch_swa,
+                    representation_changed,
                 });
                 total_token_references += token_references;
+                refresh_selected |= representation_changed;
             } catch (...) {
                 return 0;
             }
@@ -10406,7 +10459,7 @@ private:
         server_vbr_projected_host_capture_diagnostics diagnostics;
         const int64_t started = ggml_time_us();
         if (!vbr_artifact_store->capture_projected_host_batch(
-                *llama_get_memory(ctx_tgt), std::move(manifests), runway,
+                *memory, std::move(manifests), runway,
                 captured, &diagnostics)) {
             SRV_DBG(
                 "VBR_IDLE_CAPTURE refused status=%s phase=%s planned=%" PRIu64
@@ -10447,7 +10500,10 @@ private:
         }
 
         size_t published_count = 0;
+        size_t refreshed_count = 0;
         size_t displaced_count = 0;
+        const auto representation_after =
+            memory->vbr_representation_identity();
         for (auto & row : captured) {
             if (!row.payload ||
                 (row.status !=
@@ -10482,9 +10538,45 @@ private:
                 continue;
             }
             auto & source = *found->slot;
+            const bool representation_stable =
+                representation_after.tier_epoch == found->tier_epoch &&
+                representation_after.tier_epoch_swa ==
+                    found->tier_epoch_swa;
             const auto adapter_key =
                 row.payload->package().manifest().identity.
                     adapter_config_identity;
+            if (found->refresh) {
+                const auto refresh = prompt_cache->refresh_vbr_compact(
+                    source.prompt, std::move(row.payload),
+                    frontier_execution_identity, adapter_key, source.id);
+                if (refresh ==
+                        server_prompt_cache_vbr_refresh_status::
+                            updated_with_anchor ||
+                    refresh ==
+                        server_prompt_cache_vbr_refresh_status::
+                            updated_compact_only ||
+                    refresh ==
+                        server_prompt_cache_vbr_refresh_status::unchanged) {
+                    source.vbr_idle_capture_published_identity =
+                        found->attempt_identity;
+                    source.vbr_idle_capture_representation_valid =
+                        representation_stable;
+                    if (refresh !=
+                            server_prompt_cache_vbr_refresh_status::unchanged) {
+                        ++refreshed_count;
+                    }
+                    // Refresh publication never clears its live source. A
+                    // later idle/pressure wave observes the now-current
+                    // durable frontier and owns any displacement decision.
+                    continue;
+                }
+                source.vbr_idle_capture_attempt_identity =
+                    found->attempt_identity;
+                source.vbr_idle_capture_terminal = false;
+                source.vbr_idle_capture_retry_after_ms =
+                    ggml_time_ms() + 5000;
+                continue;
+            }
             auto staged = prompt_cache->stage_vbr(
                 source.prompt,
                 server_prompt_cache_payload::from_vbr(
@@ -10511,6 +10603,10 @@ private:
                 continue;
             }
             ++published_count;
+            source.vbr_idle_capture_published_identity =
+                found->attempt_identity;
+            source.vbr_idle_capture_representation_valid =
+                representation_stable;
             SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_PUBLISHED__\n");
 
             // Publication is durable, but it is not authority to destroy a
@@ -10524,8 +10620,11 @@ private:
             const bool source_unchanged =
                 build_capture_identity_fields(
                     source, current_identity, identity_status) &&
-                vbr_idle_capture_attempt_digest(current_identity) ==
-                    found->attempt_identity;
+                vbr_idle_capture_attempt_digest(
+                    current_identity,
+                    found->tier_epoch,
+                    found->tier_epoch_swa) ==
+                    found->attempt_identity && representation_stable;
             if (!source_unchanged || source.is_processing() ||
                 source.state != SLOT_STATE_IDLE || source.can_speculate() ||
                 !automatic_vbr_restore_supported(
@@ -10547,10 +10646,10 @@ private:
         }
 
         SRV_INF(
-            "VBR_IDLE_CAPTURE manifests=%zu published=%zu displaced=%zu "
+            "VBR_IDLE_CAPTURE manifests=%zu published=%zu refreshed=%zu displaced=%zu "
             "union_cells=%" PRIu64 " planned=%" PRIu64
             " transfers=%u duration_ms=%.3f\n",
-            candidates.size(), published_count,
+            candidates.size(), published_count, refreshed_count,
             displaced_existing + displaced_count,
             diagnostics.union_cells, diagnostics.planned_packed_bytes,
             diagnostics.unit_transfer_calls,

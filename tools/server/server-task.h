@@ -833,6 +833,20 @@ struct server_prompt_cache_state {
 
 struct server_prompt_cache;
 
+enum class server_prompt_cache_vbr_refresh_status : uint8_t {
+    updated_with_anchor = 0,
+    updated_compact_only,
+    unchanged,
+    not_found,
+    ambiguous,
+    busy,
+    budget_refused,
+    accounting_unavailable,
+    invalid,
+    internal_error,
+    _count,
+};
+
 // Move-only, non-consuming citation of one immutable VBR host entry. The
 // highest-quality same-frontier owner is preferred; compact current remains
 // available as a bounded fallback when destination negotiation refuses it.
@@ -1116,8 +1130,8 @@ struct server_prompt_cache {
     // compact-only configuration: anchors are optional and are stripped
     // without invalidating their compact current artifact.
     size_t limit_anchor_size = 0;
-    // H1 backend gate. H2 will bind the product budget deliberately; keeping
-    // this false preserves literal zero work before automatic anchors exist.
+    // Explicit H2 product gate. Keeping this false preserves literal zero
+    // anchor work unless a nonzero --vbr-anchor-cache-mib pool is requested.
     bool quality_anchor_budget_enabled = false;
 
     int32_t cache_plan_next_source_id = 0;
@@ -1139,6 +1153,17 @@ struct server_prompt_cache {
         const server_prompt & prompt,
         const std::string & execution_identity,
         const std::string & adapter_config_key) const noexcept;
+
+    // Replace one exact logical node's compact representation in place. A
+    // lower-quality recapture preserves the prior best owner as an optional
+    // anchor when its independent budget fits. No unrelated cache victim is
+    // selected by this bounded refresh transaction.
+    server_prompt_cache_vbr_refresh_status refresh_vbr_compact(
+        const server_prompt & source_prompt,
+        server_prompt_cache_vbr_owner incoming,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        int32_t source_slot) noexcept;
 
     // Select and pin the longest VBR artifact whose complete token block is an
     // exact prefix of the incoming text-only request and whose execution and

@@ -122,6 +122,13 @@ struct llama_memory_context_i {
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
 
+// Allocation-free ordered tier identity for scheduler-private automatic
+// capture retry. Ordinary attention-content mutation does not move it.
+struct llama_memory_vbr_representation_identity {
+    uint64_t tier_epoch = 0;
+    uint64_t tier_epoch_swa = 0;
+};
+
 // general concept of LLM memory
 // the KV cache is a type of LLM memory, but there can be other types
 struct llama_memory_i {
@@ -162,6 +169,11 @@ struct llama_memory_i {
     // their CURRENT types (dynamic VBR tier flips move this at runtime; f16 = 16, q8_0 = 8.5,
     // turbo tiers struct-true). -1 when the memory holds no attention KV (recurrent-only).
     virtual double kv_bpv() const { return -1.0; }
+
+    virtual llama_memory_vbr_representation_identity
+    vbr_representation_identity() const {
+        return {};
+    }
 
     // dynamic-VBR pressure/quality state (llama.h: llama_memory_vbr_state_data_v2). Default =
     // all zeros: "no controller, no pressure, nothing resident" — safe for policy consumers.

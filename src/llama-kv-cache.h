@@ -166,6 +166,11 @@ public:
     bool get_can_shift() const override;
     bool can_seq_rm_partial() const override { return true; }
 
+    llama_memory_vbr_representation_identity
+    vbr_representation_identity() const override {
+        return { vbr_tier_epoch(), 0 };
+    }
+
     void breathe() override;
 
     void clear(bool data) override;

@@ -11,6 +11,7 @@
 class vbr_artifact_package_view;
 class vbr_artifact_prepared_retire;
 struct vbr_artifact_allocation_view;
+struct server_prompt_cache;
 
 struct server_prompt_cache_vbr_accounting_summary {
     uint64_t logical_bytes = 0;
@@ -197,6 +198,16 @@ public:
     bool same_storage(const server_prompt_cache_payload & other) const noexcept;
 
 private:
+    friend struct server_prompt_cache;
+    // Cache-owned refresh transaction internals. Callers outside the cache
+    // cannot mint a mismatched payload or publish an invalid empty owner.
+    bool prepare_vbr_refresh(
+        vbr_owner incoming,
+        server_prompt_cache_payload & replacement,
+        bool allow_anchor,
+        bool & unchanged) const noexcept;
+    void swap_vbr_storage(server_prompt_cache_payload & other) noexcept;
+    void reset_vbr_storage() noexcept;
     std::variant<server_prompt_data, vbr_variant_owner> storage_;
 };
 

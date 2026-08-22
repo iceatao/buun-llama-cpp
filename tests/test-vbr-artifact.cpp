@@ -5193,6 +5193,146 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     cache.states.clear();
     CHECK(fixture.catalog->snapshot().references == 0);
 
+    // A quiescent lower-quality recapture refreshes the existing logical
+    // host node in place. The old compact becomes the quality anchor; source
+    // identity, family, prefix association, and node address remain stable.
+    const auto refresh_high_reference = publish_fixture(*fixture.catalog,
+        anchor_package, fixture.completions(), fixture.budget);
+    const auto refresh_low_reference = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(refresh_high_reference.reference_artifact.v != 0);
+    CHECK(refresh_low_reference.reference_artifact.v != 0);
+    auto refresh_state = publish_owned(
+        refresh_high_reference.reference_artifact);
+    const auto * refresh_address = &*refresh_state;
+    const auto refresh_source_id = refresh_state->cache_plan_source_id;
+    const auto refresh_family = refresh_state->cache_family;
+    const auto refresh_host_key =
+        server_retention_instance_key::for_host_entry(refresh_address);
+    const auto refresh_host_artifact =
+        retention.artifact_id(refresh_host_key);
+    cache.quality_anchor_budget_enabled = true;
+    cache.limit_anchor_size = SIZE_MAX;
+    auto refresh_low = owned_payload(
+        refresh_low_reference.reference_artifact);
+    const auto refresh_status = cache.refresh_vbr_compact(
+        prompt, refresh_low.vbr_compact_owner(),
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        source_slot);
+    refresh_low = {};
+    CHECK(refresh_status ==
+          server_prompt_cache_vbr_refresh_status::updated_with_anchor);
+    CHECK(cache.states.size() == 1);
+    CHECK(&cache.states.front() == refresh_address);
+    CHECK(cache.states.front().cache_plan_source_id == refresh_source_id);
+    CHECK(cache.states.front().cache_family == refresh_family);
+    CHECK(retention.artifact_id(refresh_host_key) == refresh_host_artifact);
+    CHECK(cache.states.front().payload.vbr_compact_owner()
+              ->reference_artifact() ==
+          refresh_low_reference.reference_artifact);
+    CHECK(cache.states.front().payload.vbr_variants()->quality_anchor()
+              ->reference_artifact() ==
+          refresh_high_reference.reference_artifact);
+    CHECK(fixture.catalog->snapshot().references == 2);
+
+    const size_t refresh_anchor_bytes = cache.anchor_size();
+    CHECK(refresh_anchor_bytes > 0);
+    const auto exact_refresh_reference = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(exact_refresh_reference.reference_artifact.v != 0);
+    auto exact_refresh = owned_payload(
+        exact_refresh_reference.reference_artifact);
+    cache.limit_anchor_size = refresh_anchor_bytes;
+    CHECK(cache.refresh_vbr_compact(
+              prompt, exact_refresh.vbr_compact_owner(),
+              fixture.package.manifest.identity.execution_identity,
+              fixture.package.manifest.identity.adapter_config_identity,
+              source_slot) ==
+          server_prompt_cache_vbr_refresh_status::updated_with_anchor);
+    exact_refresh = {};
+    CHECK(cache.anchor_size() == refresh_anchor_bytes);
+    CHECK(cache.states.front().payload.vbr_compact_owner()
+              ->reference_artifact() ==
+          exact_refresh_reference.reference_artifact);
+    CHECK(fixture.catalog->snapshot().references == 2);
+
+    // A restore pin and an anchor-budget refusal are both transactional. The
+    // exact pair remains unchanged and an incoming owner retires on scope
+    // exit without perturbing the host association.
+    const auto busy_reference = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(busy_reference.reference_artifact.v != 0);
+    auto busy_payload = owned_payload(busy_reference.reference_artifact);
+    cache.states.front().recovery_pins = 1;
+    CHECK(cache.refresh_vbr_compact(
+              prompt, busy_payload.vbr_compact_owner(),
+              fixture.package.manifest.identity.execution_identity,
+              fixture.package.manifest.identity.adapter_config_identity,
+              source_slot) == server_prompt_cache_vbr_refresh_status::busy);
+    cache.states.front().recovery_pins = 0;
+    busy_payload = {};
+    CHECK(fixture.catalog->snapshot().references == 2);
+
+    const auto refused_refresh_reference = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(refused_refresh_reference.reference_artifact.v != 0);
+    auto refused_refresh = owned_payload(
+        refused_refresh_reference.reference_artifact);
+    cache.limit_anchor_size = refresh_anchor_bytes - 1;
+    CHECK(cache.refresh_vbr_compact(
+              prompt, refused_refresh.vbr_compact_owner(),
+              fixture.package.manifest.identity.execution_identity,
+              fixture.package.manifest.identity.adapter_config_identity,
+              source_slot) ==
+          server_prompt_cache_vbr_refresh_status::budget_refused);
+    refused_refresh = {};
+    CHECK(&cache.states.front() == refresh_address);
+    CHECK(cache.states.front().payload.vbr_compact_owner()
+              ->reference_artifact() ==
+          exact_refresh_reference.reference_artifact);
+    CHECK(cache.states.front().payload.vbr_variants()->quality_anchor()
+              ->reference_artifact() ==
+          refresh_high_reference.reference_artifact);
+    CHECK(fixture.catalog->snapshot().references == 2);
+
+    // Without an anchor allowance the same degraded refresh still updates
+    // compact-current, but retires the former high-quality owner instead of
+    // creating hidden anchor debt or a second logical node.
+    cache.clear_accounting();
+    cache.states.clear();
+    CHECK(fixture.catalog->snapshot().references == 0);
+    const auto compact_only_high = publish_fixture(*fixture.catalog,
+        anchor_package, fixture.completions(), fixture.budget);
+    const auto compact_only_low = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(compact_only_high.reference_artifact.v != 0);
+    CHECK(compact_only_low.reference_artifact.v != 0);
+    auto compact_only_state = publish_owned(
+        compact_only_high.reference_artifact);
+    const auto * compact_only_address = &*compact_only_state;
+    auto compact_only_incoming = owned_payload(
+        compact_only_low.reference_artifact);
+    cache.limit_anchor_size = 0;
+    CHECK(cache.refresh_vbr_compact(
+              prompt, compact_only_incoming.vbr_compact_owner(),
+              fixture.package.manifest.identity.execution_identity,
+              fixture.package.manifest.identity.adapter_config_identity,
+              source_slot) ==
+          server_prompt_cache_vbr_refresh_status::updated_compact_only);
+    compact_only_incoming = {};
+    CHECK(cache.states.size() == 1);
+    CHECK(&cache.states.front() == compact_only_address);
+    CHECK(!cache.states.front().payload.vbr_has_quality_anchor());
+    CHECK(cache.states.front().payload.vbr_compact_owner()
+              ->reference_artifact() ==
+          compact_only_low.reference_artifact);
+    CHECK(fixture.catalog->snapshot().references == 1);
+    cache.clear_accounting();
+    cache.states.clear();
+    cache.quality_anchor_budget_enabled = false;
+    CHECK(fixture.catalog->snapshot().references == 0);
+
     // Two logical nodes can share one immutable variant owner when a pinned
     // incumbent causes publication dedup to retain an exact alias. Anchor
     // pressure must prepare one physical catalog retirement before changing

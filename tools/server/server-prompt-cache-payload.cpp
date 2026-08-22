@@ -662,6 +662,60 @@ uint64_t server_prompt_cache_payload::vbr_anchor_resident_bytes()
     return variants ? variants->anchor_resident_bytes() : 0;
 }
 
+bool server_prompt_cache_payload::prepare_vbr_refresh(
+        vbr_owner incoming,
+        server_prompt_cache_payload & replacement,
+        bool allow_anchor,
+        bool & unchanged) const noexcept {
+    replacement = {};
+    unchanged = false;
+    const auto * variants = vbr_variants();
+    if (!incoming || !variants || !variants->compact_current()) {
+        return false;
+    }
+    const auto best = variants->quality_anchor()
+        ? variants->quality_anchor() : variants->compact_current();
+    try {
+        if (!same_frontier(
+                incoming->package().manifest(),
+                best->package().manifest())) {
+            return false;
+        }
+        if (!quality_anchor_dominates(
+                incoming->package(), best->package())) {
+            unchanged = true;
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    if (!allow_anchor && !variants->quality_anchor()) {
+        replacement = from_vbr(std::move(incoming));
+        return replacement.valid();
+    }
+    auto refreshed = server_prompt_cache_vbr_variant_set::create(
+        std::move(incoming), std::move(best));
+    if (!refreshed) {
+        return false;
+    }
+    replacement = from_vbr_variants(std::move(refreshed));
+    return replacement.valid() && replacement.vbr_has_quality_anchor();
+}
+
+void server_prompt_cache_payload::swap_vbr_storage(
+        server_prompt_cache_payload & other) noexcept {
+    auto * lhs = std::get_if<vbr_variant_owner>(&storage_);
+    auto * rhs = std::get_if<vbr_variant_owner>(&other.storage_);
+    GGML_ASSERT(lhs && rhs);
+    lhs->swap(*rhs);
+}
+
+void server_prompt_cache_payload::reset_vbr_storage() noexcept {
+    auto * owner = std::get_if<vbr_variant_owner>(&storage_);
+    GGML_ASSERT(owner);
+    owner->reset();
+}
+
 bool server_prompt_cache_payload::prepare_vbr_compact_only(
         server_prompt_cache_payload & out) const noexcept {
     out = {};

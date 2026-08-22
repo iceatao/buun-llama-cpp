@@ -2428,6 +2428,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_VBR_PROMPT_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--vbr-anchor-cache-mib"}, "N",
+        string_format("set the optional VBR quality-anchor cache size in MiB (default: %d, 0 - compact only; requires --vbr-prompt-cache)", params.vbr_anchor_cache_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("vbr-anchor-cache-mib must be non-negative");
+            }
+            params.vbr_anchor_cache_mib = value;
+        }
+    ).set_env("LLAMA_ARG_VBR_ANCHOR_CACHE_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

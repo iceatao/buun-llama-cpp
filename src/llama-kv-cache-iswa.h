@@ -72,6 +72,14 @@ public:
 
     double kv_bpv() const override; // value-weighted combination of the base and SWA caches
 
+    llama_memory_vbr_representation_identity
+    vbr_representation_identity() const override {
+        return {
+            kv_base->vbr_tier_epoch(),
+            kv_swa->vbr_tier_epoch(),
+        };
+    }
+
     llama_memory_vbr_state_data_v2 memory_vbr_state_v2(
             llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
     bool vbr_operation_armed() const override;
