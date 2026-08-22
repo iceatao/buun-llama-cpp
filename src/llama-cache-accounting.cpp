@@ -1426,6 +1426,114 @@ bool llama_cache_acct_ledger::preview_release_set_resident_batch(
     }
 }
 
+bool llama_cache_acct_ledger::preview_release_set_resident_conditioned_batch(
+        llama_cache_acct_release_set_view baseline,
+        const std::vector<llama_cache_acct_release_set_view> & candidates,
+        uint64_t expected_serial,
+        std::vector<uint64_t> & out) const noexcept {
+    out.clear();
+    std::lock_guard<std::mutex> lock(mtx);
+    if (state.serial != expected_serial || baseline.data == nullptr ||
+        baseline.size == 0 ||
+        baseline.size > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    try {
+        size_t max_candidate_ops = 0;
+        for (const auto & candidate : candidates) {
+            if ((candidate.size != 0 && candidate.data == nullptr) ||
+                candidate.size > std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            max_candidate_ops = std::max(max_candidate_ops, candidate.size);
+        }
+
+        std::unordered_map<llama_cache_acct_alloc_id, uint32_t> baseline_refs;
+        std::unordered_set<llama_cache_acct_op_id> baseline_ops;
+        baseline_refs.reserve(baseline.size);
+        baseline_ops.reserve(baseline.size);
+        for (size_t i = 0; i < baseline.size; ++i) {
+            const auto op = baseline.data[i];
+            if (!op || !baseline_ops.insert(op).second) {
+                return false;
+            }
+            release_resolution resolved;
+            if (resolve_release_locked(op, resolved) !=
+                    release_resolution_status::ok) {
+                return false;
+            }
+            auto & count = baseline_refs[resolved.operation->alloc];
+            if (count == std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            count++;
+        }
+        for (const auto & [alloc, count] : baseline_refs) {
+            const auto it = allocs.find(alloc);
+            if (it == allocs.end() || count > it->second.committed_refs) {
+                return false;
+            }
+        }
+
+        out.assign(candidates.size(), 0);
+        std::unordered_map<llama_cache_acct_alloc_id, uint32_t> candidate_refs;
+        std::unordered_set<llama_cache_acct_op_id> unique_ops;
+        candidate_refs.reserve(max_candidate_ops);
+        unique_ops.reserve(max_candidate_ops);
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            candidate_refs.clear();
+            unique_ops.clear();
+            const auto & candidate = candidates[i];
+            for (size_t j = 0; j < candidate.size; ++j) {
+                const auto op = candidate.data[j];
+                if (!op || baseline_ops.count(op) != 0 ||
+                    !unique_ops.insert(op).second) {
+                    out.clear();
+                    return false;
+                }
+                release_resolution resolved;
+                if (resolve_release_locked(op, resolved) !=
+                        release_resolution_status::ok) {
+                    out.clear();
+                    return false;
+                }
+                auto & count = candidate_refs[resolved.operation->alloc];
+                if (count == std::numeric_limits<uint32_t>::max()) {
+                    out.clear();
+                    return false;
+                }
+                count++;
+            }
+            uint64_t resident = 0;
+            for (const auto & [alloc, count] : candidate_refs) {
+                const auto it = allocs.find(alloc);
+                const auto base = baseline_refs.find(alloc);
+                const uint32_t baseline_count = base == baseline_refs.end()
+                    ? 0 : base->second;
+                if (it == allocs.end() ||
+                    baseline_count > it->second.committed_refs ||
+                    count > it->second.committed_refs - baseline_count) {
+                    out.clear();
+                    return false;
+                }
+                if (baseline_count != it->second.committed_refs &&
+                    baseline_count + count == it->second.committed_refs) {
+                    if (it->second.resident_bytes > UINT64_MAX - resident) {
+                        out.clear();
+                        return false;
+                    }
+                    resident += it->second.resident_bytes;
+                }
+            }
+            out[i] = resident;
+        }
+        return true;
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
 llama_cache_conditional_release_status
 llama_cache_acct_ledger::release_set_if_serial(
         const std::vector<llama_cache_acct_op_id> & selected,

@@ -894,8 +894,8 @@ private:
 
 // Scheduler-thread citation that the complete conservative fresh-capture
 // batch fits the ordinary prompt-cache limits. Pressure support is limited to
-// one incoming row and one canonically selected victim; the ordinary
-// publication terminal remains the sole eviction authority.
+// one incoming row and at most two canonically selected compact VBR victims;
+// the ordinary publication terminal remains the sole eviction authority.
 class server_prompt_cache_vbr_capacity_claim {
 public:
     server_prompt_cache_vbr_capacity_claim() = default;
@@ -911,19 +911,25 @@ public:
 
     bool ready() const noexcept { return cache_ != nullptr; }
     bool requires_publication_revalidation() const noexcept {
-        return ready() && victim_ != nullptr;
+        return ready() && victim_count_ != 0;
     }
 
 private:
     void clear() noexcept;
     server_prompt_cache * cache_ = nullptr;
-    server_prompt_cache_state * victim_ = nullptr;
-    llama_cache_acct_artifact_id victim_artifact_;
+    std::array<server_prompt_cache_state *, 2> victims_ {};
+    std::array<llama_cache_acct_artifact_id, 2> victim_artifacts_ {};
+    size_t victim_count_ = 0;
     llama_cache_acct_artifact_id destination_artifact_;
     uint64_t incoming_compact_bytes_ = 0;
     size_t incoming_tokens_ = 0;
     std::thread::id scheduler_owner_;
     friend struct server_prompt_cache;
+};
+
+struct server_prompt_cache_vbr_pressure_citation {
+    std::array<llama_cache_acct_artifact_id, 2> artifacts {};
+    size_t count = 0;
 };
 
 enum class server_prompt_cache_vbr_capacity_status : uint8_t {
@@ -1279,7 +1285,7 @@ struct server_prompt_cache {
         server_prompt_cache_vbr_capacity_claim * capacity = nullptr) noexcept;
     // Cite one complete conservative fresh-capture batch at the exact
     // pre-D2H scheduler checkpoint. Pressure is limited to one incoming row
-    // and one canonical victim. A pressure citation is consumed only by the
+    // and at most two canonical victims. A pressure citation is consumed only by the
     // matching publication terminal; ordinary publication still owns the
     // eviction and refuses if its first victim no longer matches.
     bool prepare_vbr_publication_capacity(
@@ -1422,7 +1428,7 @@ private:
         int32_t source_slot,
         iterator * published,
         bool vbr_retention_prepared,
-        llama_cache_acct_artifact_id required_first_victim = {});
+        server_prompt_cache_vbr_pressure_citation required_victims = {});
     void release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
     friend class server_prompt_cache_vbr_publication_metadata;
@@ -1519,9 +1525,17 @@ private:
         vbr_artifact_prepared_retire * vbr_retire = nullptr,
         uint64_t * released_bytes = nullptr,
         size_t * released_tokens = nullptr);
+    bool destroy_vbr_pair(
+        iterator first,
+        iterator second,
+        server_cache_destruction_reason reason,
+        bool first_soft_leased,
+        bool second_soft_leased,
+        uint64_t & released_bytes,
+        size_t & released_tokens);
     bool update_impl(
         iterator incoming,
-        llama_cache_acct_artifact_id required_first_victim = {});
+        server_prompt_cache_vbr_pressure_citation required_victims = {});
     bool enforce_quality_anchor_budget(
         iterator incoming,
         uint64_t competition_epoch,

@@ -5019,6 +5019,18 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     }
     CHECK(first_marginal > 0 && first_marginal < union_bytes);
     first_retire.reset();
+    std::vector<const server_prompt_cache_payload *> conditioned_candidates {
+        &second_state->payload,
+    };
+    std::vector<vbr_artifact_retire_resident_preview> conditioned;
+    CHECK(server_prompt_cache_payload::
+        preview_vbr_retire_resident_conditioned_batch(
+            &first_state->payload, conditioned_candidates,
+            fixture.ledger.serial(), conditioned));
+    CHECK(conditioned.size() == 1 && conditioned[0].known);
+    CHECK(conditioned[0].resident > 0);
+    CHECK(conditioned[0].resident <= UINT64_MAX - first_marginal);
+    CHECK(first_marginal + conditioned[0].resident == union_bytes);
 
     // One incoming row may cite the canonical first victim across a
     // multi-incumbent cache. The citation remains non-mutating until the
@@ -5332,9 +5344,9 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
             &metadata,
         };
         server_prompt_cache_vbr_capacity_claim capacity;
-        CHECK(!cache.prepare_vbr_publication_capacity(
+        CHECK(cache.prepare_vbr_publication_capacity(
             batch, 1, multi_incoming_payload.size(), capacity));
-        CHECK(!capacity.ready());
+        CHECK(capacity.requires_publication_revalidation());
     }
     cache.limit_size = size_t(multi_budget.compact_resident_bytes - 1);
 
@@ -6206,18 +6218,28 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     {
         server_prompt drift_prompt_a;
         server_prompt drift_prompt_b;
+        server_prompt drift_prompt_c;
         server_prompt drift_prompt_incoming;
         drift_prompt_a.tokens = server_tokens(
             llama_tokens { 301, 302 }, false);
         drift_prompt_b.tokens = server_tokens(
-            llama_tokens { 401, 402 }, false);
+            llama_tokens { 301, 402 }, false);
+        drift_prompt_c.tokens = server_tokens(
+            llama_tokens { 601, 602 }, false);
         drift_prompt_incoming.tokens = server_tokens(
             llama_tokens { 501, 502 }, false);
         drift_prompt_a.sequence_epoch = 11;
         drift_prompt_b.sequence_epoch = 12;
-        drift_prompt_incoming.sequence_epoch = 13;
+        drift_prompt_c.sequence_epoch = 13;
+        drift_prompt_incoming.sequence_epoch = 14;
+        fixture_storage drift_storage_c;
+        drift_storage_c.payload0.bytes[0] ^= 0x44;
+        drift_storage_c.payload1.bytes[0] ^= 0x44;
+        drift_storage_c.stash0.bytes[0] ^= 0x44;
+        drift_storage_c.stash1.bytes[0] ^= 0x44;
         auto drift_package_a = multi_package_a;
         auto drift_package_b = multi_package_b;
+        auto drift_package_c = make_package(drift_storage_c);
         auto drift_package_incoming = multi_package_incoming;
         const auto bind_prompt = [](vbr_artifact_package & package,
                                     const server_prompt & value) {
@@ -6236,6 +6258,8 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         };
         CHECK(bind_prompt(drift_package_a, drift_prompt_a));
         CHECK(bind_prompt(drift_package_b, drift_prompt_b));
+        drift_package_c.manifest.identity = fixture.package.manifest.identity;
+        CHECK(bind_prompt(drift_package_c, drift_prompt_c));
         CHECK(bind_prompt(drift_package_incoming, drift_prompt_incoming));
 
         server_cache_authority drift_authority;
@@ -6245,14 +6269,16 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         CHECK(drift_retention.enable_prefix_tracking());
         constexpr int32_t drift_slot_a = 31;
         constexpr int32_t drift_slot_b = 32;
-        constexpr int32_t drift_slot_incoming = 33;
+        constexpr int32_t drift_slot_c = 33;
+        constexpr int32_t drift_slot_incoming = 34;
         const server_prompt * drift_prompts[] = {
-            &drift_prompt_a, &drift_prompt_b, &drift_prompt_incoming,
+            &drift_prompt_a, &drift_prompt_b, &drift_prompt_c,
+            &drift_prompt_incoming,
         };
         const int32_t drift_slots[] = {
-            drift_slot_a, drift_slot_b, drift_slot_incoming,
+            drift_slot_a, drift_slot_b, drift_slot_c, drift_slot_incoming,
         };
-        for (size_t i = 0; i < 3; ++i) {
+        for (size_t i = 0; i < std::size(drift_prompts); ++i) {
             common_chat_msg_spans drift_spans;
             drift_spans.add(
                 COMMON_CHAT_ROLE_USER, 0, drift_prompts[i]->n_tokens());
@@ -6369,6 +6395,307 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         CHECK(drift_retention.artifact_id(drift_key_b) == drift_artifact_b);
         CHECK(drift_cache.retention_shadow_snapshot().last.proposed_artifact ==
               drift_artifact_b);
+
+        drift_cache.limit_size = 1;
+        drift_cache.update();
+        drift_cache.limit_size = 0;
+        CHECK(drift_cache.states.empty());
+        CHECK(fixture.catalog->snapshot().references == 0);
+
+        for (size_t i = 0; i < std::size(drift_prompts); ++i) {
+            const auto source =
+                server_retention_instance_key::for_slot(drift_slots[i]);
+            drift_retention.retire(source);
+            common_chat_msg_spans shared_spans;
+            shared_spans.add(
+                COMMON_CHAT_ROLE_USER, 0, drift_prompts[i]->n_tokens());
+            CHECK(drift_retention.publish(
+                source, common_retention_pool::attention,
+                shared_spans, true, drift_prompts[i]->n_tokens(),
+                drift_prompts[i]->n_tokens(), true));
+            CHECK(server_prompt_retention_publish_exact_prefix(
+                drift_retention, source, *drift_prompts[i],
+                fixture.package.manifest.identity.adapter_config_identity,
+                drift_prompts[i]->n_tokens()));
+        }
+
+        // The second canonical victim is priced after the first one in the
+        // same physical accounting projection. These two distinct prompt
+        // frontiers deliberately share their sealed unit/stash allocations;
+        // neither singleton is sufficient, but the conditioned pair is.
+        const auto shared_reference_a =
+            republish(drift_package_a, multi_storage_a);
+        const auto shared_reference_b =
+            republish(drift_package_b, multi_storage_a);
+        const auto shared_reference_c =
+            republish(drift_package_c, drift_storage_c);
+        const auto shared_reference_incoming =
+            republish(drift_package_incoming, multi_storage_incoming);
+        CHECK(shared_reference_a.reference_artifact.v != 0);
+        CHECK(shared_reference_b.reference_artifact.v != 0);
+        CHECK(shared_reference_c.reference_artifact.v != 0);
+        CHECK(shared_reference_incoming.reference_artifact.v != 0);
+        auto shared_a = drift_publish(
+            shared_reference_a.reference_artifact,
+            drift_prompt_a, drift_slot_a);
+        auto shared_b = drift_publish(
+            shared_reference_b.reference_artifact,
+            drift_prompt_b, drift_slot_b);
+        auto shared_c = drift_publish(
+            shared_reference_c.reference_artifact,
+            drift_prompt_c, drift_slot_c);
+        drift_retention.retire(
+            server_retention_instance_key::for_slot(drift_slot_a));
+        drift_retention.retire(
+            server_retention_instance_key::for_slot(drift_slot_b));
+        drift_retention.retire(
+            server_retention_instance_key::for_slot(drift_slot_c));
+        const auto shared_key_a =
+            server_retention_instance_key::for_host_entry(&*shared_a);
+        const auto shared_key_b =
+            server_retention_instance_key::for_host_entry(&*shared_b);
+        const auto shared_key_c =
+            server_retention_instance_key::for_host_entry(&*shared_c);
+        const auto shared_artifact_a =
+            drift_retention.artifact_id(shared_key_a);
+        const auto shared_artifact_b =
+            drift_retention.artifact_id(shared_key_b);
+        const auto shared_artifact_c =
+            drift_retention.artifact_id(shared_key_c);
+        auto shared_incoming = owned_payload(
+            shared_reference_incoming.reference_artifact);
+        std::vector<const server_prompt_cache_payload *> shared_incumbents {
+            &shared_a->payload, &shared_b->payload, &shared_c->payload,
+        };
+        std::vector<const server_prompt_cache_payload *> shared_union {
+            &shared_a->payload, &shared_b->payload, &shared_c->payload,
+            &shared_incoming,
+        };
+        std::vector<const server_prompt_cache_payload *> shared_survivors {
+            &shared_b->payload, &shared_incoming,
+        };
+        std::vector<vbr_artifact_retire_resident_preview> shared_marginals;
+        server_prompt_cache_vbr_budget_summary shared_budget;
+        server_prompt_cache_vbr_budget_summary shared_survivor_budget;
+        CHECK(server_prompt_cache_payload::preview_vbr_retire_resident_batch(
+            shared_incumbents, fixture.ledger.serial(), shared_marginals));
+        CHECK(server_prompt_cache_payload::summarize_vbr_budgets(
+            shared_union, shared_budget));
+        CHECK(server_prompt_cache_payload::summarize_vbr_budgets(
+            shared_survivors, shared_survivor_budget));
+        CHECK(shared_marginals.size() == 3 &&
+              shared_marginals[0].known && shared_marginals[1].known &&
+              shared_marginals[2].known);
+        CHECK(shared_survivor_budget.compact_resident_bytes <= SIZE_MAX);
+        drift_cache.limit_size =
+            size_t(shared_survivor_budget.compact_resident_bytes);
+        CHECK(shared_budget.compact_resident_bytes >
+              drift_cache.limit_size);
+        CHECK(shared_budget.compact_resident_bytes -
+              shared_marginals[0].resident > drift_cache.limit_size);
+        CHECK(shared_budget.compact_resident_bytes -
+              shared_marginals[1].resident > drift_cache.limit_size);
+        CHECK(shared_budget.compact_resident_bytes -
+              shared_marginals[2].resident > drift_cache.limit_size);
+        CHECK(drift_retention.set_lineage_prior(shared_key_a, 1));
+        CHECK(drift_retention.set_lineage_prior(shared_key_b, 2000));
+        CHECK(drift_retention.set_lineage_prior(shared_key_c, 1500));
+
+        server_prompt_cache_vbr_publication_metadata shared_metadata;
+        CHECK(drift_cache.prepare_vbr_publication_metadata(
+            drift_prompt_incoming,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            drift_slot_incoming, shared_metadata));
+        server_prompt_cache_vbr_publication_metadata * shared_batch[] = {
+            &shared_metadata,
+        };
+        server_prompt_cache_vbr_capacity_claim shared_capacity;
+        CHECK(drift_cache.prepare_vbr_publication_capacity(
+            shared_batch, 1, shared_incoming.size(), shared_capacity));
+        CHECK(shared_capacity.requires_publication_revalidation());
+        server_prompt_cache::iterator shared_published;
+        const bool shared_fault =
+            server_fault("vbr_prompt_cache_pair_prepare_fail");
+        const bool shared_ok = drift_cache.publish_vbr(
+            shared_metadata, std::move(shared_incoming), {}, false,
+            &shared_published, &shared_capacity);
+        CHECK(shared_ok == !shared_fault);
+        CHECK(drift_cache.states.size() == (shared_fault ? 3 : 2));
+        CHECK((drift_retention.artifact_id(shared_key_a).v == 0) ==
+              !shared_fault);
+        CHECK(drift_retention.artifact_id(shared_key_b) ==
+              shared_artifact_b);
+        CHECK((drift_retention.artifact_id(shared_key_c).v == 0) ==
+              !shared_fault);
+        if (!shared_fault) {
+            CHECK(shared_published != drift_cache.states.end());
+        }
+        CHECK(shared_artifact_a.v != 0 && shared_artifact_b.v != 0 &&
+              shared_artifact_c.v != 0);
+        drift_cache.limit_size = 1;
+        drift_cache.update();
+        drift_cache.limit_size = 0;
+        CHECK(drift_cache.states.empty());
+    }
+    CHECK(fixture.catalog->snapshot().references == 0);
+
+    // Two distinct, physically exclusive victims are one atomic retirement
+    // transaction. Each singleton is insufficient, while their exact union
+    // makes the incoming row fit. A preparation fault must leave both
+    // incumbents and both sidecar identities intact.
+    {
+        const auto republish = [&](const vbr_artifact_package & package,
+                                   const fixture_storage & storage) {
+            return publish_fixture(*fixture.catalog, package, {
+                { 0, 1, true,  true, storage.stash1.bytes },
+                { 0, 0, false, true, storage.payload0.bytes },
+                { 0, 0, true,  true, storage.stash0.bytes },
+                { 0, 1, false, true, storage.payload1.bytes },
+            }, fixture.budget);
+        };
+        const auto pair_reference_a =
+            republish(multi_package_a, multi_storage_a);
+        const auto pair_reference_b =
+            republish(multi_package_b, multi_storage_b);
+        const auto pair_reference_incoming =
+            republish(multi_package_incoming, multi_storage_incoming);
+        CHECK(pair_reference_a.reference_artifact.v != 0);
+        CHECK(pair_reference_b.reference_artifact.v != 0);
+        CHECK(pair_reference_incoming.reference_artifact.v != 0);
+        cache.limit_size = 0;
+        auto pair_a = publish_owned(pair_reference_a.reference_artifact);
+        auto pair_b = publish_owned(pair_reference_b.reference_artifact);
+        const auto pair_key_a =
+            server_retention_instance_key::for_host_entry(&*pair_a);
+        const auto pair_key_b =
+            server_retention_instance_key::for_host_entry(&*pair_b);
+        const auto pair_artifact_a = retention.artifact_id(pair_key_a);
+        const auto pair_artifact_b = retention.artifact_id(pair_key_b);
+        auto pair_incoming =
+            owned_payload(pair_reference_incoming.reference_artifact);
+        std::vector<const server_prompt_cache_payload *> pair_union {
+            &pair_a->payload, &pair_b->payload, &pair_incoming,
+        };
+        std::vector<const server_prompt_cache_payload *> pair_incumbents {
+            &pair_a->payload, &pair_b->payload,
+        };
+        server_prompt_cache_vbr_budget_summary pair_budget;
+        std::vector<vbr_artifact_retire_resident_preview> pair_marginals;
+        llama_cache_acct_release_set_preview pair_release;
+        CHECK(server_prompt_cache_payload::summarize_vbr_budgets(
+            pair_union, pair_budget));
+        CHECK(server_prompt_cache_payload::preview_vbr_retire_resident_batch(
+            pair_incumbents, fixture.ledger.serial(), pair_marginals));
+        CHECK(server_prompt_cache_payload::preview_vbr_retire_union(
+            pair_incumbents, fixture.ledger.serial(), pair_release));
+        uint64_t pair_release_bytes = 0;
+        for (const auto & row : pair_release.rows) {
+            CHECK(row.resident_allocated <=
+                  UINT64_MAX - pair_release_bytes);
+            pair_release_bytes += row.resident_allocated;
+        }
+        CHECK(pair_release_bytes > 0);
+        CHECK(pair_marginals.size() == 2);
+        CHECK(pair_marginals[0].known && pair_marginals[1].known);
+        CHECK(pair_incoming.size() <= SIZE_MAX);
+        cache.limit_size = pair_incoming.size();
+        CHECK(pair_budget.compact_resident_bytes > cache.limit_size);
+        CHECK(pair_budget.compact_resident_bytes -
+              pair_marginals[0].resident > cache.limit_size);
+        CHECK(pair_budget.compact_resident_bytes -
+              pair_marginals[1].resident > cache.limit_size);
+
+        server_prompt_cache_vbr_publication_metadata pair_metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, pair_metadata));
+        server_prompt_cache_vbr_publication_metadata * pair_batch[] = {
+            &pair_metadata,
+        };
+        server_prompt_cache_vbr_capacity_claim pair_capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            pair_batch, 1, pair_incoming.size(), pair_capacity));
+        CHECK(pair_capacity.requires_publication_revalidation());
+        const uint64_t commits_before =
+            authority.destruction.prepared_release_commits;
+        const uint64_t df2_before =
+            authority.destruction.host_trade_df2_executed;
+        const uint64_t attempted_before =
+            authority.destruction.host_trade_attempted;
+        const uint64_t certified_before =
+            authority.destruction.host_trade_certified;
+        const uint64_t executed_before =
+            authority.destruction.host_trade_executed;
+        const uint64_t release_bytes_before =
+            authority.destruction.host_trade_release_bytes;
+        const uint64_t events_before = authority.destruction.n_events;
+        server_prompt_cache::iterator pair_published;
+        const bool pair_fault =
+            server_fault("vbr_prompt_cache_pair_prepare_fail");
+        const bool pair_ok = cache.publish_vbr(
+            pair_metadata, std::move(pair_incoming), {}, false,
+            &pair_published, &pair_capacity);
+        CHECK(pair_ok == !pair_fault);
+        CHECK(!pair_capacity.ready());
+        if (pair_fault) {
+            CHECK(cache.states.size() == 2);
+            CHECK(retention.artifact_id(pair_key_a) == pair_artifact_a);
+            CHECK(retention.artifact_id(pair_key_b) == pair_artifact_b);
+            CHECK(authority.destruction.prepared_release_commits ==
+                  commits_before + 1);
+            CHECK(authority.destruction.host_trade_df2_executed ==
+                  df2_before);
+            CHECK(authority.destruction.host_trade_attempted ==
+                  attempted_before);
+            CHECK(authority.destruction.host_trade_certified ==
+                  certified_before);
+            CHECK(authority.destruction.host_trade_executed ==
+                  executed_before);
+            CHECK(authority.destruction.host_trade_release_bytes ==
+                  release_bytes_before);
+        } else {
+            CHECK(pair_published != cache.states.end());
+            CHECK(cache.states.size() == 1);
+            CHECK(retention.artifact_id(pair_key_a).v == 0);
+            CHECK(retention.artifact_id(pair_key_b).v == 0);
+            CHECK(authority.destruction.prepared_release_commits ==
+                  commits_before + 1);
+            CHECK(authority.destruction.host_trade_df2_executed ==
+                  df2_before + 2);
+            CHECK(authority.destruction.host_trade_attempted ==
+                  attempted_before + 2);
+            CHECK(authority.destruction.host_trade_certified ==
+                  certified_before + 2);
+            CHECK(authority.destruction.host_trade_executed ==
+                  executed_before + 2);
+            CHECK(authority.destruction.host_trade_release_bytes ==
+                  release_bytes_before + pair_release_bytes);
+            CHECK(authority.destruction.n_events == events_before + 1);
+            const auto * pair_event = authority.destruction.event_for_sequence(
+                authority.destruction.n_events);
+            CHECK(pair_event != nullptr);
+            CHECK(pair_event->request.n_targets == 2);
+            uint64_t observed_pair_bytes = 0;
+            for (size_t i = 0; i < pair_event->request.n_yields; ++i) {
+                const auto & value = pair_event->request.yields[i];
+                if (value.measure ==
+                        llama_cache_acct_measure::resident_allocated) {
+                    CHECK(value.value.state ==
+                          llama_cache_acct_known::known);
+                    CHECK(value.value.value <=
+                          UINT64_MAX - observed_pair_bytes);
+                    observed_pair_bytes += value.value.value;
+                }
+            }
+            CHECK(observed_pair_bytes == pair_release_bytes);
+        }
+        cache.limit_size = 1;
+        cache.update();
+        cache.limit_size = 0;
+        CHECK(cache.states.empty());
     }
     CHECK(fixture.catalog->snapshot().references == 0);
 
@@ -6815,6 +7142,16 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+    if (server_fault("vbr_prompt_cache_pair_prepare_fail")) {
+        test_prompt_cache_vbr_pressure_retires_physical_union();
+        if (failures != 0) {
+            fprintf(stderr, "%d VBR pair rollback test(s) failed\n",
+                    failures);
+            return 1;
+        }
+        printf("VBR prompt-cache pair rollback: PASS\n");
+        return 0;
+    }
     if (server_fault("vbr_anchor_prepare_fail")) {
         test_prompt_cache_vbr_anchor_prepare_rollback();
         if (failures != 0) {

@@ -579,7 +579,9 @@ void server_retention_prefix_index::retire(
 
 bool server_retention_prefix_index::external_shared_coverage(
         llama_cache_acct_artifact_id artifact,
-        uint64_t & coverage_tokens) const noexcept {
+        uint64_t & coverage_tokens,
+        llama_cache_acct_artifact_id excluded,
+        uint64_t * compared_tokens) const noexcept {
     coverage_tokens = 0;
     if (!pimpl || !pimpl->healthy || artifact.v == 0) {
         return false;
@@ -589,13 +591,25 @@ bool server_retention_prefix_index::external_shared_coverage(
         return false;
     }
     const auto & record = found->second;
+    const impl::artifact_record * excluded_record = nullptr;
+    if (excluded.v) {
+        const auto excluded_found = pimpl->artifacts.find(excluded.v);
+        if (excluded_found == pimpl->artifacts.end() ||
+            !excluded_found->second.tokens) {
+            return false;
+        }
+        excluded_record = &excluded_found->second;
+    }
     const impl::node * cur = &pimpl->root;
     size_t pos = 0;
     if (!record.tokens) {
         return false;
     }
     const auto & tokens = record.tokens->values;
+    bool excluded_still_matches = excluded_record &&
+        excluded_record->lineage_id != record.lineage_id;
     while (pos < tokens.size()) {
+        const size_t edge_begin = pos;
         const auto edge = cur->edges.find(tokens[pos]);
         if (edge == cur->edges.end() || !edge->second.child ||
             edge->second.label.size() > tokens.size() - pos ||
@@ -606,7 +620,34 @@ bool server_retention_prefix_index::external_shared_coverage(
         }
         pos += edge->second.label.size();
         cur = edge->second.child.get();
-        if (cur->total_refs > impl::lineage_refs_at(*cur, record.lineage_id)) {
+        if (excluded_still_matches) {
+            const uint64_t compared = uint64_t(pos - edge_begin);
+            if (compared_tokens && compared >
+                    UINT64_MAX - *compared_tokens) {
+                return false;
+            }
+            excluded_still_matches =
+                excluded_record->tokens->values.size() >= pos &&
+                std::equal(
+                    tokens.begin() + edge_begin, tokens.begin() + pos,
+                    excluded_record->tokens->values.begin() + edge_begin);
+            if (compared_tokens) {
+                *compared_tokens += compared;
+            }
+        }
+        const uint32_t same_lineage_refs =
+            impl::lineage_refs_at(*cur, record.lineage_id);
+        if (same_lineage_refs > cur->total_refs) {
+            return false;
+        }
+        uint32_t external_refs = cur->total_refs - same_lineage_refs;
+        if (excluded_still_matches) {
+            if (external_refs == 0) {
+                return false;
+            }
+            external_refs--;
+        }
+        if (external_refs != 0) {
             coverage_tokens = pos;
         } else {
             break;
@@ -839,7 +880,8 @@ struct server_retention_sidecar_store::prefix_tracking {
 
     bool coverage(
             llama_cache_acct_artifact_id artifact,
-            uint64_t & out) const noexcept {
+            uint64_t & out,
+            llama_cache_acct_artifact_id excluded = {}) const noexcept {
         out = 0;
         if (!healthy || artifact.v == 0) {
             return false;
@@ -851,11 +893,21 @@ struct server_retention_sidecar_store::prefix_tracking {
         // A scope with one artifact cannot contain cross-lineage coverage.
         // Avoid walking its private radix tree on every pressure projection;
         // the index is still the authority as soon as the scope is shared.
-        if (found->second.scope->refs == 1) {
+        const auto excluded_found = excluded.v
+            ? artifacts.find(excluded.v) : artifacts.end();
+        const bool excludes_same_scope = excluded_found != artifacts.end() &&
+            excluded_found->second.scope == found->second.scope;
+        if (excluded.v && excluded_found == artifacts.end()) {
+            return false;
+        }
+        if (found->second.scope->refs == 1 ||
+            (found->second.scope->refs == 2 && excludes_same_scope &&
+             excluded != artifact)) {
             return true;
         }
         return found->second.scope->index.external_shared_coverage(
-            artifact, out);
+            artifact, out, excludes_same_scope ? excluded :
+                llama_cache_acct_artifact_id {});
     }
 
     bool visit(
@@ -1954,7 +2006,8 @@ bool server_retention_sidecar_store::lineage_for_instance(
 server_retention_value_snapshot_result
 server_retention_sidecar_store::value_snapshots(
         void * context,
-        server_retention_value_snapshot_visitor visitor) const noexcept {
+        server_retention_value_snapshot_visitor visitor,
+        llama_cache_acct_artifact_id excluded) const noexcept {
     server_retention_value_snapshot_result result;
     if (!prefix_tracking_available()) {
         return result;
@@ -1996,9 +2049,10 @@ server_retention_sidecar_store::value_snapshots(
             lineage->second.record,
             0,
         };
-        if (prefixes && !prefixes->coverage(
+        if (prefixes && association.second != excluded &&
+            !prefixes->coverage(
                 association.second,
-                value.external_shared_coverage_tokens)) {
+                value.external_shared_coverage_tokens, excluded)) {
             return result;
         }
         if (!visitor(context, value)) {

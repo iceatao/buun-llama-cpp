@@ -95,6 +95,15 @@ llama_cache_prepared_release_set llama_cache_prepare_release_set(
         llama_cache_acct_ledger & ledger,
         const std::vector<llama_cache_acct_op_id> & selected,
         uint64_t expected_serial) noexcept {
+    return llama_cache_prepare_release_set(
+        ledger, selected, expected_serial, false);
+}
+
+llama_cache_prepared_release_set llama_cache_prepare_release_set(
+        llama_cache_acct_ledger & ledger,
+        const std::vector<llama_cache_acct_op_id> & selected,
+        uint64_t expected_serial,
+        bool include_category_yields) noexcept {
     llama_cache_prepared_release_set out;
     try {
         if (expected_serial == 0) {
@@ -108,7 +117,8 @@ llama_cache_prepared_release_set llama_cache_prepare_release_set(
             return out;
         }
         if (!ledger.preview_release_set(
-                out.ops_, expected_serial, out.preview_)) {
+                out.ops_, expected_serial, out.preview_,
+                include_category_yields)) {
             // A fresh snapshot distinguishes benign serial drift from a hard
             // invalid operation set without turning drift into a ledger fault.
             out.status_ = ledger.snapshot().serial != expected_serial

@@ -1369,6 +1369,21 @@ bool vbr_artifact_package_view::preview_owned_retire_resident_batch(
         package_sets, expected_serial, out);
 }
 
+bool vbr_artifact_package_view::
+preview_owned_retire_resident_conditioned_batch(
+        vbr_artifact_package_set_view baseline,
+        const std::vector<vbr_artifact_package_set_view> & package_sets,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) const noexcept {
+    out.clear();
+    if (owner_ == nullptr || !storage_ || baseline.data == nullptr ||
+        baseline.size == 0 || package_sets.empty()) {
+        return false;
+    }
+    return owner_->preview_owned_retire_resident_conditioned_batch(
+        baseline, package_sets, expected_serial, out);
+}
+
 const std::vector<vbr_artifact_portable_topology> &
 vbr_artifact_package_view::topologies() const noexcept {
     static const std::vector<vbr_artifact_portable_topology> empty;
@@ -4323,7 +4338,7 @@ bool llama_vbr_artifact_catalog::prepare_owned_retire(
             std::unique(stash_ids.begin(), stash_ids.end(), digest_equal),
             stash_ids.end());
         auto release = llama_cache_prepare_release_set(
-            impl_->ledger, operations, expected_serial);
+            impl_->ledger, operations, expected_serial, true);
         if (!release.ready()) {
             return false;
         }
@@ -4469,6 +4484,120 @@ bool llama_vbr_artifact_catalog::preview_owned_retire_resident_batch(
         }
         std::vector<uint64_t> resident;
         if (!impl_->ledger.preview_release_set_resident_batch(
+                views, expected_serial, resident) ||
+            resident.size() != valid_indices.size()) {
+            out.clear();
+            return false;
+        }
+        for (size_t i = 0; i < valid_indices.size(); ++i) {
+            out[valid_indices[i]] = { resident[i], true };
+        }
+        return true;
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
+bool llama_vbr_artifact_catalog::
+preview_owned_retire_resident_conditioned_batch(
+        vbr_artifact_package_set_view baseline,
+        const std::vector<vbr_artifact_package_set_view> & package_sets,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) const noexcept {
+    out.clear();
+    try {
+        if (!baseline.data || baseline.size == 0 || package_sets.empty() ||
+            expected_serial == 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto group_ops = [&](vbr_artifact_package_set_view group,
+                                   size_t & count) {
+            count = 0;
+            if (!group.data || group.size == 0) {
+                return false;
+            }
+            for (size_t i = 0; i < group.size; ++i) {
+                const auto * package = group.data[i];
+                if (!package || package->owner_ != this ||
+                    !package->storage_ || !package->host_owned_) {
+                    return false;
+                }
+                for (size_t j = 0; j < i; ++j) {
+                    if (group.data[j]->storage_->reference ==
+                            package->storage_->reference) {
+                        return false;
+                    }
+                }
+                const auto it = impl_->references.find(
+                    package->storage_->reference.v);
+                if (it == impl_->references.end() ||
+                    !it->second.host_owned || it->second.retire_pending ||
+                    it->second.prepared_retire_token != 0 ||
+                    it->second.borrow_count != 1 ||
+                    it->second.operations.size() > SIZE_MAX - count) {
+                    return false;
+                }
+                count += it->second.operations.size();
+            }
+            return count != 0;
+        };
+
+        size_t baseline_ops = 0;
+        if (!group_ops(baseline, baseline_ops)) {
+            return false;
+        }
+        size_t total_candidate_ops = 0;
+        std::vector<size_t> valid_indices;
+        valid_indices.reserve(package_sets.size());
+        out.assign(package_sets.size(), {});
+        for (size_t i = 0; i < package_sets.size(); ++i) {
+            size_t count = 0;
+            if (!group_ops(package_sets[i], count) ||
+                count > SIZE_MAX - total_candidate_ops) {
+                continue;
+            }
+            total_candidate_ops += count;
+            valid_indices.push_back(i);
+        }
+        if (valid_indices.empty()) {
+            return true;
+        }
+
+        std::vector<llama_cache_acct_op_id> baseline_arena;
+        std::vector<llama_cache_acct_op_id> candidate_arena;
+        std::vector<llama_cache_acct_release_set_view> views;
+        baseline_arena.reserve(baseline_ops);
+        candidate_arena.reserve(total_candidate_ops);
+        views.reserve(valid_indices.size());
+        for (size_t i = 0; i < baseline.size; ++i) {
+            const auto it = impl_->references.find(
+                baseline.data[i]->storage_->reference.v);
+            GGML_ASSERT(it != impl_->references.end());
+            baseline_arena.insert(
+                baseline_arena.end(), it->second.operations.begin(),
+                it->second.operations.end());
+        }
+        for (const size_t index : valid_indices) {
+            const size_t first = candidate_arena.size();
+            const auto group = package_sets[index];
+            for (size_t i = 0; i < group.size; ++i) {
+                const auto it = impl_->references.find(
+                    group.data[i]->storage_->reference.v);
+                GGML_ASSERT(it != impl_->references.end());
+                candidate_arena.insert(
+                    candidate_arena.end(), it->second.operations.begin(),
+                    it->second.operations.end());
+            }
+            views.push_back({
+                candidate_arena.data() + first,
+                candidate_arena.size() - first,
+            });
+        }
+        std::vector<uint64_t> resident;
+        if (!impl_->ledger.preview_release_set_resident_conditioned_batch(
+                { baseline_arena.data(), baseline_arena.size() },
                 views, expected_serial, resident) ||
             resident.size() != valid_indices.size()) {
             out.clear();

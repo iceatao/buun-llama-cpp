@@ -311,6 +311,11 @@ public:
         const std::vector<vbr_artifact_package_set_view> & package_sets,
         uint64_t expected_serial,
         std::vector<vbr_artifact_retire_resident_preview> & out) const noexcept;
+    bool preview_owned_retire_resident_conditioned_batch(
+        vbr_artifact_package_set_view baseline,
+        const std::vector<vbr_artifact_package_set_view> & package_sets,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) const noexcept;
     llama_cache_acct_artifact_id reference_artifact() const noexcept;
     const std::vector<vbr_artifact_portable_topology> & topologies() const noexcept;
     const vbr_artifact_reference_manifest & manifest() const noexcept;
@@ -532,6 +537,11 @@ private:
         uint64_t expected_serial,
         llama_cache_acct_release_set_preview & out) const noexcept;
     bool preview_owned_retire_resident_batch(
+        const std::vector<vbr_artifact_package_set_view> & package_sets,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) const noexcept;
+    bool preview_owned_retire_resident_conditioned_batch(
+        vbr_artifact_package_set_view baseline,
         const std::vector<vbr_artifact_package_set_view> & package_sets,
         uint64_t expected_serial,
         std::vector<vbr_artifact_retire_resident_preview> & out) const noexcept;

@@ -99,6 +99,12 @@ static void test_exact_prefix_index() {
     CHECK(index.publish(child_a_id, 20, child_a));
     CHECK(index.external_shared_coverage(main_id, coverage));
     CHECK(coverage == 80);
+    CHECK(index.external_shared_coverage(
+        main_id, coverage, child_a_id));
+    CHECK(coverage == 0);
+    CHECK(index.external_shared_coverage(
+        child_a_id, coverage, main_id));
+    CHECK(coverage == child_a.size());
     CHECK(index.external_shared_coverage(child_a_id, coverage));
     CHECK(coverage == child_a.size());
 
@@ -171,6 +177,32 @@ static void test_exact_prefix_index() {
     CHECK(index.available());
     CHECK(index.external_shared_coverage(main_id, coverage));
     CHECK(coverage == 0);
+}
+
+static void test_excluded_prefix_coverage_scale() {
+    server_retention_prefix_index index;
+    CHECK(index.available());
+    constexpr size_t count = 256;
+    llama_tokens tokens;
+    tokens.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        tokens.push_back(10000 + llama_token(i));
+        CHECK(index.publish(
+            llama_cache_acct_artifact_id { uint64_t(i + 1) },
+            uint64_t(i + 1), tokens));
+    }
+    const llama_cache_acct_artifact_id excluded { count };
+    uint64_t comparisons = 0;
+    uint64_t expected = 0;
+    for (size_t i = 0; i + 1 < count; ++i) {
+        uint64_t coverage = 0;
+        CHECK(index.external_shared_coverage(
+            llama_cache_acct_artifact_id { uint64_t(i + 1) },
+            coverage, excluded, &comparisons));
+        CHECK(coverage == std::min(i + 1, count - 2));
+        expected += i + 1;
+    }
+    CHECK(comparisons == expected);
 }
 
 static void test_prefix_index_cap_fail_closed() {
@@ -1316,6 +1348,7 @@ static void test_observer_store_accounting() {
 
 int main() {
     test_exact_prefix_index();
+    test_excluded_prefix_coverage_scale();
     test_prefix_index_cap_fail_closed();
     test_prefix_index_identical_terminal_cleanup();
     test_prefix_index_oversized_input_fail_closed();

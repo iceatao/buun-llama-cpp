@@ -170,7 +170,8 @@ private:
     friend llama_cache_prepared_release_set llama_cache_prepare_release_set(
         llama_cache_acct_ledger &,
         const std::vector<llama_cache_acct_op_id> &,
-        uint64_t) noexcept;
+        uint64_t,
+        bool) noexcept;
 };
 
 // Fresh-serial prepare at the mutation boundary. The quote's earlier serial is
@@ -182,6 +183,11 @@ llama_cache_prepared_release_set llama_cache_prepare_release_set(
     llama_cache_acct_ledger & ledger,
     const std::vector<llama_cache_acct_op_id> & ops,
     uint64_t expected_serial) noexcept;
+llama_cache_prepared_release_set llama_cache_prepare_release_set(
+    llama_cache_acct_ledger & ledger,
+    const std::vector<llama_cache_acct_op_id> & ops,
+    uint64_t expected_serial,
+    bool include_category_yields) noexcept;
 
 // One leaf in the shared all-or-nothing authority transaction. A zero existing_allocation asks
 // the primitive to mint a fresh allocation; a nonzero one joins that immutable allocation and

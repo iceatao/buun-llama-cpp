@@ -308,6 +308,26 @@ struct server_cache_destruction_observer {
         }
     }
 
+    void note_prepared_release_batch(
+            const uint64_t * sequences,
+            size_t count,
+            bool committed) noexcept {
+        if (committed) {
+            prepared_release_commits++;
+        } else {
+            prepared_release_fallbacks++;
+        }
+        if (!committed || !sequences) {
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (auto * event = event_for_sequence(sequences[i])) {
+                event->execution =
+                    server_cache_destruction_execution::prepared_release;
+            }
+        }
+    }
+
     void note_live_displacement_certified() noexcept {
         live_displacement_certified++;
     }

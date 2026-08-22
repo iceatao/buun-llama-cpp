@@ -148,6 +148,12 @@ if (LLAMA_BUILD_TESTS)
             test-vbr-artifact-vbr-anchor-prepare-fault PROPERTIES
             LABELS "main;vbr-h1"
             ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_anchor_prepare_fail")
+        add_test(NAME test-vbr-artifact-vbr-pair-prepare-fault
+            COMMAND test-vbr-artifact)
+        set_tests_properties(
+            test-vbr-artifact-vbr-pair-prepare-fault PROPERTIES
+            LABELS "main;vbr-h1"
+            ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_prompt_cache_pair_prepare_fail")
     endif()
 
     if (TARGET test-vbr-artifact AND

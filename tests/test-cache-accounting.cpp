@@ -341,6 +341,21 @@ static void test_release_set_preview() {
     CHECK(ledger.preview_release_set({ op1 }, before.serial, preview));
     CHECK(preview.rows.empty());
 
+    const llama_cache_acct_release_set_view baseline { &op0, 1 };
+    const std::vector<llama_cache_acct_release_set_view> candidates {
+        { &op1, 1 },
+    };
+    std::vector<uint64_t> conditioned;
+    CHECK(ledger.preview_release_set_resident_conditioned_batch(
+        baseline, candidates, before.serial, conditioned));
+    CHECK(conditioned.size() == 1 && conditioned[0] == 128);
+    const std::vector<llama_cache_acct_release_set_view> overlapping {
+        { &op0, 1 },
+    };
+    CHECK(!ledger.preview_release_set_resident_conditioned_batch(
+        baseline, overlapping, before.serial, conditioned));
+    CHECK(conditioned.empty());
+
     CHECK(ledger.preview_release_set({ op0, op1 }, before.serial, preview));
     CHECK(preview.rows.size() == 1);
     CHECK(preview.rows[0].domain == DOM);
@@ -437,10 +452,23 @@ static void test_release_set_resident_batch_cardinality() {
     CHECK(resident.size() == count);
     CHECK(std::all_of(resident.begin(), resident.end(),
         [](uint64_t value) { return value == 1; }));
+    std::vector<llama_cache_acct_release_set_view> conditioned_sets(
+        sets.begin() + 1, sets.end());
+    std::vector<uint64_t> conditioned;
+    const auto conditioned_begin = std::chrono::steady_clock::now();
+    CHECK(ledger.preview_release_set_resident_conditioned_batch(
+        sets.front(), conditioned_sets, ledger.serial(), conditioned));
+    const auto conditioned_end = std::chrono::steady_clock::now();
+    CHECK(conditioned.size() == count - 1);
+    CHECK(std::all_of(conditioned.begin(), conditioned.end(),
+        [](uint64_t value) { return value == 1; }));
     std::fprintf(stderr,
-        "CACHE_RELEASE_BATCH cardinality=%zu elapsed_us=%" PRIu64 "\n",
+        "CACHE_RELEASE_BATCH cardinality=%zu elapsed_us=%" PRIu64
+        " conditioned_us=%" PRIu64 "\n",
         count, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-            end - begin).count()));
+            end - begin).count()),
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            conditioned_end - conditioned_begin).count()));
     for (const auto op : ops) {
         CHECK(ledger.release(op));
     }

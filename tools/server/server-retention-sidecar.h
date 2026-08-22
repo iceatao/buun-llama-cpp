@@ -136,7 +136,9 @@ public:
     void retire(llama_cache_acct_artifact_id artifact) noexcept;
     bool external_shared_coverage(
         llama_cache_acct_artifact_id artifact,
-        uint64_t & coverage_tokens) const noexcept;
+        uint64_t & coverage_tokens,
+        llama_cache_acct_artifact_id excluded = {},
+        uint64_t * compared_tokens = nullptr) const noexcept;
     bool visit_prefixes(
         const std::vector<llama_token> & tokens,
         void * context,
@@ -295,7 +297,8 @@ public:
         common_retention_lineage_record & out) const noexcept;
     server_retention_value_snapshot_result value_snapshots(
         void * context,
-        server_retention_value_snapshot_visitor visitor) const noexcept;
+        server_retention_value_snapshot_visitor visitor,
+        llama_cache_acct_artifact_id excluded = {}) const noexcept;
     // Interim D-S bridge: lifecycle choke points retire associations directly.
     // D-S5/D-S6 can consolidate this onto retire-by-artifact-id once D-S4 admission
     // owns the catalog mutation rather than merely carrying the strong id.

@@ -121,7 +121,16 @@ public:
         const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
         uint64_t expected_serial,
         llama_cache_acct_release_set_preview & out) noexcept;
+    static bool prepare_retire_union(
+        const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) noexcept;
     static bool preview_retire_resident_batch(
+        const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) noexcept;
+    static bool preview_retire_resident_conditioned_batch(
+        const server_prompt_cache_vbr_variant_set * baseline,
         const std::vector<const server_prompt_cache_vbr_variant_set *> & variants,
         uint64_t expected_serial,
         std::vector<vbr_artifact_retire_resident_preview> & out) noexcept;
@@ -196,7 +205,16 @@ public:
         const std::vector<const server_prompt_cache_payload *> & payloads,
         uint64_t expected_serial,
         llama_cache_acct_release_set_preview & out) noexcept;
+    static bool prepare_vbr_retire_union(
+        const std::vector<const server_prompt_cache_payload *> & payloads,
+        uint64_t expected_serial,
+        vbr_artifact_prepared_retire & out) noexcept;
     static bool preview_vbr_retire_resident_batch(
+        const std::vector<const server_prompt_cache_payload *> & payloads,
+        uint64_t expected_serial,
+        std::vector<vbr_artifact_retire_resident_preview> & out) noexcept;
+    static bool preview_vbr_retire_resident_conditioned_batch(
+        const server_prompt_cache_payload * baseline,
         const std::vector<const server_prompt_cache_payload *> & payloads,
         uint64_t expected_serial,
         std::vector<vbr_artifact_retire_resident_preview> & out) noexcept;

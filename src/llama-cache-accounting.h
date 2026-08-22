@@ -759,6 +759,16 @@ struct llama_cache_acct_ledger {
             uint64_t expected_serial,
             std::vector<uint64_t> & out) const noexcept;
 
+    // Exact candidate marginals after one common baseline set has already
+    // been removed. The baseline is resolved once; every candidate is then
+    // evaluated in O(candidate ops) under the same ledger lock. Output is the
+    // additional resident yield beyond the baseline, in candidate order.
+    bool preview_release_set_resident_conditioned_batch(
+            llama_cache_acct_release_set_view baseline,
+            const std::vector<llama_cache_acct_release_set_view> & candidates,
+            uint64_t expected_serial,
+            std::vector<uint64_t> & out) const noexcept;
+
     // Commit a previously previewed canonical operation set atomically. The
     // caller must pass strictly increasing, nonzero operation ids; this keeps
     // the post-mutation terminal allocation-free and prevents duplicate refs.
