@@ -998,6 +998,8 @@ static bool h2_test_representation_identity(
 struct h2_pretransfer_admission {
     uint32_t calls = 0;
     bool accept = true;
+    vbr_pinned_chunk_ring * ring = nullptr;
+    bool ring_owned_at_admission = false;
     vbr_projected_capture_batch_request::pretransfer_quote quote;
     uint32_t continuation_calls = 0;
     uint32_t continuations_allowed = UINT32_MAX;
@@ -1013,6 +1015,19 @@ static bool h2_pretransfer_admit(
     }
     ++state->calls;
     state->quote = quote;
+    if (state->ring) {
+        bool competing_acquired = false;
+        try {
+            std::thread competing([&]() {
+                auto operation = state->ring->try_begin_operation();
+                competing_acquired = bool(operation);
+            });
+            competing.join();
+            state->ring_owned_at_admission = !competing_acquired;
+        } catch (...) {
+            state->ring_owned_at_admission = false;
+        }
+    }
     return state->accept;
 }
 
@@ -1080,6 +1095,7 @@ static bool h2_projected_capture_batch_exact(
     request.representation_context = &identity_counts;
     request.representation_identity = h2_test_representation_identity;
     h2_pretransfer_admission admission;
+    admission.ring = ring.get();
     request.pretransfer_context = &admission;
     request.pretransfer_admit = h2_pretransfer_admit;
     request.continue_context = &admission;
@@ -1108,6 +1124,7 @@ static bool h2_projected_capture_batch_exact(
         captured.planned_packed_bytes == 0 ||
         captured.planned_packed_bytes > request.max_packed_bytes ||
         admission.calls != 1 || !admission.accept ||
+        !admission.ring_owned_at_admission ||
         admission.quote.planned_packed_bytes !=
             captured.planned_packed_bytes ||
         admission.quote.union_cells != captured.union_cells ||
@@ -1188,6 +1205,7 @@ static bool h2_projected_capture_batch_exact(
         auto admission_refused_request = request;
         h2_pretransfer_admission refused_admission;
         refused_admission.accept = false;
+        refused_admission.ring = ring.get();
         admission_refused_request.pretransfer_context = &refused_admission;
         admission_refused_request.continue_context = &refused_admission;
         const auto admission_refused = vbr_capture_projected_batch(
@@ -1199,7 +1217,10 @@ static bool h2_projected_capture_batch_exact(
             refused_admission.calls != 1 ||
             refused_admission.continuation_calls != 0 ||
             refused_admission.quote.planned_packed_bytes == 0 ||
-            admission_refused.ring_operation_attempts != 0 ||
+            !refused_admission.ring_owned_at_admission ||
+            admission_refused.ring_operation_attempts != 1 ||
+            admission_refused.ring_operation_acquires != 1 ||
+            admission_refused.ring_operation_refusals != 0 ||
             admission_refused.unit_transfer_calls != 0 ||
             admission_refused.transferred_units != 0 ||
             admission_refused.transfer.bytes != 0 ||
@@ -1207,11 +1228,17 @@ static bool h2_projected_capture_batch_exact(
             !admission_refused.publications.empty()) {
             return false;
         }
+        auto released_after_refusal = ring->try_begin_operation();
+        if (!released_after_refusal) {
+            return false;
+        }
+        released_after_refusal = {};
         auto held_operation = ring->try_begin_operation();
         if (!held_operation) {
             return false;
         }
         h2_pretransfer_admission busy_admission;
+        busy_admission.ring = ring.get();
         auto busy_request = request;
         busy_request.pretransfer_context = &busy_admission;
         busy_request.continue_context = &busy_admission;
@@ -1221,7 +1248,8 @@ static bool h2_projected_capture_batch_exact(
                 vbr_explicit_capture_phase::reservation_preparation ||
             busy.inner_stream_status !=
                 vbr_capture_stream_status::ring_unavailable ||
-            busy_admission.calls != 1 ||
+            busy_admission.calls != 0 ||
+            busy_admission.ring_owned_at_admission ||
             busy_admission.continuation_calls != 0 ||
             busy.ring_operation_attempts != 1 ||
             busy.ring_operation_acquires != 0 ||

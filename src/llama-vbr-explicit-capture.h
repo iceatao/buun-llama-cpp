@@ -378,11 +378,13 @@ struct vbr_projected_capture_batch_request {
     const void * representation_context = nullptr;
     representation_identity_fn representation_identity = nullptr;
     // Invoked exactly once after the initial bounded projection is priced and
-    // before companion or attention D2H begins. The synchronous caller may
-    // refuse when queued work or a scheduler-owned reservation changed while
-    // planning. Dependency-local companion failures may later shrink the
-    // admitted union; they never grow it or invoke this callback again.
-    // Refusal returns admission_refused with zero unit transfers.
+    // before companion or attention D2H begins. For nonzero work the
+    // batch-long ring operation is already held; the canonical zero-work quote
+    // requires none. The synchronous caller may refuse when queued work or a
+    // scheduler-owned reservation changed while planning. Dependency-local
+    // companion failures may later shrink the admitted union; they never grow
+    // it or invoke this callback again. Refusal returns admission_refused with
+    // zero unit transfers and releases any ring operation.
     void * pretransfer_context = nullptr;
     pretransfer_admit_fn pretransfer_admit = nullptr;
     // Optional store-owned reservation shrink after a dependency-local

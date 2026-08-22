@@ -10783,9 +10783,10 @@ private:
                 server_queue::idle_capture_session *>(opaque);
             // Planning can include controller settlement, projection and
             // recurrent sizing. The store now holds the exact transfer-
-            // staging claim while this final queue check runs, so capture
-            // cannot begin behind work already queued. Later arrivals cancel
-            // between bounded recurrent writes or attention ring chunks.
+            // staging and durable claims plus the persistent ring operation
+            // while this final queue check runs, so capture cannot begin
+            // behind queued work or a competing transfer. Later arrivals
+            // cancel between bounded recurrent writes or attention chunks.
             return session && session->continue_capture();
         };
         admission.continue_capture = [](void * opaque) noexcept {

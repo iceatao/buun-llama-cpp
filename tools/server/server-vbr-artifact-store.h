@@ -236,9 +236,11 @@ struct server_vbr_projected_host_capture_diagnostics {
 
 // Scheduler-owned last-mile admission at the exact pre-D2H boundary. The
 // store holds both the exact transfer-staging claim and every conservative
-// durable-publication claim while this callback runs. The callback can only
-// accept or refuse the immutable quote; it must not retain it or mutate source
-// memory.
+// durable-publication claim while this callback runs. The projected capture
+// core also holds the one persistent ring operation, so acceptance observes
+// queue, capacity and transport ownership at the same checkpoint. The
+// callback can only accept or refuse the immutable quote; it must not retain
+// it or mutate source memory.
 struct server_vbr_projected_capture_admission {
     using quote = vbr_projected_capture_batch_request::pretransfer_quote;
     void * context = nullptr;

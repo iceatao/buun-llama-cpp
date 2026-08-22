@@ -2101,17 +2101,15 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
         if (!build_pretransfer_quote(current_quote)) {
             return result;
         }
-        if (request.pretransfer_admit) {
-            result.phase =
-                vbr_explicit_capture_phase::reservation_preparation;
-            if (!request.pretransfer_admit(
-                    request.pretransfer_context, current_quote)) {
-                result.status =
-                    vbr_explicit_capture_status::admission_refused;
-                return result;
-            }
-        }
 
+        // A positive scheduler/resource admission is the final pre-D2H
+        // readiness checkpoint. For nonzero work, hold the persistent
+        // transport operation at that checkpoint as well: a busy ring then
+        // refuses before budget sampling or reservation preparation, and an
+        // admission refusal releases it without transferring a byte. The
+        // canonical zero-work quote requires no transport operation.
+        result.phase =
+            vbr_explicit_capture_phase::reservation_preparation;
         vbr_pinned_ring_operation ring_operation;
         if (result.planned_packed_bytes != 0) {
             ++result.ring_operation_attempts;
@@ -2124,6 +2122,14 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 return result;
             }
             ++result.ring_operation_acquires;
+        }
+        if (request.pretransfer_admit) {
+            if (!request.pretransfer_admit(
+                    request.pretransfer_context, current_quote)) {
+                result.status =
+                    vbr_explicit_capture_status::admission_refused;
+                return result;
+            }
         }
 
         // Payload runway is proven before the first companion D2H byte. A
