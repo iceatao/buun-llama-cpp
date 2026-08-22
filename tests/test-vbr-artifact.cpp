@@ -4105,6 +4105,12 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_publication_metadata>);
     static_assert(std::is_nothrow_move_assignable_v<
         server_prompt_cache_vbr_publication_metadata>);
+    static_assert(!std::is_copy_constructible_v<
+        server_prompt_cache_vbr_capacity_claim>);
+    static_assert(std::is_nothrow_move_constructible_v<
+        server_prompt_cache_vbr_capacity_claim>);
+    static_assert(std::is_nothrow_move_assignable_v<
+        server_prompt_cache_vbr_capacity_claim>);
     catalog_fixture fixture;
 
     server_prompt prompt;
@@ -4186,6 +4192,68 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         CHECK(ledger_after.serial >= ledger_before.serial);
         return;
     }
+
+    // A complete fit-only batch is cited once from the conservative shared
+    // union. Its metadata nodes remain independently owned and releasable.
+    {
+        server_prompt_cache_vbr_publication_metadata first;
+        server_prompt_cache_vbr_publication_metadata second;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, first));
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, second));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &first, &second,
+        };
+        server_prompt_cache_vbr_publication_metadata * duplicate[] = {
+            &first, &first,
+        };
+        server_prompt_cache_vbr_capacity_claim duplicate_capacity;
+        CHECK(!cache.prepare_vbr_publication_capacity(
+            duplicate, 2, owner->resident_bytes(), duplicate_capacity));
+        CHECK(!duplicate_capacity.ready());
+        CHECK(owner->resident_bytes() > 1);
+        cache.limit_size = size_t(owner->resident_bytes());
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 2, owner->resident_bytes(), capacity));
+        CHECK(capacity.ready());
+        server_prompt_cache_vbr_capacity_claim moved(
+            std::move(capacity));
+        CHECK(!capacity.ready());
+        CHECK(moved.ready());
+        CHECK(cache.consume_vbr_publication_capacity(moved));
+        CHECK(!moved.ready());
+        cache.limit_size = 0;
+    }
+    CHECK(fixture.ledger.snapshot().live_ops == live_ops_before);
+
+    // A pressure batch without the lifecycle/victim substrate refuses its
+    // citation before any payload exists; metadata remains rollback-safe.
+    {
+        server_prompt_cache_vbr_publication_metadata prepared_pressure;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, prepared_pressure));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &prepared_pressure,
+        };
+        cache.limit_size = size_t(owner->resident_bytes() - 1);
+        server_prompt_cache_vbr_capacity_claim refused_capacity;
+        CHECK(!cache.prepare_vbr_publication_capacity(
+            batch, 1, owner->resident_bytes(), refused_capacity));
+        CHECK(!refused_capacity.ready());
+        cache.limit_size = 0;
+    }
+    CHECK(fixture.ledger.snapshot().live_ops == live_ops_before);
 
     {
         server_prompt_cache_vbr_publication_metadata prepared;
@@ -4569,6 +4637,42 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(mixed.size() == 32);
     CHECK(fixture.ledger.snapshot().live_ops == mixed_ops_before + 3);
     const uint64_t mixed_exact_cap = uint64_t(owner->resident_bytes()) + 32;
+
+    // Far below pressure, the allocation-free per-entry upper bound admits
+    // without consulting the exact shared-plane ledger. Near the boundary,
+    // one exact union pass recovers the 100 shared bytes; exact cap accepts
+    // and one byte under refuses.
+    {
+        server_prompt_cache_vbr_publication_metadata mixed_metadata;
+        CHECK(mixed.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, mixed_metadata));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &mixed_metadata,
+        };
+        const size_t naive_cap = mixed.states.front().size() +
+            size_t(owner->resident_bytes());
+        mixed.limit_size = naive_cap;
+        auto * saved_ledger = mixed.acct;
+        mixed.acct = nullptr;
+        server_prompt_cache_vbr_capacity_claim fast_capacity;
+        CHECK(mixed.prepare_vbr_publication_capacity(
+            batch, 1, owner->resident_bytes(), fast_capacity));
+        CHECK(mixed.consume_vbr_publication_capacity(fast_capacity));
+        mixed.acct = saved_ledger;
+
+        mixed.limit_size = size_t(mixed_exact_cap);
+        server_prompt_cache_vbr_capacity_claim exact_capacity;
+        CHECK(mixed.prepare_vbr_publication_capacity(
+            batch, 1, owner->resident_bytes(), exact_capacity));
+        CHECK(mixed.consume_vbr_publication_capacity(exact_capacity));
+        mixed.limit_size = size_t(mixed_exact_cap - 1);
+        server_prompt_cache_vbr_capacity_claim refused_capacity;
+        CHECK(!mixed.prepare_vbr_publication_capacity(
+            batch, 1, owner->resident_bytes(), refused_capacity));
+    }
     mixed.limit_size = mixed_exact_cap;
     auto mixed_vbr = mixed.stage_vbr(
         prompt, payload,
@@ -4897,6 +5001,47 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     }
     CHECK(first_marginal > 0 && first_marginal < union_bytes);
     first_retire.reset();
+
+    // This first capacity citation is fit-only. Even a singleton with a
+    // sufficient lawful incumbent refuses before D2H; canonical victim
+    // selection remains solely in the ordinary publication terminal.
+    cache.limit_size = size_t(union_bytes);
+    {
+        server_prompt_cache_vbr_publication_metadata incoming;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, incoming));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &incoming,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(!cache.prepare_vbr_publication_capacity(
+            batch, 1, first_marginal, capacity));
+        CHECK(!capacity.ready());
+    }
+    {
+        server_prompt_cache_vbr_publication_metadata incoming_a;
+        server_prompt_cache_vbr_publication_metadata incoming_b;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, incoming_a));
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, incoming_b));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &incoming_a, &incoming_b,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(!cache.prepare_vbr_publication_capacity(
+            batch, 2, first_marginal, capacity));
+        CHECK(!capacity.ready());
+    }
 
     // The configured byte bound observes the exact physical union, not the
     // naïve sum of two logical manifests that share sealed segments.

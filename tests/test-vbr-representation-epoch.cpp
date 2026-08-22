@@ -1127,6 +1127,7 @@ static bool h2_projected_capture_batch_exact(
         !admission.ring_owned_at_admission ||
         admission.quote.planned_packed_bytes !=
             captured.planned_packed_bytes ||
+        admission.quote.projected_host_resident_bytes == 0 ||
         admission.quote.union_cells != captured.union_cells ||
         admission.quote.manifests != manifest_count ||
         admission.quote.durable.size() != manifest_count ||
@@ -1139,6 +1140,29 @@ static bool h2_projected_capture_batch_exact(
         captured.transferred_units != captured.unit_transfer_calls ||
         captured.transfer.submitted_bytes != captured.transfer.bytes ||
         captured.transfer.submitted_chunks != captured.transfer.chunks) {
+        return false;
+    }
+    uint64_t projected_host_bytes = 0;
+    for (const auto & durable : admission.quote.durable) {
+        for (const auto & row : durable.accounting) {
+            if (row.role == vbr_artifact_accounting_role::unit_payload) {
+                continue;
+            }
+            if (row.resident_bytes > UINT64_MAX - projected_host_bytes) {
+                return false;
+            }
+            projected_host_bytes += row.resident_bytes;
+        }
+        for (const auto & row : durable.reserve_accounting) {
+            if (row.role != vbr_artifact_accounting_role::unit_payload ||
+                row.resident_bytes > UINT64_MAX - projected_host_bytes) {
+                return false;
+            }
+            projected_host_bytes += row.resident_bytes;
+        }
+    }
+    if (projected_host_bytes !=
+            admission.quote.projected_host_resident_bytes) {
         return false;
     }
     uint64_t staging_bytes = 0;

@@ -1904,6 +1904,138 @@ server_prompt_cache_budget_bytes server_prompt_cache_measure_budgets(
 
 } // namespace
 
+static size_t server_prompt_cache_effective_token_limit(
+    size_t limit_size,
+    size_t limit_tokens,
+    size_t cache_bytes,
+    size_t cache_tokens) noexcept;
+
+server_prompt_cache_vbr_capacity_claim::
+server_prompt_cache_vbr_capacity_claim(
+        server_prompt_cache_vbr_capacity_claim && other) noexcept
+    : cache_(other.cache_),
+      scheduler_owner_(other.scheduler_owner_) {
+    other.clear();
+}
+
+server_prompt_cache_vbr_capacity_claim &
+server_prompt_cache_vbr_capacity_claim::operator=(
+        server_prompt_cache_vbr_capacity_claim && other) noexcept {
+    if (this != &other) {
+        cache_ = other.cache_;
+        scheduler_owner_ = other.scheduler_owner_;
+        other.clear();
+    }
+    return *this;
+}
+
+void server_prompt_cache_vbr_capacity_claim::clear() noexcept {
+    cache_ = nullptr;
+    scheduler_owner_ = {};
+}
+
+bool server_prompt_cache::prepare_vbr_publication_capacity(
+        server_prompt_cache_vbr_publication_metadata * const * prepared,
+        size_t prepared_count,
+        uint64_t incoming_compact_bytes,
+        server_prompt_cache_vbr_capacity_claim & claim) noexcept {
+    if (claim.ready() || !prepared || prepared_count == 0 ||
+        prepared_count > VBR_PROJECTED_CAPTURE_MAX_MANIFESTS ||
+        incoming_compact_bytes == 0 ||
+        incoming_compact_bytes > SIZE_MAX) {
+        return false;
+    }
+    size_t incoming_tokens = 0;
+    for (size_t i = 0; i < prepared_count; ++i) {
+        const auto * item = prepared[i];
+        if (!item || !item->ready() || item->cache_ != this ||
+            item->entry_.size() != 1) {
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (prepared[j] == item) {
+                return false;
+            }
+        }
+        const int tokens = item->entry_.front().prompt.n_tokens();
+        if (tokens <= 0 || size_t(tokens) > SIZE_MAX - incoming_tokens) {
+            return false;
+        }
+        incoming_tokens += size_t(tokens);
+    }
+
+    size_t naive_bytes = 0;
+    size_t current_tokens = 0;
+    for (const auto & state : states) {
+        const int tokens = state.prompt.n_tokens();
+        const size_t total = state.size();
+        const uint64_t anchor = quality_anchor_budget_enabled &&
+                state.payload.kind() ==
+                    server_prompt_cache_payload_kind::vbr_artifact
+            ? state.payload.vbr_anchor_resident_bytes() : 0;
+        if (tokens < 0 || size_t(tokens) > SIZE_MAX - current_tokens ||
+            anchor > total || total - size_t(anchor) >
+                SIZE_MAX - naive_bytes) {
+            return false;
+        }
+        naive_bytes += total - size_t(anchor);
+        current_tokens += size_t(tokens);
+    }
+    if (incoming_tokens > SIZE_MAX - current_tokens ||
+        size_t(incoming_compact_bytes) > SIZE_MAX - naive_bytes) {
+        return false;
+    }
+    const size_t projected_tokens = current_tokens + incoming_tokens;
+    const size_t projected_naive = naive_bytes +
+        size_t(incoming_compact_bytes);
+    const auto fits = [&](size_t bytes, size_t tokens) {
+        if (limit_size > 0 && bytes > limit_size) {
+            return false;
+        }
+        const size_t effective = server_prompt_cache_effective_token_limit(
+            limit_size, limit_tokens, bytes, tokens);
+        return limit_tokens == 0 || tokens <= effective;
+    };
+
+    if (!fits(projected_naive, projected_tokens)) {
+        // The allocation-free per-entry sum is conservative. Only a byte
+        // bound can make exact shared-allocation accounting admit a shape the
+        // upper bound rejects; token-only pressure is already exact above.
+        if (limit_size == 0) {
+            return false;
+        }
+        const auto measured =
+            server_prompt_cache_measure_budgets(states, acct);
+        if (!measured.exact ||
+            measured.compact >
+                SIZE_MAX - size_t(incoming_compact_bytes) ||
+            (!quality_anchor_budget_enabled &&
+             measured.anchor > SIZE_MAX - measured.compact -
+                 size_t(incoming_compact_bytes))) {
+            return false;
+        }
+        const size_t exact_bytes = measured.compact +
+            (quality_anchor_budget_enabled ? 0 : measured.anchor) +
+            size_t(incoming_compact_bytes);
+        if (!fits(exact_bytes, projected_tokens)) {
+            return false;
+        }
+    }
+    claim.cache_ = this;
+    claim.scheduler_owner_ = std::this_thread::get_id();
+    return true;
+}
+
+bool server_prompt_cache::consume_vbr_publication_capacity(
+        server_prompt_cache_vbr_capacity_claim & claim) noexcept {
+    if (!claim.ready() || claim.cache_ != this ||
+        claim.scheduler_owner_ != std::this_thread::get_id()) {
+        return false;
+    }
+    claim.clear();
+    return true;
+}
+
 size_t server_prompt_cache::size() const {
     size_t naive = 0;
     bool has_vbr = false;

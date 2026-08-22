@@ -10641,6 +10641,13 @@ private:
                 (!idle.vbr_idle_capture_representation_valid ||
                  idle.vbr_idle_capture_published_identity !=
                     durable_identity);
+            // Refresh and fresh publication have different cache terminals.
+            // Keep each projected wave homogeneous so neither class can make
+            // the other fail admission forever on a stable ranking.
+            if ((representation_changed && !manifests.empty()) ||
+                (!representation_changed && refresh_selected)) {
+                continue;
+            }
             // Scalar refresh performs one exact physical-union admission.
             // Bound that global work to one row per synchronous idle wave;
             // remaining durable sources drain on later quiet ticks. Initial
@@ -10784,25 +10791,101 @@ private:
 
         std::vector<server_vbr_projected_host_publish_result> captured;
         server_vbr_projected_host_capture_diagnostics diagnostics;
+        std::vector<server_prompt_cache_vbr_publication_metadata *>
+            admitted_publications;
+        bool has_refresh_candidate = false;
+        bool has_fresh_candidate = false;
+        try {
+            admitted_publications.reserve(candidates.size());
+            for (const auto & candidate : candidates) {
+                has_refresh_candidate |= candidate.refresh;
+                has_fresh_candidate |= !candidate.refresh;
+            }
+        } catch (...) {
+            return 0;
+        }
+        server_prompt_cache_vbr_capacity_claim capacity_claim;
+        struct idle_admission_context {
+            server_queue::idle_capture_session * session = nullptr;
+            server_prompt_cache * cache = nullptr;
+            std::vector<candidate> * candidates = nullptr;
+            std::vector<server_prompt_cache_vbr_publication_metadata *> *
+                admitted = nullptr;
+            server_prompt_cache_vbr_capacity_claim * capacity = nullptr;
+            bool has_refresh = false;
+            bool has_fresh = false;
+        } admission_state {
+            &capture_session, prompt_cache.get(), &candidates,
+            &admitted_publications, &capacity_claim,
+            has_refresh_candidate, has_fresh_candidate,
+        };
         server_vbr_projected_capture_admission admission;
-        admission.context = &capture_session;
+        admission.context = &admission_state;
         admission.admit = [](
                 void * opaque,
-                const server_vbr_projected_capture_admission::quote &)
+                const server_vbr_projected_capture_admission::quote & quote)
                 noexcept {
-            auto * session = static_cast<
-                server_queue::idle_capture_session *>(opaque);
+            auto * context = static_cast<idle_admission_context *>(opaque);
+            auto * session = context ? context->session : nullptr;
             // Planning can include controller settlement, projection and
             // recurrent sizing. The store now holds the exact transfer-
             // staging and durable claims plus the persistent ring operation
             // while this final queue check runs, so capture cannot begin
             // behind queued work or a competing transfer. Later arrivals
             // cancel between bounded recurrent writes or attention chunks.
-            return session && session->continue_capture();
+            if (!context || !context->cache || !context->candidates ||
+                !context->admitted ||
+                !context->capacity || !session ||
+                !session->continue_capture()) {
+                return false;
+            }
+            // Refresh owns a separate in-place transaction. Do not partition
+            // one physical quote between refresh and fresh publication in
+            // this first bounded capacity-claim slice.
+            if (context->has_refresh) {
+                return !context->has_fresh &&
+                    session->continue_capture();
+            }
+            context->admitted->clear();
+            for (const auto & durable : quote.durable) {
+                server_prompt_cache_vbr_publication_metadata * found =
+                    nullptr;
+                for (auto & candidate : *context->candidates) {
+                    if (!candidate.refresh &&
+                        candidate.manifest_id == durable.manifest_id) {
+                        if (found) {
+                            return false;
+                        }
+                        found = &candidate.publication;
+                    }
+                }
+                if (!found) {
+                    return false;
+                }
+                if (std::find(
+                        context->admitted->begin(),
+                        context->admitted->end(), found) !=
+                    context->admitted->end()) {
+                    return false;
+                }
+                context->admitted->push_back(found);
+            }
+            if (context->admitted->empty() ||
+                !context->cache->prepare_vbr_publication_capacity(
+                    context->admitted->data(), context->admitted->size(),
+                    quote.projected_host_resident_bytes,
+                    *context->capacity)) {
+                return false;
+            }
+            if (!session->continue_capture()) {
+                *context->capacity = {};
+                return false;
+            }
+            return true;
         };
         admission.continue_capture = [](void * opaque) noexcept {
-            auto * session = static_cast<
-                server_queue::idle_capture_session *>(opaque);
+            auto * context = static_cast<idle_admission_context *>(opaque);
+            auto * session = context ? context->session : nullptr;
             return session && session->continue_capture();
         };
         const int64_t started = ggml_time_us();
@@ -10845,6 +10928,22 @@ private:
                         ? 0 : retry_after_ms;
             }
             return 0;
+        }
+
+        if (has_fresh_candidate &&
+            !prompt_cache->consume_vbr_publication_capacity(
+                capacity_claim)) {
+            const int64_t retry_after_ms = ggml_time_ms() + 5000;
+            for (auto & candidate : candidates) {
+                if (!candidate.refresh && candidate.slot) {
+                    candidate.slot->vbr_idle_capture_attempt_identity =
+                        candidate.attempt_identity;
+                    candidate.slot->vbr_idle_capture_terminal = false;
+                    candidate.slot->vbr_idle_capture_retry_after_ms =
+                        retry_after_ms;
+                }
+            }
+            return displaced_existing;
         }
 
         size_t published_count = 0;

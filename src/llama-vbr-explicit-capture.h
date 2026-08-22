@@ -349,6 +349,11 @@ struct vbr_projected_capture_batch_request {
         };
 
         uint64_t planned_packed_bytes = 0;
+        // Conservative compact prompt-cache footprint for the complete
+        // projected batch: every manifest-local non-unit row plus the
+        // first-owner physical unit union. Existing-catalog content dedup may
+        // shrink this after D2H; it can never grow.
+        uint64_t projected_host_resident_bytes = 0;
         uint64_t union_cells = 0;
         uint32_t manifests = 0;
         uint32_t projected_units = 0;

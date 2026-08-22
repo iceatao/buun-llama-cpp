@@ -2095,6 +2095,36 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 [](const auto & lhs, const auto & rhs) {
                     return lhs.manifest_id < rhs.manifest_id;
                 });
+            const auto add_host_bytes = [&](uint64_t bytes) {
+                if (bytes > UINT64_MAX -
+                        quote.projected_host_resident_bytes) {
+                    result.status =
+                        vbr_explicit_capture_status::size_overflow;
+                    return false;
+                }
+                quote.projected_host_resident_bytes += bytes;
+                return true;
+            };
+            for (const auto & durable : quote.durable) {
+                for (const auto & row : durable.accounting) {
+                    if (row.role !=
+                            vbr_artifact_accounting_role::unit_payload &&
+                        !add_host_bytes(row.resident_bytes)) {
+                        return false;
+                    }
+                }
+                for (const auto & row : durable.reserve_accounting) {
+                    if (row.role !=
+                            vbr_artifact_accounting_role::unit_payload) {
+                        result.status =
+                            vbr_explicit_capture_status::internal_error;
+                        return false;
+                    }
+                    if (!add_host_bytes(row.resident_bytes)) {
+                        return false;
+                    }
+                }
+            }
             return true;
         };
         vbr_projected_capture_batch_request::pretransfer_quote current_quote;

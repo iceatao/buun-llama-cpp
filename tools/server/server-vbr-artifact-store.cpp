@@ -616,7 +616,8 @@ public:
         if (!scheduler_checked_) {
             if (value.planned_packed_bytes == 0) {
                 scheduler_checked_ = true;
-                if (!value.staging.empty() || !value.durable.empty() ||
+                if (value.projected_host_resident_bytes != 0 ||
+                    !value.staging.empty() || !value.durable.empty() ||
                     value.manifests != 0 || value.projected_units != 0 ||
                     value.union_cells != 0) {
                     status_ = status::invalid_quote;

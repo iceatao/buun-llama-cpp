@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <thread>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -891,6 +892,32 @@ private:
     friend struct server_prompt_cache;
 };
 
+// Scheduler-thread citation that the complete conservative fresh-capture
+// batch fits the ordinary prompt-cache limits without pressure. A later slice
+// may add a canonical batch-victim terminal; this citation never scans,
+// chooses, pins, or retires an incumbent while transport resources are held.
+class server_prompt_cache_vbr_capacity_claim {
+public:
+    server_prompt_cache_vbr_capacity_claim() = default;
+    ~server_prompt_cache_vbr_capacity_claim() = default;
+    server_prompt_cache_vbr_capacity_claim(
+        const server_prompt_cache_vbr_capacity_claim &) = delete;
+    server_prompt_cache_vbr_capacity_claim & operator=(
+        const server_prompt_cache_vbr_capacity_claim &) = delete;
+    server_prompt_cache_vbr_capacity_claim(
+        server_prompt_cache_vbr_capacity_claim && other) noexcept;
+    server_prompt_cache_vbr_capacity_claim & operator=(
+        server_prompt_cache_vbr_capacity_claim && other) noexcept;
+
+    bool ready() const noexcept { return cache_ != nullptr; }
+
+private:
+    void clear() noexcept;
+    server_prompt_cache * cache_ = nullptr;
+    std::thread::id scheduler_owner_;
+    friend struct server_prompt_cache;
+};
+
 // Move-only, non-consuming citation of one immutable VBR host entry. The
 // highest-quality same-frontier owner is preferred; compact current remains
 // available as a bounded fallback when destination negotiation refuses it.
@@ -1234,6 +1261,17 @@ struct server_prompt_cache {
         common_cache_family_binding family,
         bool automatic_main_family,
         iterator * published = nullptr) noexcept;
+    // Cite one complete conservative fresh-capture batch at the exact
+    // pre-D2H scheduler checkpoint. Every pressure shape is refused in this
+    // first bounded slice. The prompt-cache remains scheduler-thread
+    // synchronous until consume.
+    bool prepare_vbr_publication_capacity(
+        server_prompt_cache_vbr_publication_metadata * const * prepared,
+        size_t prepared_count,
+        uint64_t incoming_compact_bytes,
+        server_prompt_cache_vbr_capacity_claim & claim) noexcept;
+    bool consume_vbr_publication_capacity(
+        server_prompt_cache_vbr_capacity_claim & claim) noexcept;
 
     // Select and pin the longest VBR artifact whose complete token block is an
     // exact prefix of the incoming text-only request and whose execution and
