@@ -1127,9 +1127,9 @@ struct server_prompt_cache {
     // the state is durable and the live slot may be safely cleared without saving again [I6/I7].
     bool contains(const server_tokens & tokens, const std::string & adapter_config_key) const;
 
-    // Publication-presence query for automatic capture suppression. Unlike
-    // contains(), this is not a durability/clear authority: it recognizes an
-    // exact immutable VBR frontier even before automatic restore is wired.
+    // Exact immutable VBR-frontier presence query. This alone is not a clear
+    // authority: automatic displacement also revalidates the live semantic
+    // frontier, scheduler state, pending work, and lease/recovery protection.
     bool contains_vbr_frontier(
         const server_prompt & prompt,
         const std::string & execution_identity,

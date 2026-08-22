@@ -1589,6 +1589,7 @@ void test_lifecycle_df2_rollout_and_reuse_thresholds() {
     CHECK(vbr_reclaim.stopped_at_sufficiency);
     CHECK(vbr_reclaim.fallback_removed_oldest);
     CHECK(vbr_reclaim.zero_yield_fell_back);
+    CHECK(vbr_reclaim.automatic_cache_preserved_undurable);
     available_host_fallback vbr_selection_fallback;
     const auto vbr_selection = server_vbr_slot_selection_for_test(
         &vbr_selection_fallback);

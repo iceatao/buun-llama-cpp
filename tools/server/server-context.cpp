@@ -1169,6 +1169,20 @@ struct server_slot {
         server_cache_slot_drop_impl();
     }
 
+    bool prompt_clear_after_vbr_publication() {
+        const auto admission = observe_full_slot(
+            server_cache_destruction_class::slot_drop,
+            server_cache_destruction_reason::idle_reclaim);
+        if (admission.verdict ==
+                server_cache_destruction_verdict::would_refuse_hard_leased ||
+            admission.verdict ==
+                server_cache_destruction_verdict::unavailable) {
+            return false;
+        }
+        server_cache_slot_drop_impl();
+        return true;
+    }
+
     server_cache_destruction_admission observe_live_range_drop(
             server_cache_destruction_reason reason,
             bool include_checkpoints = false) const {
@@ -2596,6 +2610,8 @@ private:
     // reclaim preparation sorts it once and every victim re-projection is allocation-free.
     std::vector<server_live_retention_candidate> vbr_retention_candidates;
     std::vector<uint32_t> vbr_exclusive_cells_by_seq;
+    std::vector<uint8_t> vbr_durable_sources_by_seq;
+    std::vector<uint8_t> vbr_reclaim_refused_by_seq;
     size_t vbr_retention_candidate_count = 0;
     uint64_t vbr_retention_projection_epoch = 0;
     const std::vector<uint32_t> * vbr_exclusive_cells_for_test = nullptr;
@@ -4383,6 +4399,25 @@ private:
             ? cells[size_t(slot_id)] : 0;
     }
 
+    bool vbr_idle_source_durable(
+            const server_slot & slot) const noexcept {
+        if (!params_base.vbr_prompt_cache) {
+            return true;
+        }
+        if (!prompt_cache || slot.prompt.n_tokens() <= 0) {
+            return false;
+        }
+        try {
+            return automatic_vbr_restore_supported(
+                       slot.prompt.tokens, slot.lora) &&
+                prompt_cache->contains_vbr_frontier(
+                    slot.prompt, frontier_execution_identity,
+                    lora_config_identity(slot.lora));
+        } catch (...) {
+            return false;
+        }
+    }
+
     llama_memory_vbr_state_data vbr_pool_state(
             uint32_t n_tokens_extra) noexcept {
         if (vbr_reclaim_cells_needed_for_test >= 0 &&
@@ -4409,15 +4444,23 @@ private:
             llama_get_memory(ctx_tgt), -1, n_tokens_extra);
     }
 
-    void vbr_clear_reclaim_victim(server_slot & slot) {
+    bool vbr_clear_idle_source(server_slot & slot) {
+        if (params_base.vbr_prompt_cache) {
+            return slot.prompt_clear_after_vbr_publication();
+        }
+        slot.prompt_clear(server_cache_destruction_reason::idle_reclaim);
+        return true;
+    }
+
+    bool vbr_clear_reclaim_victim(server_slot & slot) {
         if (vbr_reclaim_cells_needed_for_test >= 0) {
             if (slot.retention_obs) {
                 slot.retention_obs->retire_slot(slot.id);
             }
             slot.prompt.clear();
-            return;
+            return true;
         }
-        slot.prompt_clear(server_cache_destruction_reason::idle_reclaim);
+        return vbr_clear_idle_source(slot);
     }
 
     server_slot * find_slot_by_id(int32_t slot_id) noexcept {
@@ -4432,13 +4475,21 @@ private:
     struct vbr_live_retention_filter {
         int except_id = -1;
         int spec_tier = -1;
+        const std::vector<uint8_t> * refused_by_seq = nullptr;
     };
 
     bool vbr_idle_reclaim_eligible(
             const server_slot & slot,
             const vbr_live_retention_filter & filter) noexcept {
+        const bool durable = !params_base.vbr_prompt_cache ||
+            (slot.id >= 0 &&
+             size_t(slot.id) < vbr_durable_sources_by_seq.size() &&
+             vbr_durable_sources_by_seq[size_t(slot.id)] != 0);
+        const bool refused = filter.refused_by_seq && slot.id >= 0 &&
+            size_t(slot.id) < filter.refused_by_seq->size() &&
+            (*filter.refused_by_seq)[size_t(slot.id)] != 0;
         return slot.id != filter.except_id && !slot.is_processing() &&
-            slot.prompt.n_tokens() > 0 &&
+            slot.prompt.n_tokens() > 0 && durable && !refused &&
             !slot.hard_lease_blocks_live_prefix() &&
             !queue_tasks.has_deferred_for_slot(slot.id) &&
             (filter.spec_tier < 0 ||
@@ -4451,6 +4502,21 @@ private:
         auto * owner = live_retention_owner();
         vbr_retention_candidate_count = 0;
         vbr_retention_projection_epoch = 0;
+        if (params_base.vbr_prompt_cache) {
+            if (vbr_durable_sources_by_seq.size() != slots.size()) {
+                return false;
+            }
+            std::fill(
+                vbr_durable_sources_by_seq.begin(),
+                vbr_durable_sources_by_seq.end(), uint8_t(0));
+            for (const auto & slot : slots) {
+                if (slot.id >= 0 &&
+                    size_t(slot.id) < vbr_durable_sources_by_seq.size()) {
+                    vbr_durable_sources_by_seq[size_t(slot.id)] =
+                        vbr_idle_source_durable(slot) ? 1 : 0;
+                }
+            }
+        }
         if (!owner || vbr_retention_candidates.size() != slots.size()) {
             return false;
         }
@@ -4664,10 +4730,10 @@ private:
         return vbr_oldest_idle_slot(filter);
     }
 
-    // dynamic VBR: clear-only reclaim of idle slots (the prompt cache is disabled under the VBR
-    // gates, so unlike cache_idle_slots there is nothing to save into — the cost is a re-prefill
-    // if that conversation returns). Never touches processing slots or a slot an explicitly
-    // pinned deferred task is waiting on. Returns the number of slots cleared.
+    // Dynamic VBR clear-only reclaim of idle slots. With automatic host
+    // caching enabled, an exact immutable frontier is required before clear;
+    // otherwise the older clear-only behavior remains unchanged. Never touch
+    // a processing slot or one pinned by an explicitly deferred task.
     int vbr_clear_idle_slots(int except_id, const char * reason) {
         int cleared = 0;
         for (auto & s : slots) {
@@ -4680,13 +4746,20 @@ private:
                 SLT_INF(s, "vbr reclaim (%s): kept — hard lease seals the live prefix\n", reason);
                 continue;
             }
+            if (!vbr_idle_source_durable(s)) {
+                SLT_INF(s, "vbr reclaim (%s): kept — no durable VBR frontier\n",
+                        reason);
+                continue;
+            }
             if (queue_tasks.has_deferred_for_slot(s.id)) {
                 SLT_INF(s, "vbr reclaim (%s): kept — a deferred id_slot task pins this slot\n", reason);
                 continue;
             }
             SLT_WRN(s, "vbr reclaim (%s): clearing %d cached tokens\n", reason, (int) s.prompt.n_tokens());
-            s.prompt_clear(server_cache_destruction_reason::idle_reclaim);
-            cleared++;
+            const bool removed = vbr_clear_idle_source(s);
+            if (removed) {
+                cleared++;
+            }
         }
         return cleared;
     }
@@ -4706,7 +4779,16 @@ private:
         if (st.deficit_raw <= 0 || st.bpv_if_degraded >= (double) params_base.vbr_reclaim_floor_bpv) {
             return;
         }
-        const vbr_live_retention_filter filter { except_id };
+        if (params_base.vbr_prompt_cache) {
+            std::fill(
+                vbr_reclaim_refused_by_seq.begin(),
+                vbr_reclaim_refused_by_seq.end(), uint8_t(0));
+        }
+        const vbr_live_retention_filter filter {
+            except_id, -1,
+            params_base.vbr_prompt_cache
+                ? &vbr_reclaim_refused_by_seq : nullptr,
+        };
         bool learned_available = vbr_prepare_retention_wave(filter);
         int cleared = 0;
         while (st.deficit_raw > 0 &&
@@ -4721,7 +4803,19 @@ private:
                 "vbr reclaim (%s): clearing %d cached tokens (%s order)\n",
                 reason, (int) victim->prompt.n_tokens(),
                 learned_available ? "decayed-value" : "oldest-idle");
-            vbr_clear_reclaim_victim(*victim);
+            if (!vbr_clear_reclaim_victim(*victim)) {
+                SLT_INF(*victim,
+                    "vbr reclaim (%s): kept — full-slot lease refused displacement\n",
+                    reason);
+                if (victim->id >= 0 &&
+                    size_t(victim->id) <
+                        vbr_reclaim_refused_by_seq.size()) {
+                    vbr_reclaim_refused_by_seq[
+                        size_t(victim->id)] = 1;
+                    continue;
+                }
+                break;
+            }
             cleared++;
             st = vbr_pool_state(n_tokens_extra);
         }
@@ -6203,6 +6297,10 @@ private:
         if (server_vbr_dynamic_active(params_base)) {
             vbr_retention_candidates.resize(slots.size());
             vbr_exclusive_cells_by_seq.resize(slots.size());
+            if (params_base.vbr_prompt_cache) {
+                vbr_durable_sources_by_seq.resize(slots.size());
+                vbr_reclaim_refused_by_seq.resize(slots.size());
+            }
         }
 
         // try speculative decoding (shared multi-seq spec — not used by legacy fork types which init per-slot)
@@ -8678,10 +8776,19 @@ private:
                     SLT_INF(slot, "%s", "idle purge skipped: hard lease seals the live prefix\n");
                     continue;
                 }
+                if (!vbr_idle_source_durable(slot)) {
+                    SLT_INF(slot, "%s",
+                            "idle purge skipped: no durable VBR frontier\n");
+                    continue;
+                }
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                slot.prompt_clear(
-                    server_cache_destruction_reason::idle_reclaim);
+                const bool removed = vbr_clear_idle_source(slot);
+                if (!removed) {
+                    SLT_INF(slot, "%s",
+                            "idle purge skipped: full-slot lease refused displacement\n");
+                    continue;
+                }
 
                 res = true;
 
@@ -8890,8 +8997,8 @@ private:
                 !vbr_artifact_store || ctx_dft ||
                 task.type != SERVER_TASK_TYPE_COMPLETION || task.is_child() ||
                 task.is_parent() || task.tokens.empty() ||
-                !task.params.cache_prompt || task.tokens.has_media() ||
-                lora_all_alora(slot.lora) ||
+                !task.params.cache_prompt ||
+                !automatic_vbr_restore_supported(task.tokens, slot.lora) ||
                 slot.state != SLOT_STATE_IDLE || slot.is_processing() ||
                 !slot.prompt.tokens.empty() ||
                 !slot.prompt.checkpoints.empty() ||
@@ -9996,6 +10103,38 @@ private:
         return true;
     }
 
+    static std::array<uint8_t, 32> vbr_idle_capture_attempt_digest(
+            const vbr_artifact_identity_block & identity) {
+        llama_sha256_writer attempt_hash;
+        static constexpr char ATTEMPT_DOMAIN[] =
+            "buun.vbr.idle-capture-attempt/v1";
+        attempt_hash.string(
+            ATTEMPT_DOMAIN, sizeof(ATTEMPT_DOMAIN) - 1);
+        attempt_hash.string(
+            identity.execution_identity.data(),
+            identity.execution_identity.size());
+        attempt_hash.string(
+            identity.adapter_config_identity.data(),
+            identity.adapter_config_identity.size());
+        attempt_hash.string(
+            identity.media_content_identity.data(),
+            identity.media_content_identity.size());
+        attempt_hash.u64(identity.sequence_epoch);
+        attempt_hash.u64(uint64_t(identity.token_count));
+        attempt_hash.u64(uint64_t(identity.next_position));
+        return attempt_hash.finish();
+    }
+
+    static bool automatic_vbr_restore_supported(
+            const server_tokens & tokens,
+            const std::vector<common_adapter_lora_info> & lora) {
+        // H2 currently has no frontier-media lookup authority and cannot
+        // resume through an aLoRA invocation boundary. Such artifacts remain
+        // useful to explicit control paths, but automatic displacement must
+        // retain their live source until the matching restore route exists.
+        return !tokens.has_media() && !lora_all_alora(lora);
+    }
+
     bool build_capture_request(
             server_slot & slot,
             vbr_explicit_capture_request & request,
@@ -10145,6 +10284,8 @@ private:
         };
         std::vector<candidate> candidates;
         std::vector<vbr_projected_capture_manifest_request> manifests;
+        size_t displaced_existing = 0;
+        size_t displacement_attempts = 0;
         try {
             candidates.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
             manifests.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
@@ -10155,13 +10296,15 @@ private:
         uint64_t total_token_references = 0;
         static constexpr uint64_t MAX_IDLE_TOKEN_REFERENCES = 1024ull*1024;
         for (auto & idle : slots) {
-            if (candidates.size() == VBR_PROJECTED_CAPTURE_MAX_MANIFESTS) {
+            if (candidates.size() + displacement_attempts ==
+                    VBR_PROJECTED_CAPTURE_MAX_MANIFESTS) {
                 break;
             }
             if (idle.is_processing() || idle.state != SLOT_STATE_IDLE ||
                 idle.prompt.n_tokens() <= 0 || idle.can_speculate() ||
                 idle.hard_lease_blocks_live_prefix() ||
                 idle.cache_plan_destruction_recovery_pin.valid() ||
+                queue_tasks.has_deferred_for_slot(idle.id) ||
                 !prompt_cache->vbr_retention_source_available(idle.id)) {
                 continue;
             }
@@ -10169,6 +10312,20 @@ private:
             if (prompt_cache->contains_vbr_frontier(
                     idle.prompt, frontier_execution_identity,
                     adapter_key)) {
+                // A prior publication can outlive an arrival race that kept
+                // its live source. Retry only the cheap displacement terminal
+                // on later idle ticks; never recapture an already durable
+                // frontier merely to get another chance to clear it.
+                if (automatic_vbr_restore_supported(
+                        idle.prompt.tokens, idle.lora) &&
+                    !queue_tasks.has_pending_tasks()) {
+                    ++displacement_attempts;
+                    if (idle.prompt_clear_after_vbr_publication()) {
+                        ++displaced_existing;
+                        SLT_DBG(idle, "%s",
+                                "__TEST_TAG_VBR_IDLE_DISPLACED__\n");
+                    }
+                }
                 continue;
             }
             const uint64_t token_references =
@@ -10186,24 +10343,8 @@ private:
                     idle, manifest.identity, identity_status)) {
                 continue;
             }
-            llama_sha256_writer attempt_hash;
-            static constexpr char ATTEMPT_DOMAIN[] =
-                "buun.vbr.idle-capture-attempt/v1";
-            attempt_hash.string(
-                ATTEMPT_DOMAIN, sizeof(ATTEMPT_DOMAIN) - 1);
-            attempt_hash.string(
-                manifest.identity.execution_identity.data(),
-                manifest.identity.execution_identity.size());
-            attempt_hash.string(
-                manifest.identity.adapter_config_identity.data(),
-                manifest.identity.adapter_config_identity.size());
-            attempt_hash.string(
-                manifest.identity.media_content_identity.data(),
-                manifest.identity.media_content_identity.size());
-            attempt_hash.u64(manifest.identity.sequence_epoch);
-            attempt_hash.u64(uint64_t(manifest.identity.token_count));
-            attempt_hash.u64(uint64_t(manifest.identity.next_position));
-            const auto attempt_identity = attempt_hash.finish();
+            const auto attempt_identity =
+                vbr_idle_capture_attempt_digest(manifest.identity);
             if (idle.vbr_idle_capture_attempt_identity == attempt_identity &&
                 (idle.vbr_idle_capture_terminal ||
                  ggml_time_ms() < idle.vbr_idle_capture_retry_after_ms)) {
@@ -10226,7 +10367,7 @@ private:
             }
         }
         if (manifests.empty() || !cache_plan_observe_live_memory(false)) {
-            return 0;
+            return displaced_existing;
         }
 
         // This first synchronous scheduler slice is deliberately smaller than
@@ -10285,6 +10426,7 @@ private:
         }
 
         size_t published_count = 0;
+        size_t displaced_count = 0;
         for (auto & row : captured) {
             if (!row.payload ||
                 (row.status !=
@@ -10349,16 +10491,47 @@ private:
             }
             ++published_count;
             SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_PUBLISHED__\n");
+
+            // Publication is durable, but it is not authority to destroy a
+            // different live frontier. Re-derive the complete semantic key
+            // immediately before the canonical clear and repeat every live
+            // protection check that can change while capture was in flight.
+            // A refusal intentionally retains both the host artifact and the
+            // live source; a later pressure wave may reconsider the latter.
+            vbr_artifact_identity_block current_identity;
+            server_vbr_artifact_capture_status identity_status;
+            const bool source_unchanged =
+                build_capture_identity_fields(
+                    source, current_identity, identity_status) &&
+                vbr_idle_capture_attempt_digest(current_identity) ==
+                    found->attempt_identity;
+            if (!source_unchanged || source.is_processing() ||
+                source.state != SLOT_STATE_IDLE || source.can_speculate() ||
+                !automatic_vbr_restore_supported(
+                    source.prompt.tokens, source.lora) ||
+                source.hard_lease_blocks_live_prefix() ||
+                source.cache_plan_destruction_recovery_pin.valid() ||
+                queue_tasks.has_pending_tasks() ||
+                queue_tasks.has_deferred_for_slot(source.id) ||
+                !prompt_cache->contains_vbr_frontier(
+                    source.prompt, frontier_execution_identity,
+                    adapter_key)) {
+                continue;
+            }
+            if (!source.prompt_clear_after_vbr_publication()) {
+                continue;
+            }
+            ++displaced_count;
+            SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_DISPLACED__\n");
         }
 
-        // Restore is armed, but source destruction remains a separate policy
-        // transaction. Retain the live copy until the displacement slice can
-        // revalidate the exact published frontier immediately before clear.
         SRV_INF(
-            "VBR_IDLE_CAPTURE manifests=%zu published=%zu union_cells=%" PRIu64
-            " planned=%" PRIu64 " transfers=%u duration_ms=%.3f\n",
-            candidates.size(), published_count, diagnostics.union_cells,
-            diagnostics.planned_packed_bytes,
+            "VBR_IDLE_CAPTURE manifests=%zu published=%zu displaced=%zu "
+            "union_cells=%" PRIu64 " planned=%" PRIu64
+            " transfers=%u duration_ms=%.3f\n",
+            candidates.size(), published_count,
+            displaced_existing + displaced_count,
+            diagnostics.union_cells, diagnostics.planned_packed_bytes,
             diagnostics.unit_transfer_calls,
             (ggml_time_us() - started)/1000.0);
         return published_count;
@@ -15107,9 +15280,12 @@ server_vbr_retention_wiring_for_test() {
 server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test() {
     server_vbr_reclaim_policy_result result;
-    const auto run = [](bool complete_evidence, bool zero_yield = false) {
+    const auto run = [](
+            bool complete_evidence, bool zero_yield = false,
+            bool require_durable_vbr = false) {
         server_context_impl context;
         context.sleeping = true;
+        context.params_base.vbr_prompt_cache = require_durable_vbr;
         context.slots.resize(3);
         for (int32_t i = 0; i < 3; ++i) {
             auto & slot = context.slots[size_t(i)];
@@ -15159,6 +15335,7 @@ server_vbr_reclaim_policy_for_test() {
 
         context.vbr_retention_candidates.resize(context.slots.size());
         context.vbr_exclusive_cells_by_seq.resize(context.slots.size());
+        context.vbr_durable_sources_by_seq.resize(context.slots.size());
         const std::vector<uint32_t> exclusive {
             zero_yield ? 0u : 100u, 100, 100,
         };
@@ -15196,6 +15373,9 @@ server_vbr_reclaim_policy_for_test() {
     result.zero_yield_fell_back =
         zero_yield[0] && !zero_yield[1] && !zero_yield[2] &&
         zero_yield[3] && zero_yield[4];
+    const auto undurable = run(true, false, true);
+    result.automatic_cache_preserved_undurable =
+        undurable[0] && undurable[1] && undurable[2] && undurable[3];
     return result;
 }
 
@@ -15328,6 +15508,7 @@ server_vbr_slot_selection_for_test(
 
         context.vbr_retention_candidates.resize(context.slots.size());
         context.vbr_exclusive_cells_by_seq.resize(context.slots.size());
+        context.vbr_durable_sources_by_seq.resize(context.slots.size());
         const std::vector<uint32_t> exclusive { 100, 100, 100 };
         context.vbr_exclusive_cells_for_test = &exclusive;
 

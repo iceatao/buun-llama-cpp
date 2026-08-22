@@ -64,6 +64,7 @@ struct server_vbr_reclaim_policy_result {
     bool stopped_at_sufficiency = false;
     bool fallback_removed_oldest = false;
     bool zero_yield_fell_back = false;
+    bool automatic_cache_preserved_undurable = false;
 };
 
 server_vbr_reclaim_policy_result
