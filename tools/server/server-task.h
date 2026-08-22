@@ -893,9 +893,9 @@ private:
 };
 
 // Scheduler-thread citation that the complete conservative fresh-capture
-// batch fits the ordinary prompt-cache limits without pressure. A later slice
-// may add a canonical batch-victim terminal; this citation never scans,
-// chooses, pins, or retires an incumbent while transport resources are held.
+// batch fits the ordinary prompt-cache limits. Pressure support is limited to
+// one incoming row and one incumbent, where no victim-choice policy exists;
+// the ordinary publication terminal remains the sole eviction authority.
 class server_prompt_cache_vbr_capacity_claim {
 public:
     server_prompt_cache_vbr_capacity_claim() = default;
@@ -914,6 +914,8 @@ public:
 private:
     void clear() noexcept;
     server_prompt_cache * cache_ = nullptr;
+    server_prompt_cache_state * incumbent_ = nullptr;
+    llama_cache_acct_artifact_id incumbent_artifact_;
     std::thread::id scheduler_owner_;
     friend struct server_prompt_cache;
 };
@@ -1262,9 +1264,9 @@ struct server_prompt_cache {
         bool automatic_main_family,
         iterator * published = nullptr) noexcept;
     // Cite one complete conservative fresh-capture batch at the exact
-    // pre-D2H scheduler checkpoint. Every pressure shape is refused in this
-    // first bounded slice. The prompt-cache remains scheduler-thread
-    // synchronous until consume.
+    // pre-D2H scheduler checkpoint. Multi-row and multi-incumbent pressure
+    // are refused. A singleton/single-incumbent pressure citation is
+    // revalidated at consume; ordinary publication still owns the eviction.
     bool prepare_vbr_publication_capacity(
         server_prompt_cache_vbr_publication_metadata * const * prepared,
         size_t prepared_count,

@@ -5002,8 +5002,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(first_marginal > 0 && first_marginal < union_bytes);
     first_retire.reset();
 
-    // This first capacity citation is fit-only. Even a singleton with a
-    // sufficient lawful incumbent refuses before D2H; canonical victim
+    // Multi-incumbent pressure refuses before D2H; canonical victim
     // selection remains solely in the ordinary publication terminal.
     cache.limit_size = size_t(union_bytes);
     {
@@ -5075,6 +5074,60 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     }
     CHECK(remaining_bytes > 0);
     remaining.reset();
+
+    // With exactly one incumbent there is no alternate victim policy to
+    // choose. The pre-D2H citation proves that sole lawful retirement covers
+    // the conservative incoming row, then revalidates its exact artifact and
+    // lease state before ordinary publication owns the actual eviction.
+    cache.limit_size = size_t(remaining_bytes);
+    {
+        server_prompt_cache_vbr_publication_metadata incoming;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, incoming));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &incoming,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 1, remaining_bytes, capacity));
+        CHECK(capacity.ready());
+        // Production publishes the captured catalog row between prepare and
+        // consume. Exact dedup shrinks both incoming growth and incumbent
+        // marginal by the same bytes; identity/lease revalidation must not
+        // subtract the new marginal from the old conservative total.
+        const auto shared_incoming = publish_fixture(
+            *fixture.catalog, fixture.package,
+            fixture.completions(), fixture.budget);
+        CHECK(shared_incoming.status ==
+              llama_vbr_artifact_publish_status::adopted);
+        auto shared_payload =
+            owned_payload(shared_incoming.reference_artifact);
+        CHECK(shared_payload.vbr_artifact() != nullptr);
+        CHECK(cache.consume_vbr_publication_capacity(capacity));
+        CHECK(!capacity.ready());
+    }
+    CHECK(fixture.catalog->snapshot().references == 1);
+    {
+        server_prompt_cache_vbr_publication_metadata incoming;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, incoming));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &incoming,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 1, remaining_bytes, capacity));
+        cache.states.front().recovery_pins++;
+        CHECK(!cache.consume_vbr_publication_capacity(capacity));
+        CHECK(!capacity.ready());
+        cache.states.front().recovery_pins--;
+    }
     cache.limit_size = size_t(remaining_bytes - 1);
     cache.update();
     CHECK(cache.states.empty());
@@ -5083,8 +5136,74 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(authority.destruction.host_trade_df2_executed == 2);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
 
-    // Token pressure uses the logical frontier as its denominator while the
-    // same prepared capability still owns the physical retirement terminal.
+    // Carry the singleton pressure citation through the real publication
+    // terminal with a distinct physical payload. The sole incumbent is the
+    // canonical victim by construction and exactly one host row replaces it.
+    cache.limit_size = 0;
+    const auto pressure_incumbent = publish_fixture(
+        *fixture.catalog, fixture.package,
+        fixture.completions(), fixture.budget);
+    CHECK(pressure_incumbent.status ==
+          llama_vbr_artifact_publish_status::published);
+    auto pressure_incumbent_state =
+        publish_owned(pressure_incumbent.reference_artifact);
+    const auto pressure_incumbent_key =
+        server_retention_instance_key::for_host_entry(
+            &*pressure_incumbent_state);
+    fixture_storage changed_storage;
+    changed_storage.payload0.bytes[0] ^= 1;
+    changed_storage.payload1.bytes[0] ^= 1;
+    changed_storage.stash0.bytes[0] ^= 1;
+    changed_storage.stash1.bytes[0] ^= 1;
+    auto changed_package = make_package(changed_storage);
+    changed_package.manifest.identity = fixture.package.manifest.identity;
+    const auto pressure_incoming = publish_fixture(
+        *fixture.catalog, changed_package, {
+            { 0, 1, true,  true, changed_storage.stash1.bytes },
+            { 0, 0, false, true, changed_storage.payload0.bytes },
+            { 0, 0, true,  true, changed_storage.stash0.bytes },
+            { 0, 1, false, true, changed_storage.payload1.bytes },
+        }, fixture.budget);
+    CHECK(pressure_incoming.status ==
+          llama_vbr_artifact_publish_status::published);
+    auto pressure_payload =
+        owned_payload(pressure_incoming.reference_artifact);
+    const auto * pressure_owner = pressure_payload.vbr_artifact();
+    CHECK(pressure_owner != nullptr);
+    const uint64_t pressure_bytes = pressure_payload.size();
+    CHECK(pressure_bytes > 0 && pressure_bytes <= SIZE_MAX);
+    cache.limit_size = size_t(pressure_bytes);
+    server_prompt_cache_vbr_publication_metadata pressure_metadata;
+    CHECK(cache.prepare_vbr_publication_metadata(
+        prompt,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        source_slot, pressure_metadata));
+    server_prompt_cache_vbr_publication_metadata * pressure_batch[] = {
+        &pressure_metadata,
+    };
+    server_prompt_cache_vbr_capacity_claim pressure_capacity;
+    CHECK(cache.prepare_vbr_publication_capacity(
+        pressure_batch, 1, pressure_bytes, pressure_capacity));
+    CHECK(cache.consume_vbr_publication_capacity(pressure_capacity));
+    server_prompt_cache::iterator pressure_published;
+    CHECK(cache.publish_vbr(
+        pressure_metadata, std::move(pressure_payload), {}, false,
+        &pressure_published));
+    CHECK(pressure_published != cache.states.end());
+    CHECK(cache.states.size() == 1);
+    CHECK(pressure_published->payload.vbr_artifact() == pressure_owner);
+    CHECK(retention.artifact_id(pressure_incumbent_key).v == 0);
+    CHECK(authority.destruction.host_trade_df2_executed == 3);
+    cache.limit_size = size_t(pressure_bytes - 1);
+    cache.update();
+    CHECK(cache.states.empty());
+    CHECK(fixture.catalog->snapshot().references == 0);
+    CHECK(authority.destruction.host_trade_df2_executed == 4);
+
+    // Token-pressure feasibility uses the exact logical frontier denominator
+    // under the same singleton bound; physical publication is covered by the
+    // distinct-payload byte-pressure transaction above.
     const auto token_reference = publish_fixture(*fixture.catalog,
         fixture.package, fixture.completions(), fixture.budget);
     CHECK(token_reference.status ==
@@ -5093,11 +5212,27 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     cache.limit_tokens = 0;
     auto token_state = publish_owned(token_reference.reference_artifact);
     CHECK(token_state != cache.states.end());
+    cache.limit_tokens = size_t(prompt.n_tokens());
+    {
+        server_prompt_cache_vbr_publication_metadata incoming;
+        CHECK(cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            source_slot, incoming));
+        server_prompt_cache_vbr_publication_metadata * batch[] = {
+            &incoming,
+        };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 1, token_state->size(), capacity));
+        CHECK(cache.consume_vbr_publication_capacity(capacity));
+    }
     cache.limit_tokens = size_t(prompt.n_tokens() - 1);
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 3);
+    CHECK(authority.destruction.host_trade_df2_executed == 5);
     CHECK(cache.retention_shadow_snapshot().last.reason ==
           server_cache_destruction_reason::host_token_limit);
     CHECK(cache.retention_shadow_snapshot().last.proposed_resource ==
@@ -5149,14 +5284,14 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(cache.states.size() == 1);
     CHECK(fixture.catalog->snapshot().references == 1);
     CHECK(cache.states.front().payload.vbr_retirement_exclusive());
-    CHECK(authority.destruction.host_trade_df2_executed == 3);
+    CHECK(authority.destruction.host_trade_df2_executed == 5);
 
     cache.limit_tokens = 0;
     cache.limit_size = cache.states.front().size() - 1;
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 4);
+    CHECK(authority.destruction.host_trade_df2_executed == 6);
 
     // A zero-byte alias is also lawful capacity cleanup: erasing it makes
     // the survivor exclusive, after which the next bounded iteration can
@@ -5211,7 +5346,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 6);
+    CHECK(authority.destruction.host_trade_df2_executed == 8);
 
     // The publication transaction itself—not only later maintenance—may
     // reclaim a lawful incumbent. The incoming node is protected until the
