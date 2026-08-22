@@ -2606,6 +2606,8 @@ private:
     // the frozen ledger but is destroyed before it. It exists only for an
     // armed dynamic-VBR memory after the one-shot manifest and ring admission.
     std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
+    uint64_t vbr_automatic_restore_attempts = 0;
+    uint64_t vbr_automatic_restore_succeeded = 0;
     // E1.1a is lazily constructed by its scheduler-only task. destroy()
     // explicitly closes it before prompt_cache because host proofs point into
     // cache list nodes; this declaration after the F store is the secondary
@@ -7089,7 +7091,7 @@ private:
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
             } else if (params_base.vbr_prompt_cache) {
-                SRV_TRC("%s", "idle dynamic-VBR slots will be published as projected prompt-cache artifacts; live sources remain resident until automatic restore is armed\n");
+                SRV_TRC("%s", "idle dynamic-VBR slots will be published as projected prompt-cache artifacts; live sources remain resident during the initial restore rollout\n");
             } else {
                 if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
@@ -8880,7 +8882,120 @@ private:
         GGML_ABORT("invalid slot prompt admission");
     }
 
-    bool launch_slot_with_task(server_slot & slot, server_task && task) {
+    bool try_automatic_vbr_restore(
+            server_slot & slot,
+            const server_task & task) noexcept {
+        try {
+            if (!params_base.vbr_prompt_cache || !prompt_cache ||
+                !vbr_artifact_store || ctx_dft ||
+                task.type != SERVER_TASK_TYPE_COMPLETION || task.is_child() ||
+                task.is_parent() || task.tokens.empty() ||
+                !task.params.cache_prompt || task.tokens.has_media() ||
+                lora_all_alora(slot.lora) ||
+                slot.state != SLOT_STATE_IDLE || slot.is_processing() ||
+                !slot.prompt.tokens.empty() ||
+                !slot.prompt.checkpoints.empty() ||
+                slot.prompt.sequence_epoch != 0) {
+                return false;
+            }
+            server_prompt_cache_vbr_restore_candidate candidate;
+            const auto adapter_identity = lora_config_identity(slot.lora);
+            if (!prompt_cache->prepare_vbr_restore(
+                    task.tokens, frontier_execution_identity,
+                    adapter_identity, candidate)) {
+                return false;
+            }
+            auto * memory = llama_get_memory(ctx_tgt);
+            const bool target_ready =
+                memory && memory->seq_pos_min(slot.id) < 0 &&
+                memory->seq_pos_max(slot.id) < 0 &&
+                cache_plan_observe_live_memory(false);
+            if (!target_ready ||
+                !prompt_cache->prepare_vbr_restore_destination(
+                    candidate, slot.prompt, slot.id)) {
+                return false;
+            }
+
+            struct publish_state {
+                server_prompt_cache * cache = nullptr;
+                server_prompt_cache_vbr_restore_candidate * candidate = nullptr;
+                bool published = false;
+            } state { prompt_cache.get(), &candidate, false };
+
+            server_vbr_artifact_import_target request;
+            request.memory = memory;
+            request.destination = slot.id;
+            request.execution_identity = frontier_execution_identity;
+            request.adapter_config_identity = adapter_identity;
+            request.previously_observed = false;
+            request.publish_context = &state;
+            request.prepare_publish = [](
+                    void * opaque,
+                    const std::vector<llama_token> & tokens,
+                    uint64_t sequence_epoch) noexcept {
+                const auto * current = static_cast<const publish_state *>(opaque);
+                if (!current || !current->candidate ||
+                    !current->candidate->ready() ||
+                    !current->candidate->payload()) {
+                    return false;
+                }
+                const auto & package = current->candidate->payload()->package();
+                return package && tokens.size() ==
+                           current->candidate->prefix_tokens() &&
+                       sequence_epoch ==
+                           package.manifest().identity.sequence_epoch;
+            };
+            request.publish = [](void * opaque) noexcept {
+                auto * current = static_cast<publish_state *>(opaque);
+                GGML_ASSERT(current && current->cache && current->candidate);
+                current->published = current->cache->publish_vbr_restore(
+                    *current->candidate);
+                GGML_ASSERT(current->published);
+            };
+
+            vbr_automatic_restore_attempts++;
+            const int64_t started = ggml_time_us();
+            const auto imported = vbr_artifact_store->import_host_payload(
+                std::move(request), candidate.payload());
+            if (imported.status != server_vbr_artifact_import_status::ok) {
+                SLT_DBG(
+                    slot,
+                    "automatic VBR host restore refused: status=%s\n",
+                    server_vbr_artifact_import_status_name(imported.status));
+                return false;
+            }
+            GGML_ASSERT(state.published);
+            const uint64_t prefix_tokens = candidate.prefix_tokens();
+            const int32_t source_id = candidate.source_id();
+            const bool committed = prompt_cache->commit_vbr_restore(
+                candidate, slot.prompt, slot.cache_family, slot.id);
+            GGML_ASSERT(committed);
+            if (!committed) {
+                return false;
+            }
+            vbr_automatic_restore_succeeded++;
+            SLT_INF(
+                slot,
+                "automatic VBR host restore source=%d prefix=%" PRIu64
+                " status=%s duration_ms=%.3f total=%" PRIu64 "/%" PRIu64
+                "\n",
+                source_id, prefix_tokens,
+                server_vbr_artifact_import_status_name(imported.status),
+                (ggml_time_us() - started)/1000.0,
+                vbr_automatic_restore_succeeded,
+                vbr_automatic_restore_attempts);
+            return true;
+        } catch (...) {
+            // Automatic reuse is a cache optimization. Allocation or identity
+            // preparation failure must remain a soft cold-launch fallback.
+            return false;
+        }
+    }
+
+    bool launch_slot_with_task(
+            server_slot & slot,
+            server_task && task,
+            bool reclaim_before_launch = false) {
         // Defensive backstop for any future caller which does not pass through
         // process_single_task's group-wide preselection admission.
         prepare_prompt_tokens_for_launch(slot, task);
@@ -8898,7 +9013,6 @@ private:
                 ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
-
 
         // process per-request lora adapters (fall back to the server's base adapters when the
         // request carries none). Identity is checked for BOTH branches [I6]: a slot that computed
@@ -9017,13 +9131,29 @@ private:
             slot.smpl.reset();
         }
 
+        // Complete the last ordinary fallible launch allocation before an
+        // automatic import can atomically publish live KV/prompt metadata.
+        auto launched_task =
+            std::make_unique<const server_task>(std::move(task));
+        (void) try_automatic_vbr_restore(slot, *launched_task);
+
+        const size_t retained_prefix =
+            slot.prompt.tokens.get_common_prefix(launched_task->tokens);
+
+        if (reclaim_before_launch &&
+            server_vbr_dynamic_active(params_base) &&
+            launched_task->n_tokens() > 0) {
+            vbr_reclaim_before_degrade(
+                slot.id,
+                uint32_t(launched_task->n_tokens() - retained_prefix),
+                "launch");
+        }
+
         // The binding follows retained immutable content. Only a full-prefix
         // append/resume keeps the existing lineage; a branch/replacement
         // adopts the incoming declaration even when BOS or a shared system
         // prefix overlaps. Children carry the opaque token and later copy the
         // parent's resolved slot binding.
-        const size_t retained_prefix =
-            slot.prompt.tokens.get_common_prefix(task.tokens);
         // A live-prefix lease binds the execution/adapter/media identity while
         // its proven token boundary lives in the lease frontier. Preserve the
         // sidecar artifact only when the entire decoded ledger is an exact
@@ -9060,7 +9190,7 @@ private:
         slot.cache_family = common_cache_family_follow_lineage(
             slot.cache_family, incoming_family, retained_prefix,
             slot.prompt.tokens.size());
-        slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.task = std::move(launched_task);
 
         if (prepared_host_restore) {
             server_retention_lineage_ticket restored_source;
@@ -10221,9 +10351,9 @@ private:
             SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_PUBLISHED__\n");
         }
 
-        // H2.3 is publication-only. A projected payload becomes durable for
-        // live-slot destruction only when H2.4's automatic restore terminal is
-        // wired; retaining the source here is the fail-safe behavior.
+        // Restore is armed, but source destruction remains a separate policy
+        // transaction. Retain the live copy until the displacement slice can
+        // revalidate the exact published frontier immediately before clear.
         SRV_INF(
             "VBR_IDLE_CAPTURE manifests=%zu published=%zu union_cells=%" PRIu64
             " planned=%" PRIu64 " transfers=%u duration_ms=%.3f\n",
@@ -10357,17 +10487,8 @@ private:
                             }
                         }
 
-                        // dynamic VBR: if this launch's projected footprint would degrade the
-                        // pool below the quality floor, clear idle caches first. The probe is
-                        // sized by the post-LCP SUFFIX — the common prefix refills in place with
-                        // zero cell growth, and probing the full prompt evicted other clients'
-                        // caches for growth that was never going to happen.
-                        if (server_vbr_dynamic_active(params_base) && task.n_tokens() > 0) {
-                            const size_t lcp = slot->prompt.tokens.get_common_prefix(task.tokens);
-                            vbr_reclaim_before_degrade(slot->id, (uint32_t) (task.n_tokens() - lcp), "launch");
-                        }
-
-                        if (!launch_slot_with_task(*slot, std::move(task))) {
+                        if (!launch_slot_with_task(
+                                *slot, std::move(task), true)) {
                             SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                             server_cache_plan_disarm_unlaunched(
                                 slot->cache_plan_execution, slot->cache_plan,

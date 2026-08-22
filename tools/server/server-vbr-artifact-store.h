@@ -233,6 +233,7 @@ struct server_vbr_artifact_store_counters {
     // and entered the common import kernel (even when target validation later
     // refuses). This keeps the credential-free authority boundary observable.
     uint64_t host_imports_authenticated = 0;
+    uint64_t host_imports_succeeded = 0;
     uint64_t imports_succeeded = 0;
     uint64_t imports_report_only = 0;
     uint64_t imports_not_found = 0;

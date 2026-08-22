@@ -1213,7 +1213,12 @@ server_vbr_artifact_store::import_host_payload(
         return output;
     }
     impl_->counters.host_imports_authenticated++;
-    return import_package(std::move(request), payload->package());
+    auto imported = import_package(
+        std::move(request), payload->package());
+    if (imported.status == server_vbr_artifact_import_status::ok) {
+        impl_->counters.host_imports_succeeded++;
+    }
+    return imported;
 }
 
 server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
