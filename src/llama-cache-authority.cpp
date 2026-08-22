@@ -1,6 +1,7 @@
 #include "llama-cache-authority.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 const char * llama_cache_admission_status_name(llama_cache_admission_status status) noexcept {
@@ -317,6 +318,63 @@ bool llama_cache_prepared_claim_group::shrink_equal_reservations(
     return true;
 }
 
+bool llama_cache_prepared_claim_group::repartition_downward(
+        const std::vector<llama_cache_transaction_leaf> & leaves) noexcept {
+    if (!ready() || leaves.empty()) {
+        return false;
+    }
+    try {
+        // Complete every allocation before the ledger's irreversible atomic
+        // repartition. After that terminal only claim disarms and vector moves
+        // remain, so an exception cannot leave a falsely-ready group whose
+        // recorded operations were already replaced.
+        std::vector<llama_cache_transaction_leaf> replacement_leaves = leaves;
+        std::vector<llama_cache_conditional_reserve_request> requests(
+            leaves.size());
+        std::vector<llama_cache_acct_op_id> operations(leaves.size());
+        std::vector<llama_cache_admission_result> admissions(leaves.size());
+        std::unordered_set<const void *> operation_outputs;
+        std::unordered_set<const void *> allocation_outputs;
+        operation_outputs.reserve(leaves.size());
+        allocation_outputs.reserve(leaves.size());
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            const auto & leaf = leaves[i];
+            if (!leaf.committed_op ||
+                (leaf.existing_allocation && leaf.reserve_resident != 0) ||
+                (!leaf.existing_allocation &&
+                 leaf.stage_resident != leaf.reserve_resident) ||
+                !operation_outputs.insert(leaf.committed_op).second ||
+                (leaf.allocation_out &&
+                 !allocation_outputs.insert(leaf.allocation_out).second)) {
+                return false;
+            }
+            requests[i] = {
+                leaf.category, leaf.domain, leaf.attribution,
+                leaf.expected_logical, leaf.reserve_resident,
+            };
+        }
+        if (!impl_->ledger->repartition_reservation_set_downward(
+                impl_->reserved_ops.data(), impl_->reserved_ops.size(),
+                requests.data(), requests.size(), operations.data())) {
+            return false;
+        }
+        for (size_t i = 0; i < operations.size(); ++i) {
+            admissions[i].status = llama_cache_admission_status::admitted;
+            admissions[i].claim = llama_cache_reservation_claim(
+                impl_->ledger, operations[i]);
+        }
+        for (auto & admission : impl_->admissions) {
+            admission.claim.release();
+        }
+        impl_->leaves = std::move(replacement_leaves);
+        impl_->reserved_ops = std::move(operations);
+        impl_->admissions = std::move(admissions);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 llama_cache_prepared_claim_group
 llama_cache_prepare_reservation_transaction(
         llama_cache_acct_ledger & ledger,
@@ -368,20 +426,6 @@ llama_cache_prepare_reservation_transaction(
         std::vector<llama_cache_acct_op_id> operations(leaves.size());
         llama_cache_budget_plan plan;
         plan.entries.reserve(leaves.size());
-        const auto domain_less = [](
-                const llama_cache_acct_resource_domain & lhs,
-                const llama_cache_acct_resource_domain & rhs) {
-            if (lhs.residency != rhs.residency) {
-                return lhs.residency < rhs.residency;
-            }
-            if (lhs.kind != rhs.kind) {
-                return lhs.kind < rhs.kind;
-            }
-            if (lhs.topology.v != rhs.topology.v) {
-                return lhs.topology.v < rhs.topology.v;
-            }
-            return lhs.device_ordinal.v < rhs.device_ordinal.v;
-        };
         for (size_t i = 0; i < leaves.size(); ++i) {
             const auto & leaf = leaves[i];
             requests[i] = {
@@ -391,7 +435,8 @@ llama_cache_prepare_reservation_transaction(
             const auto position = std::lower_bound(
                 plan.entries.begin(), plan.entries.end(), leaf.domain,
                 [&](const auto & entry, const auto & domain) {
-                    return domain_less(entry.domain, domain);
+                    return llama_cache_acct_resource_domain_less(
+                        entry.domain, domain);
                 });
             if (position != plan.entries.end() &&
                 position->domain == leaf.domain) {
@@ -558,6 +603,10 @@ llama_cache_prepared_claim_group::materialize_and_commit(
                     invalid_argument;
             return out;
         }
+        std::unordered_set<const void *> operation_outputs;
+        std::unordered_set<const void *> allocation_outputs;
+        operation_outputs.reserve(finalized_leaves.size());
+        allocation_outputs.reserve(finalized_leaves.size());
         for (size_t i = 0; i < finalized_leaves.size(); ++i) {
             const auto & prepared = impl_->leaves[i];
             const auto & finalized = finalized_leaves[i];
@@ -577,25 +626,17 @@ llama_cache_prepared_claim_group::materialize_and_commit(
                     finalized.stage_resident ||
                 prepared.existing_allocation !=
                     finalized.existing_allocation ||
-                !finalized.committed_op) {
+                !finalized.committed_op ||
+                !operation_outputs.insert(
+                    finalized.committed_op).second ||
+                (finalized.allocation_out &&
+                 !allocation_outputs.insert(
+                    finalized.allocation_out).second)) {
                 out.status =
                     llama_cache_transaction_status::
                         invalid_argument;
                 out.failed_leaf = i;
                 return out;
-            }
-            for (size_t j = 0; j < i; ++j) {
-                if (finalized_leaves[j].committed_op ==
-                        finalized.committed_op ||
-                    (finalized.allocation_out &&
-                     finalized_leaves[j].allocation_out ==
-                         finalized.allocation_out)) {
-                    out.status =
-                        llama_cache_transaction_status::
-                            invalid_argument;
-                    out.failed_leaf = i;
-                    return out;
-                }
             }
         }
         impl_->consumed = true;

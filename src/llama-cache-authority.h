@@ -295,6 +295,13 @@ public:
     bool shrink_equal_reservations(
         const std::vector<uint64_t> & resident_bytes) noexcept;
 
+    // Repartition a conservative prepared fence into exact final leaves while
+    // preserving one uninterrupted capacity claim. The replacement may split
+    // or merge leaves and may bind existing immutable allocations, but its
+    // reserved aggregate can only decrease within each category/domain.
+    bool repartition_downward(
+        const std::vector<llama_cache_transaction_leaf> & leaves) noexcept;
+
     // Single terminal. The optional hook remains after all claims are admitted
     // and before the first stage. Re-entry or a failed preparation returns a
     // typed invalid/internal result and never exposes success outputs.

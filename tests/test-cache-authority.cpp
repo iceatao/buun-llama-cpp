@@ -483,6 +483,178 @@ static void test_prepared_transaction_split_phase() {
     CHECK(ledger.snapshot().live_ops == 0);
 }
 
+static void test_prepared_transaction_downward_repartition() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    llama_cache_budget_config config;
+    llama_cache_acct_op_id initial_op;
+    llama_cache_acct_alloc_id initial_allocation;
+    std::vector<llama_cache_transaction_leaf> initial {
+        transaction_leaf(PAYLOAD, 96, initial_op, initial_allocation),
+    };
+    auto prepared = llama_cache_prepare_reservation_transaction(
+        ledger, config, initial);
+    CHECK(prepared.ready());
+    CHECK(ledger.snapshot().live_ops == 1);
+    CHECK(host_reserved(ledger) == 96);
+
+    llama_cache_acct_op_id first_op;
+    llama_cache_acct_op_id second_op;
+    llama_cache_acct_alloc_id first_allocation;
+    llama_cache_acct_alloc_id second_allocation;
+    std::vector<llama_cache_transaction_leaf> growth {
+        transaction_leaf(PAYLOAD, 64, first_op, first_allocation),
+        transaction_leaf(PAYLOAD, 33, second_op, second_allocation),
+    };
+    CHECK(!prepared.repartition_downward(growth));
+    CHECK(prepared.ready());
+    CHECK(ledger.snapshot().live_ops == 1);
+    CHECK(host_reserved(ledger) == 96);
+
+    llama_cache_acct_op_id foreign_op;
+    llama_cache_acct_alloc_id foreign_allocation;
+    auto foreign = transaction_leaf(
+        llama_cache_acct_category::checkpoint_state_payload,
+        0, foreign_op, foreign_allocation);
+    foreign.existing_allocation = { 777 };
+    std::vector<llama_cache_transaction_leaf> foreign_domain {
+        std::move(foreign),
+    };
+    CHECK(!prepared.repartition_downward(foreign_domain));
+    CHECK(prepared.ready());
+    CHECK(ledger.snapshot().live_ops == 1);
+    CHECK(host_reserved(ledger) == 96);
+
+    std::vector<llama_cache_transaction_leaf> exact {
+        transaction_leaf(PAYLOAD, 40, first_op, first_allocation),
+        transaction_leaf(PAYLOAD, 20, second_op, second_allocation),
+    };
+    CHECK(prepared.repartition_downward(exact));
+    CHECK(prepared.ready());
+    CHECK(ledger.snapshot().live_ops == 2);
+    CHECK(host_reserved(ledger) == 60);
+
+    const auto committed = prepared.materialize_and_commit(exact);
+    CHECK(committed.status == llama_cache_transaction_status::committed);
+    CHECK(!prepared.ready());
+    CHECK(first_op && second_op && first_op != second_op);
+    CHECK(first_allocation && second_allocation &&
+          first_allocation != second_allocation);
+    CHECK(ledger.snapshot().live_ops == 2);
+    CHECK(host_reserved(ledger) == 0);
+    CHECK(ledger.release(first_op));
+    CHECK(ledger.release(second_op));
+    CHECK(ledger.snapshot().live_ops == 0);
+
+    // A content-addressed final leaf may join an authenticated existing
+    // allocation. Its zero resident reservation is a valid downward
+    // conversion of the conservative fresh fence, while staging still cites
+    // the complete immutable allocation size.
+    llama_cache_acct_ledger dedup_ledger;
+    configure_fitting_host(dedup_ledger);
+    auto owner = llama_cache_admit_reservation(
+        dedup_ledger, config, host_request(32));
+    CHECK(owner.status == llama_cache_admission_status::admitted);
+    const auto shared_allocation = dedup_ledger.new_alloc();
+    CHECK(shared_allocation);
+    CHECK(dedup_ledger.stage(owner.claim.op(), shared_allocation, 32));
+    llama_cache_acct_op_id owner_op;
+    CHECK(owner.claim.commit(32, owner_op));
+
+    llama_cache_acct_op_id fence_op;
+    llama_cache_acct_alloc_id fence_allocation;
+    std::vector<llama_cache_transaction_leaf> fence {
+        transaction_leaf(PAYLOAD, 64, fence_op, fence_allocation),
+    };
+    auto dedup_prepared = llama_cache_prepare_reservation_transaction(
+        dedup_ledger, config, fence);
+    CHECK(dedup_prepared.ready());
+    llama_cache_acct_op_id joined_op;
+    llama_cache_acct_alloc_id joined_allocation;
+    auto joined = transaction_leaf(
+        PAYLOAD, 32, joined_op, joined_allocation);
+    joined.reserve_resident = 0;
+    joined.existing_allocation = shared_allocation;
+    std::vector<llama_cache_transaction_leaf> deduplicated {
+        std::move(joined),
+    };
+    CHECK(dedup_prepared.repartition_downward(deduplicated));
+    CHECK(host_reserved(dedup_ledger) == 0);
+    const auto joined_result =
+        dedup_prepared.materialize_and_commit(deduplicated);
+    CHECK(joined_result.status ==
+          llama_cache_transaction_status::committed);
+    CHECK(joined_allocation == shared_allocation);
+    CHECK(dedup_ledger.snapshot().live_ops == 2);
+    CHECK(dedup_ledger.release(owner_op));
+    CHECK(dedup_ledger.snapshot().live_ops == 1);
+    CHECK(dedup_ledger.release(joined_op));
+    CHECK(dedup_ledger.snapshot().live_ops == 0);
+
+    llama_cache_acct_ledger dropped_ledger;
+    configure_fitting_host(dropped_ledger);
+    llama_cache_acct_op_id dropped_initial_op;
+    llama_cache_acct_alloc_id dropped_initial_allocation;
+    {
+        std::vector<llama_cache_transaction_leaf> dropped_initial {
+            transaction_leaf(
+                PAYLOAD, 32, dropped_initial_op,
+                dropped_initial_allocation),
+        };
+        auto dropped = llama_cache_prepare_reservation_transaction(
+            dropped_ledger, config, dropped_initial);
+        CHECK(dropped.ready());
+        llama_cache_acct_op_id dropped_first_op;
+        llama_cache_acct_op_id dropped_second_op;
+        llama_cache_acct_alloc_id dropped_first_allocation;
+        llama_cache_acct_alloc_id dropped_second_allocation;
+        std::vector<llama_cache_transaction_leaf> dropped_final {
+            transaction_leaf(
+                PAYLOAD, 12, dropped_first_op,
+                dropped_first_allocation),
+            transaction_leaf(
+                PAYLOAD, 8, dropped_second_op,
+                dropped_second_allocation),
+        };
+        CHECK(dropped.repartition_downward(dropped_final));
+        CHECK(dropped_ledger.snapshot().live_ops == 2);
+        CHECK(host_reserved(dropped_ledger) == 20);
+    }
+    CHECK(dropped_ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(dropped_ledger) == 0);
+
+    // Keep the projected maximum leaf shape out of quadratic validation.
+    // This does not materialize payload; it exercises the exact atomic split
+    // and destructor terminal at the 16,384-unit assembly ceiling.
+    llama_cache_acct_ledger scale_ledger;
+    configure_fitting_host(scale_ledger);
+    llama_cache_acct_op_id scale_initial_op;
+    llama_cache_acct_alloc_id scale_initial_allocation;
+    std::vector<llama_cache_transaction_leaf> scale_initial {
+        transaction_leaf(
+            PAYLOAD, 16384, scale_initial_op,
+            scale_initial_allocation),
+    };
+    {
+        auto scale = llama_cache_prepare_reservation_transaction(
+            scale_ledger, config, scale_initial);
+        CHECK(scale.ready());
+        std::vector<llama_cache_acct_op_id> operations(16384);
+        std::vector<llama_cache_acct_alloc_id> allocations(16384);
+        std::vector<llama_cache_transaction_leaf> leaves;
+        leaves.reserve(16384);
+        for (size_t i = 0; i < 16384; ++i) {
+            leaves.push_back(transaction_leaf(
+                PAYLOAD, 1, operations[i], allocations[i]));
+        }
+        CHECK(scale.repartition_downward(leaves));
+        CHECK(scale_ledger.snapshot().live_ops == 16384);
+        CHECK(host_reserved(scale_ledger) == 16384);
+    }
+    CHECK(scale_ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(scale_ledger) == 0);
+}
+
 static void test_atomic_reservation_sets() {
     llama_cache_acct_ledger ledger;
     configure_fitting_host(ledger);
@@ -627,6 +799,7 @@ int main() {
     test_transaction_fault_rollback();
     test_transaction_after_admit_failure();
     test_prepared_transaction_split_phase();
+    test_prepared_transaction_downward_repartition();
     test_atomic_reservation_sets();
     test_prepared_release_set();
     test_status_names();

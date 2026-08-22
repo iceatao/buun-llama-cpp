@@ -209,6 +209,20 @@ inline bool operator!=(const llama_cache_acct_resource_domain & a,
                        const llama_cache_acct_resource_domain & b) {
     return !(a == b);
 }
+inline bool llama_cache_acct_resource_domain_less(
+        const llama_cache_acct_resource_domain & a,
+        const llama_cache_acct_resource_domain & b) {
+    if (a.residency != b.residency) {
+        return a.residency < b.residency;
+    }
+    if (a.kind != b.kind) {
+        return a.kind < b.kind;
+    }
+    if (a.topology != b.topology) {
+        return a.topology.v < b.topology.v;
+    }
+    return a.device_ordinal.v < b.device_ordinal.v;
+}
 static_assert(sizeof(llama_cache_acct_resource_domain) <= 12,
               "resource domains must remain interned keys, not inline topology descriptors");
 
@@ -709,6 +723,19 @@ struct llama_cache_acct_ledger {
             const llama_cache_acct_op_id * selected,
             const uint64_t * resident_bytes,
             size_t n_selected) noexcept;
+
+    // Atomically replace one complete reserved set with a differently
+    // partitioned reserved set. For every category/domain pair, replacement
+    // resident bytes must be no greater than the selected aggregate. This is
+    // the split-phase content-addressing seam: a conservative pre-materialize
+    // fence can become exact fresh/deduplicated publication leaves without
+    // releasing capacity or taking a second budget sample.
+    bool repartition_reservation_set_downward(
+            const llama_cache_acct_op_id * selected,
+            size_t n_selected,
+            const llama_cache_conditional_reserve_request * replacements,
+            size_t n_replacements,
+            llama_cache_acct_op_id * output_ops) noexcept;
 
     // Drop the op's reference; discharges durable bytes when the allocation loses its last
     // reference. Exactly-once per reference — a second release is a fault.

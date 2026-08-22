@@ -984,6 +984,169 @@ bool llama_cache_acct_ledger::shrink_reservation_set(
     return true;
 }
 
+bool llama_cache_acct_ledger::repartition_reservation_set_downward(
+        const llama_cache_acct_op_id * selected,
+        size_t n_selected,
+        const llama_cache_conditional_reserve_request * replacements,
+        size_t n_replacements,
+        llama_cache_acct_op_id * output_ops) noexcept {
+    if (!selected || n_selected == 0 || !replacements ||
+        n_replacements == 0 || !output_ops) {
+        return false;
+    }
+    std::fill(output_ops, output_ops + n_replacements,
+              llama_cache_acct_op_id {});
+    std::lock_guard<std::mutex> lock(mtx);
+    try {
+        struct aggregate {
+            llama_cache_acct_category category;
+            llama_cache_acct_resource_domain domain;
+            uint64_t selected = 0;
+            uint64_t replacement = 0;
+            bool selected_present = false;
+            bool replacement_present = false;
+        };
+        std::vector<aggregate> totals;
+        totals.reserve(n_selected + n_replacements);
+
+        llama_cache_acct_op_id previous;
+        for (size_t i = 0; i < n_selected; ++i) {
+            const auto op = selected[i];
+            const auto found = ops.find(op);
+            if (!op || (previous && op.v <= previous.v) ||
+                found == ops.end() ||
+                found->second.state != llama_cache_acct_txn_state::reserved) {
+                state.faults_invalid_transition++;
+                bump_serial();
+                return false;
+            }
+            previous = op;
+            totals.push_back({ found->second.category,
+                               found->second.domain,
+                               found->second.reserved_bytes, 0,
+                               true, false });
+        }
+        for (size_t i = 0; i < n_replacements; ++i) {
+            const auto & request = replacements[i];
+            totals.push_back({ request.category, request.domain, 0,
+                               request.expected_resident, false, true });
+        }
+        std::sort(totals.begin(), totals.end(), [&](const aggregate & lhs,
+                                                    const aggregate & rhs) {
+            if (lhs.category != rhs.category) {
+                return lhs.category < rhs.category;
+            }
+            return llama_cache_acct_resource_domain_less(
+                lhs.domain, rhs.domain);
+        });
+        size_t aggregate_count = 0;
+        for (size_t begin = 0; begin < totals.size();) {
+            size_t end = begin + 1;
+            uint64_t selected_total = totals[begin].selected;
+            uint64_t replacement_total = totals[begin].replacement;
+            bool selected_present = totals[begin].selected_present;
+            bool replacement_present = totals[begin].replacement_present;
+            while (end < totals.size() &&
+                   totals[end].category == totals[begin].category &&
+                   totals[end].domain == totals[begin].domain) {
+                if (totals[end].selected >
+                        std::numeric_limits<uint64_t>::max() -
+                            selected_total ||
+                    totals[end].replacement >
+                        std::numeric_limits<uint64_t>::max() -
+                            replacement_total) {
+                    state.faults_overflow++;
+                    bump_serial();
+                    return false;
+                }
+                selected_total += totals[end].selected;
+                replacement_total += totals[end].replacement;
+                selected_present = selected_present ||
+                    totals[end].selected_present;
+                replacement_present = replacement_present ||
+                    totals[end].replacement_present;
+                ++end;
+            }
+            if ((replacement_present && !selected_present) ||
+                (replacement_present &&
+                 (!domain_use_valid(totals[begin].category,
+                                    totals[begin].domain) ||
+                  !find_cell(totals[begin].category,
+                             totals[begin].domain))) ||
+                replacement_total > selected_total) {
+                state.faults_invalid_transition++;
+                bump_serial();
+                return false;
+            }
+            totals[aggregate_count] = totals[begin];
+            totals[aggregate_count].selected = selected_total;
+            totals[aggregate_count].replacement = replacement_total;
+            totals[aggregate_count].selected_present = selected_present;
+            totals[aggregate_count].replacement_present = replacement_present;
+            ++aggregate_count;
+            begin = end;
+        }
+        totals.resize(aggregate_count);
+        if (n_replacements >
+                std::numeric_limits<uint64_t>::max() - next_op.v) {
+            state.faults_overflow++;
+            bump_serial();
+            return false;
+        }
+
+        // Insert the replacement nodes before touching the selected set. If a
+        // node allocation fails, erase the invisible replacements and leave
+        // every old reservation and gauge intact.
+        ops.reserve(ops.size() + n_replacements);
+        size_t inserted = 0;
+        try {
+            for (; inserted < n_replacements; ++inserted) {
+                const auto op = llama_cache_acct_op_id {
+                    next_op.v + inserted,
+                };
+                txn transaction;
+                transaction.state = llama_cache_acct_txn_state::reserved;
+                transaction.category = replacements[inserted].category;
+                transaction.domain = replacements[inserted].domain;
+                transaction.attribution = replacements[inserted].attribution;
+                transaction.reserved_bytes =
+                    replacements[inserted].expected_resident;
+                const auto added = ops.emplace(op, transaction);
+                if (!added.second) {
+                    throw std::bad_alloc();
+                }
+                output_ops[inserted] = op;
+            }
+        } catch (...) {
+            for (size_t i = 0; i < inserted; ++i) {
+                ops.erase(output_ops[i]);
+                output_ops[i] = {};
+            }
+            state.faults_allocation++;
+            bump_serial();
+            return false;
+        }
+
+        for (size_t i = 0; i < n_selected; ++i) {
+            const auto found = ops.find(selected[i]);
+            GGML_ASSERT(found != ops.end());
+            ops.erase(found);
+        }
+        for (const auto & total : totals) {
+            cell_sub(total.category, total.domain,
+                     llama_cache_acct_measure::reserved,
+                     total.selected - total.replacement);
+        }
+        next_op.v += n_replacements;
+        bump_serial();
+        return true;
+    } catch (...) {
+        state.faults_allocation++;
+        bump_serial();
+        return false;
+    }
+}
+
 llama_cache_acct_ledger::release_resolution_status
 llama_cache_acct_ledger::resolve_release_locked(
         llama_cache_acct_op_id op,
