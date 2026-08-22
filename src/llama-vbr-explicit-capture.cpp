@@ -2507,7 +2507,7 @@ uint64_t vbr_explicit_import_policy_epoch(
     }
 }
 
-bool vbr_explicit_import_target_snapshot(
+static bool import_target_snapshot_core(
         llama_memory_i & memory,
         llama_seq_id destination,
         const vbr_artifact_package_view & package,
@@ -2516,13 +2516,18 @@ bool vbr_explicit_import_target_snapshot(
         uint64_t accounting_serial,
         vbr_target_validation_snapshot & output,
         vbr_downward_policy_projection * downward_projection,
-        bool * downward_required) noexcept {
+        bool * downward_required,
+        vbr_import_schedule_quote * schedule_quote,
+        const vbr_import_schedule_quote * authenticated_schedule) noexcept {
     output = {};
     if (downward_projection) {
         *downward_projection = {};
     }
     if (downward_required) {
         *downward_required = false;
+    }
+    if (schedule_quote) {
+        *schedule_quote = {};
     }
     try {
         std::vector<llama_memory_tree_child> tree;
@@ -2597,17 +2602,51 @@ bool vbr_explicit_import_target_snapshot(
             output = {};
             return false;
         }
-        // A projection pointer grants permission to classify a mismatch; it
-        // must not make an all-match/native import run the downward binder.
-        // The binder rewrites projected policy digests/cursors, so this branch
-        // is the semantic separation between native and downward snapshots.
-        if (type_mismatch) {
+        vbr_import_schedule_quote local_schedule;
+        const vbr_import_schedule_quote * negotiated = nullptr;
+        if (authenticated_schedule != nullptr) {
+            if (!vbr_import_schedule_quote_matches(
+                    *authenticated_schedule, output, package)) {
+                output = {};
+                return false;
+            }
+            negotiated = authenticated_schedule;
+        } else {
+            auto * destination = schedule_quote != nullptr
+                ? schedule_quote : &local_schedule;
+            if (!vbr_quote_import_schedule(output, package, *destination)) {
+                output = {};
+                return false;
+            }
+            negotiated = destination;
+        }
+        const auto schedule_status = negotiated->status();
+        if (schedule_status != vbr_import_schedule_status::exact &&
+            schedule_status != vbr_import_schedule_status::downward) {
+            // A caller asking for the quote can report the unsupported
+            // schedule without pretending it was a downward-bind failure.
+            return schedule_quote != nullptr;
+        }
+        if (type_mismatch !=
+                (schedule_status == vbr_import_schedule_status::downward)) {
+            output = {};
+            if (schedule_quote) {
+                *schedule_quote = {};
+            }
+            return false;
+        }
+        // The binder rewrites projected policy digests/cursors only for the
+        // already-classified downward schedule. Exact imports stay native.
+        if (schedule_status == vbr_import_schedule_status::downward) {
             if (downward_projection == nullptr ||
                 !vbr_live_capture_adapter::bind_import_downward(
                     tree, package, output, *downward_projection)) {
                 output = {};
                 if (downward_projection) {
                     *downward_projection = {};
+                }
+                if (schedule_quote) {
+                    *schedule_quote = {};
                 }
                 return false;
             }
@@ -2621,8 +2660,85 @@ bool vbr_explicit_import_target_snapshot(
         if (downward_projection) {
             *downward_projection = {};
         }
+        if (schedule_quote) {
+            *schedule_quote = {};
+        }
         return false;
     }
+}
+
+bool vbr_explicit_import_target_snapshot(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_artifact_package_view & package,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        bool previously_observed,
+        uint64_t accounting_serial,
+        vbr_target_validation_snapshot & output,
+        vbr_downward_policy_projection * downward_projection,
+        bool * downward_required) noexcept {
+    return import_target_snapshot_core(
+        memory, destination, package, bindings, previously_observed,
+        accounting_serial, output, downward_projection, downward_required,
+        nullptr, nullptr);
+}
+
+vbr_import_target_snapshot_status
+vbr_explicit_import_target_schedule_snapshot(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_artifact_package_view & package,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        bool previously_observed,
+        uint64_t accounting_serial,
+        vbr_target_validation_snapshot & output,
+        vbr_downward_policy_projection & downward_projection,
+        bool & downward_required,
+        vbr_import_schedule_quote & schedule_quote) noexcept {
+    if (!import_target_snapshot_core(
+            memory, destination, package, bindings, previously_observed,
+            accounting_serial, output, &downward_projection,
+            &downward_required, &schedule_quote, nullptr)) {
+        return vbr_import_target_snapshot_status::unavailable;
+    }
+    switch (schedule_quote.status()) {
+        case vbr_import_schedule_status::exact:
+        case vbr_import_schedule_status::downward:
+            return vbr_import_target_snapshot_status::actionable;
+        case vbr_import_schedule_status::upward_same_domain:
+        case vbr_import_schedule_status::upward_cross_domain:
+        case vbr_import_schedule_status::mixed_direction_unsupported:
+            return vbr_import_target_snapshot_status::report_only;
+        case vbr_import_schedule_status::unavailable:
+        case vbr_import_schedule_status::_count:
+            return vbr_import_target_snapshot_status::unavailable;
+    }
+    return vbr_import_target_snapshot_status::unavailable;
+}
+
+bool vbr_explicit_import_downward_projection_recheck(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_artifact_package_view & package,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        const vbr_import_schedule_quote & authenticated_schedule,
+        std::array<uint8_t, 32> & tree_digest) noexcept {
+    tree_digest = {};
+    vbr_target_validation_snapshot snapshot;
+    vbr_downward_policy_projection projection;
+    bool downward = false;
+    if (!import_target_snapshot_core(
+            memory, destination, package, bindings, false,
+            authenticated_schedule.accounting_serial(), snapshot,
+            &projection, &downward,
+            nullptr, &authenticated_schedule) || !downward ||
+        projection.status != vbr_downward_policy_status::coherent) {
+        return false;
+    }
+    tree_digest = projection.tree_digest;
+    return std::any_of(
+        tree_digest.begin(), tree_digest.end(),
+        [](uint8_t byte) { return byte != 0; });
 }
 
 bool vbr_explicit_import_target_recheck(

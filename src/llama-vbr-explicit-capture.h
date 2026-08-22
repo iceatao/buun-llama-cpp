@@ -15,6 +15,7 @@ struct vbr_target_empty_fingerprint;
 struct vbr_downward_policy_projection;
 struct vbr_downward_stage_reservation;
 struct vbr_validated_child_plan;
+struct vbr_import_schedule_quote;
 
 enum class vbr_explicit_capture_status : uint8_t {
     ok = 0,
@@ -181,6 +182,41 @@ bool vbr_explicit_import_target_snapshot(
     vbr_target_validation_snapshot & output,
     vbr_downward_policy_projection * downward_projection = nullptr,
     bool * downward_required = nullptr) noexcept;
+
+enum class vbr_import_target_snapshot_status : uint8_t {
+    actionable = 0,
+    report_only,
+    unavailable,
+    _count,
+};
+static_assert(uint8_t(vbr_import_target_snapshot_status::_count) == 3);
+
+// Typed reporting seam. Unlike the legacy actionable-only boolean above,
+// report-only upward/mixed schedules return their immutable quote without
+// implying that validation, staging, or adoption may proceed.
+vbr_import_target_snapshot_status
+vbr_explicit_import_target_schedule_snapshot(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & package,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    bool previously_observed,
+    uint64_t accounting_serial,
+    vbr_target_validation_snapshot & output,
+    vbr_downward_policy_projection & downward_projection,
+    bool & downward_required,
+    vbr_import_schedule_quote & schedule_quote) noexcept;
+
+// Final downward barrier. Reuses the immutable validated schedule capability
+// and recomputes only live target/projection evidence; it does not rematerialize
+// or rehash the package.
+bool vbr_explicit_import_downward_projection_recheck(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & package,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    const vbr_import_schedule_quote & authenticated_schedule,
+    std::array<uint8_t, 32> & tree_digest) noexcept;
 bool vbr_explicit_import_target_recheck(
     llama_memory_i & memory,
     llama_seq_id destination,

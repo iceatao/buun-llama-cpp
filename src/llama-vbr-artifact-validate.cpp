@@ -492,6 +492,231 @@ bool accounting_plan(
 
 } // namespace
 
+const char * vbr_import_schedule_status_name(
+        vbr_import_schedule_status status) noexcept {
+    switch (status) {
+        case vbr_import_schedule_status::exact: return "exact";
+        case vbr_import_schedule_status::downward: return "downward";
+        case vbr_import_schedule_status::upward_same_domain:
+            return "upward_same_domain";
+        case vbr_import_schedule_status::upward_cross_domain:
+            return "upward_cross_domain";
+        case vbr_import_schedule_status::mixed_direction_unsupported:
+            return "mixed_direction_unsupported";
+        case vbr_import_schedule_status::unavailable: return "unavailable";
+        case vbr_import_schedule_status::_count: break;
+    }
+    return "invalid";
+}
+
+vbr_import_schedule_status vbr_classify_import_schedule_units(
+        const std::vector<vbr_import_schedule_unit> & units) noexcept {
+    if (units.empty()) {
+        return vbr_import_schedule_status::unavailable;
+    }
+    bool has_downward = false;
+    bool has_upward = false;
+    bool has_cross_domain_upward = false;
+    for (const auto & unit : units) {
+        if (unit.source_type < 0 || unit.target_type < 0) {
+            return vbr_import_schedule_status::unavailable;
+        }
+        const auto source = static_cast<ggml_type>(unit.source_type);
+        const auto target = static_cast<ggml_type>(unit.target_type);
+        if (unit.source_domain != vbr_downward_tier_domain(source) ||
+            unit.target_domain != vbr_downward_tier_domain(target)) {
+            return vbr_import_schedule_status::unavailable;
+        }
+        vbr_downward_recipe recipe;
+        const auto relation = vbr_downward_resolve_recipe(
+            source, target, GGML_TYPE_TURBO1_TCQ, true, recipe);
+        if (relation == vbr_downward_recipe_status::resolved) {
+            has_downward = true;
+        } else if (relation ==
+                   vbr_downward_recipe_status::upward_forbidden) {
+            has_upward = true;
+            has_cross_domain_upward |=
+                unit.source_domain != unit.target_domain;
+        } else if (relation != vbr_downward_recipe_status::equal_tier) {
+            return vbr_import_schedule_status::unavailable;
+        }
+    }
+    if (has_downward && has_upward) {
+        return vbr_import_schedule_status::mixed_direction_unsupported;
+    }
+    if (has_upward) {
+        return has_cross_domain_upward
+            ? vbr_import_schedule_status::upward_cross_domain
+            : vbr_import_schedule_status::upward_same_domain;
+    }
+    return has_downward
+        ? vbr_import_schedule_status::downward
+        : vbr_import_schedule_status::exact;
+}
+
+bool vbr_quote_import_schedule(
+        const vbr_target_validation_snapshot & target,
+        const vbr_artifact_package_view & package,
+        vbr_import_schedule_quote & output) noexcept {
+    output = {};
+    try {
+        if (!package || package.validate() != vbr_artifact_status::ok ||
+            !package.manifest().manifest_digest.valid() ||
+            target.memory_instance_cookie == 0 ||
+            target.target_state_serial == 0 ||
+            target.tree_shape_digest == 0 || target.policy_epoch == 0 ||
+            target.children.empty() || package.units().empty()) {
+            return false;
+        }
+        output.manifest_digest_ = package.manifest().manifest_digest;
+        output.memory_instance_cookie_ = target.memory_instance_cookie;
+        output.target_state_serial_ = target.target_state_serial;
+        output.accounting_serial_ = target.accounting_serial;
+        output.tree_shape_digest_ = target.tree_shape_digest;
+        output.policy_epoch_ = target.policy_epoch;
+
+        for (size_t child_index = 0;
+             child_index < target.children.size(); ++child_index) {
+            const auto & child = target.children[child_index];
+            if (child.child_id != child_index) {
+                output = {};
+                return false;
+            }
+            for (size_t unit_index = 0;
+                 unit_index < child.units.size(); ++unit_index) {
+                if (child.units[unit_index].logical_unit_id != unit_index) {
+                    output = {};
+                    return false;
+                }
+            }
+        }
+        output.units_.reserve(package.units().size());
+        for (const auto & source : package.units()) {
+            if (source.descriptor.child_id >= target.children.size()) {
+                output = {};
+                return false;
+            }
+            const auto & child =
+                target.children[source.descriptor.child_id];
+            if (source.descriptor.logical_unit_id >= child.units.size() ||
+                source.descriptor.current_type < 0 ||
+                child.units[source.descriptor.logical_unit_id].current_type < 0) {
+                output = {};
+                return false;
+            }
+            const auto & unit =
+                child.units[source.descriptor.logical_unit_id];
+            const auto source_type = static_cast<ggml_type>(
+                source.descriptor.current_type);
+            const auto target_type = static_cast<ggml_type>(
+                unit.current_type);
+            const auto source_domain = vbr_downward_tier_domain(source_type);
+            const auto target_domain = vbr_downward_tier_domain(target_type);
+            if (unit.current_domain != target_domain) {
+                output = {};
+                return false;
+            }
+            for (const auto & shard : source.descriptor.shards) {
+                uint64_t next = 0;
+                if (!add_checked(
+                        output.source_payload_bytes_,
+                        shard.payload_bytes, next)) {
+                    output = {};
+                    return false;
+                }
+                output.source_payload_bytes_ = next;
+            }
+            for (const auto & shard : unit.shards) {
+                uint64_t next = 0;
+                if (!add_checked(
+                        output.target_mapped_bytes_,
+                        shard.mapped_bytes, next)) {
+                    output = {};
+                    return false;
+                }
+                output.target_mapped_bytes_ = next;
+            }
+            output.units_.push_back({
+                source.descriptor.child_id,
+                source.descriptor.logical_unit_id,
+                source.descriptor.current_type,
+                unit.current_type,
+                source_domain,
+                target_domain,
+            });
+        }
+        output.status_ = vbr_classify_import_schedule_units(output.units_);
+        return output.status_ != vbr_import_schedule_status::unavailable;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+bool vbr_import_schedule_quote_matches(
+        const vbr_import_schedule_quote & quote,
+        const vbr_target_validation_snapshot & target,
+        const vbr_artifact_package_view & package) noexcept {
+    if (!package ||
+        quote.status_ == vbr_import_schedule_status::unavailable ||
+        quote.status_ == vbr_import_schedule_status::_count ||
+        quote.manifest_digest_ != package.manifest().manifest_digest ||
+        quote.memory_instance_cookie_ != target.memory_instance_cookie ||
+        quote.target_state_serial_ != target.target_state_serial ||
+        quote.accounting_serial_ != target.accounting_serial ||
+        quote.tree_shape_digest_ != target.tree_shape_digest ||
+        quote.policy_epoch_ != target.policy_epoch) {
+        return false;
+    }
+    if (quote.units_.size() != package.units().size()) {
+        return false;
+    }
+    uint64_t source_payload_bytes = 0;
+    uint64_t target_mapped_bytes = 0;
+    for (size_t i = 0; i < quote.units_.size(); ++i) {
+        const auto & expected = quote.units_[i];
+        const auto & source = package.units()[i].descriptor;
+        if (expected.child_id != source.child_id ||
+            expected.logical_unit_id != source.logical_unit_id ||
+            expected.source_type != source.current_type ||
+            source.child_id >= target.children.size() ||
+            target.children[source.child_id].child_id != source.child_id ||
+            source.logical_unit_id >=
+                target.children[source.child_id].units.size()) {
+            return false;
+        }
+        const auto & unit = target.children[source.child_id].units[
+            source.logical_unit_id];
+        if (unit.logical_unit_id != source.logical_unit_id ||
+            expected.target_type != unit.current_type ||
+            expected.source_domain != vbr_downward_tier_domain(
+                static_cast<ggml_type>(source.current_type)) ||
+            expected.target_domain != unit.current_domain ||
+            expected.target_domain != vbr_downward_tier_domain(
+                static_cast<ggml_type>(unit.current_type))) {
+            return false;
+        }
+        for (const auto & shard : source.shards) {
+            uint64_t next = 0;
+            if (!add_checked(
+                    source_payload_bytes, shard.payload_bytes, next)) {
+                return false;
+            }
+            source_payload_bytes = next;
+        }
+        for (const auto & shard : unit.shards) {
+            uint64_t next = 0;
+            if (!add_checked(
+                    target_mapped_bytes, shard.mapped_bytes, next)) {
+                return false;
+            }
+            target_mapped_bytes = next;
+        }
+    }
+    return source_payload_bytes == quote.source_payload_bytes_ &&
+           target_mapped_bytes == quote.target_mapped_bytes_;
+}
+
 vbr_validated_manifest::vbr_validated_manifest(
         vbr_validated_manifest &&) noexcept = default;
 vbr_validated_manifest & vbr_validated_manifest::operator=(
@@ -508,9 +733,31 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             return terminal_result(
                 vbr_manifest_validation_status::unsupported_artifact_version);
         }
-        const auto codec = package.validate();
-        if (codec != vbr_artifact_status::ok) {
-            return terminal_result(codec_status(codec));
+        if (policy.schedule_quote != nullptr) {
+            if (!vbr_import_schedule_quote_matches(
+                    *policy.schedule_quote, target, package)) {
+                return terminal_result(
+                    vbr_manifest_validation_status::unavailable);
+            }
+            switch (policy.schedule_quote->status()) {
+                case vbr_import_schedule_status::exact:
+                case vbr_import_schedule_status::downward:
+                    break;
+                case vbr_import_schedule_status::upward_same_domain:
+                case vbr_import_schedule_status::upward_cross_domain:
+                case vbr_import_schedule_status::mixed_direction_unsupported:
+                    return terminal_result(
+                        vbr_manifest_validation_status::unavailable);
+                case vbr_import_schedule_status::unavailable:
+                case vbr_import_schedule_status::_count:
+                    return terminal_result(
+                        vbr_manifest_validation_status::unavailable);
+            }
+        } else {
+            const auto codec = package.validate();
+            if (codec != vbr_artifact_status::ok) {
+                return terminal_result(codec_status(codec));
+            }
         }
         const auto & manifest = package.manifest();
         if (manifest.version <
@@ -1078,6 +1325,14 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         }
 
         vbr_import_decision decision;
+        if (policy.schedule_quote != nullptr &&
+            ((needs_downward && policy.schedule_quote->status() !=
+                                  vbr_import_schedule_status::downward) ||
+             (!needs_downward && policy.schedule_quote->status() !=
+                                   vbr_import_schedule_status::exact))) {
+            return terminal_result(
+                vbr_manifest_validation_status::unavailable);
+        }
         if (needs_downward) {
             decision = vbr_import_decision::downward_rebase;
         } else if (needs_live_rebase || !policy.allow_native) {

@@ -63,6 +63,91 @@ const char * vbr_import_decision_name(vbr_import_decision decision) noexcept;
 const char * vbr_manifest_validation_status_name(
     vbr_manifest_validation_status status) noexcept;
 
+struct vbr_target_validation_snapshot;
+
+// Immutable classification of the artifact schedule against one canonical
+// target snapshot.  This deliberately precedes any transcode/materialization:
+// unsupported upward cases remain observable instead of being collapsed into
+// a failed downward bind.
+enum class vbr_import_schedule_status : uint8_t {
+    unavailable = 0,
+    exact,
+    downward,
+    upward_same_domain,
+    upward_cross_domain,
+    mixed_direction_unsupported,
+    _count,
+};
+static_assert(uint8_t(vbr_import_schedule_status::_count) == 6);
+
+const char * vbr_import_schedule_status_name(
+    vbr_import_schedule_status status) noexcept;
+
+struct vbr_import_schedule_unit {
+    uint32_t child_id = UINT32_MAX;
+    uint32_t logical_unit_id = UINT32_MAX;
+    int32_t source_type = -1;
+    int32_t target_type = -1;
+    vbr_repr_domain source_domain = vbr_repr_domain::full;
+    vbr_repr_domain target_domain = vbr_repr_domain::full;
+
+    bool operator==(const vbr_import_schedule_unit & other) const noexcept {
+        return child_id == other.child_id &&
+               logical_unit_id == other.logical_unit_id &&
+               source_type == other.source_type &&
+               target_type == other.target_type &&
+               source_domain == other.source_domain &&
+               target_domain == other.target_domain;
+    }
+};
+
+// Canonical direction reducer used by the quote builder and model-free
+// mutation tests. Rows must already carry canonical tier domains.
+vbr_import_schedule_status vbr_classify_import_schedule_units(
+    const std::vector<vbr_import_schedule_unit> & units) noexcept;
+
+class vbr_import_schedule_quote {
+public:
+    vbr_import_schedule_status status() const noexcept { return status_; }
+    const vbr_manifest_digest & manifest_digest() const noexcept {
+        return manifest_digest_;
+    }
+    uint64_t source_payload_bytes() const noexcept {
+        return source_payload_bytes_;
+    }
+    uint64_t target_mapped_bytes() const noexcept {
+        return target_mapped_bytes_;
+    }
+    uint64_t accounting_serial() const noexcept {
+        return accounting_serial_;
+    }
+    const std::vector<vbr_import_schedule_unit> & units() const noexcept {
+        return units_;
+    }
+
+private:
+    vbr_import_schedule_status status_ =
+        vbr_import_schedule_status::unavailable;
+    vbr_manifest_digest manifest_digest_;
+    uint64_t memory_instance_cookie_ = 0;
+    uint64_t target_state_serial_ = 0;
+    uint64_t accounting_serial_ = 0;
+    uint64_t tree_shape_digest_ = 0;
+    uint64_t policy_epoch_ = 0;
+    uint64_t source_payload_bytes_ = 0;
+    uint64_t target_mapped_bytes_ = 0;
+    std::vector<vbr_import_schedule_unit> units_;
+
+    friend bool vbr_quote_import_schedule(
+        const vbr_target_validation_snapshot &,
+        const vbr_artifact_package_view &,
+        vbr_import_schedule_quote &) noexcept;
+    friend bool vbr_import_schedule_quote_matches(
+        const vbr_import_schedule_quote &,
+        const vbr_target_validation_snapshot &,
+        const vbr_artifact_package_view &) noexcept;
+};
+
 struct vbr_import_identity {
     std::string execution_identity;
     std::string adapter_config_identity;
@@ -199,6 +284,18 @@ struct vbr_target_validation_snapshot {
     std::vector<vbr_target_companion_snapshot> companions;
 };
 
+// Quotes the already-selected current target schedule. It does not choose a
+// higher tier; the controller-owned highest-feasible selector is a separate
+// step that will consume this immutable evidence.
+bool vbr_quote_import_schedule(
+    const vbr_target_validation_snapshot & target,
+    const vbr_artifact_package_view & package,
+    vbr_import_schedule_quote & output) noexcept;
+bool vbr_import_schedule_quote_matches(
+    const vbr_import_schedule_quote & quote,
+    const vbr_target_validation_snapshot & target,
+    const vbr_artifact_package_view & package) noexcept;
+
 struct vbr_target_empty_fingerprint;
 class vbr_staged_payloads;
 struct vbr_adopt_result;
@@ -243,6 +340,7 @@ struct vbr_adopt_policy {
     const llama_cache_budget_config * budget_config = nullptr;
     const llama_cache_budget_plan * downward_budget_plan = nullptr;
     const vbr_downward_policy_projection * downward_projection = nullptr;
+    const vbr_import_schedule_quote * schedule_quote = nullptr;
     const void * context = nullptr;
     inspect_target_fn inspect_target = nullptr;
     parse_companion_fn parse_companion = nullptr;

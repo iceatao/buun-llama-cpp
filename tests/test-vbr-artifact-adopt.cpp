@@ -2953,11 +2953,18 @@ static bool f42a_model_backed_adoption(
         vbr_target_validation_snapshot target_snapshot;
         vbr_downward_policy_projection downward_projection;
         bool detected_downward = false;
-        CHECK(vbr_explicit_import_target_snapshot(
+        vbr_import_schedule_quote schedule_quote;
+        CHECK(vbr_explicit_import_target_schedule_snapshot(
             *target_memory, 0, package, bindings, previously_observed,
             accounting_snapshot.serial, target_snapshot,
-            &downward_projection, &detected_downward));
+            downward_projection, detected_downward, schedule_quote) ==
+            vbr_import_target_snapshot_status::actionable);
         CHECK(detected_downward == downward_mode);
+        CHECK(schedule_quote.status() == (downward_mode
+            ? vbr_import_schedule_status::downward
+            : vbr_import_schedule_status::exact));
+        CHECK(vbr_import_schedule_quote_matches(
+            schedule_quote, target_snapshot, package));
         if (!detected_downward) {
             CHECK(downward_projection.final_types.empty());
         }
@@ -2994,6 +3001,7 @@ static bool f42a_model_backed_adoption(
         policy.domain_bindings.push_back({ UINT32_MAX, UINT16_MAX, pinned });
         policy.accounting_snapshot = &accounting_snapshot;
         policy.budget_config = &budget;
+        policy.schedule_quote = &schedule_quote;
         policy.context = &target_owner;
         policy.recheck_target_empty = f42a_harness_target::recheck;
         policy.read_accounting_serial =

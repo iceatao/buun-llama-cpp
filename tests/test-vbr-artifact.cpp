@@ -3257,7 +3257,8 @@ struct validator_fixture {
     vbr_adopt_policy policy;
 
     // stash_case: 0 = exact full prefix, 1 = source-present partial
-    // authorization, 2 = tapped/absent at source, 3 = full-domain/absent.
+    // authorization, 2 = absent at source, 3 = T8/full-domain absent,
+    // 4 = T4/tapped-domain absent.
     explicit validator_fixture(
             bool legacy_v1 = false,
             int stash_case = 0,
@@ -3307,12 +3308,14 @@ struct validator_fixture {
                             vbr_artifact_accounting_role::clean_stash_payload;
                     }),
                 manifest.accounting.end());
-            if (stash_case == 3) {
-                descriptor.current_type = GGML_TYPE_TURBO8_0;
+            if (stash_case == 3 || stash_case == 4) {
+                descriptor.current_type = stash_case == 3
+                    ? GGML_TYPE_TURBO8_0 : GGML_TYPE_TURBO4_0;
                 manifest.generation.controllers[0].units[0].current_type =
-                    GGML_TYPE_TURBO8_0;
+                    descriptor.current_type;
                 manifest.generation.controllers[0].units[0].domain =
-                    vbr_repr_domain::full;
+                    stash_case == 3
+                        ? vbr_repr_domain::full : vbr_repr_domain::tapped;
             }
         }
         manifest.manifest_digest = {};
@@ -3511,6 +3514,36 @@ static vbr_manifest_validation_result validate(
 static void test_manifest_validator_matrix() {
     validator_fixture f;
 
+    vbr_import_schedule_quote exact_quote;
+    CHECK(vbr_quote_import_schedule(f.target, f.view, exact_quote));
+    CHECK(exact_quote.status() == vbr_import_schedule_status::exact);
+    CHECK(exact_quote.manifest_digest() == f.view.manifest().manifest_digest);
+    CHECK(exact_quote.units().size() == f.view.units().size());
+    CHECK(vbr_import_schedule_quote_matches(
+        exact_quote, f.target, f.view));
+    auto drifted_target = f.target;
+    ++drifted_target.accounting_serial;
+    CHECK(!vbr_import_schedule_quote_matches(
+        exact_quote, drifted_target, f.view));
+    auto drifted_schedule = f.target;
+    drifted_schedule.children[0].units[0].current_type =
+        GGML_TYPE_TURBO8_0;
+    drifted_schedule.children[0].units[0].current_domain =
+        vbr_repr_domain::full;
+    CHECK(!vbr_import_schedule_quote_matches(
+        exact_quote, drifted_schedule, f.view));
+
+    auto quoted_policy = f.policy;
+    quoted_policy.schedule_quote = &exact_quote;
+    auto quoted_native = validate(f, f.target, quoted_policy);
+    CHECK(quoted_native.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(quoted_native.decision == vbr_import_decision::native_import);
+    auto refused_quote = validate(f, drifted_target, quoted_policy);
+    CHECK(refused_quote.status ==
+          vbr_manifest_validation_status::unavailable);
+    CHECK(!refused_quote.proof);
+
     vbr_artifact_package_view absent_package;
     const auto absent = vbr_validate_unit_manifest_snapshot(
         f.target, absent_package, f.policy);
@@ -3678,6 +3711,69 @@ static void test_manifest_validator_matrix() {
     CHECK(downward.proof->tracker_install().children[0].units[0].repr_gen == 1);
     CHECK(downward.proof->tracker_install().children[0].units[0].last_transition ==
           vbr_repr_transition::whole_import);
+    vbr_import_schedule_quote downward_quote;
+    CHECK(vbr_quote_import_schedule(
+        downward_target, f.view, downward_quote));
+    CHECK(downward_quote.status() == vbr_import_schedule_status::downward);
+
+    validator_fixture same_domain_source(false, 3);
+    auto same_domain_target = same_domain_source.target;
+    same_domain_target.children[0].units[0].current_type = GGML_TYPE_F16;
+    same_domain_target.children[0].units[0].current_domain =
+        vbr_repr_domain::full;
+    vbr_import_schedule_quote same_domain_upward;
+    CHECK(vbr_quote_import_schedule(
+        same_domain_target, same_domain_source.view, same_domain_upward));
+    CHECK(same_domain_upward.status() ==
+          vbr_import_schedule_status::upward_same_domain);
+
+    validator_fixture cross_domain_source(false, 4);
+    auto cross_domain_target = cross_domain_source.target;
+    cross_domain_target.children[0].units[0].current_type = GGML_TYPE_F16;
+    cross_domain_target.children[0].units[0].current_domain =
+        vbr_repr_domain::full;
+    vbr_import_schedule_quote cross_domain_upward;
+    CHECK(vbr_quote_import_schedule(
+        cross_domain_target, cross_domain_source.view,
+        cross_domain_upward));
+    CHECK(cross_domain_upward.status() ==
+          vbr_import_schedule_status::upward_cross_domain);
+    CHECK(vbr_classify_import_schedule_units({
+        { 0, 0, GGML_TYPE_F16, GGML_TYPE_TURBO4_0,
+          vbr_repr_domain::full, vbr_repr_domain::tapped },
+        { 0, 1, GGML_TYPE_TURBO4_0, GGML_TYPE_F16,
+          vbr_repr_domain::tapped, vbr_repr_domain::full },
+    }) == vbr_import_schedule_status::mixed_direction_unsupported);
+    CHECK(vbr_classify_import_schedule_units({
+        { 0, 0, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+          vbr_repr_domain::tapped, vbr_repr_domain::full },
+    }) == vbr_import_schedule_status::unavailable);
+
+    auto unsupported_policy = same_domain_source.policy;
+    unsupported_policy.schedule_quote = &same_domain_upward;
+    auto unsupported = validate(
+        same_domain_source, same_domain_target, unsupported_policy);
+    CHECK(unsupported.status == vbr_manifest_validation_status::unavailable);
+    CHECK(!unsupported.proof);
+    unsupported_policy.authorized = false;
+    auto unauthorized_upward = validate(
+        same_domain_source, same_domain_target, unsupported_policy);
+    CHECK(unauthorized_upward.status ==
+          vbr_manifest_validation_status::unavailable);
+    CHECK(unauthorized_upward.decision == vbr_import_decision::reject);
+    unsupported_policy = same_domain_source.policy;
+    unsupported_policy.identity.execution_identity += ":wrong";
+    unsupported_policy.schedule_quote = &same_domain_upward;
+    auto wrong_identity_upward = validate(
+        same_domain_source, same_domain_target, unsupported_policy);
+    CHECK(wrong_identity_upward.status ==
+          vbr_manifest_validation_status::unavailable);
+    CHECK(!wrong_identity_upward.proof);
+    for (uint8_t i = 0;
+         i < uint8_t(vbr_import_schedule_status::_count); ++i) {
+        CHECK(strcmp(vbr_import_schedule_status_name(
+                  vbr_import_schedule_status(i)), "invalid") != 0);
+    }
 
     auto restrictive = f.base.budget;
     for (auto & device : restrictive.devices) {

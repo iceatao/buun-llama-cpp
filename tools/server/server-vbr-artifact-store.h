@@ -285,6 +285,8 @@ struct server_vbr_artifact_store_counters {
     uint64_t imports_unavailable = 0;
     std::array<uint64_t, size_t(vbr_import_decision::_count)>
         import_decisions = {};
+    std::array<uint64_t, size_t(vbr_import_schedule_status::_count)>
+        import_schedules = {};
     std::array<uint64_t, size_t(vbr_manifest_validation_status::_count)>
         validation_outcomes = {};
 };
@@ -329,6 +331,8 @@ struct server_vbr_artifact_import_output {
     uint64_t h2d_bytes = 0;
     uint64_t h2d_chunks = 0;
     uint64_t rollback_count = 0;
+    vbr_import_schedule_status schedule_status =
+        vbr_import_schedule_status::unavailable;
     vbr_import_decision decision = vbr_import_decision::reject;
     vbr_artifact_consistency_kind consistency =
         vbr_artifact_consistency_kind::live_rebased;

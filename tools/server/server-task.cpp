@@ -1706,6 +1706,7 @@ json server_task_result_cache_import::to_json() {
               : json(nullptr) },
         { "downward_edge",
           downward_edge == UINT32_MAX ? json(nullptr) : json(downward_edge) },
+        { "schedule", vbr_import_schedule_status_name(schedule_status) },
         { "decision", vbr_import_decision_name(decision) },
         { "consistency", consistency_name },
         { "units", units },

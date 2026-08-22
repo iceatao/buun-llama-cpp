@@ -122,6 +122,7 @@ struct live_import_context {
     llama_cache_acct_ledger * ledger = nullptr;
     const vbr_artifact_package_view * package = nullptr;
     const std::vector<llama_vbr_artifact_domain_binding> * bindings = nullptr;
+    const vbr_import_schedule_quote * schedule_quote = nullptr;
     llama_seq_id destination = -1;
     vbr_target_validation_snapshot snapshot;
 };
@@ -173,20 +174,13 @@ bool import_downward_digest(
         std::array<uint8_t, 32> & output) noexcept {
     const auto * context = static_cast<const live_import_context *>(opaque);
     if (!context || !context->memory || !context->package ||
-        !context->bindings) {
+        !context->bindings || !context->schedule_quote) {
         return false;
     }
-    vbr_target_validation_snapshot snapshot;
-    vbr_downward_policy_projection projection;
-    if (!vbr_explicit_import_target_snapshot(
+    return vbr_explicit_import_downward_projection_recheck(
             *context->memory, context->destination,
-            *context->package, *context->bindings, false,
-            1, snapshot, &projection)) {
-        return false;
-    }
-    output = projection.tree_digest;
-    return std::any_of(output.begin(), output.end(),
-        [](uint8_t byte) { return byte != 0; });
+            *context->package, *context->bindings,
+            *context->schedule_quote, output);
 }
 
 bool import_parse_companion(
@@ -2069,11 +2063,49 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         context.destination = request.destination;
         vbr_downward_policy_projection downward_projection;
         bool downward = false;
-        if (!vbr_explicit_import_target_snapshot(
+        vbr_import_schedule_quote schedule_quote;
+        const auto snapshot_status =
+            vbr_explicit_import_target_schedule_snapshot(
                 *request.memory, request.destination, package,
                 impl_->domain_bindings, request.previously_observed,
                 accounting_snapshot.serial, context.snapshot,
-                &downward_projection, &downward)) {
+                downward_projection, downward, schedule_quote);
+        if (snapshot_status ==
+                vbr_import_target_snapshot_status::unavailable) {
+            output.validation_status =
+                vbr_manifest_validation_status::unavailable;
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
+        output.schedule_status = schedule_quote.status();
+        context.schedule_quote = &schedule_quote;
+        if (schedule_quote.status() != vbr_import_schedule_status::_count) {
+            impl_->counters.import_schedules[
+                size_t(schedule_quote.status())]++;
+        }
+        if (schedule_quote.status() ==
+                vbr_import_schedule_status::unavailable ||
+            schedule_quote.status() == vbr_import_schedule_status::_count) {
+            output.validation_status =
+                vbr_manifest_validation_status::unavailable;
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
+        if (snapshot_status ==
+                vbr_import_target_snapshot_status::report_only) {
+            // Schedule classification is authenticated by the catalog-owned
+            // package and target snapshot, but the full identity validator has
+            // intentionally not run. Do not report it as validated.
+            output.validation_status =
+                vbr_manifest_validation_status::unavailable;
+            output.decision = vbr_import_decision::rebuild;
+            impl_->counters.import_decisions[
+                size_t(vbr_import_decision::rebuild)]++;
+            return fail(server_vbr_artifact_import_status::report_only,
+                        impl_->counters.imports_report_only);
+        }
+        if (snapshot_status !=
+                vbr_import_target_snapshot_status::actionable) {
             output.validation_status =
                 vbr_manifest_validation_status::unavailable;
             return fail(server_vbr_artifact_import_status::unavailable,
@@ -2104,6 +2136,7 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         policy.domain_bindings = impl_->policy_bindings;
         policy.accounting_snapshot = &accounting_snapshot;
         policy.budget_config = &budget;
+        policy.schedule_quote = &schedule_quote;
         policy.context = &context;
         policy.inspect_target = import_inspect_target;
         policy.parse_companion = import_parse_companion;

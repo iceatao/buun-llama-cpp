@@ -11850,6 +11850,7 @@ private:
                         res->phase = imported.phase;
                         res->downward_subphase = imported.downward_subphase;
                         res->downward_edge = imported.downward_edge;
+                        res->schedule_status = imported.schedule_status;
                         res->decision = imported.decision;
                         res->consistency = server_cache_import_route_consistency(
                             imported.status, imported.consistency);
@@ -12006,7 +12007,8 @@ private:
                             "VBR_ARTIFACT_IMPORT end task=%d slot=%d status=%s "
                             "validation=%s stage=%s downward_reserve=%s "
                             "adopt=%s phase=%s subphase=%s edge=%s "
-                            "decision=%s consistency=%s units=%u companions=%u "
+                            "schedule=%s decision=%s consistency=%s "
+                            "units=%u companions=%u "
                             "payload=%" PRIu64 " companion_bytes=%" PRIu64
                             " duration_ms=%.3f total_requested=%" PRIu64
                             " total_succeeded=%" PRIu64
@@ -12024,6 +12026,8 @@ private:
                             vbr_adopt_status_name(imported.adopt_status),
                             phase_name, subphase_name,
                             edge_name.c_str(),
+                            vbr_import_schedule_status_name(
+                                imported.schedule_status),
                             vbr_import_decision_name(imported.decision),
                             server_cache_import_consistency_name(
                                 server_cache_import_route_consistency(
