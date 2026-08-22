@@ -3283,6 +3283,85 @@ bool llama_vbr_artifact_catalog::publish_projected_batch(
     return true;
 }
 
+vbr_artifact_resolve_status
+llama_vbr_artifact_catalog::materialize_reference_locked(
+        llama_cache_acct_artifact_id reference,
+        std::shared_ptr<const vbr_artifact_package_view::storage> & output) {
+    output.reset();
+    const auto it = impl_->references.find(reference.v);
+    if (it == impl_->references.end()) {
+        return vbr_artifact_resolve_status::not_found;
+    }
+
+    auto state = std::make_shared<vbr_artifact_package_view::storage>();
+    const auto allocation_view = [](const impl::allocation & value) {
+        return vbr_artifact_allocation_view {
+            value.category,
+            value.domain,
+            value.logical,
+            value.resident,
+            value.alloc,
+            value.artifact,
+            value.content,
+            value.lineage,
+        };
+    };
+    state->reference = reference;
+    state->topologies = impl_->topologies;
+    state->manifest = it->second.manifest;
+    state->projected_ranges = it->second.projected_ranges;
+    state->projected_sealed = it->second.projected_sealed;
+    state->units.reserve(it->second.unit_ids.size());
+    for (const auto & id : it->second.unit_ids) {
+        const auto found = impl_->blobs.find(id.bytes());
+        if (found == impl_->blobs.end()) {
+            return vbr_artifact_resolve_status::unavailable;
+        }
+        vbr_artifact_unit_view unit;
+        unit.unit_version_id = found->second.id;
+        unit.payload_digest = found->second.payload_digest;
+        unit.descriptor = found->second.descriptor;
+        for (auto & shard : unit.descriptor.shards) {
+            shard.payload = {};
+        }
+        for (auto & shard : unit.descriptor.clean_stash.shards) {
+            shard.payload = {};
+        }
+        unit.payload_shards = found->second.payload_shards;
+        for (const auto & allocation : found->second.allocations) {
+            unit.payload_allocations.push_back(allocation_view(allocation));
+        }
+        if (found->second.stash_id.valid()) {
+            const auto stash = impl_->stashes.find(found->second.stash_id.bytes());
+            if (stash == impl_->stashes.end()) {
+                return vbr_artifact_resolve_status::unavailable;
+            }
+            unit.stash_shards = stash->second.shards;
+            for (const auto & allocation : stash->second.allocations) {
+                unit.stash_allocations.push_back(allocation_view(allocation));
+            }
+        }
+        state->units.push_back(std::move(unit));
+    }
+    if (it->second.companion_payloads.size() !=
+        it->second.manifest.companions.size()) {
+        return vbr_artifact_resolve_status::unavailable;
+    }
+    state->companions.reserve(it->second.companion_payloads.size());
+    for (size_t i = 0; i < it->second.companion_payloads.size(); ++i) {
+        vbr_artifact_companion_view companion;
+        companion.descriptor = it->second.manifest.companions[i];
+        companion.descriptor.payload = {};
+        companion.payload = it->second.companion_payloads[i];
+        state->companions.push_back(std::move(companion));
+    }
+    for (const auto & allocation : it->second.allocations) {
+        state->reference_allocations.push_back(allocation_view(allocation));
+    }
+    output = std::move(state);
+    return vbr_artifact_resolve_status::ok;
+}
+
 vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
         llama_cache_acct_artifact_id reference,
         vbr_artifact_package_view & out) noexcept {
@@ -3298,83 +3377,84 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
             it->second.borrow_count == UINT64_MAX) {
             return vbr_artifact_resolve_status::busy;
         }
-
-        auto state = std::make_shared<vbr_artifact_package_view::storage>();
-        const auto allocation_view = [](const impl::allocation & value) {
-            return vbr_artifact_allocation_view {
-                value.category,
-                value.domain,
-                value.logical,
-                value.resident,
-                value.alloc,
-                value.artifact,
-                value.content,
-                value.lineage,
-            };
-        };
-        state->reference = reference;
-        state->topologies = impl_->topologies;
-        state->manifest = it->second.manifest;
-        state->projected_ranges = it->second.projected_ranges;
-        state->projected_sealed = it->second.projected_sealed;
-        state->units.reserve(it->second.unit_ids.size());
-        for (const auto & id : it->second.unit_ids) {
-            const auto found = impl_->blobs.find(id.bytes());
-            if (found == impl_->blobs.end()) {
-                return vbr_artifact_resolve_status::unavailable;
-            }
-            vbr_artifact_unit_view unit;
-            unit.unit_version_id = found->second.id;
-            unit.payload_digest = found->second.payload_digest;
-            unit.descriptor = found->second.descriptor;
-            for (auto & shard : unit.descriptor.shards) {
-                shard.payload = {};
-            }
-            for (auto & shard : unit.descriptor.clean_stash.shards) {
-                shard.payload = {};
-            }
-            unit.payload_shards = found->second.payload_shards;
-            for (const auto & allocation : found->second.allocations) {
-                unit.payload_allocations.push_back(
-                    allocation_view(allocation));
-            }
-            if (found->second.stash_id.valid()) {
-                const auto stash = impl_->stashes.find(
-                    found->second.stash_id.bytes());
-                if (stash == impl_->stashes.end()) {
-                    return vbr_artifact_resolve_status::unavailable;
-                }
-                unit.stash_shards = stash->second.shards;
-                for (const auto & allocation : stash->second.allocations) {
-                    unit.stash_allocations.push_back(
-                        allocation_view(allocation));
-                }
-            }
-            state->units.push_back(std::move(unit));
+        const auto status = materialize_reference_locked(reference, out.storage_);
+        if (status != vbr_artifact_resolve_status::ok) {
+            return status;
         }
-        if (it->second.companion_payloads.size() !=
-            it->second.manifest.companions.size()) {
-            return vbr_artifact_resolve_status::unavailable;
-        }
-        state->companions.reserve(it->second.companion_payloads.size());
-        for (size_t i = 0; i < it->second.companion_payloads.size(); ++i) {
-            vbr_artifact_companion_view companion;
-            companion.descriptor = it->second.manifest.companions[i];
-            companion.descriptor.payload = {};
-            companion.payload = it->second.companion_payloads[i];
-            state->companions.push_back(std::move(companion));
-        }
-        for (const auto & allocation : it->second.allocations) {
-            state->reference_allocations.push_back(
-                allocation_view(allocation));
-        }
-
         ++it->second.borrow_count;
         out.owner_ = this;
-        out.storage_ = std::move(state);
         return vbr_artifact_resolve_status::ok;
     } catch (...) {
         return vbr_artifact_resolve_status::internal_error;
+    }
+}
+
+bool llama_vbr_artifact_catalog::claim_fresh_host_batch(
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        std::vector<vbr_artifact_package_view> & output) noexcept {
+    const vbr_capture_manifest_assembly_limits limits;
+    if (references.empty() ||
+        references.size() > limits.max_manifests || !output.empty()) {
+        return false;
+    }
+    try {
+        std::vector<llama_cache_acct_artifact_id> canonical = references;
+        std::sort(canonical.begin(), canonical.end(),
+            [](const auto & a, const auto & b) { return a.v < b.v; });
+        if (canonical.front().v == 0 ||
+            std::adjacent_find(
+                canonical.begin(), canonical.end(),
+                [](const auto & a, const auto & b) { return a == b; }) !=
+                    canonical.end()) {
+            return false;
+        }
+        output.resize(references.size());
+
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        for (const auto reference : references) {
+            const auto it = impl_->references.find(reference.v);
+            if (it == impl_->references.end() ||
+                it->second.borrow_count != 0 || it->second.host_owned ||
+                it->second.retire_pending ||
+                it->second.prepared_retire_token != 0) {
+                output.clear();
+                return false;
+            }
+        }
+        for (size_t i = 0; i < references.size(); ++i) {
+            if (materialize_reference_locked(
+                    references[i], output[i].storage_) !=
+                    vbr_artifact_resolve_status::ok) {
+                output.clear();
+                return false;
+            }
+        }
+        for (const auto reference : references) {
+            auto & current = impl_->references.find(reference.v)->second;
+            std::sort(current.operations.begin(), current.operations.end());
+            if ((!current.operations.empty() &&
+                 !current.operations.front()) ||
+                std::adjacent_find(
+                    current.operations.begin(), current.operations.end()) !=
+                    current.operations.end()) {
+                output.clear();
+                return false;
+            }
+        }
+
+        // Every fallible operation and structural check has completed. The
+        // remaining state changes and view binding are non-throwing.
+        for (size_t i = 0; i < references.size(); ++i) {
+            auto & current = impl_->references.find(references[i].v)->second;
+            current.borrow_count = 1;
+            current.host_owned = true;
+            output[i].owner_ = this;
+            output[i].host_owned_ = true;
+        }
+        return true;
+    } catch (...) {
+        output.clear();
+        return false;
     }
 }
 
@@ -3703,6 +3783,30 @@ vbr_artifact_retire_status llama_vbr_artifact_catalog::retire(
     } catch (...) {
         return vbr_artifact_retire_status::internal_error;
     }
+}
+
+vbr_artifact_retire_status
+llama_vbr_artifact_catalog::discard_unowned_reference(
+        llama_cache_acct_artifact_id reference) noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->references.find(reference.v);
+    if (it == impl_->references.end()) {
+        return vbr_artifact_retire_status::not_found;
+    }
+    if (it->second.borrow_count != 0 || it->second.host_owned ||
+        it->second.retire_pending ||
+        it->second.prepared_retire_token != 0) {
+        return vbr_artifact_retire_status::busy;
+    }
+    if (impl_->ledger.release_set_current(it->second.operations) !=
+            llama_cache_conditional_release_status::released) {
+        return vbr_artifact_retire_status::internal_error;
+    }
+    auto units = std::move(it->second.unit_ids);
+    auto stashes = std::move(it->second.stash_ids);
+    impl_->references.erase(it);
+    impl_->erase_orphan_storage(units, stashes);
+    return vbr_artifact_retire_status::retired;
 }
 
 bool llama_vbr_artifact_catalog::reference_tokens(

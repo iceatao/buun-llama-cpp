@@ -352,6 +352,7 @@ struct server_vbr_artifact_store::impl {
     uint64_t next_reference = 1;
     uint32_t n_attention_children = 0;
     server_vbr_artifact_reference_index references;
+    bool fail_projected_host_adoption_once = false;
 
     explicit impl(llama_cache_acct_ledger & ledger)
         : ledger(&ledger), catalog(ledger) {
@@ -384,6 +385,14 @@ bool server_vbr_artifact_store_test_door::import_transport_policy(
         vbr_adopt_stage_policy & policy) noexcept {
     policy = {};
     return store.impl_ && store.impl_->bind_import_transport(policy);
+}
+
+void server_vbr_artifact_store_test_door::
+fail_projected_host_adoption_once(
+        server_vbr_artifact_store & store) noexcept {
+    if (store.impl_) {
+        store.impl_->fail_projected_host_adoption_once = true;
+    }
 }
 
 bool server_vbr_artifact_store_observe_empty_accounting(
@@ -940,6 +949,138 @@ server_vbr_artifact_capture_output server_vbr_artifact_store::capture(
         impl_->counters.internal_error++;
         return output;
     }
+}
+
+bool server_vbr_artifact_store::publish_projected_host_batch(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        server_vbr_projected_host_publish_diagnostics * diagnostics) noexcept {
+    output.clear();
+    if (diagnostics) {
+        *diagnostics = {};
+    }
+    if (!impl_ || !impl_->sample_budget) {
+        return false;
+    }
+
+    llama_cache_budget_config budget;
+    if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        return false;
+    }
+
+    const size_t manifest_count = assembly.manifests().size();
+    std::vector<vbr_projected_manifest_publish_result> published;
+    std::vector<llama_cache_acct_artifact_id> handoff_references;
+    std::vector<size_t> handoff_indices;
+    std::vector<vbr_artifact_package_view> handoff_packages;
+    // Allocate every cardinality-sized adapter arena before the catalog can
+    // commit a row. The catalog handoff may still reject allocation or
+    // structure atomically; compensating discard is allocation-free.
+    try {
+        output.resize(manifest_count);
+        published.reserve(manifest_count);
+        handoff_references.resize(manifest_count);
+        handoff_indices.resize(manifest_count);
+        handoff_packages.reserve(manifest_count);
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+
+    server_vbr_projected_host_publish_diagnostics measured;
+    if (!impl_->catalog.publish_projected_batch(
+            assembly, std::move(publications), budget,
+            published, &measured.catalog)) {
+        output.clear();
+        return false;
+    }
+
+    const auto is_published = [](vbr_projected_manifest_publish_status status) {
+        return status == vbr_projected_manifest_publish_status::published ||
+               status == vbr_projected_manifest_publish_status::adopted;
+    };
+    if (published.size() != output.size()) {
+        for (const auto & row : published) {
+            if (is_published(row.status) &&
+                row.publication.reference_artifact.v != 0) {
+                (void) impl_->catalog.discard_unowned_reference(
+                    row.publication.reference_artifact);
+            }
+        }
+        output.clear();
+        return false;
+    }
+
+    size_t handoff_count = 0;
+    size_t injected_failure = SIZE_MAX;
+    for (size_t i = 0; i < published.size(); ++i) {
+        const auto & row = published[i];
+        auto & terminal = output[i];
+        terminal.manifest_id = row.manifest_id;
+        terminal.status = row.status;
+        if (!is_published(row.status)) {
+            continue;
+        }
+
+        const auto reference = row.publication.reference_artifact;
+        if (impl_->fail_projected_host_adoption_once &&
+            injected_failure == SIZE_MAX) {
+            injected_failure = i;
+            impl_->fail_projected_host_adoption_once = false;
+            continue;
+        }
+        if (reference.v == 0) {
+            terminal.status =
+                vbr_projected_manifest_publish_status::internal_error;
+            measured.postpublish_retirements++;
+            continue;
+        }
+        handoff_references[handoff_count] = reference;
+        handoff_indices[handoff_count] = i;
+        ++handoff_count;
+    }
+    handoff_references.resize(handoff_count);
+    handoff_indices.resize(handoff_count);
+
+    const bool handed_off = handoff_count == 0 ||
+        impl_->catalog.claim_fresh_host_batch(
+            handoff_references, handoff_packages);
+    for (size_t i = 0; i < handoff_count; ++i) {
+        auto & terminal = output[handoff_indices[i]];
+        if (handed_off) {
+            terminal.payload = server_prompt_cache_vbr_payload::adopt(
+                std::move(handoff_packages[i]));
+        }
+        if (terminal.payload) {
+            measured.host_payloads_retained++;
+            continue;
+        }
+
+        // A successfully claimed view retires itself on reset; a failed atomic
+        // handoff leaves the reference unowned for allocation-free discard.
+        if (handed_off) {
+            handoff_packages[i].reset();
+        } else {
+            (void) impl_->catalog.discard_unowned_reference(
+                handoff_references[i]);
+        }
+        terminal.status =
+            vbr_projected_manifest_publish_status::internal_error;
+        measured.postpublish_retirements++;
+    }
+    if (injected_failure != SIZE_MAX) {
+        auto & terminal = output[injected_failure];
+        (void) impl_->catalog.discard_unowned_reference(
+            published[injected_failure].publication.reference_artifact);
+        terminal.status =
+            vbr_projected_manifest_publish_status::internal_error;
+        measured.postpublish_retirements++;
+    }
+    if (diagnostics) {
+        *diagnostics = measured;
+    }
+    return true;
 }
 
 server_vbr_artifact_import_output server_vbr_artifact_store::import(

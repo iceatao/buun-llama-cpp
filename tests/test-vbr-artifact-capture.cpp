@@ -2,6 +2,7 @@
 #include "llama-vbr-artifact-stage.h"
 #include "llama-vbr-identity-digest.h"
 #include "llama-vbr-operation.h"
+#include "server-prompt-cache-payload.h"
 #include "server-vbr-artifact-store.h"
 
 #include "ggml.h"
@@ -2113,6 +2114,270 @@ static vbr_artifact_portable_topology capture_test_topology() {
     return topology;
 }
 
+struct projected_store_budget_context {
+    llama_cache_acct_resource_domain device;
+    bool available = true;
+};
+
+static bool sample_projected_store_budget(
+        void * opaque,
+        llama_cache_budget_config & output) noexcept {
+    const auto * context =
+        static_cast<const projected_store_budget_context *>(opaque);
+    if (!context || !context->available) {
+        return false;
+    }
+    output = {};
+    llama_cache_budget_device_input input;
+    input.backend_device = reinterpret_cast<const void *>(uintptr_t(1));
+    input.domain = context->device;
+    input.physical_total = 1ull << 30;
+    input.physical_free = 1ull << 29;
+    input.phys_state = llama_cache_budget_capacity_state::known;
+    input.current_compute_allocated = 0;
+    input.configured_compute_reserve = 0;
+    input.compute_state = llama_cache_budget_capacity_state::known;
+    input.cache_cap_state =
+        llama_cache_budget_capacity_state::unbounded;
+    output.devices.push_back(input);
+    output.host.pageable_state =
+        llama_cache_budget_capacity_state::unbounded;
+    output.host.pinned_state =
+        llama_cache_budget_capacity_state::unbounded;
+    output.host.total_state =
+        llama_cache_budget_capacity_state::unbounded;
+    output.global_cap_state =
+        llama_cache_budget_capacity_state::unbounded;
+    return true;
+}
+
+static void test_projected_host_batch_store_adapter() {
+    const auto topology = capture_test_topology();
+    std::vector<vbr_capture_projection_manifest> manifests;
+    std::vector<vbr_capture_controller_target> targets;
+    for (uint64_t id = 1; id <= 2; ++id) {
+        vbr_capture_projection_manifest manifest;
+        manifest.manifest_id = id;
+        manifest.placements.push_back(projected_placement(
+            id, llama_seq_id(id), { uint32_t(id - 1) }));
+        auto target = projected_target(
+            id, 0, 700 + id, projected_generation(40 + id));
+        bind_projected_manifest_metadata(manifest, target);
+        manifests.push_back(std::move(manifest));
+        targets.push_back(std::move(target));
+    }
+    vbr_capture_projection projection;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, std::move(manifests) }, {}, projection));
+    std::vector<vbr_capture_projected_unit> units;
+    for (const auto & target : targets) {
+        units.push_back(capture_projected_unit_for_target(
+            projection, target));
+    }
+    projected_controller_fixture controller;
+    controller.rejected_manifest = 2;
+    vbr_capture_manifest_assembly assembly;
+    CHECK(assemble_projected_test_batch(
+        projection, targets, units, controller.provider(), {}, assembly));
+
+    const auto make_publications = [&](const auto & source_assembly) {
+        std::vector<vbr_projected_manifest_publication> publications;
+        publications.push_back(projected_publication(
+            1, source_assembly, topology));
+        publications.push_back(projected_publication(
+            2, source_assembly, topology));
+        return publications;
+    };
+
+    llama_cache_acct_ledger ledger;
+    llama_cache_acct_resource_domain device;
+    CHECK(ledger.make_device_domain(
+        topology, llama_cache_acct_device_ordinal { 0 }, device));
+    const auto pageable = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+    const auto pinned = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pinned_host);
+    const llama_cache_acct_completeness_requirement requirements[] {
+        { device, llama_cache_acct_producer::live_memory },
+        { pageable, llama_cache_acct_producer::retention_sidecar },
+        { pinned, llama_cache_acct_producer::retention_sidecar },
+    };
+    CHECK(ledger.configure_required_producers(requirements, 3));
+    for (const auto category : {
+            llama_cache_acct_category::live_attention_state,
+            llama_cache_acct_category::live_recurrent_state,
+            llama_cache_acct_category::recurrent_rollback_planes,
+            llama_cache_acct_category::rolling_window_tape }) {
+        for (const auto measure : {
+                llama_cache_acct_measure::logical_payload,
+                llama_cache_acct_measure::resident_allocated,
+                llama_cache_acct_measure::reserved }) {
+            ledger.gauge_set(category, device, measure, 0);
+        }
+    }
+    CHECK(server_vbr_artifact_store_observe_empty_accounting(
+        ledger, device));
+    CHECK(server_vbr_artifact_store_observe_empty_accounting(
+        ledger, pageable));
+    CHECK(ledger.certify_complete(
+        device, llama_cache_acct_producer::live_memory));
+    CHECK(ledger.certify_complete(
+        pageable, llama_cache_acct_producer::retention_sidecar));
+    CHECK(server_vbr_artifact_store_configure_pinned_accounting(
+        ledger, pinned));
+
+    projected_store_budget_context budget_context { device, true };
+    server_vbr_artifact_store_config config;
+    config.ledger = &ledger;
+    config.pinned_domain = pinned;
+    config.topologies.push_back(topology);
+    config.pool_bindings.push_back({
+        { 0x3333, 0x4444 }, 0, 0, 0, 0,
+    });
+    config.lanes.push_back({});
+    config.attention_children = 1;
+    config.ring_bytes = 16;
+    config.chunk_bytes = 8;
+    config.budget_context = &budget_context;
+    config.sample_budget = sample_projected_store_budget;
+    server_vbr_artifact_capture_status create_status;
+    auto store = server_vbr_artifact_store::create(
+        config, create_status);
+    CHECK(store);
+    CHECK(create_status == server_vbr_artifact_capture_status::ok);
+    if (!store) {
+        return;
+    }
+
+    const uint64_t baseline_ops = ledger.snapshot().live_ops;
+    std::vector<server_vbr_projected_host_publish_result> results;
+    server_vbr_projected_host_publish_diagnostics diagnostics;
+    CHECK(store->publish_projected_host_batch(
+        assembly, make_publications(assembly), results, &diagnostics));
+    CHECK(results.size() == 2);
+    if (results.size() != 2) {
+        return;
+    }
+    CHECK(results[0].manifest_id == 1);
+    CHECK(results[0].status ==
+              vbr_projected_manifest_publish_status::published ||
+          results[0].status ==
+              vbr_projected_manifest_publish_status::adopted);
+    CHECK(results[0].payload);
+    if (results[0].payload) {
+        CHECK(results[0].payload->retirement_owned());
+        CHECK(results[0].payload->accounted_by(&ledger));
+        CHECK(results[0].payload->reference_artifact().v != 0);
+    }
+    CHECK(results[1].manifest_id == 2);
+    CHECK(results[1].status ==
+          vbr_projected_manifest_publish_status::dependency_unavailable);
+    CHECK(!results[1].payload);
+    CHECK(diagnostics.catalog.ready_manifests == 1);
+    CHECK(diagnostics.catalog.published_manifests == 1);
+    CHECK(diagnostics.catalog.dependency_unavailable == 1);
+    CHECK(diagnostics.host_payloads_retained == 1);
+    CHECK(diagnostics.postpublish_retirements == 0);
+    CHECK(ledger.snapshot().live_ops > baseline_ops);
+    results.clear();
+    CHECK(ledger.snapshot().live_ops == baseline_ops);
+
+    auto malformed = make_publications(assembly);
+    malformed.back().manifest_id = 3;
+    results.resize(1);
+    diagnostics.catalog.ready_manifests = 99;
+    CHECK(!store->publish_projected_host_batch(
+        assembly, std::move(malformed), results, &diagnostics));
+    CHECK(results.empty());
+    CHECK(diagnostics.catalog.ready_manifests == 0);
+    CHECK(ledger.snapshot().live_ops == baseline_ops);
+
+    // A failure after both catalog rows commit must retire only the failed
+    // row. Its sibling remains a typed host owner, and releasing that owner
+    // returns the complete catalog/ledger state to the pre-batch baseline.
+    controller.rejected_manifest = 0;
+    vbr_capture_manifest_assembly ready_assembly;
+    CHECK(assemble_projected_test_batch(
+        projection, targets, units, controller.provider(), {},
+        ready_assembly));
+    server_vbr_artifact_store_test_door::
+        fail_projected_host_adoption_once(*store);
+    CHECK(store->publish_projected_host_batch(
+        ready_assembly, make_publications(ready_assembly),
+        results, &diagnostics));
+    CHECK(results.size() == 2);
+    if (results.size() == 2) {
+        CHECK(results[0].status ==
+              vbr_projected_manifest_publish_status::internal_error);
+        CHECK(!results[0].payload);
+        CHECK(results[1].status ==
+                  vbr_projected_manifest_publish_status::published ||
+              results[1].status ==
+                  vbr_projected_manifest_publish_status::adopted);
+        CHECK(results[1].payload);
+    }
+    CHECK(diagnostics.catalog.published_manifests == 2);
+    CHECK(diagnostics.host_payloads_retained == 1);
+    CHECK(diagnostics.postpublish_retirements == 1);
+    CHECK(ledger.snapshot().live_ops > baseline_ops);
+    results.clear();
+    CHECK(ledger.snapshot().live_ops == baseline_ops);
+
+    // Re-publishing the same sealed batch adopts the existing physical unit
+    // allocations while creating distinct logical reference owners. Dropping
+    // either generation of host owners must preserve the other.
+    std::vector<server_vbr_projected_host_publish_result> first_owners;
+    CHECK(store->publish_projected_host_batch(
+        ready_assembly, make_publications(ready_assembly),
+        first_owners, &diagnostics));
+    CHECK(first_owners.size() == 2);
+    std::vector<llama_cache_acct_artifact_id> first_references;
+    for (const auto & row : first_owners) {
+        CHECK(row.payload);
+        CHECK(row.status ==
+                  vbr_projected_manifest_publish_status::published ||
+              row.status ==
+                  vbr_projected_manifest_publish_status::adopted);
+        if (row.payload) {
+            first_references.push_back(
+                row.payload->reference_artifact());
+        }
+    }
+    CHECK(first_references.size() == 2);
+    std::vector<server_vbr_projected_host_publish_result> adopted_owners;
+    CHECK(store->publish_projected_host_batch(
+        ready_assembly, make_publications(ready_assembly),
+        adopted_owners, &diagnostics));
+    CHECK(adopted_owners.size() == 2);
+    for (size_t i = 0; i < adopted_owners.size(); ++i) {
+        CHECK(adopted_owners[i].status ==
+              vbr_projected_manifest_publish_status::adopted);
+        CHECK(adopted_owners[i].payload);
+        if (adopted_owners[i].payload && i < first_references.size()) {
+            CHECK(adopted_owners[i].payload->reference_artifact() !=
+                  first_references[i]);
+        }
+    }
+    CHECK(diagnostics.catalog.published_manifests == 2);
+    CHECK(diagnostics.host_payloads_retained == 2);
+    const uint64_t adopted_ops = ledger.snapshot().live_ops;
+    CHECK(adopted_ops > baseline_ops);
+    first_owners.clear();
+    CHECK(ledger.snapshot().live_ops > baseline_ops);
+    CHECK(ledger.snapshot().live_ops < adopted_ops);
+    adopted_owners.clear();
+    CHECK(ledger.snapshot().live_ops == baseline_ops);
+
+    budget_context.available = false;
+    results.resize(1);
+    diagnostics.catalog.ready_manifests = 99;
+    CHECK(!store->publish_projected_host_batch(
+        assembly, make_publications(assembly), results, &diagnostics));
+    CHECK(results.empty());
+    CHECK(diagnostics.catalog.ready_manifests == 0);
+    CHECK(ledger.snapshot().live_ops == baseline_ops);
+}
+
 static void test_capture_reservation_domain_preparation() {
     llama_cache_acct_ledger ledger;
     const auto topology = capture_test_topology();
@@ -2687,6 +2952,7 @@ int main(int argc, char ** argv) {
     test_ring_accounting_once();
     test_capture_reservation_domain_preparation();
     test_server_store_construction_and_lifetime();
+    test_projected_host_batch_store_adapter();
     test_server_capture_status_vocabulary();
     test_server_reference_tenant_authorization();
     test_server_import_route_classification();

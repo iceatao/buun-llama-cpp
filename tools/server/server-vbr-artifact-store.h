@@ -170,6 +170,23 @@ struct server_vbr_artifact_capture_output {
     bool dedup = false;
 };
 
+// Scheduler-facing terminal for one row of an immutable projected capture
+// assembly. A published/adopted row is usable only when payload is non-null;
+// that owner holds the catalog reference and retires it when the last host
+// alias is released. Other statuses are dependency-scoped soft failures.
+struct server_vbr_projected_host_publish_result {
+    uint64_t manifest_id = 0;
+    vbr_projected_manifest_publish_status status =
+        vbr_projected_manifest_publish_status::internal_error;
+    std::shared_ptr<const server_prompt_cache_vbr_payload> payload;
+};
+
+struct server_vbr_projected_host_publish_diagnostics {
+    vbr_projected_batch_publish_diagnostics catalog;
+    uint64_t host_payloads_retained = 0;
+    uint64_t postpublish_retirements = 0;
+};
+
 struct server_vbr_artifact_store_counters {
     uint64_t requested = 0;
     uint64_t exact_published = 0;
@@ -266,10 +283,11 @@ private:
     std::map<std::string, binding> entries_;
 };
 
-// F3.3 server owner for the internal catalog/ring. The library capture is the
-// only producer of authorization masks and content identities; this layer
-// returns and resolves tenant-bound opaque handles only through the exact
-// capture-time tenant key. There is no enumeration or tenant-agnostic lookup.
+// F3.3 server owner for the internal catalog/ring. Explicit control APIs
+// return and resolve tenant-bound opaque handles only through the exact
+// capture-time tenant key. The trusted scheduler path below instead receives
+// typed host owners directly; neither path exposes catalog enumeration or a
+// tenant-agnostic control lookup.
 class server_vbr_artifact_store {
 public:
     static std::unique_ptr<server_vbr_artifact_store> create(
@@ -287,6 +305,17 @@ public:
         llama_memory_i & memory,
         vbr_explicit_capture_request request,
         const std::string & tenant_key) noexcept;
+
+    // Publish an already sealed projected assembly through this store's
+    // canonical catalog and current sampled budget. Structural failure clears
+    // the complete output. Successfully published rows are returned as
+    // cache-owned typed payloads directly; no tenant reference is minted.
+    bool publish_projected_host_batch(
+        const vbr_capture_manifest_assembly & assembly,
+        std::vector<vbr_projected_manifest_publication> && publications,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        server_vbr_projected_host_publish_diagnostics * diagnostics = nullptr)
+        noexcept;
 
     server_vbr_artifact_import_output import(
         server_vbr_artifact_import_request request) noexcept;
@@ -326,4 +355,6 @@ struct server_vbr_artifact_store_test_door {
     static bool import_transport_policy(
         const server_vbr_artifact_store & store,
         vbr_adopt_stage_policy & policy) noexcept;
+    static void fail_projected_host_adoption_once(
+        server_vbr_artifact_store & store) noexcept;
 };

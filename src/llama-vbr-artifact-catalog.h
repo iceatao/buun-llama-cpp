@@ -297,7 +297,20 @@ public:
     vbr_artifact_resolve_status resolve_reference(
         llama_cache_acct_artifact_id reference,
         vbr_artifact_package_view & out) noexcept;
+    // Scheduler-only handoff for references returned by one just-completed
+    // projected publication. The input must be nonempty and unique, and the
+    // output must be empty. Allocation or structural failure leaves every
+    // reference unborrowed and unowned; success materializes the complete
+    // immutable views and transfers host retirement authority atomically.
+    bool claim_fresh_host_batch(
+        const std::vector<llama_cache_acct_artifact_id> & references,
+        std::vector<vbr_artifact_package_view> & output) noexcept;
     vbr_artifact_retire_status retire(
+        llama_cache_acct_artifact_id reference) noexcept;
+    // Allocation-free compensating terminal for a reference that was just
+    // published but could not be handed to its intended owner. The caller
+    // must hold no view and the reference must not be host-owned.
+    vbr_artifact_retire_status discard_unowned_reference(
         llama_cache_acct_artifact_id reference) noexcept;
 
     bool reference_tokens(
@@ -338,6 +351,9 @@ private:
     friend class llama_vbr_artifact_catalog_stream_build;
     friend class vbr_artifact_package_view;
     friend class vbr_artifact_prepared_retire;
+    vbr_artifact_resolve_status materialize_reference_locked(
+        llama_cache_acct_artifact_id reference,
+        std::shared_ptr<const vbr_artifact_package_view::storage> & output);
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
     bool claim_host_ownership(
         llama_cache_acct_artifact_id reference) noexcept;
