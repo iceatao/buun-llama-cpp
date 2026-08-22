@@ -94,6 +94,11 @@ public:
         return queue_tasks_deferred.size();
     }
 
+    bool has_pending_tasks() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return !queue_tasks.empty() || !queue_tasks_deferred.empty();
+    }
+
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //

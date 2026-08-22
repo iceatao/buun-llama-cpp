@@ -4177,6 +4177,16 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(!cache.contains(
         prompt.tokens,
         fixture.package.manifest.identity.adapter_config_identity));
+    CHECK(cache.contains_vbr_frontier(
+        prompt,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity));
+    server_prompt wrong_vbr_frontier = prompt.clone();
+    wrong_vbr_frontier.sequence_epoch++;
+    CHECK(!cache.contains_vbr_frontier(
+        wrong_vbr_frontier,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity));
     CHECK(logical->payload.vbr_artifact() == owner.get());
     CHECK(logical->release_ops().empty());
     // The catalog already owns every physical VBR allocation. Logical host
@@ -4185,6 +4195,22 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     auto host_key =
         server_retention_instance_key::for_host_entry(&*logical);
     CHECK(retention.artifact_id(host_key).v != 0);
+
+    // Live rewind checkpoints are not part of the projected artifact. Their
+    // presence must not exclude an ordinary-hybrid source, and the detached
+    // VBR node must retain no fixed checkpoint bytes.
+    server_prompt checkpoint_source = prompt.clone();
+    checkpoint_source.checkpoints.emplace_back();
+    checkpoint_source.checkpoints.back().data_tgt.overwrite(
+        4, [](uint8_t * data, size_t size) {
+            std::fill_n(data, size, uint8_t(9));
+        });
+    auto checkpoint_stage = cache.stage_vbr(
+        checkpoint_source, payload,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity);
+    CHECK(checkpoint_stage.size() == 1);
+    CHECK(checkpoint_stage.front().prompt.checkpoints.empty());
 
     // Mixed fixed/VBR sizing must preserve the fixed cache's physical-union
     // accounting. The host checkpoint aliases an independently accounted

@@ -187,6 +187,28 @@ struct server_vbr_projected_host_publish_diagnostics {
     uint64_t postpublish_retirements = 0;
 };
 
+// Scheduler-visible accounting for one automatic projected capture. The
+// immutable assembly and move-only publication capabilities never escape the
+// store: this record carries only scalar evidence plus the catalog handoff
+// outcome.
+struct server_vbr_projected_host_capture_diagnostics {
+    vbr_explicit_capture_status capture_status =
+        vbr_explicit_capture_status::internal_error;
+    vbr_explicit_capture_phase capture_phase =
+        vbr_explicit_capture_phase::validation;
+    vbr_capture_stream_status inner_stream_status =
+        vbr_capture_stream_status::_count;
+    uint64_t source_namespace = 0;
+    uint64_t union_cells = 0;
+    uint64_t planned_packed_bytes = 0;
+    uint32_t size_pass_calls = 0;
+    uint32_t projection_calls = 0;
+    uint32_t unit_transfer_calls = 0;
+    uint32_t transferred_units = 0;
+    vbr_capture_stream_stats transfer;
+    server_vbr_projected_host_publish_diagnostics publication;
+};
+
 struct server_vbr_artifact_store_counters {
     uint64_t requested = 0;
     uint64_t exact_published = 0;
@@ -315,6 +337,18 @@ public:
         std::vector<vbr_projected_manifest_publication> && publications,
         std::vector<server_vbr_projected_host_publish_result> & output,
         server_vbr_projected_host_publish_diagnostics * diagnostics = nullptr)
+        noexcept;
+
+    // Trusted scheduler composition of the H2 capture coordinator and the
+    // catalog handoff above. Runtime transport/topology/representation
+    // authority remains store-owned; callers provide only bounded semantic
+    // manifests and the admitted aggregate payload runway.
+    bool capture_projected_host_batch(
+        llama_memory_i & memory,
+        std::vector<vbr_projected_capture_manifest_request> manifests,
+        uint64_t max_packed_bytes,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        server_vbr_projected_host_capture_diagnostics * diagnostics = nullptr)
         noexcept;
 
     server_vbr_artifact_import_output import(

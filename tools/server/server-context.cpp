@@ -737,6 +737,9 @@ struct server_slot {
         common_cache_plan_destruction_reason::mandatory_anchor;
     common_cache_plan_destruction_reason checkpoint_thinning_refusal =
         common_cache_plan_destruction_reason::none;
+    std::array<uint8_t, 32> vbr_idle_capture_attempt_identity = {};
+    int64_t vbr_idle_capture_retry_after_ms = 0;
+    bool vbr_idle_capture_terminal = false;
 
     // B0 shadow cache-plan record [P2]: in-flight (allocated per request only when the
     // observer is enabled — absence IS the disabled state) + this slot's last finalized
@@ -3527,13 +3530,18 @@ private:
         common_cache_plan_destruction_quote quote;
     };
 
+    bool fixed_host_cache_enabled() const noexcept {
+        return prompt_cache && !server_vbr_dynamic_active(params_base);
+    }
+
     live_displacement_certification cache_plan_certify_live_displacement(
             server_slot & victim,
             server_slot & legacy_target,
             common_cache_plan_record & rec) noexcept {
         live_displacement_certification out;
         if (!params_base.cache_lifecycle || !cache_authority ||
-            !prompt_cache || !server_cache_plan_shadow_choice_valid(rec) ||
+            !fixed_host_cache_enabled() ||
+            !server_cache_plan_shadow_choice_valid(rec) ||
             rec.destruction_legacy_plan_candidate < 0 ||
             !cache_plan_authority ||
             !server_cache_plan_level_enabled(
@@ -6352,9 +6360,12 @@ private:
             // in place at runtime under the dynamic VBR controller (a FLAGS_NONE state restore
             // would land bytes under the wrong tier or past the VMM watermark; cache_reuse needs
             // shifts, and get_can_shift() is false under VMM anyway).
-            if (params_base.cache_ram_mib != 0) {
+            if (params_base.cache_ram_mib != 0 &&
+                !params_base.vbr_prompt_cache) {
                 params_base.cache_ram_mib = 0;
                 SRV_WRN("%s\n", "prompt cache state storage is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            } else if (params_base.cache_ram_mib != 0) {
+                SRV_INF("%s\n", "dynamic VBR idle caching will store projected artifacts; fixed KV state images remain disabled");
             }
             if (params_base.n_cache_reuse) {
                 params_base.n_cache_reuse = 0;
@@ -7064,6 +7075,10 @@ private:
             // allow_vbr=false, so those contexts can never have anything to breathe
             SRV_TRC("%s", "idle tick: memory breathe\n");
             llama_memory_breathe(llama_get_memory(ctx_tgt));
+            if (params_base.vbr_prompt_cache &&
+                !queue_tasks.has_pending_tasks()) {
+                (void) publish_idle_vbr_batch();
+            }
         });
 
 
@@ -7073,6 +7088,8 @@ private:
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
+            } else if (params_base.vbr_prompt_cache) {
+                SRV_TRC("%s", "idle dynamic-VBR slots will be published as projected prompt-cache artifacts; live sources remain resident until automatic restore is armed\n");
             } else {
                 if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
@@ -7083,6 +7100,13 @@ private:
                 }
                 SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
             }
+        }
+        if (params_base.vbr_prompt_cache &&
+            (!server_vbr_dynamic_active(params_base) ||
+             !params_base.cache_idle_slots || !prompt_cache ||
+             !vbr_artifact_store)) {
+            SRV_ERR("%s", "--vbr-prompt-cache requires armed dynamic VBR, --cache-idle-slots, --cache-ram, and the artifact store\n");
+            return false;
         }
 
         {
@@ -8367,7 +8391,7 @@ private:
                         // before switching targets; without a durable copy the
                         // retarget remains outside the pre-D-A envelope.
                         bool displaced_durable = false;
-                        if (prompt_cache &&
+                        if (fixed_host_cache_enabled() &&
                             task.type == SERVER_TASK_TYPE_COMPLETION) {
                             const auto saved =
                                 legacy_ret->prompt_save(*prompt_cache);
@@ -8473,7 +8497,7 @@ private:
             // wait for full promotion. Append/resume, tiny overlaps, and
             // never-reused branches stay on the existing allocation-free
             // path, and a failed save remains a soft miss.
-            const bool df2_enabled = prompt_cache &&
+            const bool df2_enabled = fixed_host_cache_enabled() &&
                 prompt_cache->retention_df2_authority;
             if (df2_enabled) {
                 common_retention_lineage_record source_lineage;
@@ -8512,7 +8536,7 @@ private:
                 !selection_deferred_busy &&
                 ret->cache_plan_execution.authoritative();
 
-            update_cache = update_cache && prompt_cache;
+            update_cache = update_cache && fixed_host_cache_enabled();
             update_cache = update_cache &&
                            task.type == SERVER_TASK_TYPE_COMPLETION;
 
@@ -9792,15 +9816,14 @@ private:
         return view;
     }
 
-    bool build_capture_request(
+    bool build_capture_identity_fields(
             server_slot & slot,
-            vbr_explicit_capture_request & request,
+            vbr_artifact_identity_block & identity,
             server_vbr_artifact_capture_status & status) {
         const int64_t token_count = slot.prompt.n_tokens();
-        const llama_pos next_position =
-            slot.prompt.tokens.pos_next();
+        const llama_pos next_position = slot.prompt.tokens.pos_next();
         std::string media_identity;
-        if (next_position < 0 ||
+        if (token_count <= 0 || next_position <= 0 ||
             !slot.prompt.tokens.media_content_identity(
                 token_count, media_identity)) {
             status =
@@ -9809,7 +9832,7 @@ private:
         }
         const uint64_t sequence_epoch =
             ensure_frontier_sequence_epoch(slot.prompt);
-        request.identity = {
+        identity = {
             frontier_execution_identity,
             lora_config_identity(slot.lora),
             std::move(media_identity),
@@ -9817,9 +9840,39 @@ private:
             token_count,
             next_position,
         };
-        request.token_block.reserve(size_t(token_count));
-        for (int64_t i = 0; i < token_count; ++i) {
-            request.token_block.push_back(slot.prompt.tokens[size_t(i)]);
+        status = server_vbr_artifact_capture_status::ok;
+        return true;
+    }
+
+    bool build_capture_identity(
+            server_slot & slot,
+            vbr_artifact_identity_block & identity,
+            std::vector<llama_token> & token_block,
+            server_vbr_artifact_capture_status & status) {
+        token_block.clear();
+        if (!build_capture_identity_fields(slot, identity, status)) {
+            return false;
+        }
+        try {
+            token_block.reserve(size_t(identity.token_count));
+            for (int64_t i = 0; i < identity.token_count; ++i) {
+                token_block.push_back(slot.prompt.tokens[size_t(i)]);
+            }
+        } catch (...) {
+            token_block.clear();
+            status = server_vbr_artifact_capture_status::internal_error;
+            return false;
+        }
+        return true;
+    }
+
+    bool build_capture_request(
+            server_slot & slot,
+            vbr_explicit_capture_request & request,
+            server_vbr_artifact_capture_status & status) {
+        if (!build_capture_identity(
+                slot, request.identity, request.token_block, status)) {
+            return false;
         }
         request.sequence = slot.id;
         request.frontier.execution_identity =
@@ -9834,9 +9887,9 @@ private:
             request.identity.media_content_identity.data();
         request.frontier.media_content_identity_len =
             request.identity.media_content_identity.size();
-        request.frontier.sequence_epoch = sequence_epoch;
-        request.frontier.token_count = token_count;
-        request.frontier.next_position = next_position;
+        request.frontier.sequence_epoch = request.identity.sequence_epoch;
+        request.frontier.token_count = request.identity.token_count;
+        request.frontier.next_position = request.identity.next_position;
         request.idle_decode_thread = true;
 
         const auto pageable_domain =
@@ -9945,6 +9998,243 @@ private:
         }
         status = server_vbr_artifact_capture_status::ok;
         return true;
+    }
+
+    size_t publish_idle_vbr_batch() noexcept {
+        if (!params_base.vbr_prompt_cache || !prompt_cache ||
+            !vbr_artifact_store || ctx_dft) {
+            return 0;
+        }
+
+        try {
+
+        struct candidate {
+            server_slot * slot = nullptr;
+            uint64_t manifest_id = 0;
+            std::array<uint8_t, 32> attempt_identity = {};
+        };
+        std::vector<candidate> candidates;
+        std::vector<vbr_projected_capture_manifest_request> manifests;
+        try {
+            candidates.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
+            manifests.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
+        } catch (...) {
+            return 0;
+        }
+
+        uint64_t total_token_references = 0;
+        static constexpr uint64_t MAX_IDLE_TOKEN_REFERENCES = 1024ull*1024;
+        for (auto & idle : slots) {
+            if (candidates.size() == VBR_PROJECTED_CAPTURE_MAX_MANIFESTS) {
+                break;
+            }
+            if (idle.is_processing() || idle.state != SLOT_STATE_IDLE ||
+                idle.prompt.n_tokens() <= 0 || idle.can_speculate() ||
+                idle.hard_lease_blocks_live_prefix() ||
+                idle.cache_plan_destruction_recovery_pin.valid() ||
+                !prompt_cache->vbr_retention_source_available(idle.id)) {
+                continue;
+            }
+            const std::string adapter_key = lora_config_identity(idle.lora);
+            if (prompt_cache->contains_vbr_frontier(
+                    idle.prompt, frontier_execution_identity,
+                    adapter_key)) {
+                continue;
+            }
+            const uint64_t token_references =
+                uint64_t(idle.prompt.n_tokens());
+            if (token_references > MAX_IDLE_TOKEN_REFERENCES -
+                    total_token_references) {
+                continue;
+            }
+
+            vbr_projected_capture_manifest_request manifest;
+            manifest.manifest_id = uint64_t(idle.id) + 1;
+            manifest.sequence = idle.id;
+            server_vbr_artifact_capture_status identity_status;
+            if (!build_capture_identity_fields(
+                    idle, manifest.identity, identity_status)) {
+                continue;
+            }
+            llama_sha256_writer attempt_hash;
+            static constexpr char ATTEMPT_DOMAIN[] =
+                "buun.vbr.idle-capture-attempt/v1";
+            attempt_hash.string(
+                ATTEMPT_DOMAIN, sizeof(ATTEMPT_DOMAIN) - 1);
+            attempt_hash.string(
+                manifest.identity.execution_identity.data(),
+                manifest.identity.execution_identity.size());
+            attempt_hash.string(
+                manifest.identity.adapter_config_identity.data(),
+                manifest.identity.adapter_config_identity.size());
+            attempt_hash.string(
+                manifest.identity.media_content_identity.data(),
+                manifest.identity.media_content_identity.size());
+            attempt_hash.u64(manifest.identity.sequence_epoch);
+            attempt_hash.u64(uint64_t(manifest.identity.token_count));
+            attempt_hash.u64(uint64_t(manifest.identity.next_position));
+            const auto attempt_identity = attempt_hash.finish();
+            if (idle.vbr_idle_capture_attempt_identity == attempt_identity &&
+                (idle.vbr_idle_capture_terminal ||
+                 ggml_time_ms() < idle.vbr_idle_capture_retry_after_ms)) {
+                continue;
+            }
+            manifest.token_block.reserve(
+                size_t(manifest.identity.token_count));
+            for (int64_t i = 0; i < manifest.identity.token_count; ++i) {
+                manifest.token_block.push_back(
+                    idle.prompt.tokens[size_t(i)]);
+            }
+            try {
+                manifests.push_back(std::move(manifest));
+                candidates.push_back({
+                    &idle, uint64_t(idle.id) + 1, attempt_identity,
+                });
+                total_token_references += token_references;
+            } catch (...) {
+                return 0;
+            }
+        }
+        if (manifests.empty() || !cache_plan_observe_live_memory(false)) {
+            return 0;
+        }
+
+        // This first synchronous scheduler slice is deliberately smaller than
+        // the generic H1 arenas. Ordinary fixed idle saves were already
+        // synchronous; the additional ceiling prevents a default cache size
+        // from turning one launch boundary into an unbounded capture wave.
+        static constexpr uint64_t MAX_IDLE_CAPTURE_BYTES =
+            64ull*1024ull*1024ull;
+        uint64_t runway = MAX_IDLE_CAPTURE_BYTES;
+        if (runway == 0 || queue_tasks.has_pending_tasks()) {
+            return 0;
+        }
+
+        std::vector<server_vbr_projected_host_publish_result> captured;
+        server_vbr_projected_host_capture_diagnostics diagnostics;
+        const int64_t started = ggml_time_us();
+        if (!vbr_artifact_store->capture_projected_host_batch(
+                *llama_get_memory(ctx_tgt), std::move(manifests), runway,
+                captured, &diagnostics)) {
+            SRV_DBG(
+                "VBR_IDLE_CAPTURE refused status=%s phase=%s planned=%" PRIu64
+                " duration_ms=%.3f\n",
+                vbr_explicit_capture_status_name(
+                    diagnostics.capture_status),
+                vbr_explicit_capture_phase_name(
+                    diagnostics.capture_phase),
+                diagnostics.planned_packed_bytes,
+                (ggml_time_us() - started)/1000.0);
+            const bool terminal =
+                diagnostics.capture_status ==
+                    vbr_explicit_capture_status::unsupported_layout ||
+                diagnostics.capture_status ==
+                    vbr_explicit_capture_status::not_armed;
+            const bool aggregate_over_cap =
+                diagnostics.capture_status ==
+                    vbr_explicit_capture_status::accounting_failed &&
+                diagnostics.planned_packed_bytes > runway;
+            const int64_t retry_after_ms = ggml_time_ms() + 5000;
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                const auto & candidate = candidates[i];
+                candidate.slot->vbr_idle_capture_attempt_identity =
+                    candidate.attempt_identity;
+                // Aggregate admission is not a property of any one frontier.
+                // Reopen one row immediately and cool down its siblings so
+                // the next idle tick isolates it. A singleton overflow also
+                // remains transient: dynamic retiering can reduce its packed
+                // representation without changing the semantic frontier.
+                candidate.slot->vbr_idle_capture_terminal =
+                    terminal;
+                candidate.slot->vbr_idle_capture_retry_after_ms =
+                    terminal ? 0 :
+                    aggregate_over_cap && candidates.size() > 1 && i == 0
+                        ? 0 : retry_after_ms;
+            }
+            return 0;
+        }
+
+        size_t published_count = 0;
+        for (auto & row : captured) {
+            if (!row.payload ||
+                (row.status !=
+                     vbr_projected_manifest_publish_status::published &&
+                 row.status !=
+                     vbr_projected_manifest_publish_status::adopted)) {
+                const auto failed = std::find_if(
+                    candidates.begin(), candidates.end(),
+                    [&](const candidate & value) {
+                        return value.manifest_id == row.manifest_id;
+                    });
+                if (failed != candidates.end()) {
+                    failed->slot->vbr_idle_capture_attempt_identity =
+                        failed->attempt_identity;
+                    // Dependency availability includes live recurrent/source
+                    // currency and can recover without a semantic frontier
+                    // change. Keep it on the bounded transient cooldown.
+                    failed->slot->vbr_idle_capture_terminal = false;
+                    failed->slot->vbr_idle_capture_retry_after_ms =
+                        ggml_time_ms() + 5000;
+                }
+                continue;
+            }
+            const auto found = std::find_if(
+                candidates.begin(), candidates.end(),
+                [&](const candidate & value) {
+                    return value.manifest_id == row.manifest_id;
+                });
+            if (found == candidates.end() || !found->slot ||
+                found->slot->is_processing() ||
+                found->slot->state != SLOT_STATE_IDLE) {
+                continue;
+            }
+            auto & source = *found->slot;
+            const auto adapter_key =
+                row.payload->package().manifest().identity.
+                    adapter_config_identity;
+            auto staged = prompt_cache->stage_vbr(
+                source.prompt,
+                server_prompt_cache_payload::from_vbr(
+                    std::move(row.payload)),
+                frontier_execution_identity, adapter_key);
+            if (staged.empty()) {
+                source.vbr_idle_capture_attempt_identity =
+                    found->attempt_identity;
+                source.vbr_idle_capture_terminal = false;
+                source.vbr_idle_capture_retry_after_ms =
+                    ggml_time_ms() + 5000;
+                continue;
+            }
+            server_prompt_cache_apply_family(
+                staged.front(), source.cache_family,
+                !source.task || !source.task->is_child());
+            if (!prompt_cache->publish(
+                    std::move(staged), &source.prompt, source.id)) {
+                source.vbr_idle_capture_attempt_identity =
+                    found->attempt_identity;
+                source.vbr_idle_capture_terminal = false;
+                source.vbr_idle_capture_retry_after_ms =
+                    ggml_time_ms() + 5000;
+                continue;
+            }
+            ++published_count;
+            SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_PUBLISHED__\n");
+        }
+
+        // H2.3 is publication-only. A projected payload becomes durable for
+        // live-slot destruction only when H2.4's automatic restore terminal is
+        // wired; retaining the source here is the fail-safe behavior.
+        SRV_INF(
+            "VBR_IDLE_CAPTURE manifests=%zu published=%zu union_cells=%" PRIu64
+            " planned=%" PRIu64 " transfers=%u duration_ms=%.3f\n",
+            candidates.size(), published_count, diagnostics.union_cells,
+            diagnostics.planned_packed_bytes,
+            diagnostics.unit_transfer_calls,
+            (ggml_time_us() - started)/1000.0);
+        return published_count;
+        } catch (...) {
+            return 0;
+        }
     }
 
     void process_single_task(server_task && task) {
@@ -10087,7 +10377,9 @@ private:
                         }
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (!params_base.vbr_prompt_cache &&
+                        params_base.cache_idle_slots &&
+                        !server_vbr_dynamic_active(params_base)) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");

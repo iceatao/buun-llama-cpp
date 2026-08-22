@@ -2190,6 +2190,23 @@ static bool server_prompt_cache_vbr_frontier_matches(
     }
 }
 
+bool server_prompt_cache::contains_vbr_frontier(
+        const server_prompt & prompt,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key) const noexcept {
+    for (const auto & state : states) {
+        if (state.payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact &&
+            state.adapter_config_key == adapter_config_key &&
+            server_prompt_cache_vbr_frontier_matches(
+                prompt, state.payload, execution_identity,
+                adapter_config_key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::list<server_prompt_cache_state> server_prompt_cache::stage_vbr(
         const server_prompt & prompt,
         server_prompt_cache_payload payload,
@@ -2197,7 +2214,6 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage_vbr(
         std::string adapter_config_key) {
     if (payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
         !payload.publishable() ||
-        !prompt.checkpoints.empty() ||
         !server_prompt_cache_vbr_frontier_matches(
             prompt, payload, execution_identity, adapter_config_key)) {
         return {};
@@ -5580,6 +5596,13 @@ bool server_prompt_cache::retention_sources_available(
         }
     }
     return true;
+}
+
+bool server_prompt_cache::vbr_retention_source_available(
+        int32_t source_slot) const noexcept {
+    return !retention_obs || source_slot < 0 ||
+        retention_obs->clone_source_available(
+            server_retention_instance_key::for_slot(source_slot));
 }
 
 bool server_prompt_cache::publish(

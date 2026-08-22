@@ -2420,6 +2420,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--vbr-prompt-cache"},
+        {"--no-vbr-prompt-cache"},
+        "publish idle dynamic-VBR slots as projected prompt-cache artifacts (default: disabled; requires cache-idle-slots and cache-ram)",
+        [](common_params & params, bool value) {
+            params.vbr_prompt_cache = value;
+        }
+    ).set_env("LLAMA_ARG_VBR_PROMPT_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

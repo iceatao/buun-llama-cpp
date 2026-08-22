@@ -1083,6 +1083,74 @@ bool server_vbr_artifact_store::publish_projected_host_batch(
     return true;
 }
 
+bool server_vbr_artifact_store::capture_projected_host_batch(
+        llama_memory_i & memory,
+        std::vector<vbr_projected_capture_manifest_request> manifests,
+        uint64_t max_packed_bytes,
+        std::vector<server_vbr_projected_host_publish_result> & output,
+        server_vbr_projected_host_capture_diagnostics * diagnostics) noexcept {
+    output.clear();
+    if (diagnostics) {
+        *diagnostics = {};
+    }
+    if (!impl_ || !impl_->ring || manifests.empty() ||
+        max_packed_bytes == 0) {
+        return false;
+    }
+
+    try {
+        vbr_projected_capture_batch_request request;
+        request.idle_decode_thread = true;
+        request.max_packed_bytes = max_packed_bytes;
+        request.manifests = std::move(manifests);
+        request.ring = impl_->ring.get();
+        request.topologies = impl_->topologies;
+        request.pool_bindings = impl_->pool_bindings;
+        const char * build_identity = llama_commit();
+        const vbr_explicit_representation_policy representation_policy {
+            build_identity, strlen(build_identity),
+            impl_->turbo_meansub_id,
+        };
+        request.representation_context = &representation_policy;
+        request.representation_identity =
+            vbr_explicit_capture_representation_identity;
+
+        auto captured = vbr_capture_projected_batch(memory, request);
+        server_vbr_projected_host_capture_diagnostics measured;
+        measured.capture_status = captured.status;
+        measured.capture_phase = captured.phase;
+        measured.inner_stream_status = captured.inner_stream_status;
+        measured.source_namespace = captured.source_namespace;
+        measured.union_cells = captured.union_cells;
+        measured.planned_packed_bytes = captured.planned_packed_bytes;
+        measured.size_pass_calls = captured.size_pass_calls;
+        measured.projection_calls = captured.projection_calls;
+        measured.unit_transfer_calls = captured.unit_transfer_calls;
+        measured.transferred_units = captured.transferred_units;
+        measured.transfer = captured.transfer;
+        if (captured.status != vbr_explicit_capture_status::ok ||
+            !captured.assembly ||
+            captured.publications.size() !=
+                captured.assembly.manifests().size()) {
+            if (diagnostics) {
+                *diagnostics = measured;
+            }
+            return false;
+        }
+
+        const bool published = publish_projected_host_batch(
+            captured.assembly, std::move(captured.publications), output,
+            &measured.publication);
+        if (diagnostics) {
+            *diagnostics = measured;
+        }
+        return published;
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+}
+
 server_vbr_artifact_import_output server_vbr_artifact_store::import(
         server_vbr_artifact_import_request request) noexcept {
     server_vbr_artifact_import_output output;

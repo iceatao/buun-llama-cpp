@@ -1087,6 +1087,14 @@ struct server_prompt_cache {
     // the state is durable and the live slot may be safely cleared without saving again [I6/I7].
     bool contains(const server_tokens & tokens, const std::string & adapter_config_key) const;
 
+    // Publication-presence query for automatic capture suppression. Unlike
+    // contains(), this is not a durability/clear authority: it recognizes an
+    // exact immutable VBR frontier even before automatic restore is wired.
+    bool contains_vbr_frontier(
+        const server_prompt & prompt,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key) const noexcept;
+
     // Resolve the exact durable host state used by prompt_save's durability
     // predicate and pin its three-payload accounting source. D-A5 calls this
     // after the same-flow save and before preparing live-slot destruction.
@@ -1133,6 +1141,8 @@ struct server_prompt_cache {
     // mutation boundary.
     bool retention_sources_available(
             const server_prompt & source_prompt,
+            int32_t source_slot) const noexcept;
+    bool vbr_retention_source_available(
             int32_t source_slot) const noexcept;
     bool publish(
             std::list<server_prompt_cache_state> entry,
