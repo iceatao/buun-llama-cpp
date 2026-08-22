@@ -3263,7 +3263,10 @@ struct validator_fixture {
     explicit validator_fixture(
             bool legacy_v1 = false,
             int stash_case = 0,
-            bool include_pinned = false)
+            bool include_pinned = false,
+            ggml_type source_type = GGML_TYPE_COUNT,
+            uint8_t source_promote_hops = 1,
+            bool include_exact_sibling = false)
         : base(true, include_pinned) {
         // Keep the historical artifact golden intact while making this
         // validator fixture's physical authorization fit its one-row unit.
@@ -3319,6 +3322,53 @@ struct validator_fixture {
                         ? vbr_repr_domain::full : vbr_repr_domain::tapped;
             }
         }
+        if (source_type != GGML_TYPE_COUNT) {
+            auto & descriptor = base.package.unit_blobs[0].descriptor;
+            auto & generation =
+                manifest.generation.controllers[0].units[0];
+            descriptor.current_type = source_type;
+            descriptor.last_source_type = source_type;
+            descriptor.promote_hops = source_promote_hops;
+            descriptor.representation.source_loss_history =
+                source_promote_hops;
+            generation.current_type = source_type;
+            generation.last_source_type = source_type;
+            generation.domain = vbr_downward_tier_domain(source_type);
+            generation.promote_hops = source_promote_hops;
+            const ggml_type source_types[] = { source_type };
+            manifest.controller_policy[0].current_type_vector_digest =
+                vbr_type_vector_digest(source_types, 1);
+        }
+        if (include_exact_sibling) {
+            auto sibling = base.package.unit_blobs.front();
+            sibling.descriptor.logical_unit_id = 1;
+            sibling.unit_version_id = {};
+            sibling.payload_digest = {};
+            base.package.unit_blobs.push_back(std::move(sibling));
+            manifest.generation.controllers[0].units.push_back(
+                manifest.generation.controllers[0].units.front());
+            auto sibling_reference = manifest.unit_references.front();
+            sibling_reference.logical_unit_id = 1;
+            sibling_reference.unit_version_id = {};
+            sibling_reference.payload_digest = {};
+            manifest.unit_references.push_back(std::move(sibling_reference));
+            for (auto & row : manifest.accounting) {
+                if (row.role == vbr_artifact_accounting_role::unit_payload ||
+                    row.role ==
+                        vbr_artifact_accounting_role::clean_stash_payload) {
+                    row.logical_bytes *= 2;
+                    row.resident_bytes *= 2;
+                }
+            }
+            const ggml_type sibling_types[] = {
+                static_cast<ggml_type>(
+                    base.package.unit_blobs[0].descriptor.current_type),
+                static_cast<ggml_type>(
+                    base.package.unit_blobs[1].descriptor.current_type),
+            };
+            manifest.controller_policy[0].current_type_vector_digest =
+                vbr_type_vector_digest(sibling_types, 2);
+        }
         manifest.manifest_digest = {};
         CHECK(base.catalog->configure_accounting(base.package));
         if (legacy_v1) {
@@ -3357,18 +3407,22 @@ struct validator_fixture {
             auto build = base.catalog->begin_capture(
                 base.package, base.budget, {}, status);
             CHECK(build && status == vbr_capture_stream_status::ok);
-            auto unit = build->begin_unit(0, status);
-            CHECK(unit && status == vbr_capture_stream_status::ok);
-            for (const auto & completion : base.completions()) {
-                if (completion.clean_stash && stash_case >= 2) {
-                    continue;
+            for (size_t unit_index = 0;
+                 unit_index < base.package.unit_blobs.size(); ++unit_index) {
+                auto unit = build->begin_unit(unit_index, status);
+                CHECK(unit && status == vbr_capture_stream_status::ok);
+                for (const auto & completion : base.completions()) {
+                    if (completion.clean_stash && stash_case >= 2) {
+                        continue;
+                    }
+                    auto copy = completion;
+                    copy.unit_index = unit_index;
+                    const auto segment = verified_segment(copy, 2);
+                    CHECK(unit->accept_verified_segment(segment) ==
+                          vbr_capture_stream_status::ok);
                 }
-                const auto segment = verified_segment(completion, 2);
-                CHECK(unit->accept_verified_segment(segment) ==
-                      vbr_capture_stream_status::ok);
+                CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
             }
-            CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
-            unit.reset();
             auto companion_bytes =
                 std::make_shared<artifact_segment_chain>();
             CHECK(companion_bytes->append(
@@ -3416,53 +3470,57 @@ struct validator_fixture {
         child.policy_epoch = target.policy_epoch;
         child.controller_policy = manifest.controller_policy[0];
 
-        const auto & descriptor = view.units()[0].descriptor;
-        vbr_target_unit_snapshot unit;
-        unit.child_id = descriptor.child_id;
-        unit.logical_unit_id = descriptor.logical_unit_id;
-        unit.current_type = descriptor.current_type;
-        unit.last_source_type = descriptor.last_source_type;
-        unit.promote_hops = descriptor.promote_hops;
-        unit.last_transition = descriptor.last_transition;
-        unit.representation_kind = descriptor.representation.kind;
-        unit.codec_id = descriptor.representation.codec_id;
-        unit.codec_version = descriptor.representation.codec_version;
-        unit.representation_reference_digest =
-            descriptor.representation.reference_digest;
-        unit.source_loss_history =
-            descriptor.representation.source_loss_history;
-        unit.checkpoint_codec_hops =
-            descriptor.representation.checkpoint_codec_hops;
-        unit.recoverability = descriptor.recoverability;
-        unit.side = descriptor.side;
-        unit.layout = descriptor.layout;
-        unit.row_codec_version = descriptor.row_codec_version;
-        unit.current_domain = manifest.generation.controllers[0].units[0].domain;
-        unit.codebook_digest = descriptor.codebook_digest;
-        unit.rotation_digest = descriptor.rotation_digest;
-        unit.meansub_digest = descriptor.meansub_digest;
-        unit.n_stream = descriptor.n_stream;
-        unit.unified = descriptor.unified;
-        unit.wm_cells = descriptor.wm_cells;
-        unit.rank = descriptor.rank;
-        unit.dimensions = descriptor.dimensions;
-        unit.row_alignment = descriptor.row_alignment;
-        for (size_t i = 0; i < descriptor.shards.size(); ++i) {
-            const auto & source = descriptor.shards[i];
-            unit.shards.push_back({
-                uint32_t(i),
-                reinterpret_cast<const void *>(uintptr_t(0x4000 + i)),
-                base.bindings[source.device_ordinal].domain,
-                source.topology_index,
-                source.device_ordinal,
-                base.package.topologies[source.topology_index].digest,
-                source.logical_offset,
-                source.row_count,
-                source.row_bytes,
-                source.payload_bytes,
-            });
+        for (const auto & source_unit : view.units()) {
+            const auto & descriptor = source_unit.descriptor;
+            vbr_target_unit_snapshot unit;
+            unit.child_id = descriptor.child_id;
+            unit.logical_unit_id = descriptor.logical_unit_id;
+            unit.current_type = descriptor.current_type;
+            unit.last_source_type = descriptor.last_source_type;
+            unit.promote_hops = descriptor.promote_hops;
+            unit.last_transition = descriptor.last_transition;
+            unit.representation_kind = descriptor.representation.kind;
+            unit.codec_id = descriptor.representation.codec_id;
+            unit.codec_version = descriptor.representation.codec_version;
+            unit.representation_reference_digest =
+                descriptor.representation.reference_digest;
+            unit.source_loss_history =
+                descriptor.representation.source_loss_history;
+            unit.checkpoint_codec_hops =
+                descriptor.representation.checkpoint_codec_hops;
+            unit.recoverability = descriptor.recoverability;
+            unit.side = descriptor.side;
+            unit.layout = descriptor.layout;
+            unit.row_codec_version = descriptor.row_codec_version;
+            unit.current_domain = manifest.generation.controllers[0]
+                .units[descriptor.logical_unit_id].domain;
+            unit.codebook_digest = descriptor.codebook_digest;
+            unit.rotation_digest = descriptor.rotation_digest;
+            unit.meansub_digest = descriptor.meansub_digest;
+            unit.n_stream = descriptor.n_stream;
+            unit.unified = descriptor.unified;
+            unit.wm_cells = descriptor.wm_cells;
+            unit.rank = descriptor.rank;
+            unit.dimensions = descriptor.dimensions;
+            unit.row_alignment = descriptor.row_alignment;
+            for (size_t i = 0; i < descriptor.shards.size(); ++i) {
+                const auto & source = descriptor.shards[i];
+                unit.shards.push_back({
+                    uint32_t(i),
+                    reinterpret_cast<const void *>(uintptr_t(
+                        0x4000 + 0x100*descriptor.logical_unit_id + i)),
+                    base.bindings[source.device_ordinal].domain,
+                    source.topology_index,
+                    source.device_ordinal,
+                    base.package.topologies[source.topology_index].digest,
+                    source.logical_offset,
+                    source.row_count,
+                    source.row_bytes,
+                    source.payload_bytes,
+                });
+            }
+            child.units.push_back(std::move(unit));
         }
-        child.units.push_back(unit);
         target.children.push_back(child);
         for (const auto & companion : view.companions()) {
             target.companions.push_back({
@@ -3740,20 +3798,59 @@ static void test_manifest_validator_matrix() {
     CHECK(vbr_upward_resolve_recipe(
               GGML_TYPE_F16, GGML_TYPE_F16, equal_recipe) ==
           vbr_upward_recipe_status::equal_tier);
+    const std::array<ggml_type, 4> tapped_types = {
+        GGML_TYPE_TURBO4_0,
+        GGML_TYPE_TURBO3_TCQ,
+        GGML_TYPE_TURBO2_TCQ,
+        GGML_TYPE_TURBO1_TCQ,
+    };
+    size_t tapped_upward_pairs = 0;
+    for (size_t source = 0; source < tapped_types.size(); ++source) {
+        for (size_t target = 0; target < tapped_types.size(); ++target) {
+            vbr_upward_recipe tapped_recipe;
+            const auto status = vbr_upward_resolve_recipe(
+                tapped_types[source], tapped_types[target], tapped_recipe);
+            if (source == target) {
+                CHECK(status == vbr_upward_recipe_status::equal_tier);
+            } else if (target < source) {
+                CHECK(status == vbr_upward_recipe_status::resolved);
+                CHECK(tapped_recipe.n_edges == 1);
+                CHECK(tapped_recipe.edges[0].source_type ==
+                      tapped_types[source]);
+                CHECK(tapped_recipe.edges[0].target_type ==
+                      tapped_types[target]);
+                CHECK(tapped_recipe.edges[0].source_domain ==
+                      vbr_repr_domain::tapped);
+                CHECK(tapped_recipe.edges[0].target_domain ==
+                      vbr_repr_domain::tapped);
+                ++tapped_upward_pairs;
+            } else {
+                CHECK(status ==
+                      vbr_upward_recipe_status::tapped_domain_unsupported);
+            }
+        }
+    }
+    CHECK(tapped_upward_pairs == 6);
     vbr_upward_recipe unsupported_recipe;
-    CHECK(vbr_upward_resolve_recipe(
-              GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_TCQ,
-              unsupported_recipe) ==
-          vbr_upward_recipe_status::tapped_domain_unsupported);
     CHECK(vbr_upward_resolve_recipe(
               GGML_TYPE_TURBO4_0, GGML_TYPE_F16,
               unsupported_recipe) ==
           vbr_upward_recipe_status::cross_domain_unsupported);
+    CHECK(vbr_upward_resolve_recipe(
+              GGML_TYPE_F16, GGML_TYPE_TURBO8_0,
+              unsupported_recipe) ==
+          vbr_upward_recipe_status::unsupported_type);
     CHECK(vbr_classify_import_schedule_units({
         { 0, 0, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
           vbr_repr_domain::full, vbr_repr_domain::full },
         { 0, 1, GGML_TYPE_F16, GGML_TYPE_F16,
           vbr_repr_domain::full, vbr_repr_domain::full },
+    }) == vbr_import_schedule_status::upward_same_domain);
+    CHECK(vbr_classify_import_schedule_units({
+        { 0, 0, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO4_0,
+          vbr_repr_domain::tapped, vbr_repr_domain::tapped },
+        { 0, 1, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ,
+          vbr_repr_domain::tapped, vbr_repr_domain::tapped },
     }) == vbr_import_schedule_status::upward_same_domain);
 
     const ggml_type upward_types[] = { GGML_TYPE_F16 };
@@ -3840,8 +3937,14 @@ static void test_manifest_validator_matrix() {
         CHECK(plan.transfer_bytes == upward_unit.upward_transfer_bytes);
         CHECK(plan.codec_workspace_bytes ==
               upward_unit.upward_codec_workspace_bytes);
+        CHECK(plan.target_last_source_type == GGML_TYPE_F16);
+        CHECK(plan.target_promote_hops == 0);
         CHECK(plan.stash_action ==
               vbr_validated_stash_action::omit_live_rebased);
+        const auto & generation =
+            upward.proof->tracker_install().children[0].units[0];
+        CHECK(generation.last_source_type == GGML_TYPE_F16);
+        CHECK(generation.promote_hops == 0);
     }
 
     auto no_upward_quote = upward_policy;
@@ -3912,6 +4015,255 @@ static void test_manifest_validator_matrix() {
           vbr_manifest_validation_status::budget_unavailable);
     same_domain_source.serials.transform_tree_digest =
         upward_destination.tree_digest;
+
+    const auto check_tapped_upward = [](
+            ggml_type source_type, ggml_type target_type,
+            uint8_t source_hops, int stash_case,
+            vbr_validated_stash_action expected_stash,
+            bool expected_valid) {
+        validator_fixture source(
+            false, stash_case, false, source_type, source_hops);
+        auto target = source.target;
+        auto & child = target.children[0];
+        auto & unit = child.units[0];
+        unit.current_type = target_type;
+        unit.current_domain = vbr_repr_domain::tapped;
+        unit.upward_supported = true;
+        unit.upward_type = target_type;
+        unit.upward_domain = vbr_repr_domain::tapped;
+        unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
+        unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
+        unit.upward_meansub_model_id = 7;
+        CHECK(vbr_upward_resolve_recipe(
+                  source_type, target_type, unit.upward_recipe) ==
+              vbr_upward_recipe_status::resolved);
+        uint64_t mapped = 0;
+        uint64_t transfer = 0;
+        for (auto & shard : unit.shards) {
+            CHECK(shard.row_bytes != 0 &&
+                  unit.wm_cells <= UINT64_MAX/shard.row_bytes);
+            shard.mapped_bytes = unit.wm_cells*shard.row_bytes;
+            CHECK(mapped <= UINT64_MAX-shard.mapped_bytes);
+            mapped += shard.mapped_bytes;
+        }
+        for (const auto & shard : source.view.units()[0].descriptor.shards) {
+            CHECK(transfer <= UINT64_MAX-shard.payload_bytes);
+            transfer += shard.payload_bytes;
+        }
+        unit.upward_row_bytes = unit.shards.front().row_bytes;
+        unit.upward_mapped_bytes = mapped;
+        unit.upward_transfer_bytes = transfer;
+        unit.upward_codec_workspace_bytes = 64;
+
+        const ggml_type target_types[] = { target_type };
+        child.controller_policy.current_type_vector_digest =
+            vbr_type_vector_digest(target_types, 1);
+        vbr_import_destination_projection destination;
+        destination.status =
+            vbr_import_destination_status::feasible_current;
+        destination.initial_types = { { target_type } };
+        destination.final_types = destination.initial_types;
+        destination.initial_cursors = { child.controller_policy.cursor };
+        destination.final_cursors = destination.initial_cursors;
+        destination.child_type_digests = {
+            child.controller_policy.current_type_vector_digest,
+        };
+        destination.tree_digest = vbr_type_tree_digest(
+            destination.child_type_digests,
+            VBR_DOWNWARD_RECIPE_VERSION);
+        CHECK(vbr_digest_nonzero(destination.tree_digest));
+
+        vbr_import_schedule_quote quote;
+        CHECK(vbr_quote_import_schedule(target, source.view, quote));
+        CHECK(quote.status() ==
+              vbr_import_schedule_status::upward_same_domain);
+        CHECK(vbr_rebind_import_schedule_quote(
+            target, source.view, destination, quote));
+        unit.upward_build_identity_digest = vbr_upward_build_identity(
+            unit.upward_recipe, unit.upward_meansub_model_id,
+            unit.meansub_digest, destination.child_type_digests[0],
+            destination.tree_digest);
+        CHECK(vbr_digest_nonzero(unit.upward_build_identity_digest));
+
+        llama_cache_budget_plan transform_plan;
+        transform_plan.accounting_serial = source.accounting.serial;
+        auto policy = source.policy;
+        policy.schedule_quote = &quote;
+        policy.transform_budget_plan = &transform_plan;
+        source.serials.transform_tree_digest = destination.tree_digest;
+        policy.read_transform_tree_digest =
+            validator_serials::read_transform_tree;
+        const auto validated = validate(source, target, policy);
+        if (!expected_valid) {
+            CHECK(validated.status ==
+                  vbr_manifest_validation_status::representation_mismatch);
+            CHECK(!validated.proof);
+            return;
+        }
+        CHECK(validated.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validated.decision ==
+              vbr_import_decision::upward_reconstruct);
+        CHECK(validated.proof && validated.proof->children().size() == 1);
+        CHECK(validated.proof &&
+              validated.proof->tracker_install().children.size() == 1);
+        if (!validated.proof || validated.proof->children().size() != 1 ||
+            validated.proof->tracker_install().children.size() != 1) {
+            return;
+        }
+        const auto & plan = validated.proof->children()[0];
+        const auto & generation =
+            validated.proof->tracker_install().children[0].units[0];
+        CHECK(plan.transform_kind ==
+              vbr_import_transform_kind::upward_same_domain);
+        CHECK(plan.upward_recipe.n_edges == 1);
+        CHECK(plan.target_last_source_type == source_type);
+        CHECK(plan.target_promote_hops == source_hops + 1);
+        CHECK(plan.stash_action == expected_stash);
+        CHECK(generation.current_type == target_type);
+        CHECK(generation.last_source_type == source_type);
+        CHECK(generation.domain == vbr_repr_domain::tapped);
+        CHECK(generation.promote_hops == source_hops + 1);
+        CHECK(generation.last_transition ==
+              vbr_repr_transition::whole_import);
+    };
+
+    for (size_t source = 1; source < tapped_types.size(); ++source) {
+        for (size_t target = 0; target < source; ++target) {
+            check_tapped_upward(
+                tapped_types[source], tapped_types[target], 0, 2,
+                vbr_validated_stash_action::none_at_source, true);
+            check_tapped_upward(
+                tapped_types[source], tapped_types[target], 1, 2,
+                vbr_validated_stash_action::none_at_source, true);
+            check_tapped_upward(
+                tapped_types[source], tapped_types[target], 2, 2,
+                vbr_validated_stash_action::none_at_source, false);
+        }
+    }
+    check_tapped_upward(
+        GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0, 0, 0,
+        vbr_validated_stash_action::restore_exact, true);
+    check_tapped_upward(
+        GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0, 1, 1,
+        vbr_validated_stash_action::omit_live_rebased, true);
+    // A controller-wide whole import must not reset the promotion history of
+    // an exact tapped sibling merely because another unit is reconstructed.
+    validator_fixture mixed_tapped(
+        false, 0, false, GGML_TYPE_TURBO3_TCQ, 1, true);
+    auto mixed_tapped_target = mixed_tapped.target;
+    auto & mixed_child = mixed_tapped_target.children[0];
+    auto & promoted_unit = mixed_child.units[0];
+    promoted_unit.current_type = GGML_TYPE_TURBO4_0;
+    promoted_unit.current_domain = vbr_repr_domain::tapped;
+    promoted_unit.upward_supported = true;
+    promoted_unit.upward_type = GGML_TYPE_TURBO4_0;
+    promoted_unit.upward_domain = vbr_repr_domain::tapped;
+    promoted_unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
+    promoted_unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
+    promoted_unit.upward_meansub_model_id = 7;
+    CHECK(vbr_upward_resolve_recipe(
+              GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0,
+              promoted_unit.upward_recipe) ==
+          vbr_upward_recipe_status::resolved);
+    uint64_t mixed_mapped = 0;
+    for (auto & shard : promoted_unit.shards) {
+        CHECK(shard.row_bytes != 0 &&
+              promoted_unit.wm_cells <= UINT64_MAX/shard.row_bytes);
+        shard.mapped_bytes = promoted_unit.wm_cells*shard.row_bytes;
+        CHECK(mixed_mapped <= UINT64_MAX-shard.mapped_bytes);
+        mixed_mapped += shard.mapped_bytes;
+    }
+    uint64_t mixed_transfer = 0;
+    for (const auto & shard :
+         mixed_tapped.view.units()[0].descriptor.shards) {
+        CHECK(mixed_transfer <= UINT64_MAX-shard.payload_bytes);
+        mixed_transfer += shard.payload_bytes;
+    }
+    promoted_unit.upward_row_bytes = promoted_unit.shards.front().row_bytes;
+    promoted_unit.upward_mapped_bytes = mixed_mapped;
+    promoted_unit.upward_transfer_bytes = mixed_transfer;
+    promoted_unit.upward_codec_workspace_bytes = 64;
+    const ggml_type mixed_target_types[] = {
+        GGML_TYPE_TURBO4_0,
+        GGML_TYPE_TURBO3_TCQ,
+    };
+    mixed_child.controller_policy.current_type_vector_digest =
+        vbr_type_vector_digest(mixed_target_types, 2);
+    vbr_import_destination_projection mixed_destination;
+    mixed_destination.status =
+        vbr_import_destination_status::feasible_current;
+    mixed_destination.initial_types = {
+        { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_TCQ },
+    };
+    mixed_destination.final_types = mixed_destination.initial_types;
+    mixed_destination.initial_cursors = {
+        mixed_child.controller_policy.cursor,
+    };
+    mixed_destination.final_cursors = mixed_destination.initial_cursors;
+    mixed_destination.child_type_digests = {
+        mixed_child.controller_policy.current_type_vector_digest,
+    };
+    mixed_destination.tree_digest = vbr_type_tree_digest(
+        mixed_destination.child_type_digests,
+        VBR_DOWNWARD_RECIPE_VERSION);
+    vbr_import_schedule_quote mixed_quote;
+    CHECK(vbr_quote_import_schedule(
+        mixed_tapped_target, mixed_tapped.view, mixed_quote));
+    CHECK(mixed_quote.status() ==
+          vbr_import_schedule_status::upward_same_domain);
+    CHECK(vbr_rebind_import_schedule_quote(
+        mixed_tapped_target, mixed_tapped.view,
+        mixed_destination, mixed_quote));
+    promoted_unit.upward_build_identity_digest = vbr_upward_build_identity(
+        promoted_unit.upward_recipe,
+        promoted_unit.upward_meansub_model_id,
+        promoted_unit.meansub_digest,
+        mixed_destination.child_type_digests[0],
+        mixed_destination.tree_digest);
+    llama_cache_budget_plan mixed_transform_plan;
+    mixed_transform_plan.accounting_serial = mixed_tapped.accounting.serial;
+    auto mixed_policy = mixed_tapped.policy;
+    mixed_policy.schedule_quote = &mixed_quote;
+    mixed_policy.transform_budget_plan = &mixed_transform_plan;
+    mixed_tapped.serials.transform_tree_digest =
+        mixed_destination.tree_digest;
+    mixed_policy.read_transform_tree_digest =
+        validator_serials::read_transform_tree;
+    const auto mixed_validated = validate(
+        mixed_tapped, mixed_tapped_target, mixed_policy);
+    CHECK(mixed_validated.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(mixed_validated.decision ==
+          vbr_import_decision::upward_reconstruct);
+    CHECK(mixed_validated.proof &&
+          mixed_validated.proof->children().size() == 2);
+    CHECK(mixed_validated.proof &&
+          mixed_validated.proof->tracker_install().children.size() == 1);
+    if (mixed_validated.proof &&
+        mixed_validated.proof->children().size() == 2 &&
+        mixed_validated.proof->tracker_install().children.size() == 1) {
+        const auto & mixed_plans = mixed_validated.proof->children();
+        CHECK(mixed_plans[0].transform_kind ==
+              vbr_import_transform_kind::upward_same_domain);
+        CHECK(mixed_plans[0].target_last_source_type ==
+              GGML_TYPE_TURBO3_TCQ);
+        CHECK(mixed_plans[0].target_promote_hops == 2);
+        CHECK(mixed_plans[1].transform_kind ==
+              vbr_import_transform_kind::none);
+        CHECK(mixed_plans[1].target_last_source_type ==
+              GGML_TYPE_TURBO3_TCQ);
+        CHECK(mixed_plans[1].target_promote_hops == 1);
+        const auto & mixed_generation =
+            mixed_validated.proof->tracker_install().children[0].units;
+        CHECK(mixed_generation.size() == 2);
+        if (mixed_generation.size() == 2) {
+            CHECK(mixed_generation[0].promote_hops == 2);
+            CHECK(mixed_generation[1].promote_hops == 1);
+            CHECK(mixed_generation[1].last_source_type ==
+                  GGML_TYPE_TURBO3_TCQ);
+        }
+    }
 
     validator_fixture cross_domain_source(false, 4);
     auto cross_domain_target = cross_domain_source.target;

@@ -1,4 +1,5 @@
 #include "../src/llama-vbr-downward.h"
+#include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cache-iswa.h"
 
 #include <algorithm>
@@ -746,10 +747,13 @@ struct fake_stash {
     uint64_t current = 0;
     uint64_t endpoint = 8192;
     bool fail = false;
+    uint64_t memory_calls = 0;
+    uint64_t reserve_calls = 0;
 };
 
 static bool stash_memory(void * context, uint64_t & now, uint64_t & endpoint) {
     auto * state = static_cast<fake_stash *>(context);
+    ++state->memory_calls;
     now = state->current;
     endpoint = state->endpoint;
     return true;
@@ -757,6 +761,7 @@ static bool stash_memory(void * context, uint64_t & now, uint64_t & endpoint) {
 
 static bool stash_reserve(void * context) {
     auto * state = static_cast<fake_stash *>(context);
+    ++state->reserve_calls;
     if (state->fail) {
         state->current = state->endpoint / 2;
         return false;
@@ -829,6 +834,118 @@ static void test_projection_reserve_retry_and_stashless() {
     assert(ledger.snapshot().live_ops == baseline_ops);
 }
 
+static void test_required_stash_reserve_fails_closed() {
+    llama_cache_acct_ledger ledger;
+    configure_resource_ledger(ledger);
+    fake_workspace workspace;
+    fake_stash stash;
+    ggml_vbr_backend_iface iface = {};
+    iface.kv_transcode_workspace_memory = workspace_memory;
+    iface.kv_transcode_workspace_reserve = workspace_reserve;
+    const int workspace_owner = 1;
+    const int stash_owner = 2;
+    vbr_downward_workspace_endpoint w;
+    w.owner = &workspace_owner;
+    w.iface = &iface;
+    w.backend = reinterpret_cast<ggml_backend_t>(&workspace);
+    w.device = 0;
+    w.domain = HOST;
+    w.requests.push_back({ 128, 256, 32 });
+    vbr_downward_stash_endpoint s;
+    s.owner = &stash_owner;
+    s.unit_ids = { 77 };
+    s.required = true;
+    s.domain = HOST;
+    s.context = &stash;
+    s.memory = stash_memory;
+    s.reserve = stash_reserve;
+    stash.fail = true;
+
+    vbr_downward_resource_receipts receipts(ledger);
+    const auto result = receipts.reserve_resources({}, { w }, { s });
+    assert(result.status ==
+           vbr_downward_reserve_status::required_stash_reserve_failed);
+    assert(result.stashless_units.empty());
+    assert(stash.memory_calls == 1);
+    assert(stash.reserve_calls == 1);
+}
+
+static void test_mixed_transform_and_stash_only_receipts() {
+    llama_cache_acct_ledger ledger;
+    configure_resource_ledger(ledger);
+    fake_workspace workspace;
+    fake_stash transformed_stash;
+    fake_stash exact_stash;
+    ggml_vbr_backend_iface iface = {};
+    iface.kv_transcode_workspace_memory = workspace_memory;
+    iface.kv_transcode_workspace_reserve = workspace_reserve;
+    const int workspace_owner = 1;
+    const int transformed_owner = 2;
+    const int exact_owner = 3;
+    vbr_downward_workspace_endpoint w;
+    w.owner = &workspace_owner;
+    w.iface = &iface;
+    w.backend = reinterpret_cast<ggml_backend_t>(&workspace);
+    w.device = 0;
+    w.domain = HOST;
+    w.requests.push_back({ 128, 256, 32 });
+    vbr_downward_stash_endpoint transformed;
+    transformed.owner = &transformed_owner;
+    transformed.unit_ids = { 77 };
+    transformed.required = true;
+    transformed.domain = HOST;
+    transformed.context = &transformed_stash;
+    transformed.memory = stash_memory;
+    transformed.reserve = stash_reserve;
+    vbr_downward_stash_endpoint exact = transformed;
+    exact.owner = &exact_owner;
+    exact.unit_ids = { 78 };
+    exact.context = &exact_stash;
+
+    vbr_downward_resource_receipts receipts(ledger);
+    const auto result = receipts.reserve_resources(
+        {}, { w }, { transformed, exact });
+    assert(result.status == vbr_downward_reserve_status::reserved);
+    assert(transformed_stash.memory_calls == 1);
+    assert(transformed_stash.reserve_calls == 1);
+    assert(exact_stash.memory_calls == 1);
+    assert(exact_stash.reserve_calls == 1);
+}
+
+struct llama_kv_cache_vbr_stash_batch_test {
+    static bool run(size_t request_count, uint64_t & request_checks) {
+        if (request_count == 0 || request_count > UINT32_MAX) {
+            return false;
+        }
+        llama_kv_cache::vbr_pool pool;
+        pool.gran = 1;
+        pool.stash_size = request_count*sizeof(uint16_t);
+        pool.k.resize(request_count);
+        ggml_tensor tensor = {};
+        tensor.ne[0] = 1;
+        std::vector<llama_kv_cache::vbr_stash_request> requests;
+        requests.reserve(request_count);
+        for (size_t i = 0; i < request_count; ++i) {
+            auto & extent = pool.k[i];
+            extent.t = &tensor;
+            extent.stash_off = i*sizeof(uint16_t);
+            requests.push_back({ &extent, 1 });
+        }
+        bool needs_mapping = false;
+        return llama_kv_cache::vbr_stash_requests_valid(
+                   pool, requests, 1, true, needs_mapping,
+                   &request_checks) && needs_mapping;
+    }
+};
+
+static void test_trusted_stash_batch_validation_is_linear() {
+    constexpr size_t request_count = 16384;
+    uint64_t request_checks = 0;
+    assert(llama_kv_cache_vbr_stash_batch_test::run(
+        request_count, request_checks));
+    assert(request_checks == request_count);
+}
+
 static void test_workspace_prices_max_shape_but_reserves_once() {
     constexpr size_t request_count = 16384;
     llama_cache_acct_ledger ledger;
@@ -875,6 +992,9 @@ int main() {
     test_edge_oracles_and_stash_boundaries();
     test_straddled_kv_independent_chains();
     test_projection_reserve_retry_and_stashless();
+    test_required_stash_reserve_fails_closed();
+    test_mixed_transform_and_stash_only_receipts();
+    test_trusted_stash_batch_validation_is_linear();
     test_workspace_prices_max_shape_but_reserves_once();
     std::puts("test-vbr-downward: OK");
     return 0;

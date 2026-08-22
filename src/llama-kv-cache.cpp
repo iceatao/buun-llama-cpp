@@ -5112,29 +5112,33 @@ static void vbr_set_tensor_type_noalloc(
     }
 }
 
-bool llama_kv_cache::vbr_stash_memory(
+bool llama_kv_cache::vbr_stash_requests_valid(
         const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
-        size_t & physical_now, size_t & physical_if_reserved) const {
-    physical_now = p.stash_vmm != nullptr ? p.be->vmm_pool_mapped(p.stash_vmm) : 0;
-    physical_if_reserved = physical_now;
+        uint32_t stash_rows, bool ownership_authenticated,
+        bool & needs_mapping, uint64_t * request_checks) {
+    needs_mapping = false;
+    if (request_checks) {
+        *request_checks = 0;
+    }
     if (requests.empty()) {
         return true;
     }
     if (p.stash_size == 0 || p.gran == 0) {
         return false;
     }
-
-    bool needs_mapping = false;
     for (const auto & request : requests) {
+        if (request_checks) {
+            ++*request_checks;
+        }
         const vbr_extent * e = request.extent;
-        if (e == nullptr || e->t == nullptr || request.rows > vbr_stash_rows_) {
+        if (e == nullptr || e->t == nullptr || request.rows > stash_rows) {
             return false;
         }
-        const bool owned = std::any_of(p.k.begin(), p.k.end(),
-                    [&](const vbr_extent & candidate) { return &candidate == e; }) ||
-                std::any_of(p.v.begin(), p.v.end(),
-                    [&](const vbr_extent & candidate) { return &candidate == e; });
-        if (!owned) {
+        if (!ownership_authenticated &&
+            !std::any_of(p.k.begin(), p.k.end(),
+                [&](const vbr_extent & candidate) { return &candidate == e; }) &&
+            !std::any_of(p.v.begin(), p.v.end(),
+                [&](const vbr_extent & candidate) { return &candidate == e; })) {
             return false;
         }
         const size_t ne0 = (size_t) e->t->ne[0];
@@ -5151,6 +5155,22 @@ bool llama_kv_cache::vbr_stash_memory(
             return false;
         }
     }
+    return true;
+}
+
+bool llama_kv_cache::vbr_stash_memory_impl(
+        const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+        bool ownership_authenticated,
+        size_t & physical_now, size_t & physical_if_reserved,
+        uint64_t * request_checks) const {
+    physical_now = p.stash_vmm != nullptr ? p.be->vmm_pool_mapped(p.stash_vmm) : 0;
+    physical_if_reserved = physical_now;
+    bool needs_mapping = false;
+    if (!vbr_stash_requests_valid(
+            p, requests, vbr_stash_rows_, ownership_authenticated,
+            needs_mapping, request_checks)) {
+        return false;
+    }
     // One capture pins the slab for the cache lifetime, just as the prior cudaMalloc did. Keeping
     // this a complete page-padded endpoint makes a transaction's stash price independent of which
     // extent happens to be the first capture and avoids page-union arithmetic in the policy layer.
@@ -5160,11 +5180,38 @@ bool llama_kv_cache::vbr_stash_memory(
     return true;
 }
 
+bool llama_kv_cache::vbr_stash_memory(
+        const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+        size_t & physical_now, size_t & physical_if_reserved) const {
+    return vbr_stash_memory_impl(
+        p, requests, false, physical_now, physical_if_reserved);
+}
+
+bool llama_kv_cache::vbr_stash_memory_trusted(
+        const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+        size_t & physical_now, size_t & physical_if_reserved) const {
+    return vbr_stash_memory_impl(
+        p, requests, true, physical_now, physical_if_reserved);
+}
+
 bool llama_kv_cache::vbr_stash_reserve(
         vbr_pool & p, const std::vector<vbr_stash_request> & requests) {
+    return vbr_stash_reserve_impl(p, requests, false);
+}
+
+bool llama_kv_cache::vbr_stash_reserve_trusted(
+        vbr_pool & p, const std::vector<vbr_stash_request> & requests) {
+    return vbr_stash_reserve_impl(p, requests, true);
+}
+
+bool llama_kv_cache::vbr_stash_reserve_impl(
+        vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+        bool ownership_authenticated) {
     size_t physical_now = 0;
     size_t physical_if_reserved = 0;
-    if (!vbr_stash_memory(p, requests, physical_now, physical_if_reserved)) {
+    if (!vbr_stash_memory_impl(
+            p, requests, ownership_authenticated,
+            physical_now, physical_if_reserved)) {
         return false;
     }
     if (physical_if_reserved == physical_now) {
@@ -5205,6 +5252,7 @@ bool llama_kv_cache::vbr_import_transform_reserve(
         vbr_pool * pool = nullptr;
         std::vector<vbr_stash_request> requests;
         std::vector<uint64_t> unit_ids;
+        bool required = false;
     };
     struct pool_projection {
         vbr_pool * pool = nullptr;
@@ -5239,13 +5287,20 @@ bool llama_kv_cache::vbr_import_transform_reserve(
         }
         output.stashless_units.reserve(plans.size());
         output.status = vbr_downward_reserve_status::reserved;
-        bool have_transform = false;
+        bool have_resource = false;
         for (const auto * plan : plans) {
-            if (!plan || plan->transform_kind ==
-                    vbr_import_transform_kind::none) {
+            if (!plan) {
                 continue;
             }
-            if (plan->transform_kind !=
+            const bool stash_only =
+                plan->transform_kind == vbr_import_transform_kind::none &&
+                plan->stash_action ==
+                    vbr_validated_stash_action::restore_exact;
+            if (plan->transform_kind == vbr_import_transform_kind::none &&
+                !stash_only) {
+                continue;
+            }
+            if (!stash_only && plan->transform_kind !=
                     vbr_import_transform_kind::downward &&
                 plan->transform_kind !=
                     vbr_import_transform_kind::upward_same_domain) {
@@ -5253,7 +5308,7 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                     vbr_downward_reserve_status::projection_unavailable;
                 return false;
             }
-            have_transform = true;
+            have_resource = true;
             const size_t ikv = plan->logical_unit_id/2;
             const bool is_v = (plan->logical_unit_id & 1u) != 0;
             if (ikv >= layers.size()) {
@@ -5266,6 +5321,35 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                 output.status =
                     vbr_downward_reserve_status::projection_unavailable;
                 return false;
+            }
+            uint32_t plan_stash_rows = 0;
+            bool required_stash = false;
+            if (plan->transform_kind ==
+                    vbr_import_transform_kind::downward &&
+                vbr_downward_recipe_needs_stash(
+                    plan->transcode_recipe) && vbr_stash_rows_ > 0) {
+                plan_stash_rows = std::min<uint64_t>(
+                    vbr_stash_rows_, plan->descriptor.wm_cells);
+            } else if (plan->stash_action ==
+                           vbr_validated_stash_action::restore_exact &&
+                       (stash_only ||
+                        (plan->transform_kind ==
+                             vbr_import_transform_kind::upward_same_domain &&
+                         plan->source_domain == vbr_repr_domain::tapped))) {
+                const auto & stash = plan->descriptor.clean_stash;
+                if (plan->descriptor.clean_stash_state !=
+                        vbr_artifact_clean_stash_state::present ||
+                    stash.domain != vbr_repr_domain::tapped ||
+                    stash.valid_rows == 0 ||
+                    stash.valid_rows > plan->descriptor.wm_cells ||
+                    stash.valid_rows > vbr_stash_rows_ ||
+                    stash.valid_rows > UINT32_MAX) {
+                    output.status =
+                        vbr_downward_reserve_status::projection_unavailable;
+                    return false;
+                }
+                plan_stash_rows = uint32_t(stash.valid_rows);
+                required_stash = true;
             }
             for (const auto & shard : plan->shards) {
                 const auto pool_index = pool_indices.find(
@@ -5282,8 +5366,9 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                     !units[shard.shard_index].second ||
                     !units[shard.shard_index].second->t ||
                     pool.be == nullptr ||
-                    pool.be->kv_transcode_workspace_memory == nullptr ||
-                    pool.be->kv_transcode_workspace_reserve == nullptr) {
+                    (!stash_only &&
+                     (pool.be->kv_transcode_workspace_memory == nullptr ||
+                      pool.be->kv_transcode_workspace_reserve == nullptr))) {
                     output.status =
                         vbr_downward_reserve_status::projection_unavailable;
                     return false;
@@ -5297,40 +5382,38 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                         vbr_downward_reserve_status::projection_unavailable;
                     return false;
                 }
-                uint32_t stash_rows = 0;
-                if (plan->transform_kind ==
-                        vbr_import_transform_kind::downward &&
-                    vbr_downward_recipe_needs_stash(
-                        plan->transcode_recipe) && vbr_stash_rows_ > 0) {
-                    stash_rows = std::min<uint64_t>(
-                        vbr_stash_rows_, plan->descriptor.wm_cells);
+                if (!stash_only) {
+                    projection.workspace.requests.push_back({
+                        int64_t(plan->descriptor.wm_cells),
+                        units[shard.shard_index].second->t->ne[0],
+                        int64_t(plan_stash_rows),
+                    });
                 }
-                projection.workspace.requests.push_back({
-                    int64_t(plan->descriptor.wm_cells),
-                    units[shard.shard_index].second->t->ne[0],
-                    int64_t(stash_rows),
-                });
-                if (stash_rows > 0) {
+                if (plan_stash_rows > 0) {
                     projection.stash.requests.push_back({
-                        units[shard.shard_index].second, stash_rows,
+                        units[shard.shard_index].second, plan_stash_rows,
                     });
                     projection.stash.unit_ids.push_back(
                         vbr_downward_unit_key(
                             plan->child_id, plan->logical_unit_id));
+                    projection.stash.required =
+                        projection.stash.required || required_stash;
                 }
             }
         }
-        if (!have_transform) {
+        if (!have_resource) {
             output.status =
                 vbr_downward_reserve_status::projection_unavailable;
             return false;
         }
         for (auto & projection : projections) {
-            if (projection.workspace.requests.empty()) {
+            if (projection.workspace.requests.empty() &&
+                projection.stash.requests.empty()) {
                 continue;
             }
             auto & pool = *projection.pool;
-            if (pool.backend == nullptr) {
+            if (!projection.workspace.requests.empty() &&
+                pool.backend == nullptr) {
                 pool.backend = pool.be->backend_init(pool.device);
                 if (pool.backend == nullptr) {
                     output.status =
@@ -5341,11 +5424,14 @@ bool llama_kv_cache::vbr_import_transform_reserve(
             }
             std::vector<vbr_downward_workspace_endpoint> workspaces;
             std::vector<vbr_downward_stash_endpoint> stashes;
-            workspaces.push_back(std::move(projection.workspace));
+            if (!projection.workspace.requests.empty()) {
+                workspaces.push_back(std::move(projection.workspace));
+            }
             if (!projection.stash.requests.empty()) {
                 vbr_downward_stash_endpoint endpoint;
                 endpoint.owner = &pool;
                 endpoint.unit_ids = std::move(projection.stash.unit_ids);
+                endpoint.required = projection.stash.required;
                 endpoint.domain = projection.domain;
                 endpoint.context = &projection.stash;
                 endpoint.memory = [](void * opaque, uint64_t & now,
@@ -5353,7 +5439,7 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                     auto & value = *static_cast<stash_context *>(opaque);
                     size_t a = 0;
                     size_t b = 0;
-                    if (!value.cache->vbr_stash_memory(
+                    if (!value.cache->vbr_stash_memory_trusted(
                             *value.pool, value.requests, a, b)) {
                         return false;
                     }
@@ -5363,7 +5449,7 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                 };
                 endpoint.reserve = [](void * opaque) {
                     auto & value = *static_cast<stash_context *>(opaque);
-                    return value.cache->vbr_stash_reserve(
+                    return value.cache->vbr_stash_reserve_trusted(
                         *value.pool, value.requests);
                 };
                 stashes.push_back(std::move(endpoint));
@@ -5784,10 +5870,49 @@ bool llama_kv_cache::vbr_upward_transform_import(
             !(resolved == plan.upward_recipe)) {
             return false;
         }
+        const auto source_domain = vbr_downward_tier_domain(
+            plan.upward_recipe.source_type);
+        const auto target_domain = vbr_downward_tier_domain(
+            plan.upward_recipe.target_type);
+        if (plan.source_domain != source_domain ||
+            plan.selected_target_domain != target_domain ||
+            source_domain != target_domain) {
+            return false;
+        }
+        if (source_domain == vbr_repr_domain::tapped) {
+            if (plan.descriptor.promote_hops >= 2 ||
+                plan.target_promote_hops !=
+                    uint8_t(plan.descriptor.promote_hops + 1) ||
+                plan.target_last_source_type !=
+                    plan.descriptor.current_type) {
+                return false;
+            }
+        } else if (source_domain != vbr_repr_domain::full ||
+                   plan.target_promote_hops != 0 ||
+                   plan.target_last_source_type !=
+                       plan.selected_target_type) {
+            return false;
+        }
         const size_t ikv = plan.logical_unit_id/2;
         const bool is_v = (plan.logical_unit_id & 1u) != 0;
         const auto & units = vbr_units_of(ikv, is_v);
         if (units.size() != plan.shards.size()) {
+            return false;
+        }
+        const bool restore_stash =
+            source_domain == vbr_repr_domain::tapped &&
+            plan.stash_action == vbr_validated_stash_action::restore_exact;
+        const uint64_t stash_rows = restore_stash
+            ? plan.descriptor.clean_stash.valid_rows : 0;
+        if (restore_stash &&
+             (plan.descriptor.clean_stash_state !=
+                  vbr_artifact_clean_stash_state::present ||
+              plan.descriptor.clean_stash.domain !=
+                  vbr_repr_domain::tapped ||
+              stash_rows == 0 || stash_rows > plan.descriptor.wm_cells ||
+              stash_rows > vbr_stash_rows_ ||
+              plan.descriptor.clean_stash.shards.size() !=
+                  plan.shards.size())) {
             return false;
         }
         for (const auto & shard : plan.shards) {
@@ -5809,6 +5934,29 @@ bool llama_kv_cache::vbr_upward_transform_import(
                     plan.upward_recipe.source_type, source)) {
                 return false;
             }
+            if (restore_stash) {
+                const auto * extent =
+                    units[shard.shard_index].second;
+                const auto & stash_shard =
+                    plan.descriptor.clean_stash.shards[shard.shard_index];
+                const uint64_t ne0 = uint64_t(extent->t->ne[0]);
+                if (ne0 == 0 || ne0 > UINT64_MAX/sizeof(uint16_t)) {
+                    return false;
+                }
+                const uint64_t row_bytes = ne0*sizeof(uint16_t);
+                if (stash_rows > UINT64_MAX/row_bytes ||
+                    stash_shard.shard_index != shard.shard_index ||
+                    stash_shard.row_count != stash_rows ||
+                    stash_shard.row_bytes != row_bytes ||
+                    stash_shard.payload_bytes != stash_rows*row_bytes ||
+                    !pool->stash_vmm ||
+                    extent->stash_off > pool->stash_size ||
+                    stash_shard.payload_bytes >
+                        pool->stash_size-extent->stash_off ||
+                    pool->be->vmm_pool_base(pool->stash_vmm) == nullptr) {
+                    return false;
+                }
+            }
         }
         // Validate the complete shard set before the first asynchronous
         // submission. After this point the loop is deliberately no-fail;
@@ -5822,11 +5970,16 @@ bool llama_kv_cache::vbr_upward_transform_import(
             vbr_set_tensor_type_impl(
                 &source, no_views, plan.upward_recipe.source_type);
             source.data = extent->t->data;
+            const void * stash = restore_stash
+                ? static_cast<const char *>(
+                      pool->be->vmm_pool_base(pool->stash_vmm)) +
+                      extent->stash_off
+                : nullptr;
             const ggml_vbr_transcode_params params = {
                 &source, plan.upward_recipe.target_type,
                 extent->t->data, pool->buf,
                 int64_t(plan.descriptor.wm_cells), is_v,
-                nullptr, 0, 0,
+                stash, int64_t(stash_rows), 0,
             };
             pool->be->kv_transcode(pool->backend, &params);
         }
@@ -8480,18 +8633,12 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
             ggml_backend_buffer_t slabbuf = ggml_backend_buft_alloc_buffer(
                     ggml_backend_get_default_buffer_type(bk), r_max * (size_t) N);
             void * slab = ggml_backend_buffer_get_base(slabbuf);
-            const ggml_vbr_transcode_params tp_dn = {
-                s_t8, ladder[0], slab, slabbuf, N, /*is_v=*/ivar != 0, nullptr, 0, /*scrub_bytes=*/0,
-            };
-            be->kv_transcode(bk, &tp_dn);
-            ggml_backend_synchronize(bk);
-
             // header contexts: transcode reads type/ne[0]/nb[1]/data/name of src only
-            ggml_init_params iph = { 48*ggml_tensor_overhead(), nullptr, true };
+            ggml_init_params iph = { 128*ggml_tensor_overhead(), nullptr, true };
             ggml_context * hc = ggml_init(iph);
-            auto alias = [&](ggml_type tt) {
+            auto alias = [&](ggml_type tt, void * base, ggml_backend_buffer_t buffer) {
                 ggml_tensor * x = ggml_new_tensor_2d(hc, tt, ne0, N);
-                x->data = slab; x->buffer = slabbuf;
+                x->data = base; x->buffer = buffer;
                 ggml_set_name(x, nm);
                 return x;
             };
@@ -8501,65 +8648,111 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
                 d->data = base; d->buffer = b;
                 ggml_backend_tensor_get(d, dst, 0, nbytes);
             };
-            for (int h = 0; h + 1 < 4; ++h) {
-                const ggml_type tto  = ladder[h + 1];
-                const size_t bytesTo = ggml_row_size(tto, ne0) * (size_t) N;
-
-                ggml_backend_buffer_t hsep = ggml_backend_buft_alloc_buffer(
-                        ggml_backend_get_default_buffer_type(bk), bytesTo);
-                const ggml_vbr_transcode_params tp_hs = {
-                    alias(ladder[h]), tto, ggml_backend_buffer_get_base(hsep), hsep,
-                    N, /*is_v=*/ivar != 0, nullptr, 0, /*scrub_bytes=*/0,
+            // Exercise every direct tapped promotion edge, not only the adjacent live-promotion
+            // ladder. Import reconstruction deliberately uses one direct edge, so T1->T4 and
+            // T2->T4 must independently prove the same reverse-tile in-place invariant.
+            for (int from = 0; from + 1 < 4; ++from) {
+                const ggml_type tfrom = ladder[from];
+                const size_t bytesFrom = ggml_row_size(tfrom, ne0) * (size_t) N;
+                ggml_backend_buffer_t sourcebuf = ggml_backend_buft_alloc_buffer(
+                        ggml_backend_get_default_buffer_type(bk), bytesFrom);
+                void * source = ggml_backend_buffer_get_base(sourcebuf);
+                const ggml_vbr_transcode_params tp_dn = {
+                    s_t8, tfrom, source, sourcebuf, N, /*is_v=*/ivar != 0,
+                    nullptr, 0, /*scrub_bytes=*/0,
                 };
-                be->kv_transcode(bk, &tp_hs);
+                be->kv_transcode(bk, &tp_dn);
                 ggml_backend_synchronize(bk);
+                std::vector<uint8_t> source_host(bytesFrom);
+                download(source, sourcebuf, source_host.data(), bytesFrom);
 
-                const ggml_vbr_transcode_params tp_hi = {
-                    alias(ladder[h]), tto, slab, slabbuf,   // dst == src->data -> reverse tiles
-                    N, /*is_v=*/ivar != 0, nullptr, 0, /*scrub_bytes=*/0,
-                };
-                be->kv_transcode(bk, &tp_hi);
-                ggml_backend_synchronize(bk);
+                for (int to = from + 1; to < 4; ++to) {
+                    const ggml_type tto     = ladder[to];
+                    const size_t    bytesTo = ggml_row_size(tto, ne0) * (size_t) N;
 
-                std::vector<uint8_t> hb(bytesTo), ib(bytesTo);
-                download(ggml_backend_buffer_get_base(hsep), hsep, hb.data(), bytesTo);
-                download(slab, slabbuf, ib.data(), bytesTo);
-                size_t same = 0, first_bad = bytesTo;
-                for (size_t i = 0; i < bytesTo; ++i) {
-                    if (hb[i] == ib[i]) { same++; } else if (first_bad == bytesTo) { first_bad = i; }
-                }
-                fprintf(stderr, "VBR SELFTEST PROMOTE %s %s->%s in-place==separate: %.3f%% (%zu/%zu)%s first-diff byte %lld (row %lld)\n",
-                        nm, ggml_type_name(ladder[h]), ggml_type_name(tto),
-                        100.0*(double)same/(double)bytesTo, same, bytesTo,
-                        same == bytesTo ? "" : " byte-MISMATCH", same == bytesTo ? -1LL : (long long) first_bad,
-                        same == bytesTo ? -1LL : (long long)(first_bad / ggml_row_size(tto, ne0)));
-                if (same != bytesTo) {
-                    // TCQ trellis blocks carry trailing don't-care bits the decode never reads, so a
-                    // byte diff is not yet corruption — adjudicate on DEQUANTIZED values instead
-                    const size_t fb = (size_t) N * ne0 * sizeof(uint16_t);
-                    ggml_backend_buffer_t f1 = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), fb);
-                    ggml_backend_buffer_t f2 = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), fb);
-                    ggml_tensor * asep = ggml_new_tensor_2d(hc, tto, ne0, N);
-                    asep->data = ggml_backend_buffer_get_base(hsep); asep->buffer = hsep;
-                    ggml_set_name(asep, nm);
-                    be->kv_stash_capture(bk, asep,      ggml_backend_buffer_get_base(f1), N, ivar != 0);
-                    be->kv_stash_capture(bk, alias(tto), ggml_backend_buffer_get_base(f2), N, ivar != 0);
+                    ggml_backend_buffer_t hsep =
+                        ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), bytesTo);
+                    const ggml_vbr_transcode_params tp_hs = {
+                        alias(tfrom, source, sourcebuf),
+                        tto,
+                        ggml_backend_buffer_get_base(hsep),
+                        hsep,
+                        N,
+                        /*is_v=*/ivar != 0,
+                        nullptr,
+                        0,
+                        /*scrub_bytes=*/0,
+                    };
+                    be->kv_transcode(bk, &tp_hs);
                     ggml_backend_synchronize(bk);
-                    std::vector<uint16_t> v1(fb/2), v2(fb/2);
-                    download(ggml_backend_buffer_get_base(f1), f1, v1.data(), fb);
-                    download(ggml_backend_buffer_get_base(f2), f2, v2.data(), fb);
-                    size_t vbad = 0; int64_t first_row = -1;
-                    for (size_t i = 0; i < v1.size(); ++i) {
-                        if (v1[i] != v2[i]) { vbad++; if (first_row < 0) { first_row = (int64_t) (i / (size_t) ne0); } }
+
+                    ggml_backend_tensor_set(alias(tfrom, slab, slabbuf), source_host.data(), 0, bytesFrom);
+                    const ggml_vbr_transcode_params tp_hi = {
+                        alias(tfrom, slab, slabbuf), tto,     slab, slabbuf,           N,
+                        /*is_v=*/ivar != 0,          nullptr, 0,    /*scrub_bytes=*/0,
+                    };
+                    be->kv_transcode(bk, &tp_hi);
+                    ggml_backend_synchronize(bk);
+
+                    std::vector<uint8_t> hb(bytesTo), ib(bytesTo);
+                    download(ggml_backend_buffer_get_base(hsep), hsep, hb.data(), bytesTo);
+                    download(slab, slabbuf, ib.data(), bytesTo);
+                    size_t same = 0, first_bad = bytesTo;
+                    for (size_t i = 0; i < bytesTo; ++i) {
+                        if (hb[i] == ib[i]) {
+                            same++;
+                        } else if (first_bad == bytesTo) {
+                            first_bad = i;
+                        }
                     }
-                    fprintf(stderr, "VBR SELFTEST PROMOTE %s %s->%s DEQUANT compare: %s (%zu/%zu f16 values differ, first row %lld)\n",
-                            nm, ggml_type_name(ladder[h]), ggml_type_name(tto),
-                            vbad == 0 ? "IDENTICAL (slack bits only)" : "VALUE MISMATCH",
-                            vbad, v1.size(), (long long) first_row);
-                    ggml_backend_buffer_free(f1); ggml_backend_buffer_free(f2);
+                    fprintf(stderr,
+                            "VBR SELFTEST PROMOTE %s %s->%s in-place==separate: %.3f%% (%zu/%zu)%s first-diff byte "
+                            "%lld (row %lld)\n",
+                            nm, ggml_type_name(tfrom), ggml_type_name(tto), 100.0 * (double) same / (double) bytesTo,
+                            same, bytesTo, same == bytesTo ? "" : " byte-MISMATCH",
+                            same == bytesTo ? -1LL : (long long) first_bad,
+                            same == bytesTo ? -1LL : (long long) (first_bad / ggml_row_size(tto, ne0)));
+                    if (same != bytesTo) {
+                        // TCQ trellis blocks carry trailing don't-care bits the decode never reads, so a
+                        // byte diff is not yet corruption — adjudicate on DEQUANTIZED values instead
+                        const size_t          fb = (size_t) N * ne0 * sizeof(uint16_t);
+                        ggml_backend_buffer_t f1 =
+                            ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), fb);
+                        ggml_backend_buffer_t f2 =
+                            ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), fb);
+                        ggml_tensor * asep = ggml_new_tensor_2d(hc, tto, ne0, N);
+                        asep->data         = ggml_backend_buffer_get_base(hsep);
+                        asep->buffer       = hsep;
+                        ggml_set_name(asep, nm);
+                        be->kv_stash_capture(bk, asep, ggml_backend_buffer_get_base(f1), N, ivar != 0);
+                        be->kv_stash_capture(bk, alias(tto, slab, slabbuf), ggml_backend_buffer_get_base(f2), N,
+                                             ivar != 0);
+                        ggml_backend_synchronize(bk);
+                        std::vector<uint16_t> v1(fb / 2), v2(fb / 2);
+                        download(ggml_backend_buffer_get_base(f1), f1, v1.data(), fb);
+                        download(ggml_backend_buffer_get_base(f2), f2, v2.data(), fb);
+                        size_t  vbad      = 0;
+                        int64_t first_row = -1;
+                        for (size_t i = 0; i < v1.size(); ++i) {
+                            if (v1[i] != v2[i]) {
+                                vbad++;
+                                if (first_row < 0) {
+                                    first_row = (int64_t) (i / (size_t) ne0);
+                                }
+                            }
+                        }
+                        fprintf(stderr,
+                                "VBR SELFTEST PROMOTE %s %s->%s DEQUANT compare: %s (%zu/%zu f16 values differ, first "
+                                "row %lld)\n",
+                                nm, ggml_type_name(tfrom), ggml_type_name(tto),
+                                vbad == 0 ? "IDENTICAL (slack bits only)" : "VALUE MISMATCH", vbad, v1.size(),
+                                (long long) first_row);
+                        ggml_backend_buffer_free(f1);
+                        ggml_backend_buffer_free(f2);
+                    }
+                    ggml_backend_buffer_free(hsep);
                 }
-                // continue the chain from the in-place result (== separate when the hop passes)
-                ggml_backend_buffer_free(hsep);
+                ggml_backend_buffer_free(sourcebuf);
             }
             ggml_free(hc);
             ggml_backend_buffer_free(slabbuf);

@@ -823,6 +823,16 @@ struct storage {
         byte_source { { 0x30, 0x31, 0x32, 0x33, 0x34 } },
         byte_source { { 0x40, 0x41, 0x42, 0x43, 0x44 } },
     };
+    std::array<byte_source, 4> stash {
+        byte_source { { 0x51, 0x52, 0x53, 0x54, 0x55,
+                        0x56, 0x57, 0x58, 0x59, 0x5a } },
+        byte_source { { 0x61, 0x62, 0x63, 0x64, 0x65,
+                        0x66, 0x67, 0x68, 0x69, 0x6a } },
+        byte_source { { 0x71, 0x72, 0x73, 0x74, 0x75,
+                        0x76, 0x77, 0x78, 0x79, 0x7a } },
+        byte_source { { 0x81, 0x82, 0x83, 0x84, 0x85,
+                        0x86, 0x87, 0x88, 0x89, 0x8a } },
+    };
     byte_source companion { { 0x90, 0x91, 0x92 } };
 };
 
@@ -852,7 +862,13 @@ static vbr_artifact_shard_descriptor shard(
     return out;
 }
 
-static vbr_artifact_package package(storage & bytes, bool companion) {
+static vbr_artifact_package package(
+        storage & bytes, bool companion,
+        ggml_type source_type = GGML_TYPE_TURBO8_0,
+        uint8_t promote_hops = 0,
+        vbr_artifact_clean_stash_state stash_state =
+            vbr_artifact_clean_stash_state::absent_at_source,
+        bool partial_stash = false) {
     vbr_artifact_package out;
     out.topologies.push_back(topology());
     auto & manifest = out.manifest;
@@ -881,8 +897,9 @@ static vbr_artifact_package package(storage & bytes, bool companion) {
             UINT64_C(0x2020202020202020)+child_id,
         };
         descriptor.repr_gen = 17+child_id;
-        descriptor.current_type = GGML_TYPE_TURBO8_0;
-        descriptor.last_source_type = GGML_TYPE_TURBO8_0;
+        descriptor.current_type = source_type;
+        descriptor.last_source_type = source_type;
+        descriptor.promote_hops = promote_hops;
         descriptor.last_transition = vbr_repr_transition::initial;
         descriptor.representation.kind =
             vbr_artifact_representation_kind::approximate;
@@ -894,7 +911,7 @@ static vbr_artifact_package package(storage & bytes, bool companion) {
         descriptor.unified = true;
         descriptor.wm_cells = 5;
         descriptor.rank = 2;
-        descriptor.dimensions = { 1, 5, 0, 0 };
+        descriptor.dimensions = { 5, 2, 0, 0 };
         descriptor.row_alignment = 1;
         descriptor.row_codec_version = 1;
         descriptor.codebook_digest = marker(0x60+child_id);
@@ -904,8 +921,24 @@ static vbr_artifact_package package(storage & bytes, bool companion) {
             shard(0, bytes.payload[child_id*2]),
             shard(1, bytes.payload[child_id*2+1]),
         };
-        descriptor.clean_stash_state =
-            vbr_artifact_clean_stash_state::absent_at_source;
+        descriptor.clean_stash_state = stash_state;
+        if (stash_state == vbr_artifact_clean_stash_state::present) {
+            descriptor.clean_stash.valid_rows = 5;
+            descriptor.clean_stash.domain = vbr_repr_domain::tapped;
+            descriptor.clean_stash.layout = vbr_artifact_layout::row_major;
+            descriptor.clean_stash.row_count = 5;
+            descriptor.clean_stash.column_count = 2;
+            descriptor.clean_stash.row_bytes = 4;
+            descriptor.clean_stash.shards = {
+                shard(0, bytes.stash[child_id*2]),
+                shard(1, bytes.stash[child_id*2+1]),
+            };
+            for (auto & stash_shard : descriptor.clean_stash.shards) {
+                stash_shard.row_bytes = 2;
+                stash_shard.payload_bytes = 10;
+            }
+            descriptor.clean_stash.shards[1].logical_offset = 1;
+        }
         out.unit_blobs.push_back(blob);
 
         vbr_checkpoint_generation_controller controller;
@@ -916,7 +949,8 @@ static vbr_artifact_package package(storage & bytes, bool companion) {
         controller.global_generation = 5+child_id;
         controller.units.push_back({
             descriptor.repr_gen, descriptor.current_type,
-            descriptor.last_source_type, vbr_repr_domain::full,
+            descriptor.last_source_type,
+            vbr_downward_tier_domain(source_type),
             descriptor.promote_hops, descriptor.last_transition,
         });
         vbr_checkpoint_generation_stream stream;
@@ -959,6 +993,19 @@ static vbr_artifact_package package(storage & bytes, bool companion) {
         reference.logical_unit_id = 0;
         reference.repr_gen = descriptor.repr_gen;
         reference.authorized_stream_refs = { 0 };
+        if (stash_state == vbr_artifact_clean_stash_state::present) {
+            reference.has_stash_reference = true;
+            reference.stash_reference.valid_rows = 5;
+            reference.stash_reference.domain = vbr_repr_domain::tapped;
+            reference.stash_reference.row_count = 5;
+            reference.stash_reference.column_count = 2;
+            reference.stash_reference.row_bytes = 4;
+            reference.stash_reference.captured_sink_count =
+                partial_stash ? 4 : 5;
+            reference.stash_reference.covered_sink_pages = {
+                page(partial_stash ? 0x0f : 0x1f),
+            };
+        }
         manifest.unit_references.push_back(reference);
     }
 
@@ -985,6 +1032,16 @@ static vbr_artifact_package package(storage & bytes, bool companion) {
         { vbr_artifact_accounting_role::reference_metadata,
           host, 256, 256, llama_cache_acct_attr_kind::artifact },
     };
+    if (stash_state == vbr_artifact_clean_stash_state::present) {
+        manifest.accounting.push_back({
+            vbr_artifact_accounting_role::clean_stash_payload,
+            device0, 20, 20, llama_cache_acct_attr_kind::artifact,
+        });
+        manifest.accounting.push_back({
+            vbr_artifact_accounting_role::clean_stash_payload,
+            device1, 20, 20, llama_cache_acct_attr_kind::artifact,
+        });
+    }
     if (companion) {
         vbr_artifact_companion_payload row;
         row.kind = vbr_artifact_companion_kind::recurrent;
@@ -1066,6 +1123,12 @@ class fake_memory final : public llama_memory_i {
 class prepared_companion final : public vbr_prepared_companion_image {};
 
 struct seam final : vbr_adopt_test_seam {
+    enum class upward_event : uint8_t {
+        unit_h2d,
+        stash_h2d,
+        transform,
+        synchronize,
+    };
     fake_memory target;
     std::array<child_state, 2> children;
     recurrent_state recurrent;
@@ -1098,7 +1161,11 @@ struct seam final : vbr_adopt_test_seam {
     bool downward_synced = false;
     uint32_t upward_zero_inits = 0;
     uint32_t upward_transforms = 0;
+    uint32_t upward_stash_transforms = 0;
+    uint32_t upward_null_stash_transforms = 0;
+    uint64_t upward_stash_rows = 0;
     uint32_t upward_syncs = 0;
+    std::vector<upward_event> upward_events;
 
     seam() {
         for (uint32_t i = 0; i < children.size(); ++i) {
@@ -1258,6 +1325,11 @@ struct seam final : vbr_adopt_test_seam {
         }
         child.h2d_bytes += read.size;
         ++transfer_calls;
+        if (read.kind == vbr_staged_read_kind::unit_payload) {
+            upward_events.push_back(upward_event::unit_h2d);
+        } else if (read.kind == vbr_staged_read_kind::clean_stash) {
+            upward_events.push_back(upward_event::stash_h2d);
+        }
         stats.bytes = read.size;
         stats.chunks = 1;
         ++events;
@@ -1356,13 +1428,29 @@ struct seam final : vbr_adopt_test_seam {
 
     bool session_transform_upward(
             uint32_t child_id,
-            const vbr_validated_child_plan & plan) noexcept override {
+            const vbr_validated_child_plan & plan,
+            uint32_t stash_rows) noexcept override {
         if (child_id >= children.size() || !children[child_id].armed ||
             plan.transform_kind !=
                 vbr_import_transform_kind::upward_same_domain ||
             plan.upward_recipe.n_edges != 1) {
             return false;
         }
+        const bool expected_stash =
+            plan.source_domain == vbr_repr_domain::tapped &&
+            plan.stash_action == vbr_validated_stash_action::restore_exact;
+        if ((expected_stash &&
+             stash_rows != plan.descriptor.clean_stash.valid_rows) ||
+            (!expected_stash && stash_rows != 0)) {
+            return false;
+        }
+        if (stash_rows != 0) {
+            ++upward_stash_transforms;
+            upward_stash_rows += stash_rows;
+        } else {
+            ++upward_null_stash_transforms;
+        }
+        upward_events.push_back(upward_event::transform);
         ++upward_transforms;
         return true;
     }
@@ -1389,6 +1477,7 @@ struct seam final : vbr_adopt_test_seam {
             })) {
             return false;
         }
+        upward_events.push_back(upward_event::synchronize);
         ++upward_syncs;
         return true;
     }
@@ -1697,18 +1786,39 @@ struct fixture {
     bool with_companion = false;
     bool downward = false;
     bool upward = false;
+    ggml_type upward_source_type = GGML_TYPE_TURBO8_0;
+    ggml_type upward_target_type = GGML_TYPE_F16;
+    bool mixed_exact_upward = false;
     vbr_downward_policy_projection downward_projection;
     vbr_import_destination_projection upward_destination;
     vbr_import_schedule_quote schedule_quote;
     llama_cache_budget_plan downward_plan;
     vbr_downward_reserve_status downward_reserve_status =
         vbr_downward_reserve_status::reserved;
+    uint32_t transform_reserve_plans = 0;
+    uint32_t transform_reserve_stash_only = 0;
 
     explicit fixture(bool companion = false, bool downward_import = false,
-                     bool upward_import = false)
-        : source(package(bytes, companion)), catalog(ledger),
+                     bool upward_import = false,
+                     ggml_type upward_source = GGML_TYPE_TURBO8_0,
+                     ggml_type upward_target = GGML_TYPE_F16,
+                     uint8_t source_promote_hops = 0,
+                     vbr_artifact_clean_stash_state stash_state =
+                         vbr_artifact_clean_stash_state::absent_at_source,
+                     bool mixed_exact = false,
+                     bool partial_stash = false)
+        : source(package(
+              bytes, companion,
+              upward_import ? upward_source : GGML_TYPE_TURBO8_0,
+              upward_import ? source_promote_hops : 0,
+              upward_import ? stash_state :
+                  vbr_artifact_clean_stash_state::absent_at_source,
+              upward_import && partial_stash)),
+          catalog(ledger),
           with_companion(companion), downward(downward_import),
-          upward(upward_import) {
+          upward(upward_import), upward_source_type(upward_source),
+          upward_target_type(upward_target),
+          mixed_exact_upward(mixed_exact) {
         CHECK(!(downward && upward));
         if (downward) {
             for (auto & controller : source.manifest.controller_policy) {
@@ -1717,8 +1827,10 @@ struct fixture {
         }
         const auto prepared = vbr_artifact_prepare(source);
         if (prepared != vbr_artifact_status::ok) {
-            std::fprintf(stderr, "G2 prepare status=%s\n",
-                         vbr_artifact_status_name(prepared));
+            std::fprintf(stderr, "G2 prepare status=%s source=%s hops=%u stash=%u\n",
+                         vbr_artifact_status_name(prepared),
+                         ggml_type_name(upward_source),
+                         unsigned(source_promote_hops), unsigned(stash_state));
         }
         CHECK(prepared == vbr_artifact_status::ok);
         CHECK(catalog.bind_topologies(source.topologies, bindings));
@@ -1802,6 +1914,15 @@ struct fixture {
                     bytes.payload[unit_index*2+shard_index]);
                 CHECK(unit->accept_verified_segment(verified) ==
                       vbr_capture_stream_status::ok);
+                if (source.unit_blobs[unit_index].descriptor.clean_stash_state ==
+                        vbr_artifact_clean_stash_state::present) {
+                    auto verified_stash = segment(
+                        unit_index, shard_index,
+                        bytes.stash[unit_index*2+shard_index]);
+                    verified_stash.clean_stash = true;
+                    CHECK(unit->accept_verified_segment(verified_stash) ==
+                          vbr_capture_stream_status::ok);
+                }
             }
             CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
         }
@@ -2001,24 +2122,35 @@ struct fixture {
                 auto & unit = child.units[0];
                 const auto source_type = static_cast<ggml_type>(
                     view.units()[child.child_id].descriptor.current_type);
-                const auto target_type = GGML_TYPE_F16;
-                CHECK(source_type == GGML_TYPE_TURBO8_0);
+                const bool exact = mixed_exact_upward && child.child_id != 0;
+                const auto target_type = exact
+                    ? source_type : upward_target_type;
+                CHECK(source_type == upward_source_type);
                 unit.current_type = target_type;
-                unit.current_domain = vbr_repr_domain::full;
-                unit.upward_supported = true;
-                unit.upward_type = target_type;
-                unit.upward_domain = vbr_repr_domain::full;
-                unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
-                unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
-                unit.upward_meansub_model_id = 7;
-                CHECK(vbr_upward_resolve_recipe(
-                    source_type, target_type, unit.upward_recipe) ==
-                    vbr_upward_recipe_status::resolved);
+                unit.current_domain = vbr_downward_tier_domain(target_type);
+                if (!exact) {
+                    unit.upward_supported = true;
+                    unit.upward_type = target_type;
+                    unit.upward_domain = unit.current_domain;
+                    unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
+                    unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
+                    unit.upward_meansub_model_id = 7;
+                    CHECK(vbr_upward_resolve_recipe(
+                        source_type, target_type, unit.upward_recipe) ==
+                        vbr_upward_recipe_status::resolved);
+                }
                 uint64_t mapped = 0;
                 uint64_t transfer = 0;
                 for (auto & shard : unit.shards) {
-                    const uint64_t row = ggml_row_size(
+                    uint64_t row = ggml_row_size(
                         target_type, int64_t(unit.dimensions[0]));
+                    // The model-free fixture uses a narrow synthetic row,
+                    // below the real TCQ block width. Preserve only the
+                    // expansion relation; the permanent backend oracle covers
+                    // real row geometry.
+                    if (row == 0 && target_type != source_type) {
+                        row = shard.row_bytes + 1;
+                    }
                     CHECK(row != 0 &&
                           unit.wm_cells <= UINT64_MAX/row);
                     shard.row_bytes = row;
@@ -2029,10 +2161,12 @@ struct fixture {
                         view.units()[child.child_id].descriptor.shards) {
                     transfer += shard.payload_bytes;
                 }
-                unit.upward_row_bytes = unit.shards.front().row_bytes;
-                unit.upward_mapped_bytes = mapped;
-                unit.upward_transfer_bytes = transfer;
-                unit.upward_codec_workspace_bytes = 64;
+                if (!exact) {
+                    unit.upward_row_bytes = unit.shards.front().row_bytes;
+                    unit.upward_mapped_bytes = mapped;
+                    unit.upward_transfer_bytes = transfer;
+                    unit.upward_codec_workspace_bytes = 64;
+                }
 
                 vbr_import_destination_child destination;
                 destination.initial_types = { target_type };
@@ -2052,11 +2186,14 @@ struct fixture {
                 child.controller_policy.cursor =
                     upward_destination.final_cursors[child.child_id];
                 auto & unit = child.units[0];
-                unit.upward_build_identity_digest = vbr_upward_build_identity(
-                    unit.upward_recipe, unit.upward_meansub_model_id,
-                    unit.meansub_digest,
-                    upward_destination.child_type_digests[child.child_id],
-                    upward_destination.tree_digest);
+                if (!(mixed_exact_upward && child.child_id != 0)) {
+                    unit.upward_build_identity_digest =
+                        vbr_upward_build_identity(
+                            unit.upward_recipe, unit.upward_meansub_model_id,
+                            unit.meansub_digest,
+                            upward_destination.child_type_digests[child.child_id],
+                            upward_destination.tree_digest);
+                }
             }
             CHECK(vbr_quote_import_schedule(snapshot, view, schedule_quote));
             CHECK(schedule_quote.status() ==
@@ -2179,6 +2316,15 @@ struct fixture {
                         })) {
                     return false;
                 }
+                self.transform_reserve_plans = uint32_t(plans.size());
+                self.transform_reserve_stash_only = uint32_t(std::count_if(
+                    plans.begin(), plans.end(),
+                    [](const vbr_validated_child_plan & plan) {
+                        return plan.transform_kind ==
+                                   vbr_import_transform_kind::none &&
+                            plan.stash_action ==
+                                vbr_validated_stash_action::restore_exact;
+                    }));
                 output.status = self.downward_reserve_status;
                 if (self.downward && output.status ==
                         vbr_downward_reserve_status::reserved_stashless) {
@@ -2548,6 +2694,7 @@ static void test_g2_downward_subphase_matrix() {
             vbr_downward_reserve_status::projection_unavailable,
             vbr_downward_reserve_status::accounting_refused,
             vbr_downward_reserve_status::workspace_reserve_failed,
+            vbr_downward_reserve_status::required_stash_reserve_failed,
             vbr_downward_reserve_status::internal_error }) {
         fixture f(false, true);
         const uint64_t baseline = f.ledger.snapshot().live_ops;
@@ -2579,6 +2726,9 @@ static void test_g2_upward_reconstruction() {
         CHECK(result.h2d_bytes == compact_bytes);
         CHECK(f.target.upward_zero_inits == f.view.units().size());
         CHECK(f.target.upward_transforms == f.view.units().size());
+        CHECK(f.target.upward_stash_transforms == 0);
+        CHECK(f.target.upward_null_stash_transforms ==
+              f.view.units().size());
         CHECK(f.target.upward_syncs == 2);
         CHECK(f.target.downward_edges == 0);
         CHECK(f.target.downward_stashes == 0);
@@ -2595,6 +2745,185 @@ static void test_g2_upward_reconstruction() {
         CHECK(result.status == vbr_adopt_status::transfer_failed);
         CHECK(result.phase == vbr_adopt_phase::unit_h2d);
         CHECK(f.target.upward_transforms == f.view.units().size());
+        CHECK(f.target.upward_syncs == 2);
+        check_failed_transaction(f, result);
+    }
+    // A tapped-domain reconstruction is one direct transform over the
+    // source-sized upload.  Its authenticated clean stash survives and the
+    // quality history advances exactly once.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validation.proof);
+        for (const auto & plan : validation.proof->children()) {
+            CHECK(plan.transform_kind ==
+                  vbr_import_transform_kind::upward_same_domain);
+            CHECK(plan.source_domain == vbr_repr_domain::tapped);
+            CHECK(plan.selected_target_domain == vbr_repr_domain::tapped);
+            CHECK(plan.target_last_source_type == GGML_TYPE_TURBO2_TCQ);
+            CHECK(plan.target_promote_hops == 1);
+            CHECK(plan.stash_action ==
+                  vbr_validated_stash_action::restore_exact);
+            CHECK(plan.descriptor.clean_stash.valid_rows == 5);
+        }
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.h2d_bytes == 60); // 20 source + 40 f16 clean-stash bytes
+        CHECK(f.target.upward_transforms == 2);
+        CHECK(f.target.upward_stash_transforms == 2);
+        CHECK(f.target.upward_null_stash_transforms == 0);
+        CHECK(f.target.upward_stash_rows == 10);
+        CHECK(f.target.upward_syncs == 2);
+        CHECK(std::is_sorted(
+            f.target.upward_events.begin(), f.target.upward_events.end()));
+        for (const auto event : {
+                seam::upward_event::unit_h2d,
+                seam::upward_event::stash_h2d,
+                seam::upward_event::transform,
+                seam::upward_event::synchronize }) {
+            CHECK(std::find(
+                f.target.upward_events.begin(),
+                f.target.upward_events.end(), event) !=
+                f.target.upward_events.end());
+        }
+    }
+    // A tapped exact-stash import cannot use downward's stashless fallback.
+    // Its mandatory physical endpoint is rejected while staging, before any
+    // source or stash byte reaches the target.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present);
+        f.downward_reserve_status =
+            vbr_downward_reserve_status::required_stash_reserve_failed;
+        auto staged = f.stage();
+        CHECK(staged.status ==
+              vbr_adopt_stage_status::transform_reserve_failed);
+        CHECK(staged.transform_status ==
+              vbr_downward_reserve_status::required_stash_reserve_failed);
+        CHECK(!staged.staged);
+        CHECK(f.target.transfer_calls == 0);
+        CHECK(std::all_of(
+            f.target.children.begin(), f.target.children.end(),
+            [](const child_state & child) { return child.h2d_bytes == 0; }));
+        CHECK(f.target.construction_empty());
+    }
+    // A second tapped promotion is allowed, while a third is rejected before
+    // any stage/adoption work is created.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 1,
+            vbr_artifact_clean_stash_state::present, false, true);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validation.proof);
+        for (const auto & plan : validation.proof->children()) {
+            CHECK(plan.target_promote_hops == 2);
+            CHECK(plan.stash_action ==
+                  vbr_validated_stash_action::omit_live_rebased);
+        }
+        CHECK(adopt(f).status == vbr_adopt_status::adopted);
+        CHECK(f.target.upward_stash_transforms == 0);
+        CHECK(f.target.upward_null_stash_transforms == 2);
+    }
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 2);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::representation_mismatch);
+        CHECK(!validation.proof);
+        CHECK(f.target.construction_empty());
+    }
+    // Exact siblings stay byte-identical and do not acquire a transform; the
+    // transformed child still uses one source upload and one backend sync.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present, true, true);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validation.proof);
+        CHECK(validation.proof->children().size() == 2);
+        CHECK(validation.proof->children()[0].transform_kind ==
+              vbr_import_transform_kind::upward_same_domain);
+        CHECK(validation.proof->children()[1].transform_kind ==
+              vbr_import_transform_kind::none);
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.h2d_bytes == 20);
+        CHECK(f.target.upward_zero_inits == 1);
+        CHECK(f.target.upward_transforms == 1);
+        CHECK(f.target.upward_stash_transforms == 0);
+        CHECK(f.target.upward_null_stash_transforms == 1);
+        CHECK(f.target.upward_syncs == 1);
+    }
+    // A full-stash exact sibling in a distinct child participates in the same
+    // pre-transfer resource wave even though it has no codec workspace. Both
+    // authenticated stash reads precede the one transformed child's work.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present, true, false);
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(f.transform_reserve_plans == 2);
+        CHECK(f.transform_reserve_stash_only == 1);
+        CHECK(f.target.upward_transforms == 1);
+        CHECK(f.target.upward_stash_transforms == 1);
+        CHECK(f.target.upward_syncs == 1);
+    }
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present, true, false);
+        f.downward_reserve_status =
+            vbr_downward_reserve_status::required_stash_reserve_failed;
+        auto staged = f.stage();
+        CHECK(staged.status ==
+              vbr_adopt_stage_status::transform_reserve_failed);
+        CHECK(!staged.staged);
+        CHECK(f.transform_reserve_plans == 2);
+        CHECK(f.transform_reserve_stash_only == 1);
+        CHECK(f.target.transfer_calls == 0);
+        CHECK(f.target.construction_empty());
+    }
+    // A post-transform fault synchronizes the submitted work, then returns to
+    // the construction-empty state without publishing partial metadata.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present);
+        vbr_adopt_fault fault;
+        fault.fail_after = vbr_adopt_phase::unit_h2d;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        CHECK(f.target.upward_transforms == 2);
+        CHECK(f.target.upward_stash_transforms == 2);
+        CHECK(f.target.upward_null_stash_transforms == 0);
+        CHECK(f.target.upward_stash_rows == 10);
         CHECK(f.target.upward_syncs == 2);
         check_failed_transaction(f, result);
     }

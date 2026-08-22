@@ -387,7 +387,13 @@ class vbr_kv_import_session {
                             vbr_validated_stash_action::restore_exact
                         ? uint32_t(plan->descriptor.clean_stash.valid_rows)
                         : 0,
-                    plan->descriptor.promote_hops,
+                    uint8_t(plan->transform_kind ==
+                            vbr_import_transform_kind::upward_same_domain
+                        ? plan->target_promote_hops
+                        : plan->transform_kind ==
+                                vbr_import_transform_kind::downward
+                            ? 0
+                            : plan->descriptor.promote_hops),
                     static_cast<ggml_type>(plan->selected_target_type),
                 });
                 final_unit_indices_[plan->logical_unit_id] =
@@ -742,7 +748,14 @@ class vbr_kv_import_session {
     bool transform_upward(
             const vbr_validated_child_plan & plan) noexcept {
         if (test_seam_) {
-            return test_seam_->session_transform_upward(child_id_, plan);
+            const uint32_t stash_rows =
+                plan.source_domain == vbr_repr_domain::tapped &&
+                plan.stash_action ==
+                    vbr_validated_stash_action::restore_exact
+                    ? uint32_t(plan.descriptor.clean_stash.valid_rows)
+                    : 0;
+            return test_seam_->session_transform_upward(
+                child_id_, plan, stash_rows);
         }
         const auto metadata = final_unit_indices_.find(plan.logical_unit_id);
         if (!armed_ || plan.transform_kind !=
@@ -751,8 +764,9 @@ class vbr_kv_import_session {
             !cache_->vbr_upward_transform_import(plan)) {
             return false;
         }
-        final_units_[metadata->second].stash_valid = 0;
-        final_units_[metadata->second].promote_hops = 0;
+        // prepare_backing derived the final stash and hop metadata from the
+        // authenticated validated plan.  The transform changes only the live
+        // prefix bytes; preserve that exact terminal metadata for publication.
         return true;
     }
 
@@ -1174,7 +1188,10 @@ class vbr_kv_import_session {
             const std::vector<llama_kv_cache::vbr_stash_request> requests = {
                 { &extent, uint32_t(bytes / row_bytes) },
             };
-            if (!cache_->vbr_stash_reserve(pool, requests) ||
+            // unit_for_pool already proved this exact extent belongs to pool;
+            // retain all size/offset checks without rescanning pool inventory
+            // once per authenticated stash read.
+            if (!cache_->vbr_stash_reserve_trusted(pool, requests) ||
                 pool.stash_vmm == nullptr ||
                 extent.stash_off > pool.stash_size ||
                 bytes > pool.stash_size - extent.stash_off) {
@@ -1873,6 +1890,27 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             ++transferred_units[std::make_pair(
                 read.child_id, read.logical_unit_id)];
         }
+        // Tapped upward reconstruction consumes the authenticated clean
+        // stash as an input to kv_transcode.  Populate the pre-reserved slab
+        // after all compact source uploads and before enqueuing any transform;
+        // the ordinary exact/downward phase order remains unchanged.
+        if (out.decision == vbr_import_decision::upward_reconstruct) {
+            for (const auto & read : staged->reads()) {
+                if (read.kind != vbr_staged_read_kind::clean_stash) {
+                    continue;
+                }
+                const auto child = children.find(read.child_id);
+                vbr_h2d_stats stats;
+                if (child == children.end() ||
+                    !child->second.session->transfer(
+                        read, staged->adoption_ring(), nullptr,
+                        UINT64_MAX, stats)) {
+                    return fail(vbr_adopt_status::transfer_failed);
+                }
+                out.h2d_bytes += stats.bytes;
+                out.h2d_chunks += stats.chunks;
+            }
+        }
         // Projection owns the shared transport only across its selected H2D
         // bytes; all later validation and publication work is CPU-local.
         projection_operation = {};
@@ -1921,6 +1959,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         for (const auto & read : staged->reads()) {
             if (read.kind != vbr_staged_read_kind::clean_stash) {
+                continue;
+            }
+            if (out.decision == vbr_import_decision::upward_reconstruct) {
                 continue;
             }
             const auto child = children.find(read.child_id);

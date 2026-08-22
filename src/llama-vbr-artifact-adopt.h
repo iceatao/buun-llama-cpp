@@ -191,7 +191,8 @@ class vbr_adopt_test_seam {
         return true;
     }
     virtual bool session_transform_upward(
-        uint32_t, const vbr_validated_child_plan &) noexcept {
+        uint32_t, const vbr_validated_child_plan &,
+        uint32_t) noexcept {
         return true;
     }
     virtual bool session_synchronize_upward(

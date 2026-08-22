@@ -296,8 +296,9 @@ bool upward_recipe_complete(
            target.upward_transfer_bytes != 0 &&
            target.upward_codec_workspace_bytes != 0 &&
            target.upward_meansub_model_id >= 0 &&
-           source_domain == vbr_repr_domain::full &&
-           target.current_domain == vbr_repr_domain::full;
+           source_domain == target.current_domain &&
+           (source_domain != vbr_repr_domain::tapped ||
+            source.promote_hops < 2);
 }
 
 bool same_representation(
@@ -1394,11 +1395,31 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 }
             }
             plan.transform_kind = transform_kind;
+            plan.target_last_source_type = transform_kind ==
+                    vbr_import_transform_kind::none
+                ? descriptor.last_source_type
+                : plan.selected_target_type;
+            plan.target_promote_hops = transform_kind ==
+                    vbr_import_transform_kind::none
+                ? descriptor.promote_hops
+                : 0;
+            if (transform_kind ==
+                    vbr_import_transform_kind::upward_same_domain &&
+                source_domain == vbr_repr_domain::tapped) {
+                plan.target_last_source_type = descriptor.current_type;
+                plan.target_promote_hops = uint8_t(descriptor.promote_hops + 1);
+            }
             // Downward import regenerates the target-tier sink stash before
             // the canonical outgoing tapped edge. A source-tier stash is not a
             // target-tier byte image and must never be copied as if exact.
-            plan.stash_action = transform_kind !=
-                    vbr_import_transform_kind::none
+            // Same-domain tapped upward reconstruction keeps an authenticated
+            // clean tapped-domain prefix: it remains valid for future retiering.
+            // Full-domain upward has no such source stash.
+            plan.stash_action = transform_kind ==
+                    vbr_import_transform_kind::downward ||
+                (transform_kind ==
+                     vbr_import_transform_kind::upward_same_domain &&
+                 source_domain == vbr_repr_domain::full)
                 ? vbr_validated_stash_action::omit_live_rebased
                 : stash_action;
             if (transform_kind == vbr_import_transform_kind::downward) {
@@ -1683,9 +1704,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                     auto & fresh = child.units[plan.logical_unit_id];
                     fresh.repr_gen = 1;
                     fresh.current_type = plan.selected_target_type;
-                    fresh.last_source_type = plan.selected_target_type;
+                    fresh.last_source_type = plan.target_last_source_type;
                     fresh.domain = plan.selected_target_domain;
-                    fresh.promote_hops = 0;
+                    fresh.promote_hops = plan.target_promote_hops;
                     fresh.last_transition =
                         vbr_repr_transition::whole_import;
                     initialized[plan.logical_unit_id] = true;

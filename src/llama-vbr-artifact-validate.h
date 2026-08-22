@@ -465,6 +465,11 @@ struct vbr_validated_child_plan {
     uint64_t target_controller_cursor = 0;
     vbr_import_transform_kind transform_kind =
         vbr_import_transform_kind::none;
+    // Controller generation and live extent metadata published by adoption.
+    // Tapped upward reconstruction is one additional lossy promotion hop;
+    // full-domain T8->F16 retains the established whole-import reset.
+    int32_t target_last_source_type = -1;
+    uint8_t target_promote_hops = 0;
     vbr_validated_stash_action stash_action =
         vbr_validated_stash_action::none_at_source;
     uint64_t target_row_bytes = 0;

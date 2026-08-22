@@ -38,9 +38,10 @@ struct vbr_upward_edge {
     }
 };
 
-// H2's first upward materializer is deliberately one exact edge.  Keeping the
-// recipe explicit prevents schedule classification from being mistaken for
-// backend authority and leaves tapped/cross-domain reconstruction fail-closed.
+// Upward reconstruction is deliberately one direct edge. Keeping the recipe
+// explicit prevents schedule classification from being mistaken for backend
+// authority, avoids compounding error through intermediate tiers, and leaves
+// cross-domain reconstruction fail-closed.
 struct vbr_upward_recipe {
     uint32_t version = VBR_UPWARD_RECIPE_VERSION;
     ggml_type source_type = GGML_TYPE_COUNT;
@@ -69,4 +70,3 @@ std::array<uint8_t, 32> vbr_upward_build_identity(
     const std::array<uint8_t, 32> & meansub_digest,
     const std::array<uint8_t, 32> & policy_digest,
     const std::array<uint8_t, 32> & tree_digest) noexcept;
-

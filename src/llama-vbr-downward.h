@@ -232,6 +232,10 @@ struct vbr_downward_stash_endpoint {
     // requested stash shares that pool falls back independently if its one
     // grow-only reserve fails.
     std::vector<uint64_t> unit_ids;
+    // Downward degradation may publish without this cache on allocation
+    // failure.  A restored tapped-domain stash is authenticated source state
+    // and therefore makes the physical endpoint mandatory before transfer.
+    bool required = false;
     llama_cache_acct_resource_domain domain;
     llama_cache_acct_attribution attribution;
     void * context = nullptr;
@@ -246,6 +250,7 @@ enum class vbr_downward_reserve_status : uint8_t {
     projection_unavailable,
     accounting_refused,
     workspace_reserve_failed,
+    required_stash_reserve_failed,
     internal_error,
     _count,
 };

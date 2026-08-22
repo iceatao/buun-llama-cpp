@@ -40,10 +40,19 @@ vbr_upward_recipe_status vbr_upward_resolve_recipe(
         return vbr_upward_recipe_status::cross_domain_unsupported;
     }
     if (source_domain == vbr_repr_domain::tapped) {
-        return vbr_upward_recipe_status::tapped_domain_unsupported;
-    }
-    if (source_type != GGML_TYPE_TURBO8_0 ||
-        target_type != GGML_TYPE_F16) {
+        vbr_downward_recipe canonical_order;
+        const auto ordering = vbr_downward_resolve_recipe(
+            source_type, target_type, GGML_TYPE_TURBO1_TCQ, true,
+            canonical_order);
+        if (ordering == vbr_downward_recipe_status::unsupported_type ||
+            ordering == vbr_downward_recipe_status::invalid_argument) {
+            return vbr_upward_recipe_status::unsupported_type;
+        }
+        if (ordering != vbr_downward_recipe_status::upward_forbidden) {
+            return vbr_upward_recipe_status::tapped_domain_unsupported;
+        }
+    } else if (source_type != GGML_TYPE_TURBO8_0 ||
+               target_type != GGML_TYPE_F16) {
         return vbr_upward_recipe_status::unsupported_type;
     }
     out.edges[0] = {
@@ -96,4 +105,3 @@ std::array<uint8_t, 32> vbr_upward_build_identity(
         return {};
     }
 }
-

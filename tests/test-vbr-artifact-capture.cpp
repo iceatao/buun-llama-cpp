@@ -4403,6 +4403,57 @@ static void test_server_import_route_classification() {
     }
 }
 
+static void test_server_import_schedule_actionability() {
+    using schedule = vbr_import_schedule_status;
+    using snapshot = vbr_import_target_snapshot_status;
+    const auto unit = [](uint32_t logical_unit_id,
+                         ggml_type source, ggml_type target) {
+        return vbr_import_schedule_unit {
+            0, logical_unit_id, source, target,
+            vbr_downward_tier_domain(source),
+            vbr_downward_tier_domain(target),
+        };
+    };
+
+    // An exact sibling does not hide or poison one supported tapped-domain
+    // upward row in the authenticated quote.
+    const std::vector<vbr_import_schedule_unit> tapped_upward {
+        unit(0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0),
+        unit(1, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO4_0),
+    };
+    CHECK(vbr_classify_import_schedule_units(tapped_upward) ==
+          schedule::upward_same_domain);
+    CHECK(vbr_explicit_import_schedule_actionability(
+              schedule::upward_same_domain, tapped_upward) ==
+          snapshot::actionable);
+
+    const std::vector<vbr_import_schedule_unit> mixed {
+        unit(0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0),
+        unit(1, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO4_0),
+    };
+    CHECK(vbr_classify_import_schedule_units(mixed) ==
+          schedule::mixed_direction_unsupported);
+    CHECK(vbr_explicit_import_schedule_actionability(
+              schedule::mixed_direction_unsupported, mixed) ==
+          snapshot::report_only);
+
+    const std::vector<vbr_import_schedule_unit> cross_domain {
+        unit(0, GGML_TYPE_TURBO4_0, GGML_TYPE_F16),
+    };
+    CHECK(vbr_classify_import_schedule_units(cross_domain) ==
+          schedule::upward_cross_domain);
+    CHECK(vbr_explicit_import_schedule_actionability(
+              schedule::upward_cross_domain, cross_domain) ==
+          snapshot::report_only);
+
+    // A caller cannot relabel identical evidence into an actionable route.
+    CHECK(vbr_explicit_import_schedule_actionability(
+              schedule::upward_same_domain, cross_domain) ==
+          snapshot::unavailable);
+    CHECK(vbr_explicit_import_schedule_actionability(
+              schedule::exact, {}) == snapshot::unavailable);
+}
+
 static void test_fresh_f16_size_generation() {
     // Production ordinary decode maps a padded nonzero watermark even before
     // any retier has created the VBR side stream. That never-degraded state is
@@ -4633,6 +4684,7 @@ int main(int argc, char ** argv) {
     test_server_capture_status_vocabulary();
     test_server_reference_tenant_authorization();
     test_server_import_route_classification();
+    test_server_import_schedule_actionability();
     test_fresh_f16_size_generation();
     test_library_representation_identity();
     if (argc == 2 && std::string(argv[1]) == "--cuda") {

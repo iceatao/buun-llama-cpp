@@ -485,6 +485,7 @@ const char * vbr_downward_reserve_status_name(vbr_downward_reserve_status status
         case vbr_downward_reserve_status::projection_unavailable: return "projection_unavailable";
         case vbr_downward_reserve_status::accounting_refused: return "accounting_refused";
         case vbr_downward_reserve_status::workspace_reserve_failed: return "workspace_reserve_failed";
+        case vbr_downward_reserve_status::required_stash_reserve_failed: return "required_stash_reserve_failed";
         case vbr_downward_reserve_status::internal_error: return "internal_error";
         case vbr_downward_reserve_status::_count: break;
     }
@@ -663,6 +664,11 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
         }
         for (const auto & stash : stashes) {
             if (!stash.reserve(stash.context)) {
+                if (stash.required) {
+                    out.status =
+                        vbr_downward_reserve_status::required_stash_reserve_failed;
+                    return out;
+                }
                 out.stashless_units.insert(out.stashless_units.end(),
                     stash.unit_ids.begin(), stash.unit_ids.end());
             }

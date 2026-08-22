@@ -2996,14 +2996,28 @@ uint64_t vbr_explicit_import_policy_epoch(
     }
 }
 
-static bool import_upward_schedule_supported(
-        const vbr_import_schedule_quote & schedule) noexcept {
-    if (schedule.status() !=
-            vbr_import_schedule_status::upward_same_domain) {
-        return false;
+static vbr_import_target_snapshot_status
+import_classified_schedule_actionability(
+        vbr_import_schedule_status status,
+        const std::vector<vbr_import_schedule_unit> & units) noexcept {
+    if (units.empty()) {
+        return vbr_import_target_snapshot_status::unavailable;
     }
-    return std::all_of(
-        schedule.units().begin(), schedule.units().end(),
+    switch (status) {
+        case vbr_import_schedule_status::exact:
+        case vbr_import_schedule_status::downward:
+            return vbr_import_target_snapshot_status::actionable;
+        case vbr_import_schedule_status::upward_same_domain:
+            break;
+        case vbr_import_schedule_status::upward_cross_domain:
+        case vbr_import_schedule_status::mixed_direction_unsupported:
+            return vbr_import_target_snapshot_status::report_only;
+        case vbr_import_schedule_status::unavailable:
+        case vbr_import_schedule_status::_count:
+            return vbr_import_target_snapshot_status::unavailable;
+    }
+    const bool supported = std::all_of(
+        units.begin(), units.end(),
         [](const vbr_import_schedule_unit & unit) {
             if (unit.source_type == unit.target_type) {
                 return unit.source_domain == unit.target_domain;
@@ -3014,6 +3028,29 @@ static bool import_upward_schedule_supported(
                        static_cast<ggml_type>(unit.target_type), recipe) ==
                 vbr_upward_recipe_status::resolved;
         });
+    return supported
+        ? vbr_import_target_snapshot_status::actionable
+        : vbr_import_target_snapshot_status::report_only;
+}
+
+vbr_import_target_snapshot_status
+vbr_explicit_import_schedule_actionability(
+        vbr_import_schedule_status status,
+        const std::vector<vbr_import_schedule_unit> & units) noexcept {
+    if (units.empty() ||
+        vbr_classify_import_schedule_units(units) != status) {
+        return vbr_import_target_snapshot_status::unavailable;
+    }
+    return import_classified_schedule_actionability(status, units);
+}
+
+static bool import_upward_schedule_supported(
+        const vbr_import_schedule_quote & schedule) noexcept {
+    return schedule.status() ==
+               vbr_import_schedule_status::upward_same_domain &&
+           import_classified_schedule_actionability(
+               schedule.status(), schedule.units()) ==
+               vbr_import_target_snapshot_status::actionable;
 }
 
 static bool import_target_snapshot_core(
@@ -3252,22 +3289,12 @@ vbr_explicit_import_target_schedule_snapshot(
     if (!schedule_quote.destination().feasible()) {
         return vbr_import_target_snapshot_status::unavailable;
     }
-    switch (schedule_quote.status()) {
-        case vbr_import_schedule_status::exact:
-        case vbr_import_schedule_status::downward:
-            return vbr_import_target_snapshot_status::actionable;
-        case vbr_import_schedule_status::upward_same_domain:
-            return import_upward_schedule_supported(schedule_quote)
-                ? vbr_import_target_snapshot_status::actionable
-                : vbr_import_target_snapshot_status::report_only;
-        case vbr_import_schedule_status::upward_cross_domain:
-        case vbr_import_schedule_status::mixed_direction_unsupported:
-            return vbr_import_target_snapshot_status::report_only;
-        case vbr_import_schedule_status::unavailable:
-        case vbr_import_schedule_status::_count:
-            return vbr_import_target_snapshot_status::unavailable;
-    }
-    return vbr_import_target_snapshot_status::unavailable;
+    // The private quote was minted from these units and has already stored
+    // their canonical classification. Avoid re-scanning exact/downward imports;
+    // the public helper above retains its defensive relabeling check for
+    // external model-free callers.
+    return import_classified_schedule_actionability(
+        schedule_quote.status(), schedule_quote.units());
 }
 
 bool vbr_explicit_import_transform_projection_recheck(
@@ -3377,8 +3404,14 @@ bool vbr_explicit_import_reserve_transform(
         }
         std::vector<grouped_plan> grouped;
         grouped.reserve(plans.size());
+        bool any_transform = false;
         for (const auto & plan : plans) {
-            if (plan.transform_kind == vbr_import_transform_kind::none) {
+            const bool stash_only =
+                plan.transform_kind == vbr_import_transform_kind::none &&
+                plan.stash_action ==
+                    vbr_validated_stash_action::restore_exact;
+            if (plan.transform_kind == vbr_import_transform_kind::none &&
+                !stash_only) {
                 continue;
             }
             const auto child = child_indices.find(plan.child_id);
@@ -3387,6 +3420,8 @@ bool vbr_explicit_import_reserve_transform(
             }
             const size_t index = grouped.size();
             grouped.push_back({ &plan, SIZE_MAX });
+            any_transform = any_transform ||
+                plan.transform_kind != vbr_import_transform_kind::none;
             const size_t tree_index = child->second;
             if (tails[tree_index] == SIZE_MAX) {
                 heads[tree_index] = index;
@@ -3434,7 +3469,11 @@ bool vbr_explicit_import_reserve_transform(
                     vbr_downward_reserve_status::reserved_stashless;
             }
         }
-        if (!any) {
+        // Stash-only exact siblings are admitted only as part of a real
+        // transform manifest. This keeps the ordinary exact import path on
+        // its established staging owner while making a mixed upward tree's
+        // pre-transform stash H2D fully receipt-backed.
+        if (!any || !any_transform) {
             output.status =
                 vbr_downward_reserve_status::projection_unavailable;
             return false;

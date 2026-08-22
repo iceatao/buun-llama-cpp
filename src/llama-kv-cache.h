@@ -412,6 +412,7 @@ public:
 private:
     friend class vbr_live_capture_adapter;
     friend class vbr_kv_import_session;
+    friend struct llama_kv_cache_vbr_stash_batch_test;
     struct vbr_capture_unit_request {
         uint32_t child_id = 0;
         const void * bindings = nullptr;
@@ -1396,9 +1397,26 @@ private:
     // current occupancy includes pages retained by earlier failed maps.
     bool     vbr_stash_memory(const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
                               size_t & physical_now, size_t & physical_if_reserved) const;
+    bool     vbr_stash_memory_trusted(const vbr_pool & p,
+                                      const std::vector<vbr_stash_request> & requests,
+                                      size_t & physical_now, size_t & physical_if_reserved) const;
+    bool     vbr_stash_memory_impl(const vbr_pool & p,
+                                   const std::vector<vbr_stash_request> & requests,
+                                   bool ownership_authenticated,
+                                   size_t & physical_now, size_t & physical_if_reserved,
+                                   uint64_t * request_checks = nullptr) const;
+    static bool vbr_stash_requests_valid(
+        const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+        uint32_t stash_rows, bool ownership_authenticated,
+        bool & needs_mapping, uint64_t * request_checks = nullptr);
     // Idempotently reserve/map the same request set. false is recoverable and changes no tier or
     // stash-valid metadata; a partial VMM map may remain resident and is visible to the query.
     bool     vbr_stash_reserve(vbr_pool & p, const std::vector<vbr_stash_request> & requests);
+    bool     vbr_stash_reserve_trusted(
+        vbr_pool & p, const std::vector<vbr_stash_request> & requests);
+    bool     vbr_stash_reserve_impl(
+        vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+        bool ownership_authenticated);
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback
     void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)
     size_t   vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_cells) const;

@@ -16,6 +16,8 @@ struct vbr_downward_policy_projection;
 struct vbr_downward_stage_reservation;
 struct vbr_validated_child_plan;
 struct vbr_import_schedule_quote;
+struct vbr_import_schedule_unit;
+enum class vbr_import_schedule_status : uint8_t;
 
 enum class vbr_explicit_capture_status : uint8_t {
     ok = 0,
@@ -191,10 +193,19 @@ enum class vbr_import_target_snapshot_status : uint8_t {
 };
 static_assert(uint8_t(vbr_import_target_snapshot_status::_count) == 3);
 
-// Typed reporting seam. The first upward materializer admits only the
-// canonical full-domain T8->F16 recipe; unsupported same-domain, cross-domain,
-// and mixed schedules return their immutable quote without implying that
-// validation, staging, or adoption may proceed.
+// Pure representational actionability owner for an authenticated schedule.
+// Target inspection still owns emptiness, geometry, policy projection and
+// resource evidence; this only distinguishes executable codec directions from
+// truthful report-only schedules.
+vbr_import_target_snapshot_status
+vbr_explicit_import_schedule_actionability(
+    vbr_import_schedule_status status,
+    const std::vector<vbr_import_schedule_unit> & units) noexcept;
+
+// Typed reporting seam. Upward actionability is limited to resolver-certified
+// full-domain T8->F16 or tapped-domain reconstruction; cross-domain and mixed
+// schedules return their immutable quote without implying that validation,
+// staging, or adoption may proceed.
 vbr_import_target_snapshot_status
 vbr_explicit_import_target_schedule_snapshot(
     llama_memory_i & memory,
