@@ -180,6 +180,103 @@ struct vbr_artifact_projected_range_view {
     vbr_capture_range_proof proof;
 };
 
+struct vbr_artifact_prefix_token_digest_tag;
+struct vbr_artifact_prefix_projection_digest_tag;
+using vbr_artifact_prefix_token_digest =
+    llama_cache_acct_digest<vbr_artifact_prefix_token_digest_tag>;
+using vbr_artifact_prefix_projection_digest =
+    llama_cache_acct_digest<vbr_artifact_prefix_projection_digest_tag>;
+
+enum class vbr_artifact_prefix_projection_status : uint8_t {
+    projected = 0,
+    invalid_argument,
+    unsupported_layout,
+    prefix_mismatch,
+    parent_stale,
+    proof_unavailable,
+    limit_exceeded,
+    internal_error,
+    _count,
+};
+
+struct vbr_artifact_prefix_projection_limits {
+    uint32_t max_tokens = 1048576;
+    uint32_t max_placements = 1048576;
+    uint32_t max_units = 16384;
+    uint32_t max_proofs = 16384;
+    uint32_t max_source_runs = 1048576;
+    uint64_t max_metadata_bytes = uint64_t(64)*1024*1024;
+    vbr_capture_range_proof_limits proof;
+};
+
+struct vbr_artifact_attention_prefix_request {
+    const llama_token * tokens = nullptr;
+    size_t token_count = 0;
+    uint64_t lcp_tokens = 0;
+    // The artifact schema intentionally has no media parser. Its trusted
+    // adapter must positively assert the text-only gate that it already owns.
+    bool text_only = false;
+};
+
+// One canonical source-row mapping inherited from the parent reference. Runs
+// coalesce only when logical, captured-physical, and packed-source rows are all
+// consecutive, so a future destination binder cannot confuse those spaces.
+struct vbr_artifact_prefix_cell_run {
+    llama_pos first_logical_position = -1;
+    uint32_t first_physical_cell = UINT32_MAX;
+    uint64_t first_packed_row = 0;
+    uint32_t cell_count = 0;
+};
+
+struct vbr_artifact_prefix_source_run {
+    uint32_t unit_index = UINT32_MAX;
+    uint32_t shard_index = UINT32_MAX;
+    llama_pos first_logical_position = -1;
+    uint32_t first_physical_cell = UINT32_MAX;
+    uint64_t source_offset = 0;
+    uint64_t size = 0;
+    uint32_t cell_count = 0;
+};
+
+struct vbr_artifact_prefix_range_proof {
+    uint32_t unit_index = UINT32_MAX;
+    uint32_t shard_index = UINT32_MAX;
+    vbr_capture_range_proof proof;
+};
+
+class vbr_artifact_attention_prefix_projection {
+public:
+    vbr_artifact_attention_prefix_projection() noexcept;
+    vbr_artifact_attention_prefix_projection(
+        vbr_artifact_attention_prefix_projection &&) noexcept;
+    vbr_artifact_attention_prefix_projection & operator=(
+        vbr_artifact_attention_prefix_projection &&) noexcept;
+    ~vbr_artifact_attention_prefix_projection();
+
+    vbr_artifact_attention_prefix_projection(
+        const vbr_artifact_attention_prefix_projection &) = delete;
+    vbr_artifact_attention_prefix_projection & operator=(
+        const vbr_artifact_attention_prefix_projection &) = delete;
+
+    explicit operator bool() const noexcept;
+    llama_cache_acct_artifact_id parent_artifact() const noexcept;
+    const vbr_manifest_digest & parent_manifest_digest() const noexcept;
+    const vbr_artifact_identity_block & identity() const noexcept;
+    const std::vector<llama_token> & prefix_tokens() const noexcept;
+    const vbr_artifact_prefix_token_digest & token_digest() const noexcept;
+    const std::vector<vbr_artifact_prefix_cell_run> & cell_runs() const noexcept;
+    const std::vector<vbr_artifact_prefix_source_run> & source_runs() const noexcept;
+    const std::vector<vbr_artifact_prefix_range_proof> & proofs() const noexcept;
+    uint64_t selected_bytes() const noexcept;
+    const vbr_artifact_prefix_projection_digest & digest() const noexcept;
+    void reset() noexcept;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> impl_;
+    friend class llama_vbr_artifact_catalog;
+};
+
 enum class vbr_projected_manifest_publish_status : uint8_t {
     published = 0,
     adopted,
@@ -333,6 +430,7 @@ public:
 private:
     struct storage;
     friend class llama_vbr_artifact_catalog;
+    friend class vbr_artifact_attention_prefix_projection;
     llama_vbr_artifact_catalog * owner_ = nullptr;
     std::shared_ptr<const storage> storage_;
     bool host_owned_ = false;
@@ -456,6 +554,14 @@ public:
     // its originating catalog without reopening ownership.
     bool owns_host_package(
         const vbr_artifact_package_view & package) const noexcept;
+    // Derive an immutable, least-authority prefix capability without creating
+    // a catalog reference or reading payload bytes. The result owns an
+    // independent borrow of parent and therefore delays its physical retire.
+    vbr_artifact_prefix_projection_status project_attention_prefix(
+        const vbr_artifact_package_view & parent,
+        const vbr_artifact_attention_prefix_request & request,
+        const vbr_artifact_prefix_projection_limits & limits,
+        vbr_artifact_attention_prefix_projection & output) noexcept;
     // Scheduler-only handoff for references returned by one just-completed
     // projected publication. The input must be nonempty and unique, and the
     // output must be empty. Allocation or structural failure leaves every
@@ -522,6 +628,7 @@ private:
     friend class llama_vbr_artifact_catalog_stream_build;
     friend class vbr_artifact_package_view;
     friend class vbr_artifact_prepared_retire;
+    friend class vbr_artifact_attention_prefix_projection;
     vbr_artifact_resolve_status materialize_reference_locked(
         llama_cache_acct_artifact_id reference,
         std::shared_ptr<const vbr_artifact_package_view::storage> & output);

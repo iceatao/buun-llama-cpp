@@ -362,6 +362,147 @@ static void test_authenticated_range_tree() {
     CHECK(!vbr_capture_range_prove(
         tree, { { 2*CHUNK, 4 }, { CHUNK, 4 } }, {}, refused));
 
+    // A child proof is derived entirely from immutable parent authority. The
+    // requested ranges may split chunks and remain noncontiguous, but may not
+    // cross a byte the parent did not authorize.
+    vbr_capture_range_proof broad_parent;
+    const std::vector<vbr_capture_authenticated_range> broad_ranges {
+        { 16, 3*CHUNK + 100 },
+        { 4*CHUNK + 5, 100 },
+    };
+    CHECK(vbr_capture_range_prove(
+        tree, broad_ranges, {}, broad_parent));
+    const auto broad_root = broad_parent.root();
+    const auto broad_metadata = broad_parent.metadata_bytes();
+    const std::vector<vbr_capture_authenticated_range> child_ranges {
+        { CHUNK - 8, 16 },
+        { 3*CHUNK + 7, 11 },
+        { 4*CHUNK + 20, 5 },
+    };
+    vbr_capture_range_proof child;
+    CHECK(vbr_capture_range_restrict(
+        broad_parent, child_ranges, {}, child) ==
+        vbr_capture_range_restrict_status::restricted);
+    CHECK(child);
+    CHECK(child.root() == broad_parent.root());
+    CHECK(child.ranges().size() == child_ranges.size());
+    for (size_t i = 0; i < child_ranges.size(); ++i) {
+        CHECK(child.ranges()[i].offset == child_ranges[i].offset);
+        CHECK(child.ranges()[i].size == child_ranges[i].size);
+    }
+    CHECK(child.selected_chunk_count() == 4);
+
+    range_verify_source child_source { bytes };
+    bytes_read = 99;
+    CHECK(vbr_capture_range_verify(
+        child, child_source.source(), &bytes_read));
+    CHECK(child_source.calls == 4);
+    CHECK(bytes_read == 3*CHUNK + 123);
+    // Chunk two is omitted by the child even though the parent selected it.
+    child_source.bytes[2*CHUNK + 1] ^= 1;
+    child_source.calls = 0;
+    CHECK(vbr_capture_range_verify(
+        child, child_source.source(), &bytes_read));
+    CHECK(child_source.calls == 4);
+    child_source.bytes[CHUNK - 1] ^= 1;
+    child_source.calls = 0;
+    CHECK(!vbr_capture_range_verify(
+        child, child_source.source(), &bytes_read));
+    CHECK(bytes_read == 0);
+
+    // Exact limits accept; one below each independently refuses and clears a
+    // seeded output. This pins all four bounded arenas used by restriction.
+    auto child_limits = vbr_capture_range_proof_limits{};
+    child_limits.max_ranges = uint32_t(child.ranges().size());
+    child_limits.max_selected_chunks = child.selected_chunk_count();
+    child_limits.max_proof_nodes = child.proof_node_count();
+    child_limits.max_metadata_bytes = child.metadata_bytes();
+    vbr_capture_range_proof bounded;
+    CHECK(vbr_capture_range_restrict(
+        broad_parent, child_ranges, child_limits, bounded) ==
+        vbr_capture_range_restrict_status::restricted);
+    CHECK(bounded.metadata_bytes() == child.metadata_bytes());
+    auto one_under = child_limits;
+    one_under.max_ranges--;
+    bounded = child;
+    CHECK(vbr_capture_range_restrict(
+        broad_parent, child_ranges, one_under, bounded) ==
+        vbr_capture_range_restrict_status::limit_exceeded);
+    CHECK(!bounded);
+    one_under = child_limits;
+    one_under.max_selected_chunks--;
+    bounded = child;
+    CHECK(vbr_capture_range_restrict(
+        broad_parent, child_ranges, one_under, bounded) ==
+        vbr_capture_range_restrict_status::limit_exceeded);
+    CHECK(!bounded);
+    one_under = child_limits;
+    CHECK(one_under.max_proof_nodes > 0);
+    one_under.max_proof_nodes--;
+    bounded = child;
+    CHECK(vbr_capture_range_restrict(
+        broad_parent, child_ranges, one_under, bounded) ==
+        vbr_capture_range_restrict_status::limit_exceeded);
+    CHECK(!bounded);
+    one_under = child_limits;
+    one_under.max_metadata_bytes--;
+    bounded = child;
+    CHECK(vbr_capture_range_restrict(
+        broad_parent, child_ranges, one_under, bounded) ==
+        vbr_capture_range_restrict_status::limit_exceeded);
+    CHECK(!bounded);
+
+    // Authorization is byte-exact, not merely chunk-local.
+    bounded = child;
+    CHECK(vbr_capture_range_restrict(
+        broad_parent, {}, {}, bounded) ==
+        vbr_capture_range_restrict_status::invalid_argument);
+    CHECK(!bounded);
+    CHECK(vbr_capture_range_restrict(
+        proof, { { CHUNK + 250, 100 } }, {}, bounded) ==
+        vbr_capture_range_restrict_status::range_unauthorized);
+    CHECK(!bounded);
+    CHECK(vbr_capture_range_restrict(
+        proof, { { 2*CHUNK, 1 } }, {}, bounded) ==
+        vbr_capture_range_restrict_status::range_unauthorized);
+    CHECK(vbr_capture_range_restrict(
+        broad_parent, { { CHUNK, 0 } }, {}, bounded) ==
+        vbr_capture_range_restrict_status::invalid_argument);
+    CHECK(vbr_capture_range_restrict(
+        broad_parent,
+        { { 3*CHUNK, 4 }, { CHUNK, 4 } }, {}, bounded) ==
+        vbr_capture_range_restrict_status::invalid_argument);
+    CHECK(vbr_capture_range_restrict(
+        broad_parent,
+        { { CHUNK, 8 }, { CHUNK + 4, 8 } }, {}, bounded) ==
+        vbr_capture_range_restrict_status::invalid_argument);
+    CHECK(vbr_capture_range_restrict(
+        {}, child_ranges, {}, bounded) ==
+        vbr_capture_range_restrict_status::parent_invalid);
+
+    // Adjacent parent ranges form one continuous authority interval.
+    vbr_capture_range_proof adjacent_parent;
+    CHECK(vbr_capture_range_prove(
+        tree,
+        { { 0, CHUNK/2 }, { CHUNK/2, CHUNK/2 } },
+        {}, adjacent_parent));
+    CHECK(vbr_capture_range_restrict(
+        adjacent_parent, { { CHUNK/4, CHUNK/2 } }, {}, bounded) ==
+        vbr_capture_range_restrict_status::restricted);
+    range_verify_source adjacent_source { bytes };
+    CHECK(vbr_capture_range_verify(
+        bounded, adjacent_source.source(), &bytes_read));
+    CHECK(adjacent_source.calls == 1);
+    CHECK(bytes_read == CHUNK);
+
+    // Restriction is non-consuming and cannot mutate the parent's root or
+    // proof metadata.
+    range_verify_source parent_source { bytes };
+    CHECK(broad_parent.root() == broad_root);
+    CHECK(broad_parent.metadata_bytes() == broad_metadata);
+    CHECK(vbr_capture_range_verify(
+        broad_parent, parent_source.source(), &bytes_read));
+
     artifact_segment_chain unavailable;
     vbr_capture_range_tree unavailable_tree = tree;
     CHECK(unavailable.append(bytes.data(), 4));
@@ -1201,7 +1342,8 @@ static vbr_capture_projected_unit capture_projected_unit_for_target(
         const vbr_capture_projection & projection,
         const vbr_capture_controller_target & target,
         uint32_t stream_index = 0,
-        uint64_t row_bytes = 1) {
+        uint64_t row_bytes = 1,
+        uint32_t logical_unit_id = 0) {
     synthetic_source source;
     source.bytes.resize(size_t(8*row_bytes));
     for (uint32_t i = 0; i < source.bytes.size(); ++i) {
@@ -1222,11 +1364,11 @@ static vbr_capture_projected_unit capture_projected_unit_for_target(
     projected_snapshot_fixture snapshot;
     snapshot.snapshot.source_namespace = target.source_namespace;
     snapshot.snapshot.child_id = target.child_id;
-    snapshot.snapshot.logical_unit_id = 0;
+    snapshot.snapshot.logical_unit_id = logical_unit_id;
     snapshot.snapshot.lineage_uuid = target.lineage_uuid;
     snapshot.snapshot.controller_generation = target.controller_generation;
     snapshot.snapshot.mutation_serial = 0;
-    snapshot.snapshot.generation = target.units[0];
+    snapshot.snapshot.generation = target.units[logical_unit_id];
     CHECK(vbr_capture_projected_shard_topology(
         sources, snapshot.snapshot.shard_count,
         snapshot.snapshot.shard_topology_digest));
@@ -1239,7 +1381,7 @@ static vbr_capture_projected_unit capture_projected_unit_for_target(
     vbr_capture_projected_unit unit;
     if (ring) {
         CHECK(vbr_capture_projected_unit_transfer(
-                  projection, target.child_id, stream_index, 0,
+                  projection, target.child_id, stream_index, logical_unit_id,
                   sources, {}, snapshot.provider(), *ring, unit) ==
               vbr_capture_stream_status::ok);
     }
@@ -1348,13 +1490,24 @@ static vbr_projected_manifest_publication projected_publication(
     if (!row || row->state != vbr_capture_manifest_state::ready) {
         return out;
     }
-    CHECK(row->unit_count == 1);
-    if (row->unit_count != 1) {
+    if (row->unit_count == 0 ||
+        row->first_unit > assembly.unit_references().size() ||
+        row->unit_count >
+            assembly.unit_references().size() - row->first_unit) {
         return out;
     }
-    const uint32_t captured_index = assembly.unit_references()[
-        row->first_unit];
-    const auto & captured = assembly.projected_units()[captured_index];
+    uint64_t packed_bytes = 0;
+    for (uint32_t i = 0; i < row->unit_count; ++i) {
+        const uint32_t captured_index = assembly.unit_references()[
+            row->first_unit + i];
+        if (captured_index >= assembly.projected_units().size() ||
+            assembly.projected_units()[captured_index].packed_bytes() >
+                UINT64_MAX - packed_bytes) {
+            return out;
+        }
+        packed_bytes +=
+            assembly.projected_units()[captured_index].packed_bytes();
+    }
     vbr_artifact_portable_accounting_row payload;
     payload.role = vbr_artifact_accounting_role::unit_payload;
     payload.domain = {
@@ -1362,8 +1515,8 @@ static vbr_projected_manifest_publication projected_publication(
         llama_cache_acct_domain_kind::device_topology,
         0, 0,
     };
-    payload.logical_bytes = captured.packed_bytes();
-    payload.resident_bytes = captured.packed_bytes();
+    payload.logical_bytes = packed_bytes;
+    payload.resident_bytes = packed_bytes;
     out.accounting.push_back(payload);
     const vbr_artifact_portable_domain host {
         llama_cache_acct_residency::pageable_host,
@@ -1973,6 +2126,187 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(catalog.retire(results[0].publication.reference_artifact) ==
           vbr_artifact_retire_status::retired);
     CHECK(catalog.retire(first_sparse_reference) ==
+          vbr_artifact_retire_status::retired);
+
+    // A prefix projection is a borrow of one immutable parent, not a new
+    // catalog reference. Physical and logical order are deliberately
+    // unrelated: the source runs must name packed union rows rather than
+    // treating captured physical cells as byte offsets.
+    auto prefix_target = projected_target(
+        91, 0, 919, projected_generation(31));
+    const auto second_prefix_generation = projected_generation(32);
+    prefix_target.units.push_back(second_prefix_generation);
+    auto second_prefix_descriptor = prefix_target.unit_descriptors.front();
+    second_prefix_descriptor.logical_unit_id = 1;
+    second_prefix_descriptor.repr_gen = second_prefix_generation.repr_gen;
+    second_prefix_descriptor.current_type =
+        second_prefix_generation.current_type;
+    second_prefix_descriptor.last_source_type =
+        second_prefix_generation.last_source_type;
+    prefix_target.unit_descriptors.push_back(second_prefix_descriptor);
+    prefix_target.policy.current_type_vector_digest =
+        vbr_type_vector_digest(std::vector<ggml_type> {
+            ggml_type(prefix_target.units[0].current_type),
+            ggml_type(prefix_target.units[1].current_type),
+        });
+    vbr_capture_projection_manifest prefix_manifest;
+    prefix_manifest.manifest_id = 91;
+    auto prefix_placement = projected_placement(
+        91, 91, { 0, 1, 2, 3, 4, 5, 6, 7 });
+    const llama_pos shuffled_logical[] { 3, 5, 1, 7, 6, 2, 4, 0 };
+    for (size_t i = 0; i < prefix_placement.cells.size(); ++i) {
+        prefix_placement.cells[i].logical_position = shuffled_logical[i];
+    }
+    prefix_manifest.placements.push_back(std::move(prefix_placement));
+    bind_projected_manifest_metadata(prefix_manifest, prefix_target);
+    prefix_manifest.identity.execution_identity.assign(4096, 'e');
+    prefix_manifest.identity.adapter_config_identity.assign(4096, 'a');
+    prefix_manifest.identity.media_content_identity.assign(4096, 'm');
+    vbr_capture_projection prefix_capture;
+    CHECK(vbr_artifact_project_capture_union(
+        { 707, { prefix_manifest } }, {}, prefix_capture));
+    auto prefix_unit = capture_projected_unit_for_target(
+        prefix_capture, prefix_target);
+    auto second_prefix_unit = capture_projected_unit_for_target(
+        prefix_capture, prefix_target, 0, 1, 1);
+    projected_controller_fixture prefix_controller;
+    vbr_capture_manifest_assembly prefix_assembly;
+    CHECK(assemble_projected_test_batch(
+        prefix_capture, { prefix_target },
+        { prefix_unit, second_prefix_unit },
+        prefix_controller.provider(), {}, prefix_assembly));
+    auto prefix_publication = projected_publication(
+        91, prefix_assembly, topology);
+    std::vector<vbr_projected_manifest_publication> prefix_publications;
+    prefix_publications.push_back(std::move(prefix_publication));
+    results.clear();
+    CHECK(catalog.publish_projected_batch(
+        prefix_assembly, std::move(prefix_publications), budget, results));
+    CHECK(results.size() == 1);
+    CHECK(results[0].status ==
+          vbr_projected_manifest_publish_status::published);
+    const auto prefix_reference =
+        results[0].publication.reference_artifact;
+    vbr_artifact_package_view prefix_parent;
+    CHECK(catalog.resolve_reference(prefix_reference, prefix_parent) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(prefix_parent.validate() == vbr_artifact_status::ok);
+
+    const llama_token divergent[] { 1, 2, 99, 100 };
+    vbr_artifact_attention_prefix_request prefix_request;
+    prefix_request.tokens = divergent;
+    prefix_request.token_count = sizeof(divergent)/sizeof(divergent[0]);
+    prefix_request.lcp_tokens = 2;
+    prefix_request.text_only = true;
+    vbr_artifact_attention_prefix_projection prefix_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {}, prefix_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    CHECK(prefix_projection);
+    CHECK(prefix_projection.parent_artifact() == prefix_reference);
+    CHECK(prefix_projection.parent_manifest_digest() ==
+          prefix_parent.manifest().manifest_digest);
+    CHECK(prefix_projection.identity().token_count == 2);
+    CHECK(prefix_projection.identity().next_position == 2);
+    CHECK(prefix_projection.prefix_tokens() ==
+          std::vector<llama_token>({ 1, 2 }));
+    CHECK(prefix_projection.token_digest().valid());
+    CHECK(prefix_projection.digest().valid());
+    CHECK(prefix_projection.cell_runs().size() == 2);
+    CHECK(prefix_projection.cell_runs()[0].first_logical_position == 0);
+    CHECK(prefix_projection.cell_runs()[0].first_physical_cell == 7);
+    CHECK(prefix_projection.cell_runs()[0].first_packed_row == 7);
+    CHECK(prefix_projection.cell_runs()[1].first_logical_position == 1);
+    CHECK(prefix_projection.cell_runs()[1].first_physical_cell == 2);
+    CHECK(prefix_projection.cell_runs()[1].first_packed_row == 2);
+    CHECK(prefix_projection.source_runs().size() == 4);
+    CHECK(prefix_projection.selected_bytes() == 4);
+    CHECK(prefix_projection.proofs().size() == 2);
+    CHECK(prefix_projection.proofs()[0].proof.ranges().size() == 2);
+    uint64_t selected_read = 0;
+    CHECK(vbr_capture_range_verify(
+        prefix_projection.proofs()[0].proof,
+        prefix_parent.units()[0].payload_shards[0]->source(),
+        &selected_read));
+    CHECK(selected_read == 8); // one declared 64 KiB leaf, eight real bytes
+
+    const llama_token shorter[] { 1, 2, 3 };
+    prefix_request.tokens = shorter;
+    prefix_request.token_count = 3;
+    prefix_request.lcp_tokens = 3;
+    vbr_artifact_attention_prefix_projection shorter_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {}, shorter_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    CHECK(shorter_projection.selected_bytes() == 6);
+
+    const auto expect_projection_limit = [&](const auto & cap) {
+        vbr_artifact_attention_prefix_projection capped;
+        CHECK(catalog.project_attention_prefix(
+                  prefix_parent, prefix_request, cap, capped) ==
+              vbr_artifact_prefix_projection_status::limit_exceeded);
+        CHECK(!capped);
+    };
+    auto catalog_cap = vbr_artifact_prefix_projection_limits {};
+    catalog_cap.max_tokens = 7;
+    expect_projection_limit(catalog_cap);
+    catalog_cap = {};
+    catalog_cap.max_units = 1;
+    expect_projection_limit(catalog_cap);
+    catalog_cap = {};
+    catalog_cap.max_placements = 7;
+    expect_projection_limit(catalog_cap);
+    catalog_cap = {};
+    catalog_cap.max_proofs = 1;
+    expect_projection_limit(catalog_cap);
+
+    // The retained metadata cap includes the three copied semantic identity
+    // strings; omitting them would incorrectly fit this boundary.
+    auto identity_cap = vbr_artifact_prefix_projection_limits {};
+    identity_cap.max_metadata_bytes =
+        prefix_parent.manifest().identity.execution_identity.size() +
+        prefix_parent.manifest().identity.adapter_config_identity.size() +
+        prefix_parent.manifest().identity.media_content_identity.size();
+    vbr_artifact_attention_prefix_projection identity_refused;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, identity_cap,
+              identity_refused) ==
+          vbr_artifact_prefix_projection_status::limit_exceeded);
+    CHECK(!identity_refused);
+
+    auto tight_prefix_limits = vbr_artifact_prefix_projection_limits {};
+    tight_prefix_limits.max_source_runs = 1;
+    vbr_artifact_attention_prefix_projection refused_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, tight_prefix_limits,
+              refused_projection) ==
+          vbr_artifact_prefix_projection_status::limit_exceeded);
+    CHECK(!refused_projection);
+    tight_prefix_limits = {};
+    tight_prefix_limits.proof.max_ranges = 2;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, tight_prefix_limits,
+              refused_projection) ==
+          vbr_artifact_prefix_projection_status::limit_exceeded);
+    CHECK(!refused_projection);
+    tight_prefix_limits = {};
+    tight_prefix_limits.proof.max_selected_chunks = 0;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, tight_prefix_limits,
+              refused_projection) ==
+          vbr_artifact_prefix_projection_status::limit_exceeded);
+    CHECK(!refused_projection);
+
+    // Dropping the caller's package lease cannot retire storage while either
+    // independently borrowed projection remains alive.
+    prefix_parent.reset();
+    CHECK(catalog.retire(prefix_reference) ==
+          vbr_artifact_retire_status::busy);
+    prefix_projection.reset();
+    CHECK(catalog.retire(prefix_reference) ==
+          vbr_artifact_retire_status::busy);
+    shorter_projection.reset();
+    CHECK(catalog.retire(prefix_reference) ==
           vbr_artifact_retire_status::retired);
     CHECK(ledger.snapshot().live_ops == 0);
 }

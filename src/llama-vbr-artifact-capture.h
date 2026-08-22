@@ -148,6 +148,16 @@ struct vbr_capture_range_proof_limits {
     uint64_t max_metadata_bytes = uint64_t(64)*1024*1024;
 };
 
+enum class vbr_capture_range_restrict_status : uint8_t {
+    restricted = 0,
+    invalid_argument,
+    parent_invalid,
+    range_unauthorized,
+    limit_exceeded,
+    internal_error,
+    _count,
+};
+
 // Immutable Merkle owner produced from the same append pass that creates the
 // pageable segment chain. The root binds total bytes, canonical chunking, and
 // the complete padded tree; no payload rescan is needed to seal it.
@@ -204,6 +214,11 @@ private:
         const std::vector<vbr_capture_authenticated_range> &,
         const vbr_capture_range_proof_limits &,
         vbr_capture_range_proof &) noexcept;
+    friend vbr_capture_range_restrict_status vbr_capture_range_restrict(
+        const vbr_capture_range_proof &,
+        const std::vector<vbr_capture_authenticated_range> &,
+        const vbr_capture_range_proof_limits &,
+        vbr_capture_range_proof &) noexcept;
     friend bool vbr_capture_range_verify(
         const vbr_capture_range_proof &,
         const vbr_artifact_byte_source &,
@@ -222,6 +237,17 @@ bool vbr_capture_range_seal(
 // extent. Proof construction and verification are transactional/fail-closed.
 bool vbr_capture_range_prove(
     const vbr_capture_range_tree & tree,
+    const std::vector<vbr_capture_authenticated_range> & ranges,
+    const vbr_capture_range_proof_limits & limits,
+    vbr_capture_range_proof & output) noexcept;
+
+// Derives a manifest-local proof for an exact subset of a parent proof's
+// authorized byte ranges. The parent retains the selected leaf digests needed
+// to construct the child multiproof, so this operation never reads payload or
+// widens authority to another manifest's rows. Ranges use the same canonical
+// sorted/nonempty contract as vbr_capture_range_prove().
+vbr_capture_range_restrict_status vbr_capture_range_restrict(
+    const vbr_capture_range_proof & parent,
     const std::vector<vbr_capture_authenticated_range> & ranges,
     const vbr_capture_range_proof_limits & limits,
     vbr_capture_range_proof & output) noexcept;

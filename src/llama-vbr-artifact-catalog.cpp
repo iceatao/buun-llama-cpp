@@ -288,6 +288,21 @@ struct vbr_artifact_package_view::storage {
     std::vector<vbr_artifact_allocation_view> reference_allocations;
 };
 
+struct vbr_artifact_attention_prefix_projection::impl {
+    llama_vbr_artifact_catalog * owner = nullptr;
+    std::shared_ptr<const void> parent_storage;
+    llama_cache_acct_artifact_id parent;
+    vbr_manifest_digest parent_manifest;
+    vbr_artifact_identity_block identity;
+    std::vector<llama_token> tokens;
+    vbr_artifact_prefix_token_digest token_digest;
+    std::vector<vbr_artifact_prefix_cell_run> cell_runs;
+    std::vector<vbr_artifact_prefix_source_run> source_runs;
+    std::vector<vbr_artifact_prefix_range_proof> proofs;
+    uint64_t selected_bytes = 0;
+    vbr_artifact_prefix_projection_digest digest;
+};
+
 struct vbr_artifact_prepared_retire::impl {
     llama_vbr_artifact_catalog * owner = nullptr;
     uint64_t token = 0;
@@ -303,6 +318,18 @@ bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
     return std::any_of(
         digest.begin(), digest.end(),
         [](uint8_t byte) { return byte != 0; });
+}
+
+bool prefix_metadata_add(
+        uint64_t count, uint64_t element, uint64_t & total) noexcept {
+    return element == 0 ||
+        (count <= (UINT64_MAX - total)/element &&
+         (total += count*element, true));
+}
+
+template<typename Digest>
+Digest prefix_digest_finish(llama_sha256_writer & hash) {
+    return Digest::from_sha256(hash.finish());
 }
 
 template <typename Digest>
@@ -1245,6 +1272,98 @@ void vbr_artifact_prepared_retire::reset() noexcept {
             impl_->stash_ids, impl_->release);
     }
     impl_.reset();
+}
+
+vbr_artifact_attention_prefix_projection::
+vbr_artifact_attention_prefix_projection() noexcept = default;
+
+vbr_artifact_attention_prefix_projection::
+vbr_artifact_attention_prefix_projection(
+        vbr_artifact_attention_prefix_projection &&) noexcept = default;
+
+vbr_artifact_attention_prefix_projection &
+vbr_artifact_attention_prefix_projection::operator=(
+        vbr_artifact_attention_prefix_projection && other) noexcept {
+    if (this != &other) {
+        reset();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+
+vbr_artifact_attention_prefix_projection::
+~vbr_artifact_attention_prefix_projection() {
+    reset();
+}
+
+vbr_artifact_attention_prefix_projection::operator bool() const noexcept {
+    return impl_ && impl_->owner && impl_->parent.v != 0 &&
+        impl_->token_digest.valid() && impl_->digest.valid();
+}
+
+llama_cache_acct_artifact_id
+vbr_artifact_attention_prefix_projection::parent_artifact() const noexcept {
+    return impl_ ? impl_->parent : llama_cache_acct_artifact_id {};
+}
+
+const vbr_manifest_digest &
+vbr_artifact_attention_prefix_projection::parent_manifest_digest() const noexcept {
+    static const vbr_manifest_digest empty;
+    return impl_ ? impl_->parent_manifest : empty;
+}
+
+const vbr_artifact_identity_block &
+vbr_artifact_attention_prefix_projection::identity() const noexcept {
+    static const vbr_artifact_identity_block empty;
+    return impl_ ? impl_->identity : empty;
+}
+
+const std::vector<llama_token> &
+vbr_artifact_attention_prefix_projection::prefix_tokens() const noexcept {
+    static const std::vector<llama_token> empty;
+    return impl_ ? impl_->tokens : empty;
+}
+
+const vbr_artifact_prefix_token_digest &
+vbr_artifact_attention_prefix_projection::token_digest() const noexcept {
+    static const vbr_artifact_prefix_token_digest empty;
+    return impl_ ? impl_->token_digest : empty;
+}
+
+const std::vector<vbr_artifact_prefix_cell_run> &
+vbr_artifact_attention_prefix_projection::cell_runs() const noexcept {
+    static const std::vector<vbr_artifact_prefix_cell_run> empty;
+    return impl_ ? impl_->cell_runs : empty;
+}
+
+const std::vector<vbr_artifact_prefix_source_run> &
+vbr_artifact_attention_prefix_projection::source_runs() const noexcept {
+    static const std::vector<vbr_artifact_prefix_source_run> empty;
+    return impl_ ? impl_->source_runs : empty;
+}
+
+const std::vector<vbr_artifact_prefix_range_proof> &
+vbr_artifact_attention_prefix_projection::proofs() const noexcept {
+    static const std::vector<vbr_artifact_prefix_range_proof> empty;
+    return impl_ ? impl_->proofs : empty;
+}
+
+uint64_t
+vbr_artifact_attention_prefix_projection::selected_bytes() const noexcept {
+    return impl_ ? impl_->selected_bytes : 0;
+}
+
+const vbr_artifact_prefix_projection_digest &
+vbr_artifact_attention_prefix_projection::digest() const noexcept {
+    static const vbr_artifact_prefix_projection_digest empty;
+    return impl_ ? impl_->digest : empty;
+}
+
+void vbr_artifact_attention_prefix_projection::reset() noexcept {
+    auto state = std::move(impl_);
+    if (state && state->owner && state->parent.v != 0) {
+        state->owner->release_reference_lease(state->parent, false);
+    }
 }
 
 vbr_artifact_package_view::vbr_artifact_package_view(
@@ -4178,6 +4297,509 @@ bool llama_vbr_artifact_catalog::owns_host_package(
                found->second.prepared_retire_token == 0;
     } catch (...) {
         return false;
+    }
+}
+
+vbr_artifact_prefix_projection_status
+llama_vbr_artifact_catalog::project_attention_prefix(
+        const vbr_artifact_package_view & parent,
+        const vbr_artifact_attention_prefix_request & request,
+        const vbr_artifact_prefix_projection_limits & limits,
+        vbr_artifact_attention_prefix_projection & output) noexcept {
+    using status = vbr_artifact_prefix_projection_status;
+    output.reset();
+    if (parent.owner_ != this || !parent.storage_ || !request.text_only ||
+        !request.tokens || request.lcp_tokens == 0 ||
+        request.lcp_tokens > request.token_count ||
+        limits.max_tokens == 0 || limits.max_placements == 0 ||
+        limits.max_units == 0 || limits.max_proofs == 0 ||
+        limits.max_source_runs == 0 || limits.max_metadata_bytes == 0) {
+        return status::invalid_argument;
+    }
+
+    llama_cache_acct_artifact_id parent_id;
+    std::shared_ptr<const vbr_artifact_package_view::storage> storage;
+    try {
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            parent_id = parent.storage_->reference;
+            const auto found = impl_->references.find(parent_id.v);
+            if (parent_id.v == 0 || found == impl_->references.end() ||
+                found->second.retire_pending ||
+                found->second.prepared_retire_token != 0 ||
+                found->second.borrow_count == UINT64_MAX ||
+                !found->second.projected_sealed ||
+                found->second.manifest.manifest_digest !=
+                    parent.storage_->manifest.manifest_digest) {
+                return status::parent_stale;
+            }
+            ++found->second.borrow_count;
+            storage = parent.storage_;
+        }
+
+        const auto release_on_failure = [&](status value) {
+            release_reference_lease(parent_id, false);
+            return value;
+        };
+        const auto & manifest = storage->manifest;
+        const auto parent_tokens = manifest.token_block.tokens.size();
+        if (!storage->projected_sealed || !manifest.manifest_digest.valid() ||
+            manifest.version <
+                VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT ||
+            manifest.identity.token_count <= 1 ||
+            manifest.identity.next_position != manifest.identity.token_count ||
+            parent_tokens != size_t(manifest.identity.token_count) ||
+            request.lcp_tokens >= parent_tokens ||
+            storage->units.empty() ||
+            !storage->companions.empty() || !manifest.companions.empty() ||
+            manifest.generation.status !=
+                vbr_checkpoint_generation_status::complete ||
+            manifest.generation.controllers.size() != 1 ||
+            manifest.controller_policy.size() != 1 ||
+                manifest.stream_placements.size() != 1) {
+            return release_on_failure(status::unsupported_layout);
+        }
+        if (parent_tokens > limits.max_tokens ||
+            storage->units.size() > limits.max_units) {
+            return release_on_failure(status::limit_exceeded);
+        }
+        for (size_t i = 0; i < request.lcp_tokens; ++i) {
+            if (request.tokens[i] != manifest.token_block.tokens[i]) {
+                return release_on_failure(status::prefix_mismatch);
+            }
+        }
+        // The caller supplies the true LCP, not an arbitrary truncation of an
+        // otherwise still-matching request.
+        if (request.token_count > request.lcp_tokens &&
+            request.tokens[request.lcp_tokens] ==
+                manifest.token_block.tokens[request.lcp_tokens]) {
+            return release_on_failure(status::prefix_mismatch);
+        }
+
+        const auto & controller = manifest.generation.controllers.front();
+        const auto & policy = manifest.controller_policy.front();
+        const auto & placement = manifest.stream_placements.front();
+        if (controller.child_id != policy.child_id ||
+            controller.dependency_mode !=
+                checkpoint_child_dependency_mode::live_guarded ||
+            policy.dependency_mode !=
+                checkpoint_child_dependency_mode::live_guarded ||
+            policy.n_stream != 1 || !policy.unified || !policy.completed_wave ||
+            placement.child_id != controller.child_id ||
+            placement.stream_index != 0 || placement.source_sequence < 0 ||
+            placement.computation_frontier != manifest.identity.next_position ||
+            placement.cells.size() != parent_tokens) {
+            return release_on_failure(status::unsupported_layout);
+        }
+        if (placement.cells.size() > limits.max_placements) {
+            return release_on_failure(status::limit_exceeded);
+        }
+
+        uint64_t expected_proofs = 0;
+        for (uint32_t u = 0; u < storage->units.size(); ++u) {
+            const auto & unit = storage->units[u];
+            const auto & descriptor = unit.descriptor;
+            if (descriptor.child_id != controller.child_id ||
+                descriptor.logical_unit_id != u || descriptor.n_stream != 1 ||
+                !descriptor.unified || descriptor.shards.empty() ||
+                descriptor.clean_stash_state !=
+                    vbr_artifact_clean_stash_state::absent_at_source ||
+                !descriptor.clean_stash.shards.empty() ||
+                !unit.stash_shards.empty() ||
+                unit.payload_shards.size() != descriptor.shards.size() ||
+                descriptor.shards.size() > UINT64_MAX - expected_proofs) {
+                return release_on_failure(status::unsupported_layout);
+            }
+            expected_proofs += descriptor.shards.size();
+        }
+        if (expected_proofs == 0 ||
+            storage->projected_ranges.size() != expected_proofs) {
+            return release_on_failure(status::proof_unavailable);
+        }
+        if (expected_proofs > limits.max_proofs) {
+            return release_on_failure(status::limit_exceeded);
+        }
+
+        std::vector<const vbr_artifact_projected_range_view *> parent_proofs;
+        parent_proofs.reserve(storage->projected_ranges.size());
+        for (const auto & proof : storage->projected_ranges) {
+            parent_proofs.push_back(&proof);
+        }
+        std::sort(parent_proofs.begin(), parent_proofs.end(),
+            [](const auto * lhs, const auto * rhs) {
+                return std::tie(lhs->unit_index, lhs->shard_index) <
+                    std::tie(rhs->unit_index, rhs->shard_index);
+            });
+        for (size_t i = 0; i < parent_proofs.size(); ++i) {
+            const auto & proof = *parent_proofs[i];
+            if (proof.unit_index >= storage->units.size()) {
+                return release_on_failure(status::proof_unavailable);
+            }
+            const auto & unit = storage->units[proof.unit_index];
+            if (proof.shard_index >= unit.descriptor.shards.size() ||
+                unit.descriptor.shards[proof.shard_index].shard_index !=
+                    proof.shard_index || !proof.proof ||
+                (i != 0 && parent_proofs[i - 1]->unit_index == proof.unit_index &&
+                 parent_proofs[i - 1]->shard_index == proof.shard_index)) {
+                return release_on_failure(status::proof_unavailable);
+            }
+        }
+
+        struct row_range { uint64_t first = 0; uint64_t count = 0; };
+        const auto normalize_ranges = [](const vbr_capture_range_proof & proof,
+                                         uint64_t row_bytes,
+                                         std::vector<row_range> & rows,
+                                         uint64_t & total) {
+            rows.clear();
+            total = 0;
+            if (!proof || row_bytes == 0) {
+                return false;
+            }
+            for (const auto & range : proof.ranges()) {
+                if (range.size == 0 || range.offset%row_bytes != 0 ||
+                    range.size%row_bytes != 0) {
+                    return false;
+                }
+                const row_range current {
+                    range.offset/row_bytes, range.size/row_bytes,
+                };
+                if (current.count == 0 ||
+                    current.count > UINT64_MAX - total) {
+                    return false;
+                }
+                if (!rows.empty() &&
+                    rows.back().first + rows.back().count == current.first) {
+                    if (current.count > UINT64_MAX - rows.back().count) {
+                        return false;
+                    }
+                    rows.back().count += current.count;
+                } else {
+                    rows.push_back(current);
+                }
+                total += current.count;
+            }
+            return !rows.empty();
+        };
+
+        const auto & canonical_proof = *parent_proofs.front();
+        const auto & canonical_unit =
+            storage->units[canonical_proof.unit_index];
+        const auto & canonical_shard =
+            canonical_unit.descriptor.shards[canonical_proof.shard_index];
+        std::vector<row_range> canonical_rows;
+        uint64_t canonical_row_count = 0;
+        if (!canonical_unit.payload_shards[canonical_proof.shard_index] ||
+            canonical_shard.row_bytes == 0 ||
+            canonical_shard.section_checksum != canonical_proof.proof.root() ||
+            canonical_proof.proof.total_bytes() !=
+                canonical_unit.payload_shards[
+                    canonical_proof.shard_index]->size() ||
+            !normalize_ranges(
+                canonical_proof.proof, canonical_shard.row_bytes,
+                canonical_rows, canonical_row_count) ||
+            canonical_row_count != placement.cells.size()) {
+            return release_on_failure(status::proof_unavailable);
+        }
+
+        struct mapped_cell {
+            vbr_artifact_cell_placement cell;
+            uint64_t packed_row = 0;
+        };
+        std::vector<mapped_cell> mapped;
+        mapped.reserve(placement.cells.size());
+        std::vector<const vbr_artifact_cell_placement *> physical;
+        physical.reserve(placement.cells.size());
+        for (const auto & cell : placement.cells) {
+            physical.push_back(&cell);
+        }
+        std::sort(physical.begin(), physical.end(),
+            [](const auto * lhs, const auto * rhs) {
+                return lhs->physical_cell < rhs->physical_cell;
+            });
+        size_t cell_index = 0;
+        for (const auto & range : canonical_rows) {
+            for (uint64_t row = 0; row < range.count; ++row) {
+                if (cell_index >= physical.size() ||
+                    (cell_index != 0 &&
+                     physical[cell_index - 1]->physical_cell ==
+                         physical[cell_index]->physical_cell)) {
+                    return release_on_failure(status::unsupported_layout);
+                }
+                mapped.push_back({ *physical[cell_index], range.first + row });
+                ++cell_index;
+            }
+        }
+        if (cell_index != physical.size()) {
+            return release_on_failure(status::proof_unavailable);
+        }
+        std::sort(mapped.begin(), mapped.end(),
+            [](const auto & lhs, const auto & rhs) {
+                return lhs.cell.logical_position < rhs.cell.logical_position;
+            });
+        for (size_t i = 0; i < mapped.size(); ++i) {
+            if (mapped[i].cell.logical_position != llama_pos(i)) {
+                return release_on_failure(status::unsupported_layout);
+            }
+        }
+
+        std::unique_ptr<vbr_artifact_attention_prefix_projection::impl> result(
+            new vbr_artifact_attention_prefix_projection::impl);
+        result->owner = this;
+        result->parent_storage = storage;
+        result->parent = parent_id;
+        result->parent_manifest = manifest.manifest_digest;
+        result->identity = manifest.identity;
+        result->identity.token_count = int64_t(request.lcp_tokens);
+        result->identity.next_position = llama_pos(request.lcp_tokens);
+        result->tokens.assign(
+            manifest.token_block.tokens.begin(),
+            manifest.token_block.tokens.begin() + request.lcp_tokens);
+        result->cell_runs.reserve(request.lcp_tokens);
+        for (size_t i = 0; i < request.lcp_tokens; ++i) {
+            const auto & current = mapped[i];
+            if (!result->cell_runs.empty()) {
+                auto & prior = result->cell_runs.back();
+                if (prior.cell_count != UINT32_MAX &&
+                    uint64_t(prior.first_physical_cell) + prior.cell_count ==
+                        current.cell.physical_cell &&
+                    uint64_t(prior.first_logical_position) + prior.cell_count ==
+                        uint64_t(current.cell.logical_position) &&
+                    prior.first_packed_row + prior.cell_count ==
+                        current.packed_row) {
+                    ++prior.cell_count;
+                    continue;
+                }
+            }
+            result->cell_runs.push_back({
+                current.cell.logical_position, current.cell.physical_cell,
+                current.packed_row, 1,
+            });
+        }
+
+        llama_sha256_writer token_hash;
+        static constexpr char TOKEN_DOMAIN[] =
+            "buun.vbr.attention-prefix-token/v1";
+        token_hash.string(TOKEN_DOMAIN, sizeof(TOKEN_DOMAIN) - 1);
+        token_hash.bytes(
+            manifest.manifest_digest.bytes().data(),
+            manifest.manifest_digest.bytes().size());
+        token_hash.u64(request.lcp_tokens);
+        for (const auto token : result->tokens) {
+            token_hash.u32(uint32_t(token));
+        }
+        result->token_digest =
+            prefix_digest_finish<vbr_artifact_prefix_token_digest>(token_hash);
+        if (!result->token_digest.valid()) {
+            return release_on_failure(status::internal_error);
+        }
+
+        if (parent_proofs.size() > 0 &&
+            result->cell_runs.size() >
+                limits.max_source_runs/parent_proofs.size()) {
+            return release_on_failure(status::limit_exceeded);
+        }
+        const size_t source_run_count =
+            result->cell_runs.size()*parent_proofs.size();
+
+        // Refuse an impossible retained arena before reserving the potentially
+        // million-entry source-run vector or the per-proof handle vector.
+        uint64_t minimum_metadata = sizeof(*result);
+        if (!prefix_metadata_add(
+                result->identity.execution_identity.capacity(), 1,
+                minimum_metadata) ||
+            !prefix_metadata_add(
+                result->identity.adapter_config_identity.capacity(), 1,
+                minimum_metadata) ||
+            !prefix_metadata_add(
+                result->identity.media_content_identity.capacity(), 1,
+                minimum_metadata) ||
+            !prefix_metadata_add(
+                result->tokens.capacity(), sizeof(llama_token),
+                minimum_metadata) ||
+            !prefix_metadata_add(
+                result->cell_runs.capacity(),
+                sizeof(vbr_artifact_prefix_cell_run), minimum_metadata) ||
+            !prefix_metadata_add(
+                source_run_count, sizeof(vbr_artifact_prefix_source_run),
+                minimum_metadata) ||
+            !prefix_metadata_add(
+                parent_proofs.size(),
+                sizeof(vbr_artifact_prefix_range_proof), minimum_metadata) ||
+            minimum_metadata > limits.max_metadata_bytes) {
+            return release_on_failure(status::limit_exceeded);
+        }
+        result->proofs.reserve(parent_proofs.size());
+        result->source_runs.reserve(source_run_count);
+
+        uint64_t metadata = sizeof(*result);
+        if (!prefix_metadata_add(
+                result->identity.execution_identity.capacity(), 1, metadata) ||
+            !prefix_metadata_add(
+                result->identity.adapter_config_identity.capacity(), 1,
+                metadata) ||
+            !prefix_metadata_add(
+                result->identity.media_content_identity.capacity(), 1,
+                metadata) ||
+            !prefix_metadata_add(
+                result->tokens.capacity(), sizeof(llama_token), metadata) ||
+            !prefix_metadata_add(
+                result->cell_runs.capacity(),
+                sizeof(vbr_artifact_prefix_cell_run), metadata) ||
+            !prefix_metadata_add(
+                result->source_runs.capacity(),
+                sizeof(vbr_artifact_prefix_source_run), metadata) ||
+            !prefix_metadata_add(
+                result->proofs.capacity(),
+                sizeof(vbr_artifact_prefix_range_proof), metadata) ||
+            metadata > limits.max_metadata_bytes) {
+            return release_on_failure(status::limit_exceeded);
+        }
+
+        std::vector<row_range> proof_rows;
+        std::vector<vbr_capture_authenticated_range> selected_ranges;
+        for (const auto * parent_proof : parent_proofs) {
+            const auto & unit = storage->units[parent_proof->unit_index];
+            const auto & shard =
+                unit.descriptor.shards[parent_proof->shard_index];
+            uint64_t proof_row_count = 0;
+            if (!unit.payload_shards[parent_proof->shard_index] ||
+                shard.row_bytes == 0 ||
+                shard.section_checksum != parent_proof->proof.root() ||
+                parent_proof->proof.total_bytes() !=
+                    unit.payload_shards[parent_proof->shard_index]->size() ||
+                !normalize_ranges(
+                    parent_proof->proof, shard.row_bytes,
+                    proof_rows, proof_row_count) ||
+                proof_row_count != canonical_row_count ||
+                proof_rows.size() != canonical_rows.size() ||
+                !std::equal(
+                    proof_rows.begin(), proof_rows.end(),
+                    canonical_rows.begin(),
+                    [](const auto & lhs, const auto & rhs) {
+                        return lhs.first == rhs.first && lhs.count == rhs.count;
+                    })) {
+                return release_on_failure(status::proof_unavailable);
+            }
+
+            selected_ranges.clear();
+            selected_ranges.reserve(result->cell_runs.size());
+            for (const auto & run : result->cell_runs) {
+                if (run.first_packed_row > UINT64_MAX/shard.row_bytes ||
+                    uint64_t(run.cell_count) > UINT64_MAX/shard.row_bytes) {
+                    return release_on_failure(status::limit_exceeded);
+                }
+                selected_ranges.push_back({
+                    run.first_packed_row*shard.row_bytes,
+                    uint64_t(run.cell_count)*shard.row_bytes,
+                });
+            }
+            std::sort(selected_ranges.begin(), selected_ranges.end(),
+                [](const auto & lhs, const auto & rhs) {
+                    return lhs.offset < rhs.offset;
+                });
+            size_t write = 0;
+            for (const auto & range : selected_ranges) {
+                if (write != 0 &&
+                    selected_ranges[write - 1].offset +
+                            selected_ranges[write - 1].size == range.offset) {
+                    selected_ranges[write - 1].size += range.size;
+                } else {
+                    selected_ranges[write++] = range;
+                }
+            }
+            selected_ranges.resize(write);
+            if (selected_ranges.empty() ||
+                selected_ranges.size() > limits.proof.max_ranges) {
+                return release_on_failure(status::limit_exceeded);
+            }
+            vbr_capture_range_proof restricted;
+            auto proof_limits = limits.proof;
+            proof_limits.max_metadata_bytes = std::min(
+                proof_limits.max_metadata_bytes,
+                limits.max_metadata_bytes - metadata);
+            const auto restricted_status = vbr_capture_range_restrict(
+                parent_proof->proof, selected_ranges,
+                proof_limits, restricted);
+            if (restricted_status ==
+                    vbr_capture_range_restrict_status::limit_exceeded) {
+                return release_on_failure(status::limit_exceeded);
+            }
+            if (restricted_status !=
+                    vbr_capture_range_restrict_status::restricted ||
+                restricted.metadata_bytes() >
+                    limits.max_metadata_bytes - metadata) {
+                return release_on_failure(status::proof_unavailable);
+            }
+            metadata += restricted.metadata_bytes();
+            result->proofs.push_back({
+                parent_proof->unit_index, parent_proof->shard_index,
+                std::move(restricted),
+            });
+            for (const auto & run : result->cell_runs) {
+                const uint64_t offset =
+                    run.first_packed_row*shard.row_bytes;
+                const uint64_t size =
+                    uint64_t(run.cell_count)*shard.row_bytes;
+                result->source_runs.push_back({
+                    parent_proof->unit_index, parent_proof->shard_index,
+                    run.first_logical_position, run.first_physical_cell,
+                    offset, size, run.cell_count,
+                });
+            }
+            for (const auto & range : selected_ranges) {
+                if (range.size > UINT64_MAX - result->selected_bytes) {
+                    return release_on_failure(status::limit_exceeded);
+                }
+                result->selected_bytes += range.size;
+            }
+        }
+
+        llama_sha256_writer projection_hash;
+        static constexpr char PROJECTION_DOMAIN[] =
+            "buun.vbr.attention-prefix-projection/v1";
+        projection_hash.string(
+            PROJECTION_DOMAIN, sizeof(PROJECTION_DOMAIN) - 1);
+        projection_hash.u64(parent_id.v);
+        projection_hash.bytes(
+            result->parent_manifest.bytes().data(),
+            result->parent_manifest.bytes().size());
+        projection_hash.bytes(
+            result->token_digest.bytes().data(),
+            result->token_digest.bytes().size());
+        projection_hash.u64(result->selected_bytes);
+        projection_hash.u64(result->cell_runs.size());
+        for (const auto & run : result->cell_runs) {
+            projection_hash.u32(uint32_t(run.first_logical_position));
+            projection_hash.u32(run.first_physical_cell);
+            projection_hash.u64(run.first_packed_row);
+            projection_hash.u32(run.cell_count);
+        }
+        projection_hash.u64(result->proofs.size());
+        for (const auto & proof : result->proofs) {
+            projection_hash.u32(proof.unit_index);
+            projection_hash.u32(proof.shard_index);
+            projection_hash.bytes(
+                proof.proof.root().data(), proof.proof.root().size());
+            projection_hash.u64(proof.proof.ranges().size());
+            for (const auto & range : proof.proof.ranges()) {
+                projection_hash.u64(range.offset);
+                projection_hash.u64(range.size);
+            }
+        }
+        result->digest =
+            prefix_digest_finish<vbr_artifact_prefix_projection_digest>(
+                projection_hash);
+        if (!result->digest.valid()) {
+            return release_on_failure(status::internal_error);
+        }
+        output.impl_ = std::move(result);
+        return status::projected;
+    } catch (...) {
+        if (parent_id.v != 0 && storage) {
+            release_reference_lease(parent_id, false);
+        }
+        output.reset();
+        return status::internal_error;
     }
 }
 

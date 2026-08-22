@@ -143,6 +143,14 @@ public:
         const std::vector<llama_token> & tokens,
         void * context,
         prefix_visitor visitor) const noexcept;
+    // Visit every stored terminal tied for the longest nonzero common prefix
+    // with tokens. Unlike visit_prefixes(), the terminal may extend beyond or
+    // diverge after that prefix. Results are bounded by the index cardinality
+    // and ordered by artifact id.
+    bool visit_longest_common_prefix(
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_visitor visitor) const noexcept;
 
     bool available() const noexcept;
     size_t size() const noexcept;
@@ -225,6 +233,12 @@ public:
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept;
     bool visit_prefix_instances(
+        common_retention_pool pool,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_instance_visitor visitor) const noexcept;
+    bool visit_longest_common_prefix_instances(
         common_retention_pool pool,
         const std::string & exact_scope,
         const std::vector<llama_token> & tokens,

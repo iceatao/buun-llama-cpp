@@ -1053,6 +1053,10 @@ struct vbr_capture_range_proof::data {
     capture_range_digest root = {};
     std::vector<vbr_capture_authenticated_range> ranges;
     std::vector<uint32_t> selected_chunks;
+    // Tree-authenticated digests for exactly selected_chunks. Retaining these
+    // manifest-local leaves permits a narrower proof to be derived without
+    // rereading omitted payload or retaining the broader range tree.
+    std::vector<capture_range_digest> selected_leaf_digests;
     std::vector<capture_range_proof_node> proof_nodes;
 };
 
@@ -1250,6 +1254,8 @@ bool vbr_capture_range_prove(
                         return false;
                     }
                     result->selected_chunks.push_back(chunk);
+                    result->selected_leaf_digests.push_back(
+                        tree.data_->levels.front()[chunk]);
                 }
                 if (chunk == last) {
                     break;
@@ -1297,6 +1303,9 @@ bool vbr_capture_range_prove(
                 result->selected_chunks.capacity(), sizeof(uint32_t),
                 metadata_bytes) ||
             !capture_range_metadata_add(
+                result->selected_leaf_digests.capacity(),
+                sizeof(capture_range_digest), metadata_bytes) ||
+            !capture_range_metadata_add(
                 result->proof_nodes.capacity(),
                 sizeof(capture_range_proof_node), metadata_bytes) ||
             metadata_bytes > limits.max_metadata_bytes) {
@@ -1308,6 +1317,259 @@ bool vbr_capture_range_prove(
     } catch (...) {
         output = {};
         return false;
+    }
+}
+
+vbr_capture_range_restrict_status vbr_capture_range_restrict(
+        const vbr_capture_range_proof & parent,
+        const std::vector<vbr_capture_authenticated_range> & ranges,
+        const vbr_capture_range_proof_limits & limits,
+        vbr_capture_range_proof & output) noexcept {
+    using status = vbr_capture_range_restrict_status;
+    output = {};
+    try {
+        const auto * source = parent.data_.get();
+        if (!source) {
+            return status::parent_invalid;
+        }
+        if (ranges.empty()) {
+            return status::invalid_argument;
+        }
+        if (limits.max_ranges == 0 ||
+            ranges.size() > limits.max_ranges ||
+            limits.max_selected_chunks == 0 ||
+            limits.max_proof_nodes == 0 ||
+            limits.max_metadata_bytes == 0) {
+            return status::limit_exceeded;
+        }
+        if (source->total_bytes == 0 ||
+            source->chunk_bytes != VBR_CAPTURE_RANGE_CHUNK_BYTES ||
+            source->chunk_count == 0 || source->padded_count == 0 ||
+            (source->padded_count & (source->padded_count - 1)) != 0 ||
+            source->chunk_count > source->padded_count ||
+            source->selected_chunks.empty() ||
+            source->selected_chunks.size() !=
+                source->selected_leaf_digests.size() ||
+            source->ranges.empty() ||
+            !capture_digest_nonzero(source->root)) {
+            return status::parent_invalid;
+        }
+
+        // Validate the requested canonical ranges and prove that every byte is
+        // covered by the parent's manifest-local authority. Adjacent parent
+        // ranges may jointly cover one child range; gaps may not.
+        size_t parent_range = 0;
+        uint64_t prior_end = 0;
+        for (const auto & range : ranges) {
+            if (range.size == 0 || range.offset < prior_end ||
+                range.offset >= source->total_bytes ||
+                range.size > source->total_bytes - range.offset) {
+                return status::invalid_argument;
+            }
+            const uint64_t end = range.offset + range.size;
+            uint64_t cursor = range.offset;
+            while (cursor < end) {
+                while (parent_range < source->ranges.size()) {
+                    const auto & authorized = source->ranges[parent_range];
+                    if (authorized.size == 0 ||
+                        authorized.offset >= source->total_bytes ||
+                        authorized.size >
+                            source->total_bytes - authorized.offset) {
+                        return status::parent_invalid;
+                    }
+                    const uint64_t authorized_end =
+                        authorized.offset + authorized.size;
+                    if (authorized_end > cursor) {
+                        break;
+                    }
+                    ++parent_range;
+                }
+                if (parent_range == source->ranges.size()) {
+                    return status::range_unauthorized;
+                }
+                const auto & authorized = source->ranges[parent_range];
+                if (authorized.offset > cursor) {
+                    return status::range_unauthorized;
+                }
+                cursor = std::min(
+                    end, authorized.offset + authorized.size);
+                if (cursor < end) {
+                    ++parent_range;
+                }
+            }
+            prior_end = end;
+        }
+
+        using indexed_digest =
+            std::pair<uint32_t, capture_range_digest>;
+        uint32_t height = 0;
+        for (uint32_t width = source->padded_count;
+             width > 1; width /= 2) {
+            ++height;
+        }
+        std::vector<std::vector<indexed_digest>> available(height + 1);
+        available[0].reserve(source->selected_chunks.size());
+        uint32_t prior_chunk = 0;
+        bool first_chunk = true;
+        for (size_t i = 0; i < source->selected_chunks.size(); ++i) {
+            const uint32_t chunk = source->selected_chunks[i];
+            if (chunk >= source->chunk_count ||
+                (!first_chunk && chunk <= prior_chunk) ||
+                !capture_digest_nonzero(source->selected_leaf_digests[i])) {
+                return status::parent_invalid;
+            }
+            first_chunk = false;
+            prior_chunk = chunk;
+            available[0].push_back({
+                chunk, source->selected_leaf_digests[i],
+            });
+        }
+        for (const auto & node : source->proof_nodes) {
+            if (node.level >= height ||
+                node.index >= (source->padded_count >> node.level) ||
+                !capture_digest_nonzero(node.digest)) {
+                return status::parent_invalid;
+            }
+            available[node.level].push_back({ node.index, node.digest });
+        }
+
+        // Reconstruct the parent's sparse authenticated frontier once. Every
+        // pair must be complete; a missing, duplicate, or conflicting node is
+        // malformed authority and cannot mint a child proof.
+        for (uint32_t level = 0; level < height; ++level) {
+            auto & nodes = available[level];
+            std::sort(nodes.begin(), nodes.end(),
+                [](const indexed_digest & lhs, const indexed_digest & rhs) {
+                    return lhs.first < rhs.first;
+                });
+            if (nodes.empty() || (nodes.size() & 1u) != 0) {
+                return status::parent_invalid;
+            }
+            auto & parents = available[level + 1];
+            parents.reserve(parents.size() + nodes.size()/2);
+            for (size_t i = 0; i < nodes.size(); i += 2) {
+                if ((nodes[i].first & 1u) != 0 ||
+                    nodes[i + 1].first != nodes[i].first + 1) {
+                    return status::parent_invalid;
+                }
+                parents.push_back({
+                    nodes[i].first/2,
+                    capture_range_node_digest(
+                        level, nodes[i].second, nodes[i + 1].second),
+                });
+            }
+        }
+        auto & root_nodes = available[height];
+        std::sort(root_nodes.begin(), root_nodes.end(),
+            [](const indexed_digest & lhs, const indexed_digest & rhs) {
+                return lhs.first < rhs.first;
+            });
+        if (root_nodes.size() != 1 || root_nodes.front().first != 0 ||
+            capture_range_root_digest(
+                source->total_bytes, source->chunk_bytes,
+                source->chunk_count, source->padded_count,
+                root_nodes.front().second) != source->root) {
+            return status::parent_invalid;
+        }
+
+        auto result = std::make_shared<vbr_capture_range_proof::data>();
+        result->total_bytes = source->total_bytes;
+        result->chunk_bytes = source->chunk_bytes;
+        result->chunk_count = source->chunk_count;
+        result->padded_count = source->padded_count;
+        result->root = source->root;
+        result->ranges = ranges;
+        for (const auto & range : ranges) {
+            const uint64_t end = range.offset + range.size;
+            const uint32_t first = uint32_t(
+                range.offset/result->chunk_bytes);
+            const uint32_t last = uint32_t(
+                (end - 1)/result->chunk_bytes);
+            for (uint32_t chunk = first;; ++chunk) {
+                if (result->selected_chunks.empty() ||
+                    result->selected_chunks.back() != chunk) {
+                    if (result->selected_chunks.size() >=
+                            limits.max_selected_chunks) {
+                        return status::limit_exceeded;
+                    }
+                    const auto leaf = std::lower_bound(
+                        available[0].begin(), available[0].end(), chunk,
+                        [](const indexed_digest & value, uint32_t index) {
+                            return value.first < index;
+                        });
+                    if (leaf == available[0].end() ||
+                        leaf->first != chunk) {
+                        return status::parent_invalid;
+                    }
+                    result->selected_chunks.push_back(chunk);
+                    result->selected_leaf_digests.push_back(leaf->second);
+                }
+                if (chunk == last) {
+                    break;
+                }
+            }
+        }
+
+        std::vector<uint32_t> known = result->selected_chunks;
+        for (uint32_t level = 0; level < height; ++level) {
+            std::vector<uint32_t> parents;
+            parents.reserve((known.size() + 1)/2);
+            for (const uint32_t index : known) {
+                const uint32_t sibling = index ^ 1u;
+                if (!std::binary_search(known.begin(), known.end(), sibling)) {
+                    if (result->proof_nodes.size() >=
+                            limits.max_proof_nodes) {
+                        return status::limit_exceeded;
+                    }
+                    const auto found = std::lower_bound(
+                        available[level].begin(), available[level].end(),
+                        sibling,
+                        [](const indexed_digest & value, uint32_t target) {
+                            return value.first < target;
+                        });
+                    if (found == available[level].end() ||
+                        found->first != sibling) {
+                        return status::parent_invalid;
+                    }
+                    result->proof_nodes.push_back({
+                        level, sibling, found->second,
+                    });
+                }
+                const uint32_t next = index/2;
+                if (parents.empty() || parents.back() != next) {
+                    parents.push_back(next);
+                }
+            }
+            known = std::move(parents);
+        }
+        if (known.size() != 1 || known.front() != 0) {
+            return status::parent_invalid;
+        }
+
+        uint64_t metadata_bytes =
+            sizeof(vbr_capture_range_proof::data) +
+            CAPTURE_SHARED_OWNER_BYTES;
+        if (!capture_range_metadata_add(
+                result->ranges.capacity(),
+                sizeof(vbr_capture_authenticated_range), metadata_bytes) ||
+            !capture_range_metadata_add(
+                result->selected_chunks.capacity(), sizeof(uint32_t),
+                metadata_bytes) ||
+            !capture_range_metadata_add(
+                result->selected_leaf_digests.capacity(),
+                sizeof(capture_range_digest), metadata_bytes) ||
+            !capture_range_metadata_add(
+                result->proof_nodes.capacity(),
+                sizeof(capture_range_proof_node), metadata_bytes) ||
+            metadata_bytes > limits.max_metadata_bytes) {
+            return status::limit_exceeded;
+        }
+        result->metadata_bytes = metadata_bytes;
+        output = vbr_capture_range_proof(std::move(result));
+        return status::restricted;
+    } catch (...) {
+        output = {};
+        return status::internal_error;
     }
 }
 
@@ -1332,7 +1594,12 @@ bool vbr_capture_range_verify(
         known.reserve(proof.data_->selected_chunks.size());
         std::array<uint8_t, VBR_CAPTURE_RANGE_CHUNK_BYTES> scratch;
         uint64_t read_total = 0;
-        for (const uint32_t chunk : proof.data_->selected_chunks) {
+        if (proof.data_->selected_leaf_digests.size() !=
+                proof.data_->selected_chunks.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < proof.data_->selected_chunks.size(); ++i) {
+            const uint32_t chunk = proof.data_->selected_chunks[i];
             if (chunk >= proof.data_->chunk_count) {
                 return false;
             }
@@ -1346,8 +1613,12 @@ bool vbr_capture_range_verify(
             }
             llama_sha256_writer payload_hash;
             payload_hash.bytes(scratch.data(), size);
-            known.push_back({ chunk, capture_range_leaf_digest(
-                chunk, size, payload_hash.finish()) });
+            const auto leaf = capture_range_leaf_digest(
+                chunk, size, payload_hash.finish());
+            if (leaf != proof.data_->selected_leaf_digests[i]) {
+                return false;
+            }
+            known.push_back({ chunk, leaf });
             read_total += size;
         }
         size_t proof_cursor = 0;

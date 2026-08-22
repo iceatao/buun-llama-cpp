@@ -179,6 +179,131 @@ static void test_exact_prefix_index() {
     CHECK(coverage == 0);
 }
 
+static void test_longest_common_prefix_visits_descendant_terminals() {
+    server_retention_prefix_index index;
+    const llama_cache_acct_artifact_id long_parent { 10 };
+    const llama_cache_acct_artifact_id equal_parent { 20 };
+    const llama_cache_acct_artifact_id weaker_parent { 30 };
+    CHECK(index.publish(long_parent, 1, llama_tokens { 1, 2, 3, 4 }));
+    CHECK(index.publish(equal_parent, 2, llama_tokens { 1, 2, 8, 9 }));
+    CHECK(index.publish(weaker_parent, 3, llama_tokens { 1, 7, 8, 9 }));
+
+    struct visit_log {
+        std::array<llama_cache_acct_artifact_id, 4> artifacts {};
+        size_t size = 0;
+        uint64_t prefix = 0;
+    } log;
+    const auto visitor = [](void * opaque,
+                            llama_cache_acct_artifact_id artifact,
+                            uint64_t prefix) noexcept {
+        auto & value = *static_cast<visit_log *>(opaque);
+        if (value.size == value.artifacts.size() ||
+            (value.size != 0 && value.prefix != prefix)) {
+            return false;
+        }
+        value.prefix = prefix;
+        value.artifacts[value.size++] = artifact;
+        return true;
+    };
+
+    // A one-terminal radix retains [1,2,3,4] as one compressed edge. These
+    // probes therefore exercise request exhaustion and divergence inside that
+    // edge rather than at a split node.
+    server_retention_prefix_index compressed;
+    CHECK(compressed.publish(
+        long_parent, 1, llama_tokens { 1, 2, 3, 4 }));
+    CHECK(compressed.visit_longest_common_prefix(
+        llama_tokens { 1, 2 }, &log, visitor));
+    CHECK(log.prefix == 2);
+    CHECK(log.size == 1);
+    CHECK(log.artifacts[0] == long_parent);
+
+    log = {};
+    CHECK(compressed.visit_longest_common_prefix(
+        llama_tokens { 1, 2, 6 }, &log, visitor));
+    CHECK(log.prefix == 2);
+    CHECK(log.size == 1);
+    CHECK(log.artifacts[0] == long_parent);
+
+    // At equal LCP the shared subtree visits exact artifacts in artifact-id
+    // order, not terminal-list or unordered-map order.
+    log = {};
+    CHECK(index.visit_longest_common_prefix(
+        llama_tokens { 1, 2, 6 }, &log, visitor));
+    CHECK(log.prefix == 2);
+    CHECK(log.size == 2);
+    CHECK(log.artifacts[0] == long_parent);
+    CHECK(log.artifacts[1] == equal_parent);
+
+    // A deeper match excludes every weaker terminal.
+    log = {};
+    CHECK(index.visit_longest_common_prefix(
+        llama_tokens { 1, 2, 3, 6 }, &log, visitor));
+    CHECK(log.prefix == 3);
+    CHECK(log.size == 1);
+    CHECK(log.artifacts[0] == long_parent);
+
+    // The established exact-extension API remains terminal-only: it reports
+    // the stored parent at its full frontier, not descendant projections.
+    log = {};
+    CHECK(index.visit_prefixes(
+        llama_tokens { 1, 2, 3, 4, 5 }, &log, visitor));
+    CHECK(log.prefix == 4);
+    CHECK(log.size == 1);
+    CHECK(log.artifacts[0] == long_parent);
+
+    // No nonzero match is a successful empty lookup.
+    log = {};
+    CHECK(index.visit_longest_common_prefix(
+        llama_tokens { 99 }, &log, visitor));
+    CHECK(log.size == 0);
+}
+
+static void test_store_longest_common_prefix_instances() {
+    server_retention_sidecar_store store;
+    store.configure(nullptr, {}, nullptr);
+    CHECK(store.enable_prefix_tracking());
+    const auto first = server_retention_instance_key::for_slot(31);
+    const auto second = server_retention_instance_key::for_slot(30);
+    for (const auto & row : {
+            std::pair<server_retention_instance_key, llama_tokens> {
+                first, { 1, 2, 3, 4 } },
+            std::pair<server_retention_instance_key, llama_tokens> {
+                second, { 1, 2, 8, 9 } },
+        }) {
+        CHECK(store.publish(
+            row.first, common_retention_pool::attention, make_spans(), true,
+            44, row.second.size(), true));
+        CHECK(store.publish_prefix(row.first, "lcp-scope", row.second));
+    }
+
+    struct instance_log {
+        std::array<server_retention_instance_key, 2> instances {};
+        size_t size = 0;
+        uint64_t prefix = 0;
+    } log;
+    CHECK(store.visit_longest_common_prefix_instances(
+        common_retention_pool::attention, "lcp-scope",
+        llama_tokens { 1, 2, 7 }, &log,
+        [](void * opaque, const server_retention_instance_key & instance,
+           uint64_t prefix) noexcept {
+            auto & value = *static_cast<instance_log *>(opaque);
+            if (value.size == value.instances.size() ||
+                (value.size != 0 && value.prefix != prefix)) {
+                return false;
+            }
+            value.prefix = prefix;
+            value.instances[value.size++] = instance;
+            return true;
+        }));
+    CHECK(log.prefix == 2);
+    CHECK(log.size == 2);
+    CHECK(log.instances[0] == first);
+    CHECK(log.instances[1] == second);
+    store.retire(first);
+    store.retire(second);
+}
+
 static void test_excluded_prefix_coverage_scale() {
     server_retention_prefix_index index;
     CHECK(index.available());
@@ -203,6 +328,23 @@ static void test_excluded_prefix_coverage_scale() {
         expected += i + 1;
     }
     CHECK(comparisons == expected);
+
+    // A shortest-prefix query walks the whole nested subtree once. The
+    // callback count pins all terminals without re-auditing every descendant's
+    // lineage aggregate at every ancestor.
+    struct nested_count_context {
+        size_t count = 0;
+    } nested;
+    CHECK(index.visit_longest_common_prefix(
+        llama_tokens { tokens.front() }, &nested,
+        [](void * opaque, llama_cache_acct_artifact_id,
+           uint64_t prefix) noexcept {
+            auto & current = *static_cast<nested_count_context *>(opaque);
+            CHECK(prefix == 1);
+            current.count++;
+            return true;
+        }));
+    CHECK(nested.count == count);
 }
 
 static void test_prefix_index_cap_fail_closed() {
@@ -213,6 +355,20 @@ static void test_prefix_index_cap_fail_closed() {
             llama_cache_acct_artifact_id { i + 1 }, i + 1, tokens));
     }
     CHECK(index.size() == SERVER_RETENTION_MAX_CANDIDATES);
+    struct one_context {
+        size_t count = 0;
+    } one;
+    CHECK(index.visit_longest_common_prefix(
+        llama_tokens { 0 }, &one,
+        [](void * opaque, llama_cache_acct_artifact_id artifact,
+           uint64_t prefix) noexcept {
+            auto & current = *static_cast<one_context *>(opaque);
+            CHECK(artifact.v == 1);
+            CHECK(prefix == 1);
+            current.count++;
+            return true;
+        }));
+    CHECK(one.count == 1);
     CHECK(!index.publish(
         llama_cache_acct_artifact_id { 1 }, 1, llama_tokens { 123456 }));
     CHECK(index.available());
@@ -254,6 +410,23 @@ static void test_prefix_index_identical_terminal_cleanup() {
             return true;
         }));
     CHECK(count.count == SERVER_RETENTION_MAX_CANDIDATES);
+
+    struct ordered_count_context {
+        uint64_t next = 1;
+        size_t count = 0;
+    } ordered;
+    CHECK(index.visit_longest_common_prefix(
+        tokens, &ordered,
+        [](void * opaque, llama_cache_acct_artifact_id artifact,
+           uint64_t prefix) noexcept {
+            auto & current =
+                *static_cast<ordered_count_context *>(opaque);
+            CHECK(prefix == 1);
+            CHECK(artifact.v == current.next++);
+            current.count++;
+            return true;
+        }));
+    CHECK(ordered.count == SERVER_RETENTION_MAX_CANDIDATES);
 
     // Retire in insertion order, the worst shape for the historical singly
     // linked terminal list. Each unlink is now direct through the record's
@@ -1348,6 +1521,8 @@ static void test_observer_store_accounting() {
 
 int main() {
     test_exact_prefix_index();
+    test_longest_common_prefix_visits_descendant_terminals();
+    test_store_longest_common_prefix_instances();
     test_excluded_prefix_coverage_scale();
     test_prefix_index_cap_fail_closed();
     test_prefix_index_identical_terminal_cleanup();

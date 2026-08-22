@@ -550,6 +550,132 @@ bool server_retention_prefix_index::visit_prefixes(
     return true;
 }
 
+bool server_retention_prefix_index::visit_longest_common_prefix(
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_visitor visitor) const noexcept {
+    if (!pimpl || !pimpl->healthy || tokens.empty() || !visitor) {
+        return false;
+    }
+
+    const impl::node * cur = &pimpl->root;
+    size_t path_tokens = 0;
+    size_t common_tokens = 0;
+    while (path_tokens < tokens.size()) {
+        const auto found = cur->edges.find(tokens[path_tokens]);
+        if (found == cur->edges.end()) {
+            common_tokens = path_tokens;
+            break;
+        }
+        const auto & edge = found->second;
+        if (!edge.child || edge.label.empty() ||
+            edge.label.front() != found->first) {
+            return false;
+        }
+        size_t shared = 0;
+        while (shared < edge.label.size() &&
+               path_tokens + shared < tokens.size() &&
+               edge.label[shared] == tokens[path_tokens + shared]) {
+            shared++;
+        }
+        if (shared != edge.label.size()) {
+            common_tokens = path_tokens + shared;
+            cur = edge.child.get();
+            path_tokens += edge.label.size();
+            break;
+        }
+        path_tokens += shared;
+        common_tokens = path_tokens;
+        cur = edge.child.get();
+    }
+    if (common_tokens == 0) {
+        return true;
+    }
+
+    struct pending_node {
+        const impl::node * value;
+        size_t path_tokens;
+    };
+    try {
+        std::vector<pending_node> pending;
+        std::vector<uint64_t> artifacts;
+        pending.reserve(std::min<size_t>(
+            cur->total_refs, SERVER_RETENTION_MAX_CANDIDATES));
+        artifacts.reserve(std::min<size_t>(
+            cur->total_refs, SERVER_RETENTION_MAX_CANDIDATES));
+        pending.push_back({ cur, path_tokens });
+
+        while (!pending.empty()) {
+            const auto current = pending.back();
+            pending.pop_back();
+            if (!current.value || current.value->total_refs == 0 ||
+                current.value->total_refs > SERVER_RETENTION_MAX_CANDIDATES ||
+                (current.value->terminal_refs == 0) !=
+                    (current.value->terminal_head == 0)) {
+                return false;
+            }
+
+            uint64_t artifact = current.value->terminal_head;
+            uint64_t previous = 0;
+            uint32_t visited = 0;
+            while (artifact != 0) {
+                const auto record = pimpl->artifacts.find(artifact);
+                if (record == pimpl->artifacts.end() ||
+                    !record->second.tokens ||
+                    record->second.tokens->values.size() !=
+                        current.path_tokens ||
+                    record->second.terminal_node != current.value ||
+                    record->second.terminal_prev != previous ||
+                    ++visited > current.value->terminal_refs ||
+                    artifacts.size() == SERVER_RETENTION_MAX_CANDIDATES) {
+                    return false;
+                }
+                artifacts.push_back(artifact);
+                previous = artifact;
+                artifact = record->second.terminal_next;
+            }
+            if (visited != current.value->terminal_refs) {
+                return false;
+            }
+
+            for (const auto & item : current.value->edges) {
+                const auto & edge = item.second;
+                if (!edge.child || edge.label.empty() ||
+                    edge.label.front() != item.first ||
+                    edge.label.size() >
+                        std::numeric_limits<size_t>::max() -
+                            current.path_tokens ||
+                    edge.child->total_refs == 0 ||
+                    edge.child->total_refs >
+                        SERVER_RETENTION_MAX_CANDIDATES) {
+                    return false;
+                }
+                pending.push_back({
+                    edge.child.get(), current.path_tokens + edge.label.size(),
+                });
+            }
+        }
+        if (artifacts.size() != cur->total_refs) {
+            return false;
+        }
+        std::sort(artifacts.begin(), artifacts.end());
+        if (std::adjacent_find(artifacts.begin(), artifacts.end()) !=
+            artifacts.end()) {
+            return false;
+        }
+        for (const uint64_t artifact : artifacts) {
+            if (!visitor(
+                    context, llama_cache_acct_artifact_id { artifact },
+                    common_tokens)) {
+                break;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void server_retention_prefix_index::retire(
         llama_cache_acct_artifact_id artifact) noexcept {
     if (!pimpl || !pimpl->healthy || artifact.v == 0) {
@@ -910,12 +1036,13 @@ struct server_retention_sidecar_store::prefix_tracking {
                 llama_cache_acct_artifact_id {});
     }
 
-    bool visit(
+    bool visit_impl(
             common_retention_pool pool,
             const std::string & exact_scope,
             const std::vector<llama_token> & tokens,
             void * context,
-            server_retention_sidecar_store::prefix_instance_visitor visitor)
+            server_retention_sidecar_store::prefix_instance_visitor visitor,
+            bool longest_common_prefix)
             const noexcept {
         if (!healthy || pool >= common_retention_pool::_count ||
             exact_scope.empty() || tokens.empty() || !visitor) {
@@ -936,8 +1063,7 @@ struct server_retention_sidecar_store::prefix_tracking {
                 server_retention_sidecar_store::prefix_instance_visitor visitor;
                 bool valid = true;
             } state { this, context, visitor, true };
-            const bool walked = scope->second->index.visit_prefixes(
-                tokens, &state,
+            const auto bridge_visitor =
                 [](void * opaque, llama_cache_acct_artifact_id artifact,
                    uint64_t prefix) noexcept {
                     auto & bridge_state = *static_cast<bridge *>(opaque);
@@ -950,11 +1076,38 @@ struct server_retention_sidecar_store::prefix_tracking {
                     return bridge_state.visitor(
                         bridge_state.context,
                         found->second.instance, prefix);
-                });
+                };
+            const bool walked = longest_common_prefix
+                ? scope->second->index.visit_longest_common_prefix(
+                    tokens, &state, bridge_visitor)
+                : scope->second->index.visit_prefixes(
+                    tokens, &state, bridge_visitor);
             return walked && state.valid;
         } catch (...) {
             return false;
         }
+    }
+
+    bool visit(
+            common_retention_pool pool,
+            const std::string & exact_scope,
+            const std::vector<llama_token> & tokens,
+            void * context,
+            server_retention_sidecar_store::prefix_instance_visitor visitor)
+            const noexcept {
+        return visit_impl(
+            pool, exact_scope, tokens, context, visitor, false);
+    }
+
+    bool visit_longest_common_prefix(
+            common_retention_pool pool,
+            const std::string & exact_scope,
+            const std::vector<llama_token> & tokens,
+            void * context,
+            server_retention_sidecar_store::prefix_instance_visitor visitor)
+            const noexcept {
+        return visit_impl(
+            pool, exact_scope, tokens, context, visitor, true);
     }
 };
 
@@ -1117,6 +1270,16 @@ bool server_retention_sidecar_store::visit_prefix_instances(
         void * context,
         prefix_instance_visitor visitor) const noexcept {
     return prefixes && prefixes->visit(
+        pool, exact_scope, tokens, context, visitor);
+}
+
+bool server_retention_sidecar_store::visit_longest_common_prefix_instances(
+        common_retention_pool pool,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_instance_visitor visitor) const noexcept {
+    return prefixes && prefixes->visit_longest_common_prefix(
         pool, exact_scope, tokens, context, visitor);
 }
 
