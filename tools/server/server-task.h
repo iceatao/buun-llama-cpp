@@ -965,9 +965,11 @@ enum class server_prompt_cache_vbr_capacity_status : uint8_t {
     pressure_batch_unsupported,
 };
 
-// Move-only, non-consuming citation of one immutable VBR host entry. The
-// highest-quality same-frontier owner is preferred; compact current remains
-// available as a bounded fallback when destination negotiation refuses it.
+// Move-only, non-consuming citation of one immutable VBR host entry. Exact
+// stored prefixes are preferred; on an exact miss the capability may name a
+// shorter projected LCP and its selected logical frontier. The highest-quality
+// same-frontier owner is preferred; compact current remains available as a
+// bounded fallback when destination negotiation refuses it.
 // The source list node is pinned until commit or destruction; the shared
 // payload owner independently keeps catalog bytes alive. Raw node identity is
 // deliberately private so callers cannot forge or double-release a pin.
@@ -990,6 +992,9 @@ public:
     bool use_fallback_payload() noexcept;
     const common_cache_family_binding & cache_family() const noexcept;
     uint64_t prefix_tokens() const noexcept;
+    uint64_t source_tokens() const noexcept;
+    llama_pos selected_next_position() const noexcept;
+    bool requires_prefix_projection() const noexcept;
     int32_t source_id() const noexcept;
 
 private:
@@ -1000,6 +1005,9 @@ private:
     server_prompt_cache_vbr_owner fallback_payload_;
     common_cache_family_binding cache_family_;
     uint64_t prefix_tokens_ = 0;
+    uint64_t source_tokens_ = 0;
+    llama_pos selected_next_position_ = -1;
+    bool requires_prefix_projection_ = false;
     int32_t source_id_ = -1;
     int32_t prepared_slot_ = -1;
     server_prompt * prepared_destination_ = nullptr;
@@ -1344,9 +1352,10 @@ struct server_prompt_cache {
         server_prompt_cache_vbr_capacity_claim & claim) noexcept;
 
     // Select and pin the longest VBR artifact whose complete token block is an
-    // exact prefix of the incoming text-only request and whose execution and
-    // adapter identities match. At an equal frontier, prefer a quality anchor
-    // while retaining compact-current as a bounded pre-adoption fallback.
+    // exact prefix of the incoming text-only request. On an exact miss, select
+    // the eligible host artifact with the longest nonzero common prefix. At an
+    // equal frontier, prefer a quality anchor while retaining compact-current
+    // as a bounded pre-adoption fallback.
     // Media-bearing automatic restore is deliberately deferred until lookup
     // owns a frontier-media authority.
     // This is deliberately separate
@@ -1366,7 +1375,7 @@ struct server_prompt_cache {
         int32_t id_slot) noexcept;
     // The adopter's allocation-free final publish hook. Only this method can
     // mint the receipt consumed by commit: it installs the cache-prepared
-    // exact source prompt into the construction-empty destination itself.
+    // exact-or-projected source prompt into the construction-empty destination.
     bool publish_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
     // Scheduler metadata terminal after the store's atomic adopt transaction

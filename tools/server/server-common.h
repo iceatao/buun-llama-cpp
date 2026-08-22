@@ -292,6 +292,11 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     server_tokens clone() const;
+
+    // Copy only a text prefix. This is intentionally narrower than clone():
+    // projected VBR restore must not allocate/copy a potentially million-token
+    // parent merely to discard its suffix immediately afterward.
+    server_tokens clone_text_prefix(size_t n) const;
 };
 
 

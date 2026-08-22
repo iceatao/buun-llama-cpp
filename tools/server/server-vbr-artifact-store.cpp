@@ -2042,6 +2042,243 @@ server_vbr_artifact_store::import_host_payload(
     return imported;
 }
 
+server_vbr_artifact_import_output
+server_vbr_artifact_store::complete_validated_import(
+        server_vbr_artifact_import_target request,
+        vbr_manifest_validation_result validated,
+        vbr_adopt_stage_policy stage_policy,
+        server_vbr_artifact_import_output output) noexcept {
+    const auto fail = [&](server_vbr_artifact_import_status status,
+                          uint64_t & counter) {
+        output.status = status;
+        ++counter;
+        return output;
+    };
+    try {
+        output.validation_status = validated.status;
+        output.decision = validated.decision;
+        if (validated.status != vbr_manifest_validation_status::_count) {
+            impl_->counters.validation_outcomes[size_t(validated.status)]++;
+        }
+        if (validated.decision != vbr_import_decision::_count) {
+            impl_->counters.import_decisions[size_t(validated.decision)]++;
+        }
+        const auto disposition =
+            server_vbr_artifact_import_validation_disposition(
+                validated.status, validated.decision);
+        if (disposition != server_vbr_artifact_import_status::ok ||
+            !validated.proof) {
+            return fail(disposition,
+                disposition == server_vbr_artifact_import_status::report_only
+                    ? impl_->counters.imports_report_only
+                    : impl_->counters.imports_refused);
+        }
+        if (!request.prepare_publish(
+                request.publish_context,
+                validated.proof->token_block().tokens,
+                validated.proof->authenticated_identity().sequence_epoch)) {
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
+        if (!impl_->bind_import_transport(stage_policy)) {
+            return fail(server_vbr_artifact_import_status::stage_failed,
+                        impl_->counters.imports_refused);
+        }
+        auto staged = vbr_stage_validated_manifest(
+            std::move(validated.proof), stage_policy);
+        output.stage_status = staged.status;
+        output.downward_reserve_status = staged.downward_status;
+        if (staged.status != vbr_adopt_stage_status::staged ||
+            !staged.manifest || !staged.staged) {
+            return fail(server_vbr_artifact_import_status::stage_failed,
+                        impl_->counters.imports_refused);
+        }
+
+        vbr_composite_publish_hooks hooks;
+        hooks.publish = [](void * opaque) noexcept {
+            auto * pair = static_cast<std::pair<
+                server_vbr_artifact_import_target::publish_fn,
+                void *> *>(opaque);
+            pair->first(pair->second);
+        };
+        std::pair<server_vbr_artifact_import_target::publish_fn, void *>
+            publish { request.publish, request.publish_context };
+        hooks.context = &publish;
+        hooks.owner_token = request.memory;
+        hooks.validate_owner_token = [](
+                const void * opaque, const void * token,
+                const llama_memory_i * target) noexcept {
+            return opaque != nullptr && token == target;
+        };
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(request.memory, tree)) {
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
+        for (const auto & child : tree) {
+            if (child.recurrent) {
+                hooks.companions.push_back(
+                    vbr_recurrent_companion_adoption_provider(
+                        *child.recurrent));
+            }
+        }
+        const auto adopted = vbr_adopt_empty_manifest(
+            *request.memory, request.destination,
+            std::move(*staged.manifest), std::move(*staged.staged),
+            *impl_->ledger, hooks);
+        output.adopt_attempted = true;
+        output.adopt_status = adopted.status;
+        output.phase = adopted.phase;
+        output.downward_subphase = adopted.downward_subphase;
+        output.downward_edge = adopted.downward_edge;
+        output.h2d_bytes = adopted.h2d_bytes;
+        output.h2d_chunks = adopted.h2d_chunks;
+        output.rollback_count = adopted.rollback_count;
+        output.decision = adopted.decision;
+        output.consistency = adopted.consistency;
+        output.units = adopted.units;
+        output.companions = adopted.companions;
+        if (adopted.status != vbr_adopt_status::adopted) {
+            return fail(server_vbr_artifact_import_status::adopt_failed,
+                        impl_->counters.imports_refused);
+        }
+        output.status = server_vbr_artifact_import_status::ok;
+        impl_->counters.imports_succeeded++;
+        return output;
+    } catch (...) {
+        return fail(server_vbr_artifact_import_status::internal_error,
+                    impl_->counters.imports_unavailable);
+    }
+}
+
+vbr_artifact_prefix_projection_status
+server_vbr_artifact_store::prepare_host_prefix_projection(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload,
+        const std::vector<llama_token> & request_tokens,
+        uint64_t lcp_tokens,
+        vbr_artifact_attention_prefix_projection & output) noexcept {
+    output.reset();
+    if (!payload || !payload->retirement_owned() ||
+        !payload->accounted_by(impl_->ledger) || !payload->package() ||
+        !impl_->catalog.owns_host_package(payload->package())) {
+        return vbr_artifact_prefix_projection_status::parent_stale;
+    }
+    vbr_artifact_attention_prefix_request request;
+    request.tokens = request_tokens.data();
+    request.token_count = request_tokens.size();
+    request.lcp_tokens = lcp_tokens;
+    request.text_only = true;
+    return impl_->catalog.project_attention_prefix(
+        payload->package(), request, {}, output);
+}
+
+server_vbr_artifact_import_output
+server_vbr_artifact_store::import_host_prefix_payload(
+        server_vbr_artifact_import_target request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> payload,
+        vbr_artifact_attention_prefix_projection projection) noexcept {
+    server_vbr_artifact_import_output output;
+    impl_->counters.imports_requested++;
+    const auto fail = [&](server_vbr_artifact_import_status status,
+                          uint64_t & counter) {
+        output.status = status;
+        ++counter;
+        return output;
+    };
+    try {
+        if (!request.memory || request.destination < 0 ||
+            request.execution_identity.empty() ||
+            request.adapter_config_identity.empty() ||
+            !request.prepare_publish || !request.publish || !payload ||
+            !payload->retirement_owned() ||
+            !payload->accounted_by(impl_->ledger) || !payload->package() ||
+            !projection ||
+            projection.parent_artifact() != payload->reference_artifact() ||
+            projection.parent_manifest_digest() !=
+                payload->package().manifest().manifest_digest ||
+            !impl_->catalog.owns_host_package(payload->package())) {
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
+        output.payload_bytes = projection.selected_bytes();
+        output.companion_bytes = 0;
+
+        llama_cache_budget_config budget;
+        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
+        const auto accounting_snapshot = impl_->ledger->snapshot();
+        live_import_context context;
+        context.memory = request.memory;
+        context.ledger = impl_->ledger;
+        context.package = &payload->package();
+        context.bindings = &impl_->domain_bindings;
+        context.destination = request.destination;
+        // The first projected-import slice is exact-representation only. The
+        // legacy snapshot door therefore supplies the canonical empty target
+        // geometry while refusing any destination that would need retiering.
+        if (!vbr_explicit_import_target_snapshot(
+                *request.memory, request.destination, payload->package(),
+                impl_->domain_bindings, request.previously_observed,
+                accounting_snapshot.serial, context.snapshot, nullptr,
+                nullptr)) {
+            output.validation_status =
+                vbr_manifest_validation_status::unavailable;
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
+        output.schedule_status = vbr_import_schedule_status::exact;
+        output.destination_status =
+            vbr_import_destination_status::feasible_current;
+        impl_->counters.import_schedules[
+            size_t(vbr_import_schedule_status::exact)]++;
+        context.snapshot.scheduler_idle = true;
+
+        vbr_adopt_policy policy;
+        policy.authorized = true;
+        policy.identity = {
+            request.execution_identity,
+            request.adapter_config_identity,
+            projection.identity().media_content_identity,
+            projection.identity().sequence_epoch,
+            projection.identity().next_position,
+            &projection.prefix_tokens(),
+        };
+        policy.destination_sequence = request.destination;
+        policy.allow_native = false;
+        policy.allow_live_rebased = true;
+        policy.allow_downward = false;
+        policy.adoption_nonce = impl_->next_reference++;
+        if (policy.adoption_nonce == 0) {
+            policy.adoption_nonce = impl_->next_reference++;
+        }
+        policy.domain_bindings = impl_->policy_bindings;
+        policy.accounting_snapshot = &accounting_snapshot;
+        policy.budget_config = &budget;
+        policy.context = &context;
+        policy.inspect_target = import_inspect_target;
+        policy.recheck_target_empty = import_target_recheck;
+        policy.read_accounting_serial = import_accounting_serial;
+        policy.read_policy_epoch = import_policy_epoch;
+        auto validated = vbr_validate_attention_prefix_projection(
+            context.snapshot, std::move(projection), policy);
+        vbr_adopt_stage_policy stage_policy;
+        stage_policy.budget = &budget;
+        impl_->counters.host_imports_authenticated++;
+        auto imported = complete_validated_import(
+            std::move(request), std::move(validated), stage_policy,
+            std::move(output));
+        if (imported.status == server_vbr_artifact_import_status::ok) {
+            impl_->counters.host_imports_succeeded++;
+        }
+        return imported;
+    } catch (...) {
+        return fail(server_vbr_artifact_import_status::internal_error,
+                    impl_->counters.imports_unavailable);
+    }
+}
+
 server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         server_vbr_artifact_import_target request,
         const vbr_artifact_package_view & package) noexcept {
@@ -2176,105 +2413,13 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         }
         auto validated = vbr_validate_unit_manifest(
             *request.memory, package, policy);
-        output.validation_status = validated.status;
-        output.decision = validated.decision;
-        if (validated.status != vbr_manifest_validation_status::_count) {
-            impl_->counters.validation_outcomes[size_t(validated.status)]++;
-        }
-        if (validated.decision != vbr_import_decision::_count) {
-            impl_->counters.import_decisions[size_t(validated.decision)]++;
-        }
-        const auto disposition =
-            server_vbr_artifact_import_validation_disposition(
-                validated.status, validated.decision);
-        if (disposition ==
-                server_vbr_artifact_import_status::validation_failed) {
-            return fail(disposition, impl_->counters.imports_refused);
-        }
-        if (disposition == server_vbr_artifact_import_status::report_only) {
-            return fail(disposition, impl_->counters.imports_report_only);
-        }
-        if (!validated.proof ||
-            !request.prepare_publish(
-                request.publish_context,
-                package.manifest().token_block.tokens,
-                package.manifest().identity.sequence_epoch)) {
-            return fail(server_vbr_artifact_import_status::unavailable,
-                        impl_->counters.imports_unavailable);
-        }
-
         vbr_adopt_stage_policy stage_policy;
-        if (!impl_->bind_import_transport(stage_policy)) {
-            return fail(server_vbr_artifact_import_status::stage_failed,
-                        impl_->counters.imports_refused);
-        }
         stage_policy.budget = &budget;
         stage_policy.downward_context = &context;
         stage_policy.reserve_downward = import_reserve_downward;
-        auto staged = vbr_stage_validated_manifest(
-            std::move(validated.proof), stage_policy);
-        output.stage_status = staged.status;
-        output.downward_reserve_status = staged.downward_status;
-        if (staged.status != vbr_adopt_stage_status::staged ||
-            !staged.manifest || !staged.staged) {
-            return fail(server_vbr_artifact_import_status::stage_failed,
-                        impl_->counters.imports_refused);
-        }
-
-        vbr_composite_publish_hooks hooks;
-        hooks.publish = [](void * opaque) noexcept {
-            auto * pair = static_cast<std::pair<
-                server_vbr_artifact_import_target::publish_fn,
-                void *> *>(opaque);
-            pair->first(pair->second);
-        };
-        // The publish hook needs both the immutable owner-token context and
-        // the server metadata callback. Use a no-throw local adapter while
-        // retaining the memory pointer as the validated capability token.
-        std::pair<server_vbr_artifact_import_target::publish_fn, void *>
-            publish { request.publish, request.publish_context };
-        hooks.context = &publish;
-        hooks.owner_token = request.memory;
-        hooks.validate_owner_token = [](
-                const void * opaque, const void * token,
-                const llama_memory_i * target) noexcept {
-            return opaque != nullptr && token == target;
-        };
-        std::vector<llama_memory_tree_child> tree;
-        if (!llama_memory_tree_collect(request.memory, tree)) {
-            return fail(server_vbr_artifact_import_status::unavailable,
-                        impl_->counters.imports_unavailable);
-        }
-        for (const auto & child : tree) {
-            if (child.recurrent) {
-                hooks.companions.push_back(
-                    vbr_recurrent_companion_adoption_provider(
-                        *child.recurrent));
-            }
-        }
-        const auto adopted = vbr_adopt_empty_manifest(
-            *request.memory, request.destination,
-            std::move(*staged.manifest), std::move(*staged.staged),
-            *impl_->ledger, hooks);
-        output.adopt_attempted = true;
-        output.adopt_status = adopted.status;
-        output.phase = adopted.phase;
-        output.downward_subphase = adopted.downward_subphase;
-        output.downward_edge = adopted.downward_edge;
-        output.h2d_bytes = adopted.h2d_bytes;
-        output.h2d_chunks = adopted.h2d_chunks;
-        output.rollback_count = adopted.rollback_count;
-        output.decision = adopted.decision;
-        output.consistency = adopted.consistency;
-        output.units = adopted.units;
-        output.companions = adopted.companions;
-        if (adopted.status != vbr_adopt_status::adopted) {
-            return fail(server_vbr_artifact_import_status::adopt_failed,
-                        impl_->counters.imports_refused);
-        }
-        output.status = server_vbr_artifact_import_status::ok;
-        impl_->counters.imports_succeeded++;
-        return output;
+        return complete_validated_import(
+            std::move(request), std::move(validated), stage_policy,
+            std::move(output));
     } catch (...) {
         return fail(server_vbr_artifact_import_status::internal_error,
                     impl_->counters.imports_unavailable);

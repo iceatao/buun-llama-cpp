@@ -1227,9 +1227,27 @@ struct seam final : vbr_adopt_test_seam {
              read.shard_index == fail_transfer_shard)) {
             return false;
         }
-        std::vector<uint8_t> bytes(size_t(read.size));
-        if (!read.source->read(read.source_offset, bytes.data(), bytes.size())) {
-            return false;
+        std::vector<uint8_t> bytes;
+        bytes.reserve(size_t(read.size));
+        if (read.projection_ranges.empty()) {
+            bytes.resize(size_t(read.size));
+            if (!read.source->read(
+                    read.source_offset, bytes.data(), bytes.size())) {
+                return false;
+            }
+        } else {
+            for (const auto & range : read.projection_ranges) {
+                const size_t start = bytes.size();
+                bytes.resize(start + size_t(range.size));
+                if (!read.source->read(
+                        range.source_offset, bytes.data() + start,
+                        size_t(range.size))) {
+                    return false;
+                }
+            }
+            if (bytes.size() != read.size) {
+                return false;
+            }
         }
         auto & child = children[child_id];
         for (size_t i = 0; i < bytes.size(); ++i) {
@@ -2393,6 +2411,143 @@ static void test_g2_downward_subphase_matrix() {
 
 } // namespace g2
 
+namespace {
+
+struct packed_h2d_source {
+    std::vector<uint8_t> bytes;
+    uint64_t bytes_read = 0;
+    uint64_t read_calls = 0;
+
+    static bool read(const void * opaque, uint64_t offset,
+                     uint8_t * output, size_t size) noexcept {
+        auto & source = *const_cast<packed_h2d_source *>(
+            static_cast<const packed_h2d_source *>(opaque));
+        if (!output || offset > source.bytes.size() ||
+            size > source.bytes.size() - size_t(offset)) {
+            return false;
+        }
+        std::copy_n(source.bytes.data() + size_t(offset), size, output);
+        source.bytes_read += size;
+        ++source.read_calls;
+        return true;
+    }
+};
+
+struct packed_h2d_destination {
+    std::vector<uint8_t> bytes;
+
+    static bool issue(void * opaque, uint64_t, uint64_t offset,
+                      const uint8_t * data, size_t size,
+                      bool asynchronous) noexcept {
+        auto & destination =
+            *static_cast<packed_h2d_destination *>(opaque);
+        if (!data || asynchronous || offset > destination.bytes.size() ||
+            size > destination.bytes.size() - size_t(offset)) {
+            return false;
+        }
+        std::copy_n(data, size, destination.bytes.data() + size_t(offset));
+        return true;
+    }
+
+    static bool complete(void *, uint64_t) noexcept { return true; }
+};
+
+static void test_packed_h2d_projection_stream() {
+    packed_h2d_source source;
+    source.bytes.resize(64);
+    for (size_t i = 0; i < source.bytes.size(); ++i) {
+        source.bytes[i] = uint8_t(i + 1);
+    }
+    const std::array<vbr_h2d_source_range, 3> ranges {{
+        { 40, 7 }, { 3, 5 }, { 20, 9 },
+    }};
+    std::vector<uint8_t> expected(4, 0xa5);
+    for (const auto & range : ranges) {
+        expected.insert(expected.end(),
+            source.bytes.begin() + range.source_offset,
+            source.bytes.begin() + range.source_offset + range.size);
+    }
+    expected.resize(32, 0xa5);
+    packed_h2d_destination destination { std::vector<uint8_t>(32, 0xa5) };
+
+    vbr_h2d_status status;
+    auto ring = vbr_h2d_chunk_ring::create({ {} }, 16, 8, status);
+    CHECK(ring && status == vbr_h2d_status::ok);
+    if (!ring) {
+        return;
+    }
+    auto operation = ring->try_begin_operation();
+    CHECK(bool(operation));
+    vbr_h2d_packed_transfer transfer;
+    transfer.source = { source.bytes.size(), &source, packed_h2d_source::read };
+    transfer.ranges = ranges.data();
+    transfer.range_count = ranges.size();
+    transfer.size = 21;
+    transfer.destination_offset = 4;
+    transfer.fake = {
+        &destination, packed_h2d_destination::issue,
+        packed_h2d_destination::complete, false,
+    };
+    vbr_h2d_stats stats;
+    CHECK(ring->stream_packed_reserved(operation, transfer, stats) ==
+          vbr_h2d_status::ok);
+    CHECK(destination.bytes == expected);
+    CHECK(source.bytes_read == transfer.size);
+    CHECK(stats.bytes == transfer.size);
+    CHECK(stats.chunks == 3);
+
+    // The reservation spans the complete projected unit set rather than
+    // permitting the other direction to splice work between shards.
+    vbr_h2d_transfer competing;
+    competing.source = transfer.source;
+    competing.size = 1;
+    competing.fake = transfer.fake;
+    CHECK(ring->stream(competing, stats) ==
+          vbr_h2d_status::ring_unavailable);
+    operation = {};
+    CHECK(ring->stream(competing, stats) == vbr_h2d_status::ok);
+}
+
+static void test_packed_h2d_projection_max_ranges() {
+    static constexpr size_t n = 1024*1024;
+    packed_h2d_source source;
+    source.bytes.resize(n);
+    std::vector<vbr_h2d_source_range> ranges(n);
+    for (size_t i = 0; i < n; ++i) {
+        source.bytes[i] = uint8_t(i & 0xff);
+        ranges[i] = { n - 1 - i, 1 };
+    }
+    packed_h2d_destination destination { std::vector<uint8_t>(n) };
+    vbr_h2d_status status;
+    auto ring = vbr_h2d_chunk_ring::create(
+        { {} }, 128*1024, 64*1024, status);
+    CHECK(ring && status == vbr_h2d_status::ok);
+    if (!ring) {
+        return;
+    }
+    auto operation = ring->try_begin_operation();
+    vbr_h2d_packed_transfer transfer;
+    transfer.source = { source.bytes.size(), &source, packed_h2d_source::read };
+    transfer.ranges = ranges.data();
+    transfer.range_count = ranges.size();
+    transfer.size = n;
+    transfer.fake = {
+        &destination, packed_h2d_destination::issue,
+        packed_h2d_destination::complete, false,
+    };
+    vbr_h2d_stats stats;
+    CHECK(ring->stream_packed_reserved(operation, transfer, stats) ==
+          vbr_h2d_status::ok);
+    CHECK(stats.bytes == n);
+    CHECK(stats.chunks == 16);
+    CHECK(source.bytes_read == n);
+    CHECK(source.read_calls == n);
+    CHECK(destination.bytes.front() == source.bytes.back());
+    CHECK(destination.bytes.back() == source.bytes.front());
+}
+
+} // namespace
+
 static void test_cuda_h2d_adapter() {
     ggml_backend_load_all();
     ggml_backend_dev_t device = nullptr;
@@ -3436,6 +3591,8 @@ int main(int argc, char ** argv) {
                 argc == 5 ? argv[4] : "t3");
             return 2;
         }
+        test_packed_h2d_projection_stream();
+        test_packed_h2d_projection_max_ranges();
         test_cuda_h2d_adapter();
         if (failures == 0) {
             if (h2_destination) {

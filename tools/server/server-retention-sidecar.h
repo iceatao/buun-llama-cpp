@@ -151,6 +151,16 @@ public:
         const std::vector<llama_token> & tokens,
         void * context,
         prefix_visitor visitor) const noexcept;
+    // Visit every stored terminal with a nonzero common prefix. Unlike the
+    // longest-only view, this lets a semantic owner reject a longer terminal
+    // without hiding a shorter eligible one. Results are bounded by the index
+    // cardinality and ordered by artifact id.
+    bool visit_common_prefixes(
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_visitor visitor,
+        uint64_t * compared_tokens = nullptr,
+        uint64_t * visited_nodes = nullptr) const noexcept;
 
     bool available() const noexcept;
     size_t size() const noexcept;
@@ -244,6 +254,12 @@ public:
         const std::vector<llama_token> & tokens,
         void * context,
         prefix_instance_visitor visitor) const noexcept;
+    bool visit_common_prefix_instances(
+        common_retention_pool pool,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_instance_visitor visitor) const noexcept;
     bool prefix_tracking_enabled() const noexcept;
     bool prefix_tracking_available() const noexcept;
     bool publish(
@@ -274,6 +290,13 @@ public:
         const server_retention_instance_key & destination,
         const server_retention_instance_key * destination_lineage_source =
             nullptr,
+        bool defer_lineage_admission = false) noexcept;
+    // Prefix projection is a divergent branch whose artifact geometry is the
+    // selected parent prefix, not the complete source artifact.
+    bool branch_prefix(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination,
+        uint64_t destination_coverage_tokens,
         bool defer_lineage_admission = false) noexcept;
     bool rebind(
         const server_retention_instance_key & source,
@@ -410,6 +433,12 @@ private:
         const server_cache_lease_frontier * replacement_frontier) noexcept;
     const catalog_entry * find_clone_source(
         const server_retention_instance_key & source) const noexcept;
+    bool branch_impl(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination,
+        const server_retention_instance_key * destination_lineage_source,
+        bool defer_lineage_admission,
+        const uint64_t * destination_coverage_tokens) noexcept;
     void retire_catalog_entry(catalog_map::iterator entry) noexcept;
     bool retain_lineage(
         common_retention_pool pool,

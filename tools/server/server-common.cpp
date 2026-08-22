@@ -739,6 +739,16 @@ server_tokens server_tokens::clone() const {
     return res;
 }
 
+server_tokens server_tokens::clone_text_prefix(size_t n) const {
+    if (has_media() || n > tokens.size()) {
+        throw std::invalid_argument("server_tokens text prefix is unavailable");
+    }
+    server_tokens res;
+    res.has_mtmd = has_mtmd;
+    res.tokens.assign(tokens.begin(), tokens.begin() + n);
+    return res;
+}
+
 //
 // tokenizer and input processing utils
 //

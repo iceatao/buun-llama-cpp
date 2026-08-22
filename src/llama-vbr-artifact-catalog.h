@@ -244,6 +244,24 @@ struct vbr_artifact_prefix_range_proof {
     vbr_capture_range_proof proof;
 };
 
+// Borrowed, immutable catalog evidence available only while the owning prefix
+// projection remains alive.  The validator uses this narrow view instead of
+// manufacturing a package for a prefix which has no independent catalog
+// reference.
+struct vbr_artifact_prefix_validation_source {
+    llama_cache_acct_artifact_id artifact;
+    const std::vector<vbr_artifact_portable_topology> * topologies = nullptr;
+    const vbr_artifact_reference_manifest * manifest = nullptr;
+    const std::vector<vbr_artifact_unit_view> * units = nullptr;
+    const std::vector<vbr_artifact_companion_view> * companions = nullptr;
+    const std::vector<vbr_artifact_allocation_view> *
+        reference_allocations = nullptr;
+};
+
+struct vbr_target_validation_snapshot;
+struct vbr_adopt_policy;
+struct vbr_manifest_validation_result;
+
 class vbr_artifact_attention_prefix_projection {
 public:
     vbr_artifact_attention_prefix_projection() noexcept;
@@ -274,7 +292,17 @@ public:
 private:
     struct impl;
     std::unique_ptr<impl> impl_;
+    bool structural_ready() const noexcept;
+    bool validation_source(
+        vbr_artifact_prefix_validation_source & output) const noexcept;
+    bool transfer_ready() const noexcept;
     friend class llama_vbr_artifact_catalog;
+    friend class vbr_validated_manifest;
+    friend vbr_manifest_validation_result
+    vbr_validate_attention_prefix_projection(
+        const vbr_target_validation_snapshot &,
+        vbr_artifact_attention_prefix_projection &&,
+        const vbr_adopt_policy &) noexcept;
 };
 
 enum class vbr_projected_manifest_publish_status : uint8_t {

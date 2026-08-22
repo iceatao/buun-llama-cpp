@@ -444,6 +444,20 @@ public:
         std::shared_ptr<const server_prompt_cache_vbr_payload> payload)
         noexcept;
 
+    // Scheduler-only derivation/import of a shorter attention prefix from a
+    // cache-owned immutable parent. The move-only projection keeps the parent
+    // catalog reference borrowed through validation, proof-aware H2D, and the
+    // atomic empty-target publication terminal.
+    vbr_artifact_prefix_projection_status prepare_host_prefix_projection(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload,
+        const std::vector<llama_token> & request_tokens,
+        uint64_t lcp_tokens,
+        vbr_artifact_attention_prefix_projection & output) noexcept;
+    server_vbr_artifact_import_output import_host_prefix_payload(
+        server_vbr_artifact_import_target request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> payload,
+        vbr_artifact_attention_prefix_projection projection) noexcept;
+
     // Scheduler-only E1 resolver. Authorization is identical to import and
     // the returned move-only package is the durable catalog pin. No raw
     // artifact lookup or tenant-agnostic enumeration is exposed.
@@ -466,6 +480,11 @@ public:
     uint32_t attention_children() const noexcept;
 
 private:
+    server_vbr_artifact_import_output complete_validated_import(
+        server_vbr_artifact_import_target request,
+        vbr_manifest_validation_result validated,
+        vbr_adopt_stage_policy stage_policy,
+        server_vbr_artifact_import_output output) noexcept;
     bool publish_projected_host_batch_impl(
         const vbr_capture_manifest_assembly & assembly,
         std::vector<vbr_projected_manifest_publication> && publications,

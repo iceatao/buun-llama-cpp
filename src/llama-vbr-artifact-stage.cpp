@@ -43,6 +43,25 @@ struct vbr_h2d_chunk_ring::impl {
     std::vector<vbr_h2d_lane_binding> lanes;
 };
 
+vbr_h2d_ring_operation::vbr_h2d_ring_operation(
+        vbr_h2d_ring_operation && other) noexcept
+    : keepalive_(std::move(other.keepalive_)),
+      operation_(std::move(other.operation_)) {}
+
+vbr_h2d_ring_operation & vbr_h2d_ring_operation::operator=(
+        vbr_h2d_ring_operation && other) noexcept {
+    if (this != &other) {
+        // Release the old mutex while its core is still alive.
+        operation_ = {};
+        keepalive_.reset();
+        keepalive_ = std::move(other.keepalive_);
+        operation_ = std::move(other.operation_);
+    }
+    return *this;
+}
+
+vbr_h2d_ring_operation::~vbr_h2d_ring_operation() = default;
+
 vbr_h2d_chunk_ring::vbr_h2d_chunk_ring(
         std::unique_ptr<impl> state) noexcept
     : impl_(std::move(state)) {}
@@ -300,6 +319,192 @@ vbr_h2d_status vbr_h2d_chunk_ring::stream(
         : vbr_h2d_status::transfer_failed;
 }
 
+vbr_h2d_ring_operation
+vbr_h2d_chunk_ring::try_begin_operation() noexcept {
+    vbr_h2d_ring_operation result;
+    if (impl_ && impl_->core) {
+        result.keepalive_ = impl_->core;
+        result.operation_ = impl_->core->try_begin_operation();
+        if (!result.operation_) {
+            result.keepalive_.reset();
+        }
+    }
+    return result;
+}
+
+vbr_h2d_status vbr_h2d_chunk_ring::stream_packed_reserved(
+        const vbr_h2d_ring_operation & operation,
+        const vbr_h2d_packed_transfer & transfer,
+        vbr_h2d_stats & stats) noexcept {
+    static constexpr size_t max_ranges = 1024*1024;
+    stats = {};
+    if (!impl_ || !impl_->core || !operation || transfer.size == 0 ||
+        transfer.lane >= impl_->core->lane_count() ||
+        !transfer.source.valid() || !transfer.ranges ||
+        transfer.range_count == 0 || transfer.range_count > max_ranges ||
+        transfer.destination_offset >
+            std::numeric_limits<uint64_t>::max() - transfer.size) {
+        return vbr_h2d_status::invalid_argument;
+    }
+    uint64_t selected = 0;
+    for (size_t i = 0; i < transfer.range_count; ++i) {
+        const auto & range = transfer.ranges[i];
+        if (range.size == 0 || range.source_offset > transfer.source.size ||
+            range.size > transfer.source.size - range.source_offset ||
+            range.size > std::numeric_limits<uint64_t>::max() - selected) {
+            return vbr_h2d_status::invalid_argument;
+        }
+        selected += range.size;
+    }
+    if (selected != transfer.size) {
+        return vbr_h2d_status::invalid_argument;
+    }
+    const auto * lane = impl_->core->lane_binding(transfer.lane);
+    const bool tensor_destination = transfer.destination != nullptr;
+    const bool fake_destination = transfer.fake.issue != nullptr;
+    if (tensor_destination == fake_destination) {
+        return vbr_h2d_status::invalid_argument;
+    }
+    if (tensor_destination) {
+        if (!lane || !transfer.backend || !transfer.device ||
+            transfer.device != lane->device ||
+            ggml_backend_get_device(transfer.backend) != lane->device ||
+            transfer.destination_offset > ggml_nbytes(transfer.destination) ||
+            transfer.size > ggml_nbytes(transfer.destination) -
+                transfer.destination_offset) {
+            return vbr_h2d_status::invalid_argument;
+        }
+    } else if (!transfer.fake.complete) {
+        return vbr_h2d_status::invalid_argument;
+    }
+
+    struct packed_pump_context {
+        const vbr_h2d_packed_transfer * transfer = nullptr;
+        size_t range_index = 0;
+        uint64_t range_offset = 0;
+        uint64_t transferred = 0;
+        uint64_t next_ticket = 1;
+        bool tensor_destination = false;
+    } pump_context { &transfer, 0, 0, 0, 1, tensor_destination };
+    vbr_bounded_pinned_ring_core::pump_callbacks callbacks;
+    callbacks.context = &pump_context;
+    callbacks.ok = uint32_t(vbr_h2d_status::ok);
+    callbacks.ring_unavailable = uint32_t(vbr_h2d_status::ring_unavailable);
+    callbacks.submit_failed = uint32_t(vbr_h2d_status::internal_error);
+    callbacks.wait_failed = uint32_t(vbr_h2d_status::event_failed);
+    callbacks.internal_error = uint32_t(vbr_h2d_status::internal_error);
+    callbacks.more = [](void * opaque) noexcept {
+        const auto & context = *static_cast<packed_pump_context *>(opaque);
+        return context.transferred < context.transfer->size;
+    };
+    callbacks.fill = [](void * opaque, uint8_t * output,
+                        size_t capacity,
+                        vbr_bounded_pinned_ring_core::pump_step & step)
+            noexcept -> uint32_t {
+        auto & context = *static_cast<packed_pump_context *>(opaque);
+        const auto & transfer = *context.transfer;
+        try {
+            size_t filled = 0;
+            while (filled < capacity &&
+                   context.range_index < transfer.range_count) {
+                const auto & range =
+                    transfer.ranges[context.range_index];
+                const size_t count = size_t(std::min<uint64_t>(
+                    capacity - filled, range.size - context.range_offset));
+                if (!transfer.source.read(
+                        transfer.source.context,
+                        range.source_offset + context.range_offset,
+                        output + filled, count)) {
+                    return uint32_t(vbr_h2d_status::source_read_failed);
+                }
+                filled += count;
+                context.range_offset += count;
+                if (context.range_offset == range.size) {
+                    ++context.range_index;
+                    context.range_offset = 0;
+                }
+            }
+            if (filled == 0 ||
+                filled > transfer.size - context.transferred) {
+                return uint32_t(vbr_h2d_status::internal_error);
+            }
+            const uint64_t destination_offset =
+                transfer.destination_offset + context.transferred;
+            const uint64_t ticket = context.next_ticket++;
+            bool fake_async = false;
+            if (context.tensor_destination) {
+                ggml_backend_tensor_set_async(
+                    transfer.backend, transfer.destination,
+                    output, size_t(destination_offset), filled);
+            } else {
+                fake_async = transfer.fake.supports_events;
+                if (!transfer.fake.issue(
+                        transfer.fake.context, ticket,
+                        destination_offset, output, filled, fake_async)) {
+                    return uint32_t(vbr_h2d_status::transfer_failed);
+                }
+                if (!fake_async) {
+                    if (!transfer.fake.complete(
+                            transfer.fake.context, ticket)) {
+                        return uint32_t(vbr_h2d_status::event_failed);
+                    }
+                    step.adapter_synchronous_fallback = true;
+                }
+            }
+            step.valid = filled;
+            step.backend = context.tensor_destination
+                ? transfer.backend : nullptr;
+            step.tag = ticket;
+            step.adapter_async = fake_async;
+            context.transferred += filled;
+            return uint32_t(vbr_h2d_status::ok);
+        } catch (...) {
+            return uint32_t(vbr_h2d_status::internal_error);
+        }
+    };
+    callbacks.consume = [](void * opaque, const uint8_t *, size_t,
+                           uint64_t ticket, bool fake_async,
+                           uint64_t ordinal, bool & event_completion)
+            noexcept -> uint32_t {
+        const auto & context = *static_cast<packed_pump_context *>(opaque);
+        const auto & transfer = *context.transfer;
+        if (fake_async) {
+            if (!transfer.fake.complete(transfer.fake.context, ticket)) {
+                return uint32_t(vbr_h2d_status::event_failed);
+            }
+            event_completion = true;
+        }
+        return ordinal == transfer.fail_completion_at
+            ? uint32_t(vbr_h2d_status::transfer_failed)
+            : uint32_t(vbr_h2d_status::ok);
+    };
+    callbacks.abandon = [](void * opaque, uint64_t ticket,
+                           bool fake_async) noexcept {
+        const auto & context = *static_cast<packed_pump_context *>(opaque);
+        if (fake_async) {
+            (void) context.transfer->fake.complete(
+                context.transfer->fake.context, ticket);
+        }
+    };
+
+    vbr_bounded_pinned_ring_core::pump_stats pump_stats;
+    const auto pumped = vbr_h2d_status(impl_->core->pump_reserved(
+        operation.operation_, transfer.lane, callbacks, pump_stats));
+    stats.bytes = pump_stats.bytes;
+    stats.chunks = pump_stats.chunks;
+    stats.backpressure_waits = pump_stats.backpressure_waits;
+    stats.event_completions = pump_stats.event_completions;
+    stats.synchronous_fallbacks = pump_stats.synchronous_fallbacks;
+    stats.peak_pinned_bytes = pump_stats.peak_pinned_bytes;
+    if (pumped != vbr_h2d_status::ok) {
+        return pumped;
+    }
+    return stats.bytes == transfer.size &&
+            pump_context.range_index == transfer.range_count
+        ? vbr_h2d_status::ok
+        : vbr_h2d_status::transfer_failed;
+}
+
 struct vbr_staged_payloads::impl {
     uint64_t nonce = 0;
     uint64_t post_prepare_serial = 0;
@@ -450,7 +655,7 @@ bool stage_child(
                     vbr_staged_read_kind::unit_payload,
                     child.child_id, child.logical_unit_id,
                     shard.shard_index, lane, offset, size,
-                    shard.source, {},
+                    shard.source, {}, 0, {},
                 })) {
                 failure = vbr_adopt_stage_status::source_hash_mismatch;
                 return false;
@@ -482,8 +687,72 @@ bool stage_child(
                 uint32_t(i), lane, 0,
                 unit->stash_shards[i]
                     ? unit->stash_shards[i]->size() : 0,
-                unit->stash_shards[i], {},
+                unit->stash_shards[i], {}, 0, {},
             })) {
+            failure = vbr_adopt_stage_status::source_hash_mismatch;
+            return false;
+        }
+    }
+    return true;
+}
+
+template<class AppendRead>
+bool stage_projection_child(
+        const vbr_validated_child_plan & child,
+        const std::vector<vbr_h2d_lane_binding> & lanes,
+        AppendRead && append_read,
+        vbr_adopt_stage_status & failure) {
+    for (const auto & shard : child.shards) {
+        const uint32_t lane = find_lane(lanes, shard.domain);
+        if (lane >= lanes.size() || !shard.source ||
+            !shard.projection_proof || shard.projection_runs.empty() ||
+            shard.projection_runs.front().destination_offset != 0) {
+            failure = vbr_adopt_stage_status::source_unavailable;
+            return false;
+        }
+        // The restricted proof is the payload authority for a projection.
+        // Authenticate its selected leaves against the still-borrowed parent
+        // before any accounting claim or H2D can consume the row mapping.
+        // Verification deliberately reads only proof-selected chunks; it
+        // never hashes the omitted parent suffix.
+        uint64_t proof_verified_bytes = 0;
+        if (!vbr_capture_range_verify(
+                shard.projection_proof, shard.source->source(),
+                &proof_verified_bytes) || proof_verified_bytes == 0) {
+            failure = vbr_adopt_stage_status::source_hash_mismatch;
+            return false;
+        }
+        vbr_staged_read_descriptor read;
+        read.kind = vbr_staged_read_kind::unit_payload;
+        read.child_id = child.child_id;
+        read.logical_unit_id = child.logical_unit_id;
+        read.shard_index = shard.shard_index;
+        read.lane = lane;
+        read.destination_offset =
+            shard.projection_runs.front().destination_offset;
+        read.source = shard.source;
+        read.verified_digest = shard.projection_proof.root();
+        read.proof_verified_bytes = proof_verified_bytes;
+        read.projection_ranges.reserve(shard.projection_runs.size());
+        uint64_t next_destination = read.destination_offset;
+        for (const auto & run : shard.projection_runs) {
+            if (run.size == 0 || run.destination_offset != next_destination ||
+                run.source_offset > shard.source->size() ||
+                run.size > shard.source->size() - run.source_offset ||
+                run.size > std::numeric_limits<uint64_t>::max() - read.size ||
+                run.size > std::numeric_limits<uint64_t>::max() -
+                    next_destination) {
+                failure = vbr_adopt_stage_status::invalid_proof;
+                return false;
+            }
+            read.projection_ranges.push_back({
+                run.source_offset, run.size,
+            });
+            read.size += run.size;
+            next_destination += run.size;
+        }
+        if (read.size == 0 || !digest_nonzero(read.verified_digest) ||
+            !append_read(std::move(read))) {
             failure = vbr_adopt_stage_status::source_hash_mismatch;
             return false;
         }
@@ -543,8 +812,17 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             out.status = vbr_adopt_stage_status::accounting_unavailable;
             return out;
         }
-        if (out.manifest->source_package().validate() !=
-                vbr_artifact_status::ok) {
+        const bool prefix_projection = out.manifest->is_prefix_projection();
+        if (prefix_projection) {
+            if (!out.manifest->projection_transfer_ready() ||
+                out.manifest->decision() ==
+                    vbr_import_decision::downward_rebase ||
+                !out.manifest->companions().empty()) {
+                out.status = vbr_adopt_stage_status::invalid_proof;
+                return out;
+            }
+        } else if (out.manifest->source_package().validate() !=
+                       vbr_artifact_status::ok) {
             out.status = vbr_adopt_stage_status::source_hash_mismatch;
             return out;
         }
@@ -585,16 +863,20 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
 
         uint32_t source_index = 0;
         const auto append_read = [&](vbr_staged_read_descriptor read) {
+            const bool projected = !read.projection_ranges.empty();
             if (!read.source || read.size == 0 ||
-                read.source_offset > read.source->size() ||
-                read.size > read.source->size() - read.source_offset) {
+                (!projected &&
+                 (read.source_offset > read.source->size() ||
+                  read.size > read.source->size() - read.source_offset))) {
                 return false;
             }
             if (source_index++ == policy.fault.fail_source_verify_at) {
                 return false;
             }
-            read.verified_digest =
-                vbr_capture_stream_digest(*read.source);
+            if (!projected) {
+                read.verified_digest =
+                    vbr_capture_stream_digest(*read.source);
+            }
             if (!digest_nonzero(read.verified_digest)) {
                 return false;
             }
@@ -602,11 +884,14 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             return true;
         };
 
-        const auto & source_package = out.manifest->source_package();
         for (const auto & child : out.manifest->children()) {
-            if (!stage_child(
-                    child, source_package, policy.lanes,
-                    append_read, out.status)) {
+            const bool staged = prefix_projection
+                ? stage_projection_child(
+                    child, policy.lanes, append_read, out.status)
+                : stage_child(
+                    child, out.manifest->source_package(), policy.lanes,
+                    append_read, out.status);
+            if (!staged) {
                 return out;
             }
         }
@@ -616,7 +901,7 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                     vbr_staged_read_kind::companion,
                     UINT32_MAX, UINT32_MAX, i, UINT32_MAX, 0,
                     companion.source ? companion.source->size() : 0,
-                    companion.source, {},
+                    companion.source, {}, 0, {},
                 })) {
                 out.status = vbr_adopt_stage_status::source_hash_mismatch;
                 return out;

@@ -1,5 +1,6 @@
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-artifact-stage.h"
+#include "llama-vbr-artifact-validate.h"
 #include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-identity-digest.h"
 #include "llama-vbr-operation.h"
@@ -73,6 +74,35 @@ static std::vector<uint8_t> read_chain(
     CHECK(chain.read(0, out.data(), out.size()));
     return out;
 }
+
+struct prefix_validator_serials {
+    uint64_t accounting = 0;
+    uint64_t policy = 0;
+    uint64_t memory = 0;
+    uint64_t state = 0;
+    uint64_t tree = 0;
+
+    static bool recheck(
+            const void * opaque,
+            const vbr_target_empty_fingerprint & fingerprint) noexcept {
+        const auto & self =
+            *static_cast<const prefix_validator_serials *>(opaque);
+        return fingerprint.memory_instance_cookie == self.memory &&
+               fingerprint.target_state_serial == self.state &&
+               fingerprint.accounting_serial == self.accounting &&
+               fingerprint.tree_shape_digest == self.tree &&
+               fingerprint.policy_epoch == self.policy &&
+               fingerprint.children.size() == 1;
+    }
+
+    static uint64_t read_accounting(const void * opaque) noexcept {
+        return static_cast<const prefix_validator_serials *>(opaque)->accounting;
+    }
+
+    static uint64_t read_policy(const void * opaque) noexcept {
+        return static_cast<const prefix_validator_serials *>(opaque)->policy;
+    }
+};
 
 static void test_attention_stem_prefix_planner() {
     const auto cell = [](uint32_t physical, llama_pos logical) {
@@ -1874,11 +1904,14 @@ static void test_dependency_scoped_projected_catalog_publication() {
         topology, llama_cache_acct_device_ordinal { 0 }, device));
     const auto host = llama_cache_acct_resource_domain::non_device(
         llama_cache_acct_residency::pageable_host);
+    const auto pinned = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pinned_host);
     const llama_cache_acct_completeness_requirement requirements[] {
         { device, llama_cache_acct_producer::live_memory },
         { host, llama_cache_acct_producer::retention_sidecar },
+        { pinned, llama_cache_acct_producer::retention_sidecar },
     };
-    CHECK(ledger.configure_required_producers(requirements, 2));
+    CHECK(ledger.configure_required_producers(requirements, 3));
     vbr_artifact_package accounting_package;
     accounting_package.topologies = publications.front().topologies;
     accounting_package.manifest.accounting =
@@ -1907,10 +1940,31 @@ static void test_dependency_scoped_projected_catalog_publication() {
             category, host,
             llama_cache_acct_measure::reserved, 0);
     }
+    for (uint8_t raw = 0;
+         raw < uint8_t(llama_cache_acct_category::_count); ++raw) {
+        const auto category = llama_cache_acct_category(raw);
+        const auto classification = llama_cache_budget_classify(category);
+        if (classification.participation !=
+                llama_cache_budget_capacity_participation::participating ||
+            (classification.scope !=
+                 llama_cache_budget_residency_scope::host &&
+             classification.scope !=
+                 llama_cache_budget_residency_scope::by_domain)) {
+            continue;
+        }
+        for (const auto measure : {
+                llama_cache_acct_measure::logical_payload,
+                llama_cache_acct_measure::resident_allocated,
+                llama_cache_acct_measure::reserved }) {
+            ledger.gauge_set(category, pinned, measure, 0);
+        }
+    }
     CHECK(ledger.certify_complete(
         device, llama_cache_acct_producer::live_memory));
     CHECK(ledger.certify_complete(
         host, llama_cache_acct_producer::retention_sidecar));
+    CHECK(ledger.certify_complete(
+        pinned, llama_cache_acct_producer::retention_sidecar));
     llama_cache_budget_config budget;
     llama_cache_budget_device_input input;
     input.backend_device = reinterpret_cast<const void *>(uintptr_t(1));
@@ -2297,6 +2351,257 @@ static void test_dependency_scoped_projected_catalog_publication() {
           vbr_artifact_prefix_projection_status::limit_exceeded);
     CHECK(!refused_projection);
 
+    // The canonical validator consumes a separate projection capability. It
+    // authenticates only the selected prefix, but derives a fresh dense live
+    // image: packed rows 7 and 2 become destination rows 0 and 1 for every
+    // unit instead of preserving either source offset space.
+    prefix_request.tokens = divergent;
+    prefix_request.token_count = sizeof(divergent)/sizeof(divergent[0]);
+    prefix_request.lcp_tokens = 2;
+    vbr_artifact_attention_prefix_projection validated_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {}, validated_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    const auto accounting = ledger.snapshot();
+    prefix_validator_serials validation_serials;
+    validation_serials.accounting = accounting.serial;
+    validation_serials.policy = 0x901;
+    validation_serials.memory = 0x902;
+    validation_serials.state = 0x903;
+    validation_serials.tree = 0x904;
+
+    vbr_target_validation_snapshot validation_target;
+    validation_target.memory_instance_cookie = validation_serials.memory;
+    validation_target.target_state_serial = validation_serials.state;
+    validation_target.accounting_serial = validation_serials.accounting;
+    validation_target.tree_shape_digest = validation_serials.tree;
+    validation_target.policy_epoch = validation_serials.policy;
+    validation_target.scheduler_idle = true;
+    validation_target.destination_sequence_absent = true;
+    vbr_target_child_snapshot validation_child;
+    static const uint8_t validation_memory_cookie = 0;
+    static const uint8_t validation_pool_cookie = 0;
+    validation_child.child_id = 0;
+    validation_child.dependency_mode =
+        checkpoint_child_dependency_mode::live_guarded;
+    validation_child.memory_cookie = &validation_memory_cookie;
+    validation_child.empty = true;
+    validation_child.dedicated = true;
+    validation_child.armed = true;
+    validation_child.lineage_uuid = { 0x901, 0x902 };
+    validation_child.instance_id = { 0x903, 0x904 };
+    validation_child.state_serial = validation_target.target_state_serial;
+    validation_child.policy_epoch = validation_target.policy_epoch;
+    validation_child.controller_policy =
+        prefix_parent.manifest().controller_policy.front();
+    const auto & source_controller =
+        prefix_parent.manifest().generation.controllers.front();
+    for (size_t unit_index = 0;
+         unit_index < prefix_parent.units().size(); ++unit_index) {
+        const auto & descriptor =
+            prefix_parent.units()[unit_index].descriptor;
+        vbr_target_unit_snapshot target_unit;
+        target_unit.child_id = descriptor.child_id;
+        target_unit.logical_unit_id = descriptor.logical_unit_id;
+        target_unit.current_type = descriptor.current_type;
+        target_unit.last_source_type = descriptor.last_source_type;
+        target_unit.promote_hops = descriptor.promote_hops;
+        target_unit.last_transition = descriptor.last_transition;
+        target_unit.representation_kind = descriptor.representation.kind;
+        target_unit.codec_id = descriptor.representation.codec_id;
+        target_unit.codec_version = descriptor.representation.codec_version;
+        target_unit.representation_reference_digest =
+            descriptor.representation.reference_digest;
+        target_unit.source_loss_history =
+            descriptor.representation.source_loss_history;
+        target_unit.checkpoint_codec_hops =
+            descriptor.representation.checkpoint_codec_hops;
+        target_unit.recoverability = descriptor.recoverability;
+        target_unit.side = descriptor.side;
+        target_unit.layout = descriptor.layout;
+        target_unit.row_codec_version = descriptor.row_codec_version;
+        target_unit.current_domain =
+            source_controller.units[unit_index].domain;
+        target_unit.codebook_digest = descriptor.codebook_digest;
+        target_unit.rotation_digest = descriptor.rotation_digest;
+        target_unit.meansub_digest = descriptor.meansub_digest;
+        target_unit.n_stream = descriptor.n_stream;
+        target_unit.unified = descriptor.unified;
+        target_unit.wm_cells = descriptor.wm_cells;
+        target_unit.rank = descriptor.rank;
+        target_unit.dimensions = descriptor.dimensions;
+        target_unit.row_alignment = descriptor.row_alignment;
+        for (size_t shard_index = 0;
+             shard_index < descriptor.shards.size(); ++shard_index) {
+            const auto & shard = descriptor.shards[shard_index];
+            target_unit.shards.push_back({
+                uint32_t(shard_index), &validation_pool_cookie,
+                bindings[shard.device_ordinal].domain,
+                shard.topology_index, shard.device_ordinal,
+                prefix_parent.topologies()[shard.topology_index].digest,
+                shard.logical_offset, shard.row_count, shard.row_bytes,
+                shard.payload_bytes,
+            });
+        }
+        validation_child.units.push_back(std::move(target_unit));
+    }
+    validation_target.children.push_back(std::move(validation_child));
+
+    const std::vector<llama_token> validated_tokens { 1, 2 };
+    vbr_adopt_policy validation_policy;
+    validation_policy.authorized = true;
+    validation_policy.identity.execution_identity =
+        validated_projection.identity().execution_identity;
+    validation_policy.identity.adapter_config_identity =
+        validated_projection.identity().adapter_config_identity;
+    validation_policy.identity.media_content_identity =
+        validated_projection.identity().media_content_identity;
+    validation_policy.identity.sequence_epoch =
+        validated_projection.identity().sequence_epoch;
+    validation_policy.identity.requested_frontier = 2;
+    validation_policy.identity.tokens = &validated_tokens;
+    validation_policy.destination_sequence = 12;
+    validation_policy.adoption_nonce = 0x905;
+    validation_policy.domain_bindings = bindings;
+    validation_policy.domain_bindings.push_back({
+        UINT32_MAX, UINT16_MAX, host,
+    });
+    validation_policy.accounting_snapshot = &accounting;
+    validation_policy.budget_config = &budget;
+    validation_policy.context = &validation_serials;
+    validation_policy.recheck_target_empty =
+        prefix_validator_serials::recheck;
+    validation_policy.read_accounting_serial =
+        prefix_validator_serials::read_accounting;
+    validation_policy.read_policy_epoch =
+        prefix_validator_serials::read_policy;
+    const auto parent_manifest_digest =
+        prefix_parent.manifest().manifest_digest;
+    auto validated = vbr_validate_attention_prefix_projection(
+        validation_target, std::move(validated_projection),
+        validation_policy);
+    CHECK(!validated_projection);
+    CHECK(validated.status == vbr_manifest_validation_status::validated);
+    CHECK(validated.decision == vbr_import_decision::live_rebased);
+    CHECK(validated.proof);
+    CHECK(validated.proof->is_prefix_projection());
+    CHECK(validated.proof->projection_transfer_ready());
+    CHECK(validated.proof->source_artifact() == prefix_reference);
+    CHECK(validated.proof->manifest_digest() != parent_manifest_digest);
+    CHECK(validated.proof->authenticated_identity().requested_frontier == 2);
+    CHECK(validated.proof->token_block().tokens == validated_tokens);
+    CHECK(validated.proof->companions().empty());
+    CHECK(validated.proof->children().size() == 2);
+    CHECK(validated.proof->tracker_install().children.size() == 1);
+    CHECK(validated.proof->tracker_install().children[0].transition ==
+          vbr_tracker_install_transition::whole_import);
+    CHECK(validated.proof->source_controller(0));
+    CHECK(validated.proof->source_controller(0)->streams.size() == 1);
+    CHECK(validated.proof->source_controller(0)->streams[0]
+              .computation_frontier == 2);
+    CHECK(validated.proof->source_controller(0)->streams[0]
+              .captured_dependency_count == 2);
+    CHECK(validated.proof->source_controller(0)->streams[0].pages.empty());
+    size_t dense_placement_count = 0;
+    size_t dense_placement_cells = 0;
+    size_t validated_projection_runs = 0;
+    for (size_t child_index = 0;
+         child_index < validated.proof->children().size(); ++child_index) {
+        const auto & child = validated.proof->children()[child_index];
+        CHECK(child.descriptor.wm_cells == 2);
+        CHECK(child.placements.size() == (child_index == 0 ? 1 : 0));
+        dense_placement_count += child.placements.size();
+        if (child_index == 0) {
+            CHECK(child.placements[0].computation_frontier == 2);
+            CHECK(child.placements[0].cells.size() == 2);
+            CHECK(child.placements[0].cells[0].physical_cell == 0);
+            CHECK(child.placements[0].cells[1].physical_cell == 1);
+            dense_placement_cells += child.placements[0].cells.size();
+        }
+        CHECK(child.shards.size() == 1);
+        CHECK(child.shards[0].projection_proof);
+        CHECK(child.shards[0].projection_runs.size() == 2);
+        CHECK(child.shards[0].projection_runs[0].source_offset == 7);
+        CHECK(child.shards[0].projection_runs[0].destination_offset == 0);
+        CHECK(child.shards[0].projection_runs[0].size == 1);
+        CHECK(child.shards[0].projection_runs[1].source_offset == 2);
+        CHECK(child.shards[0].projection_runs[1].destination_offset == 1);
+        CHECK(child.shards[0].projection_runs[1].size == 1);
+        validated_projection_runs +=
+            child.shards[0].projection_runs.size();
+    }
+    // The dense destination placement is canonical child-wide metadata, not
+    // a prefix-sized vector copied once per logical unit. Proof/source-run
+    // consumption is likewise exactly once across the grouped inventory.
+    CHECK(dense_placement_count == 1);
+    CHECK(dense_placement_cells == validated_tokens.size());
+    CHECK(validated_projection_runs ==
+          validated.proof->source_projection().source_runs().size());
+    for (size_t gate = 0; gate < 32; ++gate) {
+        CHECK(validated.proof->projection_transfer_ready());
+    }
+    auto moved_prefix_proof = std::make_unique<vbr_validated_manifest>(
+        std::move(*validated.proof));
+    validated.proof = std::move(moved_prefix_proof);
+    CHECK(validated.proof->authenticated_identity().tokens ==
+          &validated.proof->token_block().tokens);
+
+    vbr_adopt_stage_policy prefix_stage_policy;
+    prefix_stage_policy.ledger = &ledger;
+    prefix_stage_policy.budget = &budget;
+    prefix_stage_policy.pinned_domain = pinned;
+    prefix_stage_policy.pinned_ring_bytes = 32;
+    prefix_stage_policy.chunk_bytes = 8;
+    for (const auto & binding : bindings) {
+        prefix_stage_policy.lanes.push_back({
+            binding.domain, nullptr, nullptr, false,
+        });
+    }
+    auto staged_prefix = vbr_stage_validated_manifest(
+        std::move(validated.proof), prefix_stage_policy);
+    if (staged_prefix.status != vbr_adopt_stage_status::staged) {
+        fprintf(stderr, "prefix stage status: %s\n",
+            vbr_adopt_stage_status_name(staged_prefix.status));
+    }
+    CHECK(staged_prefix.status == vbr_adopt_stage_status::staged);
+    CHECK(staged_prefix.manifest);
+    CHECK(staged_prefix.staged);
+    CHECK(staged_prefix.staged->read_count() == 2);
+    if (staged_prefix.staged) {
+        for (const auto & read : staged_prefix.staged->reads()) {
+            CHECK(read.size == 2);
+            // Production staging must execute the restricted Merkle verifier,
+            // not merely carry its root beside unauthenticated H2D ranges.
+            CHECK(read.proof_verified_bytes == 8);
+            CHECK(read.destination_offset == 0);
+            CHECK(read.projection_ranges.size() == 2);
+            CHECK(read.projection_ranges[0].source_offset == 7);
+            CHECK(read.projection_ranges[0].size == 1);
+            CHECK(read.projection_ranges[1].source_offset == 2);
+            CHECK(read.projection_ranges[1].size == 1);
+        }
+    }
+    staged_prefix.staged.reset();
+    CHECK(staged_prefix.manifest &&
+          staged_prefix.manifest->projection_transfer_ready());
+
+    // A target topology mutation consumes and releases the attempted
+    // capability without affecting the already-validated sibling proof.
+    vbr_artifact_attention_prefix_projection topology_mutant_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {},
+              topology_mutant_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    auto topology_mutant = validation_target;
+    topology_mutant.children[0].units[0].shards[0].topology_digest = {};
+    auto refused_validation = vbr_validate_attention_prefix_projection(
+        topology_mutant, std::move(topology_mutant_projection),
+        validation_policy);
+    CHECK(!topology_mutant_projection);
+    CHECK(refused_validation.status ==
+          vbr_manifest_validation_status::topology_mismatch);
+    CHECK(!refused_validation.proof);
+
     // Dropping the caller's package lease cannot retire storage while either
     // independently borrowed projection remains alive.
     prefix_parent.reset();
@@ -2306,6 +2611,7 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(catalog.retire(prefix_reference) ==
           vbr_artifact_retire_status::busy);
     shorter_projection.reset();
+    staged_prefix.manifest.reset();
     CHECK(catalog.retire(prefix_reference) ==
           vbr_artifact_retire_status::retired);
     CHECK(ledger.snapshot().live_ops == 0);

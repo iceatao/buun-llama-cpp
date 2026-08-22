@@ -6,6 +6,7 @@
 #include "llama-vbr-operation.h"
 #include "llama-vbr-downward.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -394,6 +395,15 @@ struct vbr_authorized_cell_run {
     uint32_t cell_count = 0;
 };
 
+// Prefix projections deliberately separate packed host rows from freshly
+// allocated destination cells.  Ordinary whole-artifact plans leave this
+// vector empty and retain their historical same-offset behavior.
+struct vbr_validated_projection_run {
+    uint64_t source_offset = 0;
+    uint64_t destination_offset = 0;
+    uint64_t size = 0;
+};
+
 struct vbr_validated_shard_plan {
     uint32_t shard_index = UINT32_MAX;
     llama_cache_acct_resource_domain domain;
@@ -405,6 +415,8 @@ struct vbr_validated_shard_plan {
     uint64_t target_mapped_bytes = 0;
     uint64_t payload_bytes = 0;
     std::shared_ptr<const artifact_segment_chain> source;
+    std::vector<vbr_validated_projection_run> projection_runs;
+    vbr_capture_range_proof projection_proof;
 };
 
 struct vbr_validated_child_plan {
@@ -499,20 +511,42 @@ public:
     const vbr_tracker_install_plan & tracker_install() const noexcept {
         return tracker_install_;
     }
+    const vbr_checkpoint_generation_controller * source_controller(
+            uint32_t child_id) const noexcept {
+        const auto found = std::find_if(
+            source_controllers_.begin(), source_controllers_.end(),
+            [&](const auto & value) { return value.child_id == child_id; });
+        return found == source_controllers_.end() ? nullptr : &*found;
+    }
     uint64_t adoption_nonce() const noexcept { return adoption_nonce_; }
     llama_cache_acct_artifact_id source_artifact() const noexcept {
-        return source_lease_.reference_artifact();
+        return source_projection_
+            ? source_projection_.parent_artifact()
+            : source_lease_.reference_artifact();
     }
     // F4.2 staging retains this lease through the proof and uses the same
     // canonical package door for its pre-transfer repeatability check.
     const vbr_artifact_package_view & source_package() const noexcept {
         return source_lease_;
     }
+    bool is_prefix_projection() const noexcept {
+        return bool(source_projection_);
+    }
+    const vbr_artifact_attention_prefix_projection &
+    source_projection() const noexcept {
+        return source_projection_;
+    }
+    // Allocation-free catalog/borrow recheck used immediately before the
+    // proof-aware H2D operation begins.
+    bool projection_transfer_ready() const noexcept {
+        return source_projection_ && source_projection_.transfer_ready();
+    }
 
 private:
     vbr_validated_manifest() = default;
 
     vbr_artifact_package_view source_lease_;
+    vbr_artifact_attention_prefix_projection source_projection_;
     vbr_import_decision decision_ = vbr_import_decision::reject;
     vbr_target_empty_fingerprint target_;
     vbr_manifest_digest manifest_digest_;
@@ -523,6 +557,7 @@ private:
     std::vector<vbr_validated_companion_plan> companions_;
     std::vector<llama_cache_transaction_leaf> accounting_leaves_;
     vbr_tracker_install_plan tracker_install_;
+    std::vector<vbr_checkpoint_generation_controller> source_controllers_;
     uint64_t adoption_nonce_ = 0;
     const void * recheck_context_ = nullptr;
     vbr_adopt_policy::target_recheck_fn recheck_target_empty_ = nullptr;
@@ -539,6 +574,11 @@ private:
     vbr_validate_unit_manifest_snapshot(
         const vbr_target_validation_snapshot &,
         const vbr_artifact_package_view &,
+        const vbr_adopt_policy &) noexcept;
+    friend vbr_manifest_validation_result
+    vbr_validate_attention_prefix_projection(
+        const vbr_target_validation_snapshot &,
+        vbr_artifact_attention_prefix_projection &&,
         const vbr_adopt_policy &) noexcept;
     friend vbr_adopt_result vbr_adopt_empty_manifest(
         llama_memory_i &, llama_seq_id,
@@ -564,4 +604,14 @@ vbr_manifest_validation_result vbr_validate_unit_manifest(
 vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
     const vbr_target_validation_snapshot & target,
     const vbr_artifact_package_view & package,
+    const vbr_adopt_policy & policy) noexcept;
+
+// Canonical construction-empty, text-only attention-prefix validation.  The
+// capability is consumed on entry; every failure releases its parent borrow.
+// This first slice accepts exact representation only, installs a fresh dense
+// destination as live_rebased/whole_import, and never validates or reads the
+// unselected parent suffix.
+vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
+    const vbr_target_validation_snapshot & target,
+    vbr_artifact_attention_prefix_projection && projection,
     const vbr_adopt_policy & policy) noexcept;

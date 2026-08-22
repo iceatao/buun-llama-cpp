@@ -676,6 +676,213 @@ bool server_retention_prefix_index::visit_longest_common_prefix(
     }
 }
 
+bool server_retention_prefix_index::visit_common_prefixes(
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_visitor visitor,
+        uint64_t * compared_tokens,
+        uint64_t * visited_nodes) const noexcept {
+    if (compared_tokens) {
+        *compared_tokens = 0;
+    }
+    if (visited_nodes) {
+        *visited_nodes = 0;
+    }
+    if (!pimpl || !pimpl->healthy || tokens.empty() || !visitor) {
+        return false;
+    }
+
+    struct result {
+        uint64_t artifact;
+        uint64_t prefix;
+    };
+    struct pending_node {
+        const impl::node * value;
+        size_t path_tokens;
+        uint64_t prefix;
+    };
+    try {
+        std::vector<result> results;
+        std::vector<pending_node> pending;
+        results.reserve(std::min<size_t>(
+            pimpl->root.total_refs, SERVER_RETENTION_MAX_CANDIDATES));
+        pending.reserve(std::min<size_t>(
+            pimpl->root.total_refs, SERVER_RETENTION_MAX_CANDIDATES));
+
+        const auto append_terminal = [&](const impl::node * value,
+                                         size_t path_tokens,
+                                         uint64_t prefix) {
+            if (!value || prefix == 0 ||
+                (value->terminal_refs == 0) !=
+                    (value->terminal_head == 0)) {
+                return false;
+            }
+            if (visited_nodes) {
+                ++*visited_nodes;
+            }
+            uint64_t artifact = value->terminal_head;
+            uint64_t previous = 0;
+            uint32_t visited = 0;
+            while (artifact != 0) {
+                const auto record = pimpl->artifacts.find(artifact);
+                if (record == pimpl->artifacts.end() ||
+                    !record->second.tokens ||
+                    record->second.tokens->values.size() != path_tokens ||
+                    record->second.terminal_node != value ||
+                    record->second.terminal_prev != previous ||
+                    ++visited > value->terminal_refs ||
+                    results.size() == SERVER_RETENTION_MAX_CANDIDATES) {
+                    return false;
+                }
+                results.push_back({ artifact, prefix });
+                previous = artifact;
+                artifact = record->second.terminal_next;
+            }
+            return visited == value->terminal_refs;
+        };
+        const auto drain_pending = [&]() {
+            while (!pending.empty()) {
+                const auto current = pending.back();
+                pending.pop_back();
+                if (!current.value || current.value->total_refs == 0 ||
+                    current.value->total_refs >
+                        SERVER_RETENTION_MAX_CANDIDATES ||
+                    !append_terminal(
+                        current.value, current.path_tokens, current.prefix)) {
+                    return false;
+                }
+                for (const auto & item : current.value->edges) {
+                    const auto & edge = item.second;
+                    if (!edge.child || edge.label.empty() ||
+                        edge.label.front() != item.first ||
+                        edge.label.size() >
+                            std::numeric_limits<size_t>::max() -
+                                current.path_tokens ||
+                        edge.child->total_refs == 0 ||
+                        edge.child->total_refs >
+                            SERVER_RETENTION_MAX_CANDIDATES) {
+                        return false;
+                    }
+                    pending.push_back({
+                        edge.child.get(),
+                        current.path_tokens + edge.label.size(),
+                        current.prefix,
+                    });
+                }
+            }
+            return true;
+        };
+
+        const impl::node * current = &pimpl->root;
+        size_t path_tokens = 0;
+        while (path_tokens < tokens.size()) {
+            const auto matching = current->edges.find(tokens[path_tokens]);
+            for (const auto & item : current->edges) {
+                if (matching != current->edges.end() &&
+                    item.first == matching->first) {
+                    continue;
+                }
+                const auto & edge = item.second;
+                if (!edge.child || edge.label.empty() ||
+                    edge.label.front() != item.first ||
+                    edge.label.size() >
+                        std::numeric_limits<size_t>::max() - path_tokens ||
+                    edge.child->total_refs == 0 ||
+                    edge.child->total_refs >
+                        SERVER_RETENTION_MAX_CANDIDATES) {
+                    return false;
+                }
+                if (path_tokens != 0) {
+                    pending.push_back({
+                        edge.child.get(), path_tokens + edge.label.size(),
+                        uint64_t(path_tokens),
+                    });
+                }
+            }
+            if (!drain_pending()) {
+                return false;
+            }
+            if (matching == current->edges.end()) {
+                break;
+            }
+            const auto & edge = matching->second;
+            if (!edge.child || edge.label.empty() ||
+                edge.label.front() != matching->first) {
+                return false;
+            }
+            size_t shared = 0;
+            while (shared < edge.label.size() &&
+                   path_tokens + shared < tokens.size()) {
+                if (compared_tokens) {
+                    ++*compared_tokens;
+                }
+                if (edge.label[shared] != tokens[path_tokens + shared]) {
+                    break;
+                }
+                shared++;
+            }
+            const size_t child_path = path_tokens + edge.label.size();
+            if (shared != edge.label.size()) {
+                const uint64_t prefix = uint64_t(path_tokens + shared);
+                if (prefix != 0) {
+                    pending.push_back({ edge.child.get(), child_path, prefix });
+                }
+                if (!drain_pending()) {
+                    return false;
+                }
+                break;
+            }
+
+            path_tokens = child_path;
+            current = edge.child.get();
+            if (!append_terminal(current, path_tokens, path_tokens)) {
+                return false;
+            }
+            if (path_tokens == tokens.size()) {
+                for (const auto & item : current->edges) {
+                    const auto & suffix = item.second;
+                    if (!suffix.child || suffix.label.empty() ||
+                        suffix.label.front() != item.first ||
+                        suffix.label.size() >
+                            std::numeric_limits<size_t>::max() - path_tokens) {
+                        return false;
+                    }
+                    pending.push_back({
+                        suffix.child.get(), path_tokens + suffix.label.size(),
+                        uint64_t(path_tokens),
+                    });
+                }
+                if (!drain_pending()) {
+                    return false;
+                }
+                break;
+            }
+        }
+
+        std::sort(results.begin(), results.end(),
+            [](const result & a, const result & b) {
+                return a.artifact < b.artifact;
+            });
+        if (std::adjacent_find(
+                results.begin(), results.end(),
+                [](const result & a, const result & b) {
+                    return a.artifact == b.artifact;
+                }) != results.end()) {
+            return false;
+        }
+        for (const auto & item : results) {
+            if (!visitor(
+                    context, llama_cache_acct_artifact_id { item.artifact },
+                    item.prefix)) {
+                break;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void server_retention_prefix_index::retire(
         llama_cache_acct_artifact_id artifact) noexcept {
     if (!pimpl || !pimpl->healthy || artifact.v == 0) {
@@ -1036,13 +1243,19 @@ struct server_retention_sidecar_store::prefix_tracking {
                 llama_cache_acct_artifact_id {});
     }
 
+    enum class prefix_visit_mode : uint8_t {
+        exact_prefixes,
+        longest_common_prefix,
+        all_common_prefixes,
+    };
+
     bool visit_impl(
             common_retention_pool pool,
             const std::string & exact_scope,
             const std::vector<llama_token> & tokens,
             void * context,
             server_retention_sidecar_store::prefix_instance_visitor visitor,
-            bool longest_common_prefix)
+            prefix_visit_mode mode)
             const noexcept {
         if (!healthy || pool >= common_retention_pool::_count ||
             exact_scope.empty() || tokens.empty() || !visitor) {
@@ -1077,11 +1290,21 @@ struct server_retention_sidecar_store::prefix_tracking {
                         bridge_state.context,
                         found->second.instance, prefix);
                 };
-            const bool walked = longest_common_prefix
-                ? scope->second->index.visit_longest_common_prefix(
-                    tokens, &state, bridge_visitor)
-                : scope->second->index.visit_prefixes(
-                    tokens, &state, bridge_visitor);
+            bool walked = false;
+            switch (mode) {
+                case prefix_visit_mode::exact_prefixes:
+                    walked = scope->second->index.visit_prefixes(
+                        tokens, &state, bridge_visitor);
+                    break;
+                case prefix_visit_mode::longest_common_prefix:
+                    walked = scope->second->index.visit_longest_common_prefix(
+                        tokens, &state, bridge_visitor);
+                    break;
+                case prefix_visit_mode::all_common_prefixes:
+                    walked = scope->second->index.visit_common_prefixes(
+                        tokens, &state, bridge_visitor);
+                    break;
+            }
             return walked && state.valid;
         } catch (...) {
             return false;
@@ -1096,7 +1319,8 @@ struct server_retention_sidecar_store::prefix_tracking {
             server_retention_sidecar_store::prefix_instance_visitor visitor)
             const noexcept {
         return visit_impl(
-            pool, exact_scope, tokens, context, visitor, false);
+            pool, exact_scope, tokens, context, visitor,
+            prefix_visit_mode::exact_prefixes);
     }
 
     bool visit_longest_common_prefix(
@@ -1107,7 +1331,20 @@ struct server_retention_sidecar_store::prefix_tracking {
             server_retention_sidecar_store::prefix_instance_visitor visitor)
             const noexcept {
         return visit_impl(
-            pool, exact_scope, tokens, context, visitor, true);
+            pool, exact_scope, tokens, context, visitor,
+            prefix_visit_mode::longest_common_prefix);
+    }
+
+    bool visit_common_prefixes(
+            common_retention_pool pool,
+            const std::string & exact_scope,
+            const std::vector<llama_token> & tokens,
+            void * context,
+            server_retention_sidecar_store::prefix_instance_visitor visitor)
+            const noexcept {
+        return visit_impl(
+            pool, exact_scope, tokens, context, visitor,
+            prefix_visit_mode::all_common_prefixes);
     }
 };
 
@@ -1280,6 +1517,16 @@ bool server_retention_sidecar_store::visit_longest_common_prefix_instances(
         void * context,
         prefix_instance_visitor visitor) const noexcept {
     return prefixes && prefixes->visit_longest_common_prefix(
+        pool, exact_scope, tokens, context, visitor);
+}
+
+bool server_retention_sidecar_store::visit_common_prefix_instances(
+        common_retention_pool pool,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens,
+        void * context,
+        prefix_instance_visitor visitor) const noexcept {
+    return prefixes && prefixes->visit_common_prefixes(
         pool, exact_scope, tokens, context, visitor);
 }
 
@@ -1834,6 +2081,28 @@ bool server_retention_sidecar_store::branch(
         const server_retention_instance_key *
             destination_lineage_source,
         bool defer_lineage_admission) noexcept {
+    return branch_impl(
+        source, destination, destination_lineage_source,
+        defer_lineage_admission, nullptr);
+}
+
+bool server_retention_sidecar_store::branch_prefix(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination,
+        uint64_t destination_coverage_tokens,
+        bool defer_lineage_admission) noexcept {
+    return branch_impl(
+        source, destination, nullptr, defer_lineage_admission,
+        &destination_coverage_tokens);
+}
+
+bool server_retention_sidecar_store::branch_impl(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination,
+        const server_retention_instance_key *
+            destination_lineage_source,
+        bool defer_lineage_admission,
+        const uint64_t * destination_coverage_tokens) noexcept {
     common_retention_pool pool = common_retention_pool::attention;
     uint64_t lineage_id = 0;
     const auto discard_unreferenced = [&]() noexcept {
@@ -1889,6 +2158,27 @@ bool server_retention_sidecar_store::branch(
         }
         auto record = item->second.record;
         record.kind = destination.kind;
+        if (destination_coverage_tokens) {
+            if (*destination_coverage_tokens == 0 ||
+                *destination_coverage_tokens >=
+                    record.stamp.coverage_tokens ||
+                !record.turns ||
+                *destination_coverage_tokens > record.turns->token_count) {
+                discard_unreferenced();
+                retire(destination);
+                return false;
+            }
+            record.stamp.coverage_tokens = *destination_coverage_tokens;
+            if (!common_retention_score(
+                    *record.turns, *destination_coverage_tokens,
+                    record.stamp)) {
+                record.stamp.state =
+                    common_retention_score_state::unavailable;
+                record.stamp.mandatory_anchor = false;
+                record.stamp.mapped_turn_ordinal = 0;
+                record.stamp.anchor_rank = 0;
+            }
+        }
         if (!allocator.issue(pool, record.stamp)) {
             discard_unreferenced();
             retire(destination);

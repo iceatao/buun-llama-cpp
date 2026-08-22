@@ -9108,7 +9108,8 @@ private:
 
     bool try_automatic_vbr_restore(
             server_slot & slot,
-            const server_task & task) noexcept {
+            const server_task & task,
+            const common_cache_family_binding & incoming_family) noexcept {
         try {
             if (!params_base.vbr_prompt_cache || !prompt_cache ||
                 !vbr_artifact_store || ctx_dft ||
@@ -9127,6 +9128,20 @@ private:
             if (!prompt_cache->prepare_vbr_restore(
                     task.tokens, frontier_execution_identity,
                     adapter_identity, candidate)) {
+                return false;
+            }
+            vbr_artifact_attention_prefix_projection prefix_projection;
+            const auto prepare_prefix_projection = [&]() noexcept {
+                if (!candidate.requires_prefix_projection()) {
+                    return true;
+                }
+                return vbr_artifact_store->prepare_host_prefix_projection(
+                           candidate.payload(),
+                           task.tokens.retention_token_ids(),
+                           candidate.prefix_tokens(), prefix_projection) ==
+                    vbr_artifact_prefix_projection_status::projected;
+            };
+            if (!prepare_prefix_projection()) {
                 return false;
             }
             auto * memory = llama_get_memory(ctx_tgt);
@@ -9184,14 +9199,23 @@ private:
 
             vbr_automatic_restore_attempts++;
             const int64_t started = ggml_time_us();
-            auto imported = vbr_artifact_store->import_host_payload(
-                make_request(), candidate.payload());
+            auto import_selected = [&]() {
+                return candidate.requires_prefix_projection()
+                    ? vbr_artifact_store->import_host_prefix_payload(
+                        make_request(), candidate.payload(),
+                        std::move(prefix_projection))
+                    : vbr_artifact_store->import_host_payload(
+                        make_request(), candidate.payload());
+            };
+            auto imported = import_selected();
             bool used_compact_fallback = false;
             if (server_vbr_artifact_import_variant_fallback_safe(imported) &&
                 candidate.use_fallback_payload()) {
                 GGML_ASSERT(!state.published);
-                imported = vbr_artifact_store->import_host_payload(
-                    make_request(), candidate.payload());
+                if (!prepare_prefix_projection()) {
+                    return false;
+                }
+                imported = import_selected();
                 used_compact_fallback =
                     imported.status == server_vbr_artifact_import_status::ok;
             }
@@ -9205,6 +9229,9 @@ private:
             GGML_ASSERT(state.published);
             const uint64_t prefix_tokens = candidate.prefix_tokens();
             const int32_t source_id = candidate.source_id();
+            if (candidate.requires_prefix_projection()) {
+                slot.cache_family = incoming_family;
+            }
             const bool committed = prompt_cache->commit_vbr_restore(
                 candidate, slot.prompt, slot.cache_family, slot.id);
             GGML_ASSERT(committed);
@@ -9380,7 +9407,8 @@ private:
         // automatic import can atomically publish live KV/prompt metadata.
         auto launched_task =
             std::make_unique<const server_task>(std::move(task));
-        (void) try_automatic_vbr_restore(slot, *launched_task);
+        (void) try_automatic_vbr_restore(
+            slot, *launched_task, incoming_family);
 
         const size_t retained_prefix =
             slot.prompt.tokens.get_common_prefix(launched_task->tokens);

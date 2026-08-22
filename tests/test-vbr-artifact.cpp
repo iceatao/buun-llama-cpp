@@ -4186,6 +4186,132 @@ static void test_validated_manifest_staging() {
 }
 
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+static void test_prompt_cache_vbr_longest_feasible_restore_selection() {
+    const auto run = [](size_t projected_lcp, bool projection_wins) {
+        catalog_fixture fixture;
+        server_retention_sidecar_store retention;
+        retention.configure(&fixture.ledger, fixture.host);
+        CHECK(retention.enable_prefix_tracking());
+        server_prompt_cache cache(/* limit_size_mib */ 0,
+                                  /* limit_tokens */ 0);
+        cache.acct = &fixture.ledger;
+        cache.retention_obs = &retention;
+
+        llama_tokens request_ids(60);
+        for (size_t i = 0; i < request_ids.size(); ++i) {
+            request_ids[i] = llama_token(1000 + i);
+        }
+        server_tokens request(request_ids, false);
+        llama_tokens exact_ids(request_ids.begin(), request_ids.begin() + 20);
+        llama_tokens projected_ids(
+            request_ids.begin(), request_ids.begin() + projected_lcp + 1);
+        projected_ids[projected_lcp] = llama_token(100000 + projected_lcp);
+
+        const auto publish_host = [&](const llama_tokens & ids) {
+            auto package = make_package(fixture.storage);
+            server_prompt source;
+            source.tokens = server_tokens(ids, false);
+            source.sequence_epoch = package.manifest.identity.sequence_epoch;
+            auto & manifest = package.manifest;
+            manifest.identity.token_count = int64_t(ids.size());
+            manifest.identity.next_position = source.tokens.pos_next();
+            CHECK(source.tokens.media_content_identity(
+                source.n_tokens(), manifest.identity.media_content_identity));
+            manifest.token_block.tokens = ids;
+            auto & stream = manifest.generation.controllers[0].streams[0];
+            stream.computation_frontier = source.tokens.pos_next();
+            stream.captured_dependency_count = ids.size();
+            stream.pages[0].covered_mask[0] =
+                (uint64_t(1) << ids.size()) - 1;
+            auto & placement = manifest.stream_placements[0];
+            placement.computation_frontier = source.tokens.pos_next();
+            placement.cells.clear();
+            placement.cells.reserve(ids.size());
+            for (size_t i = 0; i < ids.size(); ++i) {
+                placement.cells.push_back({
+                    uint32_t(i), llama_pos(i), llama_pos(10 + i),
+                    llama_pos(20 + i),
+                });
+            }
+            auto & stash = manifest.unit_references[0].stash_reference;
+            stash.captured_sink_count = ids.size();
+            stash.covered_sink_pages[0].covered_mask[0] =
+                (uint64_t(1) << ids.size()) - 1;
+
+            const auto published = publish_fixture(
+                *fixture.catalog, package, fixture.completions(),
+                fixture.budget);
+            CHECK(published.reference_artifact.v != 0);
+            vbr_artifact_package_view view;
+            CHECK(fixture.catalog->resolve_reference(
+                      published.reference_artifact, view) ==
+                  vbr_artifact_resolve_status::ok);
+            auto owner = server_prompt_cache_vbr_payload::adopt_owned(
+                std::move(view));
+            CHECK(owner);
+            if (!owner) {
+                return cache.states.end();
+            }
+            cache.states.emplace_back();
+            auto current = std::prev(cache.states.end());
+            current->prompt = std::move(source);
+            current->payload =
+                server_prompt_cache_payload::from_vbr(std::move(owner));
+            current->adapter_config_key =
+                manifest.identity.adapter_config_identity;
+            current->vbr_execution_identity =
+                manifest.identity.execution_identity;
+            common_chat_msg_spans spans;
+            spans.add(COMMON_CHAT_ROLE_USER, 0, current->prompt.n_tokens());
+            const auto key =
+                server_retention_instance_key::for_host_entry(&*current);
+            CHECK(retention.publish(
+                key, common_retention_pool::attention, spans, true,
+                current->prompt.n_tokens(), current->prompt.n_tokens(), true));
+            CHECK(server_prompt_retention_publish_exact_prefix(
+                retention, key, current->prompt,
+                current->adapter_config_key, current->prompt.n_tokens()));
+            return current;
+        };
+
+        auto exact = publish_host(exact_ids);
+        auto projected = publish_host(projected_ids);
+        if (exact == cache.states.end() || projected == cache.states.end()) {
+            return;
+        }
+        {
+            server_prompt_cache_vbr_restore_candidate candidate;
+            CHECK(cache.prepare_vbr_restore(
+                request,
+                fixture.package.manifest.identity.execution_identity,
+                fixture.package.manifest.identity.adapter_config_identity,
+                candidate));
+            CHECK(candidate.ready());
+            CHECK(candidate.requires_prefix_projection() == projection_wins);
+            CHECK(candidate.prefix_tokens() ==
+                  (projection_wins ? projected_lcp : size_t(20)));
+            CHECK(candidate.payload().get() ==
+                  (projection_wins ? projected->payload.vbr_artifact()
+                                   : exact->payload.vbr_artifact()));
+            CHECK(exact->recovery_pins == (projection_wins ? 0u : 1u));
+            CHECK(projected->recovery_pins == (projection_wins ? 1u : 0u));
+        }
+        CHECK(exact->recovery_pins == 0);
+        CHECK(projected->recovery_pins == 0);
+        for (auto & state : cache.states) {
+            retention.retire(
+                server_retention_instance_key::for_host_entry(&state));
+        }
+        cache.states.clear();
+    };
+
+    // The global comparator must not let traversal class override prefix
+    // value: a 50-token projection beats a 20-token complete artifact, while
+    // a 20-token complete artifact beats a parent that diverges after 10.
+    run(50, true);
+    run(10, false);
+}
+
 static void test_prompt_cache_vbr_atomic_logical_publication() {
     static_assert(!std::is_copy_constructible_v<
         server_prompt_cache_vbr_restore_candidate>);
@@ -4236,8 +4362,9 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     }
     auto payload = server_prompt_cache_payload::from_vbr(owner);
 
+    server_cache_authority authority;
     server_retention_sidecar_store retention;
-    retention.configure(&fixture.ledger, fixture.host);
+    retention.configure(&fixture.ledger, fixture.host, &authority.leases);
     CHECK(retention.enable_prefix_tracking());
     constexpr int32_t source_slot = 4;
     const auto source_key =
@@ -4256,6 +4383,9 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
                               /* limit_tokens */ 0);
     cache.acct = &fixture.ledger;
     cache.retention_obs = &retention;
+    cache.lease_obs = &authority.leases;
+    cache.lease_execution_identity =
+        &fixture.package.manifest.identity.execution_identity;
 
     auto staged = cache.stage_vbr(
         prompt, payload,
@@ -4742,6 +4872,22 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     auto host_key =
         server_retention_instance_key::for_host_entry(&*logical);
     CHECK(retention.artifact_id(host_key).v != 0);
+    server_cache_lease_identity host_lease_identity;
+    CHECK(server_cache_lease_build_identity(
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        logical->prompt.tokens, logical->prompt.n_tokens(),
+        host_lease_identity));
+    const server_cache_lease_subject host_lease_subject {
+        retention.artifact_id(host_key),
+        common_retention_artifact_kind::host_entry,
+        -1,
+    };
+    CHECK(authority.leases.grant_soft(
+        host_lease_subject,
+        server_cache_lease_scope::from(
+            authority.leases.new_context_scope()),
+        host_lease_identity, UINT64_MAX / 2));
 
     // Automatic VBR restore selection is a separate, non-consuming prepared
     // capability: the complete artifact must prefix the request, the host
@@ -4756,6 +4902,130 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     // on an MTMD-capable server remain eligible for this first restore slice.
     extended.has_mtmd = true;
     const uint32_t pins_before = logical->recovery_pins;
+
+    // A longer ineligible live terminal must not hide this shorter host VBR
+    // parent. Exact-prefix lookup misses first; the radix-owned all-LCP view
+    // then lets prompt-cache eligibility select the one-token projection.
+    server_prompt ineligible_longer;
+    ineligible_longer.tokens = server_tokens(
+        llama_tokens { 101, 777, 888 }, false);
+    ineligible_longer.sequence_epoch = prompt.sequence_epoch;
+    common_chat_msg_spans ineligible_spans;
+    ineligible_spans.add(
+        COMMON_CHAT_ROLE_USER, 0, ineligible_longer.n_tokens());
+    const auto ineligible_key =
+        server_retention_instance_key::for_slot(27);
+    CHECK(retention.publish(
+        ineligible_key, common_retention_pool::attention,
+        ineligible_spans, true, ineligible_longer.n_tokens(),
+        ineligible_longer.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        retention, ineligible_key, ineligible_longer,
+        fixture.package.manifest.identity.adapter_config_identity,
+        ineligible_longer.n_tokens()));
+    server_tokens divergent_request(
+        llama_tokens { 101, 777, 999 }, false);
+    server_prompt_cache_vbr_restore_candidate projected;
+    CHECK(cache.prepare_vbr_restore(
+        divergent_request,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        projected));
+    CHECK(projected.ready());
+    CHECK(projected.requires_prefix_projection());
+    CHECK(projected.prefix_tokens() == 1);
+    CHECK(projected.source_tokens() == 2);
+    CHECK(projected.selected_next_position() ==
+        divergent_request.pos_next(1));
+    CHECK(projected.payload().get() == owner.get());
+    CHECK(logical->recovery_pins == pins_before + 1);
+    server_prompt projected_destination;
+    const common_cache_family_binding incoming_projected_family {
+        common_cache_family_id { 77 }, common_cache_family_role::branch,
+    };
+    common_cache_family_binding projected_family =
+        incoming_projected_family;
+    CHECK(cache.prepare_vbr_restore_destination(
+        projected, projected_destination, 26));
+    const auto projected_key =
+        server_retention_instance_key::for_slot(26);
+    CHECK(retention.prepared_for_launch(projected_key));
+    server_cache_lease_identity projected_lease_identity;
+    CHECK(server_cache_lease_build_identity(
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        projected_destination.tokens,
+        projected_destination.n_tokens(), projected_lease_identity));
+    const auto projected_lease = authority.leases.inspect(
+        retention.artifact_id(projected_key), projected_lease_identity);
+    CHECK(projected_lease.state == server_cache_lease_eval_state::known);
+    CHECK(projected_lease.cls == server_cache_lease_class::none);
+    server_retention_lineage_ticket projected_source_lineage;
+    server_retention_lineage_ticket projected_destination_lineage;
+    CHECK(retention.acquire_lineage_ticket(
+        host_key, projected_source_lineage));
+    CHECK(retention.acquire_lineage_ticket(
+        projected_key, projected_destination_lineage));
+    CHECK(projected_source_lineage.lineage_id !=
+        projected_destination_lineage.lineage_id);
+    const uint64_t projected_source_lineage_id =
+        projected_source_lineage.lineage_id;
+    const uint64_t projected_destination_lineage_id =
+        projected_destination_lineage.lineage_id;
+    retention.release_lineage_ticket(projected_source_lineage);
+    retention.release_lineage_ticket(projected_destination_lineage);
+    common_retention_lineage_record projected_lineage_record;
+    CHECK(!retention.lineage_for_instance(
+        projected_key, projected_lineage_record));
+    CHECK(cache.publish_vbr_restore(projected));
+    CHECK(projected_destination.tokens.retention_token_ids() ==
+        llama_tokens({ 101 }));
+    CHECK(projected_destination.checkpoints.empty());
+    CHECK(projected_destination.sequence_epoch == prompt.sequence_epoch);
+    CHECK(cache.commit_vbr_restore(
+        projected, projected_destination, projected_family, 26));
+    CHECK(projected_family == incoming_projected_family);
+    CHECK(!projected.ready());
+    CHECK(logical->recovery_pins == pins_before);
+    server_retention_lineage_ticket credited_source;
+    CHECK(retention.consume_prepared_launch(
+        projected_key, credited_source));
+    CHECK(credited_source.lineage_id == projected_source_lineage_id);
+    retention.release_lineage_ticket(credited_source);
+    server_retention_lineage_ticket admitted_destination;
+    CHECK(retention.acquire_lineage_ticket(
+        projected_key, admitted_destination));
+    CHECK(admitted_destination.lineage_id ==
+        projected_destination_lineage_id);
+    CHECK(retention.activate_lineage_ticket(admitted_destination));
+    retention.release_lineage_ticket(admitted_destination);
+    CHECK(retention.lineage_for_instance(
+        projected_key, projected_lineage_record));
+    CHECK(projected_lineage_record.lineage_id ==
+        projected_destination_lineage_id);
+    retention.retire(projected_key);
+
+    // A projected destination which never reaches adoption is wholly
+    // provisional: releasing the candidate erases only its branch and keeps
+    // the pinned source lineage intact.
+    const auto abandoned_projected_key =
+        server_retention_instance_key::for_slot(25);
+    {
+        server_prompt_cache_vbr_restore_candidate abandoned_projected;
+        CHECK(cache.prepare_vbr_restore(
+            divergent_request,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            abandoned_projected));
+        server_prompt abandoned_destination;
+        CHECK(cache.prepare_vbr_restore_destination(
+            abandoned_projected, abandoned_destination, 25));
+        CHECK(retention.prepared_for_launch(abandoned_projected_key));
+    }
+    CHECK(retention.artifact_id(abandoned_projected_key).v == 0);
+    CHECK(retention.artifact_id(host_key).v != 0);
+    retention.retire(ineligible_key);
+
     server_prompt_cache_vbr_restore_candidate identity_mismatch;
     CHECK(!cache.prepare_vbr_restore(
         extended, "wrong-execution",
@@ -4776,6 +5046,9 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         CHECK(prepared.ready());
         CHECK(prepared.payload().get() == owner.get());
         CHECK(prepared.prefix_tokens() == 2);
+        CHECK(prepared.source_tokens() == 2);
+        CHECK(!prepared.requires_prefix_projection());
+        CHECK(prepared.selected_next_position() == extended.pos_next(2));
         CHECK(logical->recovery_pins == pins_before + 1);
         server_prompt_cache foreign_cache(0, 0);
         server_prompt foreign_destination = prompt.clone();
@@ -4863,6 +5136,18 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     common_cache_family_binding restored_family;
     CHECK(cache.prepare_vbr_restore_destination(
         accepted_restore, restored_destination, 8));
+    server_cache_lease_identity restored_lease_identity;
+    CHECK(server_cache_lease_build_identity(
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        restored_destination.tokens,
+        restored_destination.n_tokens(), restored_lease_identity));
+    const auto restored_live_key =
+        server_retention_instance_key::for_slot(8);
+    const auto restored_lease = authority.leases.inspect(
+        retention.artifact_id(restored_live_key), restored_lease_identity);
+    CHECK(restored_lease.state == server_cache_lease_eval_state::known);
+    CHECK(restored_lease.cls == server_cache_lease_class::soft);
     CHECK(cache.publish_vbr_restore(accepted_restore));
     CHECK(restored_destination.tokens.retention_token_ids() ==
         prompt.tokens.retention_token_ids());
@@ -4873,8 +5158,6 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(restored_family == logical->cache_family);
     CHECK(logical->recovery_pins == pins_before);
     CHECK(cache.states.size() == 1);
-    const auto restored_live_key =
-        server_retention_instance_key::for_slot(8);
     CHECK(retention.artifact_id(restored_live_key).v != 0);
     CHECK(retention.prepared_for_launch(restored_live_key));
     CHECK(retention.artifact_id(host_key).v != 0);
@@ -7508,6 +7791,7 @@ int main(int argc, char ** argv) {
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+    test_prompt_cache_vbr_longest_feasible_restore_selection();
     test_prompt_cache_vbr_atomic_logical_publication();
     test_prompt_cache_vbr_pressure_retires_physical_union();
 #endif

@@ -235,6 +235,37 @@ static void test_longest_common_prefix_visits_descendant_terminals() {
     CHECK(log.artifacts[0] == long_parent);
     CHECK(log.artifacts[1] == equal_parent);
 
+    // The all-LCP view retains weaker terminals so a semantic owner may
+    // reject both longest rows without starving an eligible shorter parent.
+    const llama_cache_acct_artifact_id shorter_parent { 12 };
+    CHECK(index.publish(shorter_parent, 4, llama_tokens { 1, 9 }));
+    struct common_log {
+        std::array<llama_cache_acct_artifact_id, 4> artifacts {};
+        std::array<uint64_t, 4> prefixes {};
+        size_t size = 0;
+    } all;
+    CHECK(index.visit_common_prefixes(
+        llama_tokens { 1, 2, 6 }, &all,
+        [](void * opaque, llama_cache_acct_artifact_id artifact,
+           uint64_t prefix) noexcept {
+            auto & value = *static_cast<common_log *>(opaque);
+            if (value.size == value.artifacts.size()) {
+                return false;
+            }
+            value.artifacts[value.size] = artifact;
+            value.prefixes[value.size++] = prefix;
+            return true;
+        }));
+    CHECK(all.size == 4);
+    CHECK(all.artifacts[0] == long_parent);
+    CHECK(all.prefixes[0] == 2);
+    CHECK(all.artifacts[1] == shorter_parent);
+    CHECK(all.prefixes[1] == 1);
+    CHECK(all.artifacts[2] == equal_parent);
+    CHECK(all.prefixes[2] == 2);
+    CHECK(all.artifacts[3] == weaker_parent);
+    CHECK(all.prefixes[3] == 1);
+
     // A deeper match excludes every weaker terminal.
     log = {};
     CHECK(index.visit_longest_common_prefix(
@@ -265,11 +296,14 @@ static void test_store_longest_common_prefix_instances() {
     CHECK(store.enable_prefix_tracking());
     const auto first = server_retention_instance_key::for_slot(31);
     const auto second = server_retention_instance_key::for_slot(30);
+    const auto shorter = server_retention_instance_key::for_slot(29);
     for (const auto & row : {
             std::pair<server_retention_instance_key, llama_tokens> {
                 first, { 1, 2, 3, 4 } },
             std::pair<server_retention_instance_key, llama_tokens> {
                 second, { 1, 2, 8, 9 } },
+            std::pair<server_retention_instance_key, llama_tokens> {
+                shorter, { 1, 9 } },
         }) {
         CHECK(store.publish(
             row.first, common_retention_pool::attention, make_spans(), true,
@@ -300,8 +334,35 @@ static void test_store_longest_common_prefix_instances() {
     CHECK(log.size == 2);
     CHECK(log.instances[0] == first);
     CHECK(log.instances[1] == second);
+
+    struct all_log {
+        std::array<server_retention_instance_key, 3> instances {};
+        std::array<uint64_t, 3> prefixes {};
+        size_t size = 0;
+    } all;
+    CHECK(store.visit_common_prefix_instances(
+        common_retention_pool::attention, "lcp-scope",
+        llama_tokens { 1, 2, 7 }, &all,
+        [](void * opaque, const server_retention_instance_key & instance,
+           uint64_t prefix) noexcept {
+            auto & value = *static_cast<all_log *>(opaque);
+            if (value.size == value.instances.size()) {
+                return false;
+            }
+            value.instances[value.size] = instance;
+            value.prefixes[value.size++] = prefix;
+            return true;
+        }));
+    CHECK(all.size == 3);
+    CHECK(all.instances[0] == first);
+    CHECK(all.prefixes[0] == 2);
+    CHECK(all.instances[1] == second);
+    CHECK(all.prefixes[1] == 2);
+    CHECK(all.instances[2] == shorter);
+    CHECK(all.prefixes[2] == 1);
     store.retire(first);
     store.retire(second);
+    store.retire(shorter);
 }
 
 static void test_excluded_prefix_coverage_scale() {
@@ -410,6 +471,25 @@ static void test_prefix_index_identical_terminal_cleanup() {
             return true;
         }));
     CHECK(count.count == SERVER_RETENTION_MAX_CANDIDATES);
+
+    // Equal-token aliases share one radix terminal. All-LCP discovery visits
+    // every owner without rescanning the token vector per owner.
+    count = {};
+    uint64_t compared_tokens = UINT64_MAX;
+    uint64_t visited_nodes = UINT64_MAX;
+    CHECK(index.visit_common_prefixes(
+        llama_tokens { 42, 99 }, &count,
+        [](void * opaque, llama_cache_acct_artifact_id, uint64_t prefix)
+                noexcept {
+            auto & current = *static_cast<count_context *>(opaque);
+            CHECK(prefix == 1);
+            current.count++;
+            return true;
+        },
+        &compared_tokens, &visited_nodes));
+    CHECK(count.count == SERVER_RETENTION_MAX_CANDIDATES);
+    CHECK(compared_tokens == 1);
+    CHECK(visited_nodes == 1);
 
     struct ordered_count_context {
         uint64_t next = 1;

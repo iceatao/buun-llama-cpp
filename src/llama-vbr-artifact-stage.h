@@ -60,6 +60,27 @@ struct vbr_h2d_transfer {
     uint64_t fail_completion_at = UINT64_MAX;
 };
 
+struct vbr_h2d_source_range {
+    uint64_t source_offset = 0;
+    uint64_t size = 0;
+};
+
+struct vbr_h2d_packed_transfer {
+    uint32_t lane = 0;
+    vbr_artifact_byte_source source;
+    const vbr_h2d_source_range * ranges = nullptr;
+    size_t range_count = 0;
+    uint64_t size = 0;
+
+    ggml_backend_t backend = nullptr;
+    ggml_backend_dev_t device = nullptr;
+    ggml_tensor * destination = nullptr;
+    uint64_t destination_offset = 0;
+    vbr_h2d_fake_destination fake;
+
+    uint64_t fail_completion_at = UINT64_MAX;
+};
+
 struct vbr_h2d_stats {
     uint64_t bytes = 0;
     uint64_t chunks = 0;
@@ -67,6 +88,27 @@ struct vbr_h2d_stats {
     uint64_t event_completions = 0;
     uint64_t synchronous_fallbacks = 0;
     uint64_t peak_pinned_bytes = 0;
+};
+
+// Keeps the shared physical ring alive while projection adoption owns its
+// direction-neutral operation mutex.
+class vbr_h2d_ring_operation {
+public:
+    vbr_h2d_ring_operation() noexcept = default;
+    vbr_h2d_ring_operation(vbr_h2d_ring_operation &&) noexcept;
+    vbr_h2d_ring_operation & operator=(
+        vbr_h2d_ring_operation &&) noexcept;
+    ~vbr_h2d_ring_operation();
+
+    vbr_h2d_ring_operation(const vbr_h2d_ring_operation &) = delete;
+    vbr_h2d_ring_operation & operator=(
+        const vbr_h2d_ring_operation &) = delete;
+    explicit operator bool() const noexcept { return bool(operation_); }
+
+private:
+    std::shared_ptr<vbr_bounded_pinned_ring_core> keepalive_;
+    vbr_pinned_ring_operation operation_;
+    friend class vbr_h2d_chunk_ring;
 };
 
 class vbr_h2d_chunk_ring {
@@ -100,6 +142,14 @@ public:
     vbr_h2d_status stream(
         const vbr_h2d_transfer & transfer,
         vbr_h2d_stats & stats) noexcept;
+    // Projection adoption reserves the direction-neutral ring once and packs
+    // discontiguous authenticated parent ranges into a dense destination.
+    // Exact/full-package adoption continues to use stream().
+    vbr_h2d_ring_operation try_begin_operation() noexcept;
+    vbr_h2d_status stream_packed_reserved(
+        const vbr_h2d_ring_operation & operation,
+        const vbr_h2d_packed_transfer & transfer,
+        vbr_h2d_stats & stats) noexcept;
 
 private:
     struct impl;
@@ -124,6 +174,11 @@ struct vbr_staged_read_descriptor {
     uint64_t size = 0;
     std::shared_ptr<const artifact_segment_chain> source;
     std::array<uint8_t, 32> verified_digest = {};
+    // Populated only for an authenticated prefix projection. Exact reads
+    // preserve their historic source_offset-as-destination mapping.
+    uint64_t destination_offset = 0;
+    std::vector<vbr_h2d_source_range> projection_ranges;
+    uint64_t proof_verified_bytes = 0;
 };
 
 enum class vbr_adopt_stage_status : uint8_t {

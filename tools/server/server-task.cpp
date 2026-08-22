@@ -2873,15 +2873,16 @@ bool server_prompt_cache::prepare_vbr_restore(
             const std::string * execution;
             const std::string * adapter;
             uint64_t prefix;
+            uint64_t source_tokens;
+            llama_pos selected_next_position;
             bool quality;
             uint64_t artifact;
-        } selected {
+            bool projected;
+        } exact {
             nullptr, &request_tokens, &execution_identity,
-            &adapter_config_key, 0, false, 0,
+            &adapter_config_key, 0, 0, -1, false, 0, false,
         };
-        const bool indexed = retention_obs->visit_prefix_instances(
-            common_retention_pool::attention, scope,
-            request_tokens.retention_token_ids(), &selected,
+        const auto select =
             [](void * opaque, const server_retention_instance_key & key,
                uint64_t prefix) noexcept {
                 auto & current = *static_cast<selection *>(opaque);
@@ -2892,19 +2893,40 @@ bool server_prompt_cache::prepare_vbr_restore(
                 }
                 auto * state = reinterpret_cast<server_prompt_cache_state *>(
                     key.instance);
+                const uint64_t source_tokens = state && state->prompt.n_tokens() > 0
+                    ? uint64_t(state->prompt.n_tokens()) : 0;
                 if (!state || state->payload.kind() !=
                         server_prompt_cache_payload_kind::vbr_artifact ||
                     state->adapter_config_key != *current.adapter ||
                     state->vbr_execution_identity != *current.execution ||
-                    state->prompt.n_tokens() <= 0 ||
-                    uint64_t(state->prompt.n_tokens()) != prefix ||
+                    source_tokens == 0 ||
+                    (current.projected
+                        ? prefix >= source_tokens ||
+                          state->prompt.tokens.has_media() ||
+                          !state->prompt.checkpoints.empty()
+                        : source_tokens != prefix) ||
                     state->recovery_pins == UINT32_MAX) {
                     return true;
                 }
                 const auto * artifact = state->payload.vbr_artifact();
-                if (!artifact || !artifact->package() ||
-                    current.request->pos_next(int64_t(prefix)) !=
-                        artifact->package().manifest().identity.next_position) {
+                if (!artifact || !artifact->package()) {
+                    return true;
+                }
+                const auto & manifest = artifact->package().manifest();
+                const llama_pos selected_next =
+                    current.request->pos_next(int64_t(prefix));
+                // The retention callback is reached through this state's
+                // immutable indexed token block, and stage_vbr authenticated
+                // that block against the sealed package before publication.
+                // Re-scanning the complete parent here for every alias would
+                // turn an 8192-owner terminal into O(owners*tokens).
+                if (selected_next <= 0 ||
+                    manifest.identity.token_count <= 0 ||
+                    uint64_t(manifest.identity.token_count) != source_tokens ||
+                    state->prompt.tokens.pos_next() !=
+                        manifest.identity.next_position ||
+                    (!current.projected && selected_next !=
+                        manifest.identity.next_position)) {
                     return true;
                 }
                 const auto * variants = state->payload.vbr_variants();
@@ -2925,11 +2947,39 @@ bool server_prompt_cache::prepare_vbr_restore(
                 }
                 current.best = state;
                 current.prefix = prefix;
+                current.source_tokens = source_tokens;
+                current.selected_next_position = selected_next;
                 current.quality = quality;
                 current.artifact = artifact_id;
                 return true;
-            });
-        if (!indexed || !selected.best) {
+            };
+        const bool indexed = retention_obs->visit_prefix_instances(
+            common_retention_pool::attention, scope,
+            request_tokens.retention_token_ids(), &exact, select);
+        if (!indexed) {
+            return false;
+        }
+        selection projected {
+            nullptr, &request_tokens, &execution_identity,
+            &adapter_config_key, 0, 0, -1, false, 0, true,
+        };
+        if (!retention_obs->visit_common_prefix_instances(
+                common_retention_pool::attention, scope,
+                request_tokens.retention_token_ids(), &projected, select)) {
+            return false;
+        }
+        const auto better = [](const selection & left,
+                               const selection & right) noexcept {
+            return left.best &&
+                (!right.best || left.prefix > right.prefix ||
+                 (left.prefix == right.prefix &&
+                  (left.quality > right.quality ||
+                   (left.quality == right.quality &&
+                    left.artifact < right.artifact))));
+        };
+        const selection & selected = better(projected, exact)
+            ? projected : exact;
+        if (!selected.best) {
             return false;
         }
         const auto * variants = selected.best->payload.vbr_variants();
@@ -2948,6 +2998,9 @@ bool server_prompt_cache::prepare_vbr_restore(
         }
         candidate.cache_family_ = selected.best->cache_family;
         candidate.prefix_tokens_ = selected.prefix;
+        candidate.source_tokens_ = selected.source_tokens;
+        candidate.selected_next_position_ = selected.selected_next_position;
+        candidate.requires_prefix_projection_ = selected.projected;
         candidate.source_id_ = selected.best->cache_plan_source_id;
         return true;
     } catch (...) {
@@ -3006,6 +3059,9 @@ server_prompt_cache_vbr_restore_candidate::operator=(
         fallback_payload_ = std::move(other.fallback_payload_);
         cache_family_ = other.cache_family_;
         prefix_tokens_ = other.prefix_tokens_;
+        source_tokens_ = other.source_tokens_;
+        selected_next_position_ = other.selected_next_position_;
+        requires_prefix_projection_ = other.requires_prefix_projection_;
         source_id_ = other.source_id_;
         prepared_slot_ = other.prepared_slot_;
         prepared_destination_ = other.prepared_destination_;
@@ -3017,7 +3073,9 @@ server_prompt_cache_vbr_restore_candidate::operator=(
 }
 
 bool server_prompt_cache_vbr_restore_candidate::ready() const noexcept {
-    return cache_ && source_ && payload_ && prefix_tokens_ > 0;
+    return cache_ && source_ && payload_ && prefix_tokens_ > 0 &&
+        source_tokens_ >= prefix_tokens_ && selected_next_position_ > 0 &&
+        requires_prefix_projection_ == (prefix_tokens_ < source_tokens_);
 }
 
 const server_prompt_cache_vbr_owner &
@@ -3050,6 +3108,21 @@ uint64_t server_prompt_cache_vbr_restore_candidate::prefix_tokens()
     return prefix_tokens_;
 }
 
+uint64_t server_prompt_cache_vbr_restore_candidate::source_tokens()
+        const noexcept {
+    return source_tokens_;
+}
+
+llama_pos server_prompt_cache_vbr_restore_candidate::selected_next_position()
+        const noexcept {
+    return selected_next_position_;
+}
+
+bool server_prompt_cache_vbr_restore_candidate::requires_prefix_projection()
+        const noexcept {
+    return requires_prefix_projection_;
+}
+
 int32_t server_prompt_cache_vbr_restore_candidate::source_id()
         const noexcept {
     return source_id_;
@@ -3062,6 +3135,9 @@ void server_prompt_cache_vbr_restore_candidate::clear() noexcept {
     fallback_payload_.reset();
     cache_family_ = {};
     prefix_tokens_ = 0;
+    source_tokens_ = 0;
+    selected_next_position_ = -1;
+    requires_prefix_projection_ = false;
     source_id_ = -1;
     prepared_slot_ = -1;
     prepared_destination_ = nullptr;
@@ -3383,6 +3459,7 @@ enum class server_prompt_cache_prefix_clone_mode : uint8_t {
     publish_from_prompt = 0,
     share_source,
     publish_stem,
+    branch_prefix,
 };
 
 static bool server_prompt_cache_mirror_artifact_clone(
@@ -3405,16 +3482,29 @@ static bool server_prompt_cache_mirror_artifact_clone(
     }
 
     common_chat_msg_spans no_spans;
-    const bool cloned = prefix_mode ==
-            server_prompt_cache_prefix_clone_mode::publish_stem
-        ? source_turn_tokens > 0 && coverage_tokens > 0 &&
-          coverage_tokens < source_turn_tokens &&
-          cache.retention_obs->publish(
-              destination_key, common_retention_pool::attention,
-              no_spans, true, uint64_t(source_turn_tokens),
-              uint64_t(coverage_tokens), true,
-              nullptr, nullptr, &source_key)
-        : cache.retention_obs->clone(source_key, destination_key);
+    bool cloned = false;
+    switch (prefix_mode) {
+        case server_prompt_cache_prefix_clone_mode::publish_stem:
+            cloned = source_turn_tokens > 0 && coverage_tokens > 0 &&
+                coverage_tokens < source_turn_tokens &&
+                cache.retention_obs->publish(
+                    destination_key, common_retention_pool::attention,
+                    no_spans, true, uint64_t(source_turn_tokens),
+                    uint64_t(coverage_tokens), true,
+                    nullptr, nullptr, &source_key);
+            break;
+        case server_prompt_cache_prefix_clone_mode::branch_prefix:
+            cloned = coverage_tokens > 0 &&
+                cache.retention_obs->branch_prefix(
+                    source_key, destination_key,
+                    uint64_t(coverage_tokens), true);
+            break;
+        case server_prompt_cache_prefix_clone_mode::publish_from_prompt:
+        case server_prompt_cache_prefix_clone_mode::share_source:
+            cloned = cache.retention_obs->clone(
+                source_key, destination_key);
+            break;
+    }
     const bool indexed = cloned &&
         (destination_kind == common_retention_artifact_kind::checkpoint ||
          (prefix_mode == server_prompt_cache_prefix_clone_mode::share_source
@@ -3433,9 +3523,15 @@ static bool server_prompt_cache_mirror_artifact_clone(
         destination_kind,
         destination_slot,
     };
-    server_prompt_cache_mirror_lease(
-        cache, indexed, &source, destination, prompt,
-        adapter_identity, coverage_tokens);
+    // A divergent prefix is a new lineage, not a continuation of the parent.
+    // In particular it must not inherit the parent's hard/soft lease. The
+    // ordinary exact restore and shared-source publication modes remain true
+    // clones and keep their existing lease transfer semantics.
+    if (prefix_mode != server_prompt_cache_prefix_clone_mode::branch_prefix) {
+        server_prompt_cache_mirror_lease(
+            cache, indexed, &source, destination, prompt,
+            adapter_identity, coverage_tokens);
+    }
     return indexed;
 }
 
@@ -7981,18 +8077,59 @@ bool server_prompt_cache::prepare_vbr_restore_destination(
         return false;
     }
     try {
-        candidate.prepared_prompt_ =
-            std::make_unique<server_prompt>(source->prompt.clone());
+        if (candidate.requires_prefix_projection_) {
+            if (source->prompt.tokens.has_media() ||
+                !source->prompt.checkpoints.empty() ||
+                uint64_t(source->prompt.n_tokens()) !=
+                    candidate.source_tokens_ ||
+                candidate.prefix_tokens_ >= candidate.source_tokens_) {
+                return false;
+            }
+            candidate.prepared_prompt_ = std::make_unique<server_prompt>();
+            candidate.prepared_prompt_->tokens =
+                source->prompt.tokens.clone_text_prefix(
+                    size_t(candidate.prefix_tokens_));
+            candidate.prepared_prompt_->sequence_epoch =
+                source->prompt.sequence_epoch;
+            if (!candidate.prepared_prompt_->checkpoints.empty() ||
+                candidate.prepared_prompt_->tokens.has_media() ||
+                candidate.prepared_prompt_->tokens.pos_next() !=
+                    candidate.selected_next_position_) {
+                candidate.prepared_prompt_.reset();
+                return false;
+            }
+        } else {
+            candidate.prepared_prompt_ =
+                std::make_unique<server_prompt>(source->prompt.clone());
+        }
     } catch (...) {
+        candidate.prepared_prompt_.reset();
         return false;
     }
-    const bool mirrored = server_prompt_cache_mirror_artifact_clone(
-        *this,
-        source_key, common_retention_artifact_kind::host_entry, -1,
-        destination_key, common_retention_artifact_kind::live_slot, id_slot,
-        source->prompt, source->adapter_config_key,
-        int64_t(candidate.prefix_tokens_),
-        server_prompt_cache_prefix_clone_mode::share_source);
+    bool mirrored = false;
+    if (candidate.requires_prefix_projection_) {
+        // Divergence inside the parent is a new probationary lineage. Keep
+        // source credit in the prepared-launch ticket, publish only the
+        // shortened destination prefix, and admit it only when the scheduler
+        // consumes the successful launch terminal.
+        mirrored = server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::host_entry, -1,
+            destination_key, common_retention_artifact_kind::live_slot,
+            id_slot, *candidate.prepared_prompt_,
+            source->adapter_config_key,
+            int64_t(candidate.prefix_tokens_),
+            server_prompt_cache_prefix_clone_mode::branch_prefix);
+    } else {
+        mirrored = server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::host_entry, -1,
+            destination_key, common_retention_artifact_kind::live_slot,
+            id_slot, *candidate.prepared_prompt_,
+            source->adapter_config_key,
+            int64_t(candidate.prefix_tokens_),
+            server_prompt_cache_prefix_clone_mode::share_source);
+    }
     if (!mirrored ||
         !retention_obs->prepare_for_launch(source_key, destination_key)) {
         retention_obs->abandon_prepared_launch(destination_key);
@@ -8048,7 +8185,12 @@ bool server_prompt_cache::commit_vbr_restore(
         release_vbr_restore(candidate);
         return false;
     }
-    destination_family = candidate.cache_family_;
+    // Exact continuation restores the parent's family. A projected prefix is
+    // a new request branch; its caller-provided incoming family must survive
+    // the restore instead of inheriting the parent's cache provenance.
+    if (!candidate.requires_prefix_projection_) {
+        destination_family = candidate.cache_family_;
+    }
     if (destruction_obs) {
         destruction_obs->note_host_restore(true);
     }

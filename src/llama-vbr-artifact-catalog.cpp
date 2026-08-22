@@ -1359,6 +1359,114 @@ vbr_artifact_attention_prefix_projection::digest() const noexcept {
     return impl_ ? impl_->digest : empty;
 }
 
+bool vbr_artifact_attention_prefix_projection::validation_source(
+        vbr_artifact_prefix_validation_source & output) const noexcept {
+    output = {};
+    if (!transfer_ready() || !structural_ready()) {
+        return false;
+    }
+    const auto storage =
+        std::static_pointer_cast<const vbr_artifact_package_view::storage>(
+            impl_->parent_storage);
+    if (!storage) {
+        return false;
+    }
+    output.artifact = impl_->parent;
+    output.topologies = &storage->topologies;
+    output.manifest = &storage->manifest;
+    output.units = &storage->units;
+    output.companions = &storage->companions;
+    output.reference_allocations = &storage->reference_allocations;
+    return true;
+}
+
+bool vbr_artifact_attention_prefix_projection::structural_ready() const noexcept {
+    if (!impl_ || impl_->owner == nullptr || impl_->parent.v == 0 ||
+        !impl_->parent_manifest.valid() || !impl_->token_digest.valid() ||
+        !impl_->digest.valid() || impl_->tokens.empty() ||
+        impl_->identity.token_count != int64_t(impl_->tokens.size()) ||
+        impl_->identity.next_position != llama_pos(impl_->tokens.size()) ||
+        impl_->cell_runs.empty() || impl_->source_runs.empty() ||
+        impl_->proofs.empty() || impl_->selected_bytes == 0) {
+        return false;
+    }
+    try {
+        const auto storage =
+            std::static_pointer_cast<const vbr_artifact_package_view::storage>(
+                impl_->parent_storage);
+        if (!storage || storage->reference != impl_->parent ||
+            storage->manifest.manifest_digest != impl_->parent_manifest ||
+            storage->units.empty() || !storage->companions.empty()) {
+            return false;
+        }
+        uint64_t selected = 0;
+        for (const auto & proof : impl_->proofs) {
+            if (!proof.proof || proof.unit_index >= storage->units.size() ||
+                proof.shard_index >=
+                    storage->units[proof.unit_index].payload_shards.size() ||
+                proof.shard_index >=
+                    storage->units[proof.unit_index].descriptor.shards.size()) {
+                return false;
+            }
+            const auto & unit = storage->units[proof.unit_index];
+            const auto & shard = unit.descriptor.shards[proof.shard_index];
+            if (!unit.payload_shards[proof.shard_index] ||
+                proof.proof.root() != shard.section_checksum ||
+                proof.proof.total_bytes() !=
+                    unit.payload_shards[proof.shard_index]->size()) {
+                return false;
+            }
+        }
+        for (const auto & run : impl_->source_runs) {
+            if (run.unit_index >= storage->units.size() ||
+                run.shard_index >=
+                    storage->units[run.unit_index].payload_shards.size() ||
+                run.size == 0 || run.cell_count == 0 ||
+                run.source_offset >
+                    storage->units[run.unit_index]
+                        .payload_shards[run.shard_index]->size() ||
+                run.size >
+                    storage->units[run.unit_index]
+                        .payload_shards[run.shard_index]->size() -
+                            run.source_offset ||
+                run.size > UINT64_MAX - selected) {
+                return false;
+            }
+            selected += run.size;
+        }
+        return selected == impl_->selected_bytes;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool vbr_artifact_attention_prefix_projection::transfer_ready() const noexcept {
+    if (!impl_ || impl_->owner == nullptr || impl_->parent.v == 0 ||
+        !impl_->parent_manifest.valid() || !impl_->token_digest.valid() ||
+        !impl_->digest.valid() || !impl_->parent_storage) {
+        return false;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(impl_->owner->impl_->mutex);
+        const auto found = impl_->owner->impl_->references.find(
+            impl_->parent.v);
+        if (found == impl_->owner->impl_->references.end() ||
+            found->second.borrow_count == 0 ||
+            found->second.retire_pending ||
+            found->second.prepared_retire_token != 0 ||
+            found->second.manifest.manifest_digest != impl_->parent_manifest) {
+            return false;
+        }
+        const auto storage =
+            std::static_pointer_cast<const vbr_artifact_package_view::storage>(
+                impl_->parent_storage);
+        return storage && storage->reference == impl_->parent &&
+            storage->manifest.manifest_digest == impl_->parent_manifest;
+    } catch (...) {
+        return false;
+    }
+}
+
 void vbr_artifact_attention_prefix_projection::reset() noexcept {
     auto state = std::move(impl_);
     if (state && state->owner && state->parent.v != 0) {

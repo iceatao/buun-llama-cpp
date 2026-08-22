@@ -216,14 +216,7 @@ bool fingerprint_equal(const vbr_target_empty_fingerprint & a,
 const vbr_checkpoint_generation_controller * source_controller(
         const vbr_validated_manifest & manifest,
         uint32_t child_id) noexcept {
-    const auto & controllers =
-        manifest.source_package().manifest().generation.controllers;
-    const auto found = std::find_if(
-        controllers.begin(), controllers.end(),
-        [&](const vbr_checkpoint_generation_controller & value) {
-            return value.child_id == child_id;
-        });
-    return found == controllers.end() ? nullptr : &*found;
+    return manifest.source_controller(child_id);
 }
 
 const vbr_tracker_install_child * tracker_plan(
@@ -570,6 +563,7 @@ class vbr_kv_import_session {
 
     bool transfer(const vbr_staged_read_descriptor & read,
                   vbr_h2d_chunk_ring * ring,
+                  const vbr_h2d_ring_operation * ring_operation,
                   uint64_t fail_completion,
                   vbr_h2d_stats & stats) noexcept {
         if (test_seam_) {
@@ -605,7 +599,8 @@ class vbr_kv_import_session {
             }
             destination = &source_alias;
         }
-        uint64_t destination_offset = read.source_offset;
+        uint64_t destination_offset = read.projection_ranges.empty()
+            ? read.source_offset : read.destination_offset;
         if (read.kind == vbr_staged_read_kind::clean_stash) {
             destination = stash_alias(*pool, *extent, read.size);
             destination_offset = 0;
@@ -613,15 +608,36 @@ class vbr_kv_import_session {
                 return false;
             }
         }
-        vbr_h2d_transfer transfer;
-        transfer.lane = read.lane;
-        transfer.source = { read.source ? read.source->size() : 0,
+        const vbr_artifact_byte_source source = {
+            read.source ? read.source->size() : 0,
             read.source.get(),
             [](const void * context, uint64_t offset,
                uint8_t * out, size_t size) noexcept {
                 return static_cast<const artifact_segment_chain *>(context)->read(
                     offset, out, size);
             } };
+        if (!read.projection_ranges.empty()) {
+            if (!ring_operation || !*ring_operation ||
+                read.kind != vbr_staged_read_kind::unit_payload) {
+                return false;
+            }
+            vbr_h2d_packed_transfer transfer;
+            transfer.lane = read.lane;
+            transfer.source = source;
+            transfer.ranges = read.projection_ranges.data();
+            transfer.range_count = read.projection_ranges.size();
+            transfer.size = read.size;
+            transfer.backend = pool->backend;
+            transfer.device = ggml_backend_get_device(pool->backend);
+            transfer.destination = destination;
+            transfer.destination_offset = destination_offset;
+            transfer.fail_completion_at = fail_completion;
+            return ring->stream_packed_reserved(
+                *ring_operation, transfer, stats) == vbr_h2d_status::ok;
+        }
+        vbr_h2d_transfer transfer;
+        transfer.lane = read.lane;
+        transfer.source = source;
         transfer.source_offset = read.source_offset;
         transfer.size = read.size;
         transfer.backend = pool->backend;
@@ -908,9 +924,11 @@ class vbr_kv_import_session {
             return test_seam_->session_barrier(
                 child_id_, ledger_serial, manifest);
         }
+        const bool source_ready = manifest.is_prefix_projection()
+            ? manifest.projection_transfer_ready()
+            : manifest.source_package().validate() == vbr_artifact_status::ok;
         if (!armed_ || !image_ready_ || !cache_->vbr_import_in_progress_ ||
-            cache_->vbr_import_operation_ != operation_ ||
-            manifest.source_package().validate() != vbr_artifact_status::ok ||
+            cache_->vbr_import_operation_ != operation_ || !source_ready ||
             !cache_->vbr_generation_tracker_get()->import_image_installable(
                 tracker_image_, operation_)) {
             return false;
@@ -1576,7 +1594,10 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         manifest.reset(new vbr_validated_manifest(std::move(manifest_value)));
         staged.reset(new vbr_staged_payloads(std::move(staged_value)));
         if (!manifest || !staged ||
-            !manifest->source_package() ||
+            (!manifest->is_prefix_projection() &&
+             !manifest->source_package()) ||
+            (manifest->is_prefix_projection() &&
+             !manifest->projection_transfer_ready()) ||
             manifest->adoption_nonce() == 0 ||
             manifest->adoption_nonce() != staged->adoption_nonce() ||
             manifest->manifest_digest() != staged->manifest_digest() ||
@@ -1737,6 +1758,18 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             (!test_target(server_hooks) && !staged->adoption_ring())) {
             return fail(vbr_adopt_status::transfer_failed);
         }
+        const bool prefix_projection = manifest->is_prefix_projection();
+        if (prefix_projection && !manifest->projection_transfer_ready()) {
+            return fail(vbr_adopt_status::source_changed);
+        }
+        vbr_h2d_ring_operation projection_operation;
+        if (prefix_projection && !test_target(server_hooks)) {
+            projection_operation =
+                staged->adoption_ring()->try_begin_operation();
+            if (!projection_operation) {
+                return fail(vbr_adopt_status::operation_unavailable);
+            }
+        }
         std::map<std::pair<uint32_t, uint32_t>, uint32_t> transferred_units;
         uint64_t completion = 0;
         if (out.decision == vbr_import_decision::downward_rebase) {
@@ -1761,6 +1794,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             auto * ring = staged->adoption_ring();
             if (!child->second.session->transfer(
                     read, ring,
+                    prefix_projection && !test_target(server_hooks)
+                        ? &projection_operation : nullptr,
                     server_hooks.test != nullptr &&
                             completion == server_hooks.test->fault.fail_h2d_completion
                         ? 0 : UINT64_MAX, stats)) {
@@ -1772,6 +1807,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             ++transferred_units[std::make_pair(
                 read.child_id, read.logical_unit_id)];
         }
+        // Projection owns the shared transport only across its selected H2D
+        // bytes; all later validation and publication work is CPU-local.
+        projection_operation = {};
         if (out.decision == vbr_import_decision::downward_rebase) {
             const auto status = downward_transform_all(
                 children, *manifest, *staged, server_hooks, out);
@@ -1788,8 +1826,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             return fail(vbr_adopt_status::transfer_failed);
         }
         for (const auto & plan : manifest->children()) {
-            const uint64_t expected =
-                uint64_t(plan.shards.size())*plan.authorized_runs.size();
+            const uint64_t expected = prefix_projection
+                ? plan.shards.size()
+                : uint64_t(plan.shards.size())*plan.authorized_runs.size();
             if (expected == 0 || expected > UINT32_MAX ||
                 transferred_units[{ plan.child_id, plan.logical_unit_id }] !=
                     expected) {
@@ -1820,7 +1859,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             vbr_h2d_stats stats;
             if (child == children.end() ||
                 !child->second.session->transfer(
-                    read, staged->adoption_ring(), UINT64_MAX, stats)) {
+                    read, staged->adoption_ring(), nullptr,
+                    UINT64_MAX, stats)) {
                 return fail(vbr_adopt_status::companion_failed);
             }
             out.h2d_bytes += stats.bytes;
@@ -1910,7 +1950,10 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 manifest->target().policy_epoch ||
             !downward_projection_stable ||
             !operation_quiescent(operation, server_hooks) ||
-            manifest->source_package().validate() != vbr_artifact_status::ok) {
+            (manifest->is_prefix_projection()
+                ? !manifest->projection_transfer_ready()
+                : manifest->source_package().validate() !=
+                    vbr_artifact_status::ok)) {
             return fail(vbr_adopt_status::barrier_failed);
         }
         std::vector<llama_memory_tree_child> barrier_tree;
