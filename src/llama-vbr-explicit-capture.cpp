@@ -195,16 +195,27 @@ std::array<uint8_t, 32> tagged_digest(
     return writer.finish();
 }
 
+struct capture_transfer_cancelled {};
+
 class chain_io_writer final : public llama_io_write_i {
 public:
     static constexpr size_t CHUNK_BYTES = 1024*1024;
 
     chain_io_writer(
             artifact_segment_chain & chain,
-            uint64_t expected_bytes)
+            uint64_t expected_bytes,
+            void * continue_context = nullptr,
+            vbr_projected_capture_batch_request::continue_transfer_fn
+                continue_transfer = nullptr,
+            uint64_t * tensor_d2h_bytes = nullptr,
+            uint64_t * tensor_d2h_reads = nullptr)
         : chain_(chain), expected_bytes_(expected_bytes),
           scratch_(size_t(std::max<uint64_t>(
-              1, std::min<uint64_t>(CHUNK_BYTES, expected_bytes)))) {
+              1, std::min<uint64_t>(CHUNK_BYTES, expected_bytes)))),
+          continue_context_(continue_context),
+          continue_transfer_(continue_transfer),
+          tensor_d2h_bytes_(tensor_d2h_bytes),
+          tensor_d2h_reads_(tensor_d2h_reads) {
         if (expected_bytes > SIZE_MAX) {
             throw std::length_error("companion payload exceeds size_t");
         }
@@ -238,10 +249,29 @@ public:
         }
         account(size);
         while (size != 0) {
+            check_continue();
             ensure_scratch();
             const size_t take = std::min(size, scratch_.size() - used_);
             ggml_backend_tensor_get(
                 tensor, scratch_.data() + used_, offset, take);
+            if (tensor_d2h_bytes_) {
+                if (*tensor_d2h_bytes_ > UINT64_MAX - take) {
+                    throw std::overflow_error(
+                        "companion D2H byte counter overflow");
+                }
+                *tensor_d2h_bytes_ += take;
+            }
+            if (tensor_d2h_reads_) {
+                if (*tensor_d2h_reads_ == UINT64_MAX) {
+                    throw std::overflow_error(
+                        "companion D2H read counter overflow");
+                }
+                ++*tensor_d2h_reads_;
+            }
+            // Bound cancellation latency to one synchronous tensor quantum
+            // even when the queue becomes nonempty immediately after the
+            // pre-read probe.
+            check_continue();
             used_ += take;
             offset += take;
             size -= take;
@@ -262,6 +292,13 @@ public:
     }
 
 private:
+    void check_continue() const {
+        if (continue_transfer_ &&
+            !continue_transfer_(continue_context_)) {
+            throw capture_transfer_cancelled {};
+        }
+    }
+
     void account(size_t size) {
         if (written_ > expected_bytes_ ||
             size > expected_bytes_ - written_ ||
@@ -298,6 +335,11 @@ private:
     uint64_t written_ = 0;
     std::vector<uint8_t> scratch_;
     size_t used_ = 0;
+    void * continue_context_ = nullptr;
+    vbr_projected_capture_batch_request::continue_transfer_fn
+        continue_transfer_ = nullptr;
+    uint64_t * tensor_d2h_bytes_ = nullptr;
+    uint64_t * tensor_d2h_reads_ = nullptr;
 };
 
 class counting_io_writer final : public llama_io_write_i {
@@ -388,9 +430,20 @@ bool recurrent_companion_capture(
         llama_seq_id sequence,
         std::unique_ptr<artifact_segment_chain> & output,
         std::array<uint8_t, 32> & digest,
-        vbr_explicit_capture_status & status) noexcept {
+        vbr_explicit_capture_status & status,
+        void * continue_context = nullptr,
+        vbr_projected_capture_batch_request::continue_transfer_fn
+            continue_transfer = nullptr,
+        uint64_t * d2h_bytes = nullptr,
+        uint64_t * d2h_reads = nullptr) noexcept {
     output.reset();
     digest = {};
+    if (d2h_bytes) {
+        *d2h_bytes = 0;
+    }
+    if (d2h_reads) {
+        *d2h_reads = 0;
+    }
     try {
         if (plan.source == nullptr ||
             plan.descriptor.payload_bytes == 0 || sequence < 0) {
@@ -404,7 +457,10 @@ bool recurrent_companion_capture(
         }
         auto chain = std::make_unique<artifact_segment_chain>(
             plan.descriptor.payload_bytes);
-        chain_io_writer writer(*chain, plan.descriptor.payload_bytes);
+        chain_io_writer writer(
+            *chain, plan.descriptor.payload_bytes,
+            continue_context, continue_transfer,
+            d2h_bytes, d2h_reads);
         plan.source->state_write(writer, sequence, 0);
         if (!writer.finish() ||
             writer.n_bytes() != plan.descriptor.payload_bytes ||
@@ -424,6 +480,11 @@ bool recurrent_companion_capture(
         }
         output = std::move(chain);
         return true;
+    } catch (const capture_transfer_cancelled &) {
+        output.reset();
+        digest = {};
+        status = vbr_explicit_capture_status::cancelled;
+        return false;
     } catch (...) {
         output.reset();
         digest = {};
@@ -471,6 +532,8 @@ vbr_explicit_capture_status stream_status(
             return vbr_explicit_capture_status::ok;
         case vbr_capture_stream_status::ring_unavailable:
             return vbr_explicit_capture_status::ring_unavailable;
+        case vbr_capture_stream_status::cancelled:
+            return vbr_explicit_capture_status::cancelled;
         case vbr_capture_stream_status::transfer_failed:
             return vbr_explicit_capture_status::transfer_failed;
         case vbr_capture_stream_status::short_read:
@@ -1002,13 +1065,21 @@ public:
             const vbr_capture_projection & projection,
             uint64_t source_namespace,
             vbr_pinned_chunk_ring & ring,
-            vbr_capture_projected_unit & output) noexcept {
+            vbr_capture_projected_unit & output,
+            void * continue_context = nullptr,
+            vbr_projected_capture_batch_request::continue_transfer_fn
+                continue_transfer = nullptr,
+            vbr_capture_stream_stats * attempted = nullptr) noexcept {
         if (!value.cache) {
             return vbr_capture_stream_status::snapshot_unavailable;
         }
         std::vector<vbr_capture_projected_shard_source> sources;
         if (!value.cache->vbr_capture_projected_sources(plan, sources)) {
             return vbr_capture_stream_status::snapshot_unavailable;
+        }
+        for (auto & source : sources) {
+            source.source.continue_context = continue_context;
+            source.source.continue_transfer = continue_transfer;
         }
         llama_kv_cache::vbr_capture_snapshot_session session;
         if (!value.cache->vbr_capture_snapshot_bind(
@@ -1017,7 +1088,7 @@ public:
         }
         return vbr_capture_projected_unit_transfer(
             projection, value.child_id, 0, plan.logical_unit,
-            sources, {}, session.provider(), ring, output);
+            sources, {}, session.provider(), ring, output, attempted);
     }
 
     struct representation_cache_entry {
@@ -1640,7 +1711,9 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             manifest_recurrent_plans.reserve(recurrent_children.size());
             for (auto * recurrent : recurrent_children) {
                 recurrent_companion_plan companion;
-                vbr_explicit_capture_status companion_status;
+                vbr_explicit_capture_status companion_status =
+                    vbr_explicit_capture_status::
+                        required_companion_unavailable;
                 if (!recurrent_companion_prepare(
                         recurrent, manifest_request.sequence,
                         identity.next_position,
@@ -1926,12 +1999,31 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                  ++companion_index) {
                 std::unique_ptr<artifact_segment_chain> chain;
                 std::array<uint8_t, 32> companion_digest;
-                vbr_explicit_capture_status companion_status;
+                vbr_explicit_capture_status companion_status =
+                    vbr_explicit_capture_status::
+                        required_companion_unavailable;
                 vbr_capture_sealed_companion capability;
-                if (!recurrent_companion_capture(
+                uint64_t companion_d2h_bytes = 0;
+                uint64_t companion_d2h_reads = 0;
+                const bool companion_captured = recurrent_companion_capture(
                         recurrent_plans[manifest_index][companion_index],
                         request.manifests[manifest_index].sequence,
-                        chain, companion_digest, companion_status) ||
+                        chain, companion_digest, companion_status,
+                        request.continue_context,
+                        request.continue_transfer,
+                        &companion_d2h_bytes,
+                        &companion_d2h_reads);
+                if (companion_d2h_bytes > UINT64_MAX -
+                        result.companion_d2h_bytes ||
+                    companion_d2h_reads > UINT64_MAX -
+                        result.companion_d2h_reads) {
+                    result.status =
+                        vbr_explicit_capture_status::size_overflow;
+                    return result;
+                }
+                result.companion_d2h_bytes += companion_d2h_bytes;
+                result.companion_d2h_reads += companion_d2h_reads;
+                if (!companion_captured ||
                     !vbr_capture_seal_companion(
                         uint32_t(companion_index), std::move(chain),
                         capability) ||
@@ -1939,6 +2031,11 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                     !recurrent_companion_current(
                         recurrent_plans[manifest_index][companion_index],
                         request.manifests[manifest_index].sequence)) {
+                    if (companion_status ==
+                            vbr_explicit_capture_status::cancelled) {
+                        result.status = companion_status;
+                        return result;
+                    }
                     manifest_dependency_available[manifest_index] = false;
                     sealed.clear();
                     rebuild_projection = true;
@@ -1993,15 +2090,57 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             }
             for (const auto & plan : child.units) {
                 vbr_capture_projected_unit captured;
+                vbr_capture_stream_stats attempted;
                 ++result.unit_transfer_calls;
                 const auto transferred =
                     vbr_live_capture_adapter::transfer_projected_unit(
                         child, plan, projection, result.source_namespace,
-                        *request.ring, captured);
+                        *request.ring, captured,
+                        request.continue_context,
+                        request.continue_transfer, &attempted);
                 if (transferred != vbr_capture_stream_status::ok) {
+                    if (attempted.bytes >
+                            UINT64_MAX - result.transfer.bytes ||
+                        attempted.chunks >
+                            UINT64_MAX - result.transfer.chunks ||
+                        attempted.submitted_bytes >
+                            UINT64_MAX - result.transfer.submitted_bytes ||
+                        attempted.submitted_chunks >
+                            UINT64_MAX - result.transfer.submitted_chunks ||
+                        attempted.backpressure_waits >
+                            UINT64_MAX - result.transfer.backpressure_waits ||
+                        attempted.event_completions >
+                            UINT64_MAX - result.transfer.event_completions ||
+                        attempted.synchronous_fallbacks >
+                            UINT64_MAX - result.transfer.synchronous_fallbacks) {
+                        result.status =
+                            vbr_explicit_capture_status::internal_error;
+                        return result;
+                    }
+                    result.transfer.bytes += attempted.bytes;
+                    result.transfer.chunks += attempted.chunks;
+                    result.transfer.submitted_bytes +=
+                        attempted.submitted_bytes;
+                    result.transfer.submitted_chunks +=
+                        attempted.submitted_chunks;
+                    result.transfer.backpressure_waits +=
+                        attempted.backpressure_waits;
+                    result.transfer.event_completions +=
+                        attempted.event_completions;
+                    result.transfer.synchronous_fallbacks +=
+                        attempted.synchronous_fallbacks;
+                    result.transfer.max_segment_size = std::max(
+                        result.transfer.max_segment_size,
+                        attempted.max_segment_size);
                     if (result.inner_stream_status ==
                             vbr_capture_stream_status::_count) {
                         result.inner_stream_status = transferred;
+                    }
+                    if (transferred ==
+                            vbr_capture_stream_status::cancelled) {
+                        result.status =
+                            vbr_explicit_capture_status::cancelled;
+                        return result;
                     }
                     if (transferred ==
                             vbr_capture_stream_status::snapshot_unavailable ||
@@ -2020,6 +2159,10 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 const auto & stats = captured.transfer();
                 if (stats.bytes > UINT64_MAX - result.transfer.bytes ||
                     stats.chunks > UINT64_MAX - result.transfer.chunks ||
+                    stats.submitted_bytes >
+                        UINT64_MAX - result.transfer.submitted_bytes ||
+                    stats.submitted_chunks >
+                        UINT64_MAX - result.transfer.submitted_chunks ||
                     stats.backpressure_waits >
                         UINT64_MAX - result.transfer.backpressure_waits ||
                     stats.event_completions >
@@ -2031,6 +2174,8 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 }
                 result.transfer.bytes += stats.bytes;
                 result.transfer.chunks += stats.chunks;
+                result.transfer.submitted_bytes += stats.submitted_bytes;
+                result.transfer.submitted_chunks += stats.submitted_chunks;
                 result.transfer.backpressure_waits +=
                     stats.backpressure_waits;
                 result.transfer.event_completions +=
@@ -3067,6 +3212,7 @@ const char * vbr_explicit_capture_status_name(
         case vbr_explicit_capture_status::size_overflow: return "size_overflow";
         case vbr_explicit_capture_status::ring_unavailable: return "ring_unavailable";
         case vbr_explicit_capture_status::admission_refused: return "admission_refused";
+        case vbr_explicit_capture_status::cancelled: return "cancelled";
         case vbr_explicit_capture_status::transfer_failed: return "transfer_failed";
         case vbr_explicit_capture_status::short_read: return "short_read";
         case vbr_explicit_capture_status::event_failed: return "event_failed";

@@ -155,6 +155,10 @@ private:
         uint32_t submit_failed = 0;
         uint32_t wait_failed = 0;
         uint32_t internal_error = 0;
+        // Cancellation-aware D2H bounds response latency by allowing only
+        // one submitted chunk at a time. Legacy/null-cancellation adapters
+        // retain the normal pipelined depth.
+        bool serialize_submissions = false;
         uint32_t (*fill)(
             void * context, uint8_t * destination,
             size_t capacity, pump_step & step) noexcept = nullptr;
@@ -171,6 +175,8 @@ private:
     struct pump_stats {
         uint64_t bytes = 0;
         uint64_t chunks = 0;
+        uint64_t submitted_bytes = 0;
+        uint64_t submitted_chunks = 0;
         uint64_t backpressure_waits = 0;
         uint64_t event_completions = 0;
         uint64_t synchronous_fallbacks = 0;

@@ -557,6 +557,7 @@ const char * vbr_capture_stream_status_name(
         case vbr_capture_stream_status::ok:                  return "ok";
         case vbr_capture_stream_status::invalid_argument:    return "invalid_argument";
         case vbr_capture_stream_status::ring_unavailable:    return "ring_unavailable";
+        case vbr_capture_stream_status::cancelled:           return "cancelled";
         case vbr_capture_stream_status::transfer_failed:     return "transfer_failed";
         case vbr_capture_stream_status::short_read:          return "short_read";
         case vbr_capture_stream_status::duplicate_segment:   return "duplicate_segment";
@@ -1585,6 +1586,7 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         uint32_t(vbr_capture_stream_status::internal_error);
     callbacks.internal_error =
         uint32_t(vbr_capture_stream_status::internal_error);
+    callbacks.serialize_submissions = source.continue_transfer != nullptr;
     callbacks.more = [](void * opaque) noexcept {
         const auto & context =
             *static_cast<capture_pump_context *>(opaque);
@@ -1597,6 +1599,10 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         auto & context = *static_cast<capture_pump_context *>(opaque);
         const auto & source = *context.source;
         try {
+            if (source.continue_transfer &&
+                !source.continue_transfer(source.continue_context)) {
+                return uint32_t(vbr_capture_stream_status::cancelled);
+            }
             size_t filled = 0;
             while (filled < capacity &&
                    context.range_index < context.range_count) {
@@ -1660,6 +1666,8 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         impl_->core->pump(source.lane, callbacks, pump_stats));
     stats.bytes = pump_stats.bytes;
     stats.chunks = pump_stats.chunks;
+    stats.submitted_bytes = pump_stats.submitted_bytes;
+    stats.submitted_chunks = pump_stats.submitted_chunks;
     stats.backpressure_waits = pump_stats.backpressure_waits;
     stats.event_completions = pump_stats.event_completions;
     stats.synchronous_fallbacks = pump_stats.synchronous_fallbacks;
@@ -1827,8 +1835,12 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
         const vbr_capture_projected_transfer_limits & limits,
         const vbr_capture_unit_snapshot_provider & snapshots,
         vbr_pinned_chunk_ring & ring,
-        vbr_capture_projected_unit & output) noexcept {
+        vbr_capture_projected_unit & output,
+        vbr_capture_stream_stats * attempted) noexcept {
     output = {};
+    if (attempted) {
+        *attempted = {};
+    }
     try {
         if (!projection || projection->source_namespace == 0 ||
             child_id == UINT32_MAX || stream_index == UINT32_MAX ||
@@ -2123,6 +2135,33 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
             vbr_capture_stream_stats stats;
             const auto streamed = ring.stream_ranges(
                 shard->source, ranges, *chain, stats);
+            if (attempted) {
+                if (stats.bytes > UINT64_MAX - attempted->bytes ||
+                    stats.chunks > UINT64_MAX - attempted->chunks ||
+                    stats.submitted_bytes >
+                        UINT64_MAX - attempted->submitted_bytes ||
+                    stats.submitted_chunks >
+                        UINT64_MAX - attempted->submitted_chunks ||
+                    stats.backpressure_waits >
+                        UINT64_MAX - attempted->backpressure_waits ||
+                    stats.event_completions >
+                        UINT64_MAX - attempted->event_completions ||
+                    stats.synchronous_fallbacks >
+                        UINT64_MAX - attempted->synchronous_fallbacks) {
+                    return vbr_capture_stream_status::internal_error;
+                }
+                attempted->bytes += stats.bytes;
+                attempted->chunks += stats.chunks;
+                attempted->submitted_bytes += stats.submitted_bytes;
+                attempted->submitted_chunks += stats.submitted_chunks;
+                attempted->backpressure_waits += stats.backpressure_waits;
+                attempted->event_completions += stats.event_completions;
+                attempted->synchronous_fallbacks +=
+                    stats.synchronous_fallbacks;
+                attempted->max_segment_size = std::max(
+                    attempted->max_segment_size,
+                    stats.max_segment_size);
+            }
             if (streamed != vbr_capture_stream_status::ok) {
                 return streamed;
             }
@@ -2139,6 +2178,8 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
             }
             result.transfer.bytes += stats.bytes;
             result.transfer.chunks += stats.chunks;
+            result.transfer.submitted_bytes += stats.submitted_bytes;
+            result.transfer.submitted_chunks += stats.submitted_chunks;
             result.transfer.backpressure_waits += stats.backpressure_waits;
             result.transfer.event_completions += stats.event_completions;
             result.transfer.synchronous_fallbacks +=

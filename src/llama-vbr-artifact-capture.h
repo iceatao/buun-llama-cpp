@@ -27,6 +27,7 @@ enum class vbr_capture_stream_status : uint8_t {
     ok = 0,
     invalid_argument,
     ring_unavailable,
+    cancelled,
     transfer_failed,
     short_read,
     duplicate_segment,
@@ -259,6 +260,14 @@ struct vbr_capture_stream_source {
     const void * context = nullptr;
     read_fn read = nullptr;
 
+    // Optional synchronous cancellation probe. It is called before each
+    // bounded ring chunk is read/submitted, never while a backend event is
+    // enqueued. False drains any already-pending events and aborts the pump;
+    // higher-level capture keeps the
+    // partial private chain unreachable and publishes no completed unit.
+    void * continue_context = nullptr;
+    bool (*continue_transfer)(void * context) noexcept = nullptr;
+
     // Deterministic synthetic completion-fault seam. Production callers keep
     // UINT64_MAX; tests prove a failed completion drains the ring and exposes
     // no verified segment.
@@ -273,6 +282,8 @@ struct vbr_capture_stream_range {
 struct vbr_capture_stream_stats {
     uint64_t bytes = 0;
     uint64_t chunks = 0;
+    uint64_t submitted_bytes = 0;
+    uint64_t submitted_chunks = 0;
     uint64_t backpressure_waits = 0;
     uint64_t event_completions = 0;
     uint64_t synchronous_fallbacks = 0;
@@ -541,7 +552,8 @@ class vbr_capture_projected_unit {
         const vbr_capture_projected_transfer_limits &,
         const vbr_capture_unit_snapshot_provider &,
         vbr_pinned_chunk_ring &,
-        vbr_capture_projected_unit &) noexcept;
+        vbr_capture_projected_unit &,
+        vbr_capture_stream_stats *) noexcept;
 };
 
 // A controller-authenticated representation target for one projected child.
@@ -695,7 +707,8 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
     const vbr_capture_projected_transfer_limits & limits,
     const vbr_capture_unit_snapshot_provider & snapshots,
     vbr_pinned_chunk_ring & ring,
-    vbr_capture_projected_unit & output) noexcept;
+    vbr_capture_projected_unit & output,
+    vbr_capture_stream_stats * attempted = nullptr) noexcept;
 
 struct vbr_verified_segment {
     uint32_t unit_index = UINT32_MAX;

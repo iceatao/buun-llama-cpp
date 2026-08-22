@@ -26,6 +26,7 @@ enum class server_vbr_artifact_capture_status : uint8_t {
     unauthorized,
     required_companion_unavailable,
     admission_refused,
+    cancelled,
     source_changed,
     internal_error,
     _count,
@@ -205,6 +206,8 @@ struct server_vbr_projected_host_capture_diagnostics {
     uint32_t projection_calls = 0;
     uint32_t unit_transfer_calls = 0;
     uint32_t transferred_units = 0;
+    uint64_t companion_d2h_bytes = 0;
+    uint64_t companion_d2h_reads = 0;
     vbr_capture_stream_stats transfer;
     server_vbr_projected_host_publish_diagnostics publication;
 };
@@ -217,6 +220,9 @@ struct server_vbr_projected_capture_admission {
     using quote = vbr_projected_capture_batch_request::pretransfer_quote;
     void * context = nullptr;
     bool (*admit)(void * context, const quote & quote) noexcept = nullptr;
+    // Optional continuation probe after admission. False cancels the batch
+    // between bounded recurrent writes or attention ring chunks.
+    bool (*continue_transfer)(void * context) noexcept = nullptr;
 };
 
 struct server_vbr_artifact_store_counters {

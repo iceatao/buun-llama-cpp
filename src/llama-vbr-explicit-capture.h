@@ -33,6 +33,7 @@ enum class vbr_explicit_capture_status : uint8_t {
     size_overflow,
     ring_unavailable,
     admission_refused,
+    cancelled,
     transfer_failed,
     short_read,
     // Reserved for a backend that can report asynchronous event failure.
@@ -336,6 +337,7 @@ struct vbr_projected_capture_batch_request {
     };
     using pretransfer_admit_fn = bool (*)(
         void * context, const pretransfer_quote & quote) noexcept;
+    using continue_transfer_fn = bool (*)(void * context) noexcept;
 
     bool idle_decode_thread = false;
     // Scheduler-admitted aggregate pageable payload runway for this batch.
@@ -355,6 +357,11 @@ struct vbr_projected_capture_batch_request {
     // Refusal returns admission_refused with zero unit transfers.
     void * pretransfer_context = nullptr;
     pretransfer_admit_fn pretransfer_admit = nullptr;
+    // Optional cancellation probe used only after pretransfer admission. It
+    // is checked between recurrent <=1 MiB writes and attention ring chunks.
+    // False aborts the complete batch without publication.
+    void * continue_context = nullptr;
+    continue_transfer_fn continue_transfer = nullptr;
 };
 
 struct vbr_projected_capture_batch_result {
@@ -377,6 +384,8 @@ struct vbr_projected_capture_batch_result {
     uint32_t projection_calls = 0;
     uint32_t unit_transfer_calls = 0;
     uint32_t transferred_units = 0;
+    uint64_t companion_d2h_bytes = 0;
+    uint64_t companion_d2h_reads = 0;
     vbr_capture_stream_stats transfer;
 };
 

@@ -1361,6 +1361,7 @@ static llama_vbr_artifact_publish_result publish_fixture(
             break;
         case vbr_capture_stream_status::transfer_failed:
         case vbr_capture_stream_status::short_read:
+        case vbr_capture_stream_status::cancelled:
             out.status = llama_vbr_artifact_publish_status::shard_failed;
             break;
         default:

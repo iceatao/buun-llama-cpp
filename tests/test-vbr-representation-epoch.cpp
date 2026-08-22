@@ -999,6 +999,8 @@ struct h2_pretransfer_admission {
     uint32_t calls = 0;
     bool accept = true;
     vbr_projected_capture_batch_request::pretransfer_quote quote;
+    uint32_t continuation_calls = 0;
+    uint32_t continuations_allowed = UINT32_MAX;
 };
 
 static bool h2_pretransfer_admit(
@@ -1012,6 +1014,12 @@ static bool h2_pretransfer_admit(
     ++state->calls;
     state->quote = quote;
     return state->accept;
+}
+
+static bool h2_transfer_continue(void * opaque) noexcept {
+    auto * state = static_cast<h2_pretransfer_admission *>(opaque);
+    return state &&
+        state->continuation_calls++ < state->continuations_allowed;
 }
 
 static bool h2_projected_capture_batch_exact(
@@ -1074,6 +1082,8 @@ static bool h2_projected_capture_batch_exact(
     h2_pretransfer_admission admission;
     request.pretransfer_context = &admission;
     request.pretransfer_admit = h2_pretransfer_admit;
+    request.continue_context = &admission;
+    request.continue_transfer = h2_transfer_continue;
     for (uint32_t i = 0; i < manifest_count; ++i) {
         vbr_projected_capture_manifest_request manifest;
         manifest.manifest_id = 100 + i;
@@ -1103,8 +1113,11 @@ static bool h2_projected_capture_batch_exact(
         admission.quote.union_cells != captured.union_cells ||
         admission.quote.manifests != manifest_count ||
         admission.quote.projected_units == 0 ||
+        admission.continuation_calls == 0 ||
         captured.unit_transfer_calls == 0 ||
-        captured.transferred_units != captured.unit_transfer_calls) {
+        captured.transferred_units != captured.unit_transfer_calls ||
+        captured.transfer.submitted_bytes != captured.transfer.bytes ||
+        captured.transfer.submitted_chunks != captured.transfer.chunks) {
         return false;
     }
     uint32_t identity_keys = 0;
@@ -1140,6 +1153,7 @@ static bool h2_projected_capture_batch_exact(
         h2_pretransfer_admission refused_admission;
         refused_admission.accept = false;
         admission_refused_request.pretransfer_context = &refused_admission;
+        admission_refused_request.continue_context = &refused_admission;
         const auto admission_refused = vbr_capture_projected_batch(
             memory, admission_refused_request);
         if (admission_refused.status !=
@@ -1147,6 +1161,7 @@ static bool h2_projected_capture_batch_exact(
             admission_refused.phase !=
                 vbr_explicit_capture_phase::reservation_preparation ||
             refused_admission.calls != 1 ||
+            refused_admission.continuation_calls != 0 ||
             refused_admission.quote.planned_packed_bytes == 0 ||
             admission_refused.unit_transfer_calls != 0 ||
             admission_refused.transferred_units != 0 ||
@@ -1155,11 +1170,84 @@ static bool h2_projected_capture_batch_exact(
             !admission_refused.publications.empty()) {
             return false;
         }
+        auto cancelled_request = request;
+        h2_pretransfer_admission cancelled_admission;
+        cancelled_admission.continuations_allowed = 0;
+        cancelled_request.pretransfer_context = &cancelled_admission;
+        cancelled_request.continue_context = &cancelled_admission;
+        const auto cancelled = vbr_capture_projected_batch(
+            memory, cancelled_request);
+        if (cancelled.status !=
+                vbr_explicit_capture_status::cancelled ||
+            cancelled.phase !=
+                vbr_explicit_capture_phase::companion_capture ||
+            cancelled_admission.calls != 1 ||
+            cancelled_admission.continuation_calls != 1 ||
+            cancelled.unit_transfer_calls != 0 ||
+            cancelled.transferred_units != 0 ||
+            cancelled.transfer.bytes != 0 || cancelled.assembly ||
+            !cancelled.publications.empty()) {
+            return false;
+        }
+        auto companion_mid_cancelled_request = request;
+        h2_pretransfer_admission companion_mid_cancelled_admission;
+        companion_mid_cancelled_admission.continuations_allowed = 1;
+        companion_mid_cancelled_request.pretransfer_context =
+            &companion_mid_cancelled_admission;
+        companion_mid_cancelled_request.continue_context =
+            &companion_mid_cancelled_admission;
+        const auto companion_mid_cancelled = vbr_capture_projected_batch(
+            memory, companion_mid_cancelled_request);
+        if (companion_mid_cancelled.status !=
+                vbr_explicit_capture_status::cancelled ||
+            companion_mid_cancelled.phase !=
+                vbr_explicit_capture_phase::companion_capture ||
+            companion_mid_cancelled_admission.calls != 1 ||
+            companion_mid_cancelled_admission.continuation_calls != 2 ||
+            companion_mid_cancelled.companion_d2h_reads != 1 ||
+            companion_mid_cancelled.companion_d2h_bytes == 0 ||
+            companion_mid_cancelled.unit_transfer_calls != 0 ||
+            companion_mid_cancelled.assembly ||
+            !companion_mid_cancelled.publications.empty()) {
+            return false;
+        }
+        if (admission.continuation_calls < 2) {
+            return false;
+        }
+        auto attention_cancelled_request = request;
+        h2_pretransfer_admission attention_cancelled_admission;
+        attention_cancelled_admission.continuations_allowed =
+            admission.continuation_calls - 1;
+        attention_cancelled_request.pretransfer_context =
+            &attention_cancelled_admission;
+        attention_cancelled_request.continue_context =
+            &attention_cancelled_admission;
+        const auto attention_cancelled = vbr_capture_projected_batch(
+            memory, attention_cancelled_request);
+        if (attention_cancelled.status !=
+                vbr_explicit_capture_status::cancelled ||
+            attention_cancelled.phase !=
+                vbr_explicit_capture_phase::unit_transfer ||
+            attention_cancelled.inner_stream_status !=
+                vbr_capture_stream_status::cancelled ||
+            attention_cancelled_admission.calls != 1 ||
+            attention_cancelled.unit_transfer_calls == 0 ||
+            attention_cancelled.transfer.submitted_chunks == 0 ||
+            attention_cancelled.transfer.submitted_bytes == 0 ||
+            attention_cancelled.transfer.submitted_bytes <
+                attention_cancelled.transfer.bytes ||
+            attention_cancelled.transfer.submitted_chunks <
+                attention_cancelled.transfer.chunks ||
+            attention_cancelled.assembly ||
+            !attention_cancelled.publications.empty()) {
+            return false;
+        }
         auto refused_request = request;
         refused_request.max_packed_bytes =
             captured.planned_packed_bytes - 1;
         h2_pretransfer_admission over_cap_admission;
         refused_request.pretransfer_context = &over_cap_admission;
+        refused_request.continue_context = &over_cap_admission;
         const auto refused = vbr_capture_projected_batch(
             memory, refused_request);
         if (refused.status !=

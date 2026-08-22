@@ -618,6 +618,8 @@ uint32_t vbr_bounded_pinned_ring_core::pump(
             stats.synchronous_fallbacks +=
                 uint64_t(synchronous_fallback) +
                 uint64_t(step.adapter_synchronous_fallback);
+            stats.submitted_bytes += step.valid;
+            stats.submitted_chunks++;
             live_pinned += step.valid;
             stats.peak_pinned_bytes =
                 std::max(stats.peak_pinned_bytes, live_pinned);
@@ -629,6 +631,13 @@ uint32_t vbr_bounded_pinned_ring_core::pump(
             } catch (...) {
                 abandon(current);
                 throw;
+            }
+            if (callbacks.serialize_submissions) {
+                const uint32_t drained = drain_front();
+                if (drained != callbacks.ok) {
+                    abandon_pending();
+                    return drained;
+                }
             }
         }
         while (!pending.empty()) {

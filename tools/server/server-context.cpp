@@ -10467,11 +10467,14 @@ private:
                 static_cast<server_context_impl *>(opaque);
             // Planning can include controller settlement, projection and
             // recurrent sizing. Recheck the scheduler queue at the exact
-            // pre-D2H boundary so a request arriving during that work never
-            // does not begin behind work that is already queued. Arrivals
-            // after this synchronous gate are covered by the deliberately
-            // bounded transfer ceiling until cancellable/background capture
-            // owns the following slice.
+            // pre-D2H boundary so capture does not begin behind work already
+            // queued. Later arrivals cancel between bounded recurrent writes
+            // or attention ring chunks.
+            return self && !self->queue_tasks.has_pending_tasks();
+        };
+        admission.continue_transfer = [](void * opaque) noexcept {
+            auto * self =
+                static_cast<server_context_impl *>(opaque);
             return self && !self->queue_tasks.has_pending_tasks();
         };
         const int64_t started = ggml_time_us();

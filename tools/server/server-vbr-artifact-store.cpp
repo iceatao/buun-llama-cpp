@@ -91,6 +91,8 @@ server_vbr_artifact_capture_status map_status(
                 required_companion_unavailable;
         case vbr_explicit_capture_status::admission_refused:
             return server_vbr_artifact_capture_status::admission_refused;
+        case vbr_explicit_capture_status::cancelled:
+            return server_vbr_artifact_capture_status::cancelled;
         case vbr_explicit_capture_status::source_changed:
             return server_vbr_artifact_capture_status::source_changed;
         case vbr_explicit_capture_status::generation_unavailable:
@@ -1145,6 +1147,10 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
             request.pretransfer_context = admission->context;
             request.pretransfer_admit = admission->admit;
         }
+        if (admission && admission->continue_transfer) {
+            request.continue_context = admission->context;
+            request.continue_transfer = admission->continue_transfer;
+        }
 
         auto captured = vbr_capture_projected_batch(memory, request);
         server_vbr_projected_host_capture_diagnostics measured;
@@ -1158,6 +1164,8 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         measured.projection_calls = captured.projection_calls;
         measured.unit_transfer_calls = captured.unit_transfer_calls;
         measured.transferred_units = captured.transferred_units;
+        measured.companion_d2h_bytes = captured.companion_d2h_bytes;
+        measured.companion_d2h_reads = captured.companion_d2h_reads;
         measured.transfer = captured.transfer;
         if (captured.status != vbr_explicit_capture_status::ok ||
             !captured.assembly ||
@@ -1547,6 +1555,7 @@ const char * server_vbr_artifact_capture_status_name(
         case server_vbr_artifact_capture_status::unauthorized: return "unauthorized";
         case server_vbr_artifact_capture_status::required_companion_unavailable: return "required_companion_unavailable";
         case server_vbr_artifact_capture_status::admission_refused: return "admission_refused";
+        case server_vbr_artifact_capture_status::cancelled: return "cancelled";
         case server_vbr_artifact_capture_status::source_changed: return "source_changed";
         case server_vbr_artifact_capture_status::internal_error: return "internal_error";
         case server_vbr_artifact_capture_status::_count: return "_count";

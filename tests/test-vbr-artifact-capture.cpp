@@ -366,6 +366,35 @@ static void test_cpu_ring_boundaries() {
     CHECK(other->stream(
         source, failed_completion, other_stats) ==
             vbr_capture_stream_status::transfer_failed);
+
+    struct cancellation_state {
+        uint32_t probes = 0;
+        uint32_t allowed = 1;
+    } cancellation;
+    source.fail_completion_at = UINT64_MAX;
+    source.continue_context = &cancellation;
+    source.continue_transfer = [](void * opaque) noexcept {
+        auto & state = *static_cast<cancellation_state *>(opaque);
+        return state.probes++ < state.allowed;
+    };
+    artifact_segment_chain cancelled;
+    CHECK(other->stream(source, cancelled, other_stats) ==
+          vbr_capture_stream_status::cancelled);
+    CHECK(cancellation.probes == 2);
+    CHECK(other_stats.bytes == other->chunk_bytes());
+    CHECK(other_stats.chunks == 1);
+    CHECK(other_stats.submitted_bytes == other->chunk_bytes());
+    CHECK(other_stats.submitted_chunks == 1);
+    CHECK(cancelled.size() == other->chunk_bytes());
+
+    // Cancellation drains the operation/chunk state; the next transfer can
+    // immediately reuse the same persistent ring.
+    source.continue_context = nullptr;
+    source.continue_transfer = nullptr;
+    artifact_segment_chain after_cancel;
+    CHECK(other->stream(source, after_cancel, other_stats) ==
+          vbr_capture_stream_status::ok);
+    CHECK(read_chain(after_cancel) == input.bytes);
 }
 
 struct projected_snapshot_fixture {
