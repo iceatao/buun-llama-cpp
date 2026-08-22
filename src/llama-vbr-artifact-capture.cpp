@@ -1488,12 +1488,25 @@ size_t vbr_pinned_chunk_ring::lane_count() const noexcept {
     return impl_ && impl_->core ? impl_->core->lane_count() : 0;
 }
 
+vbr_pinned_ring_operation
+vbr_pinned_chunk_ring::try_begin_operation() noexcept {
+    if (!impl_ || !impl_->core) {
+        return {};
+    }
+    auto operation = impl_->core->try_begin_operation();
+    if (operation) {
+        operation.keepalive_ = impl_->core;
+    }
+    return operation;
+}
+
 vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
         const vbr_capture_stream_source & source,
         artifact_segment_chain & destination,
         vbr_capture_stream_stats & stats) noexcept {
     const vbr_capture_stream_range range { 0, source.size };
-    return stream_ranges_impl(source, &range, 1, destination, stats);
+    return stream_ranges_impl(
+        nullptr, source, &range, 1, destination, stats);
 }
 
 vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges(
@@ -1502,10 +1515,21 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges(
         artifact_segment_chain & destination,
         vbr_capture_stream_stats & stats) noexcept {
     return stream_ranges_impl(
-        source, ranges.data(), ranges.size(), destination, stats);
+        nullptr, source, ranges.data(), ranges.size(), destination, stats);
+}
+
+vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_reserved(
+        const vbr_pinned_ring_operation & operation,
+        const vbr_capture_stream_source & source,
+        const std::vector<vbr_capture_stream_range> & ranges,
+        artifact_segment_chain & destination,
+        vbr_capture_stream_stats & stats) noexcept {
+    return stream_ranges_impl(
+        &operation, source, ranges.data(), ranges.size(), destination, stats);
 }
 
 vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
+        const vbr_pinned_ring_operation * operation,
         const vbr_capture_stream_source & source,
         const vbr_capture_stream_range * ranges,
         size_t range_count,
@@ -1662,8 +1686,10 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
     };
 
     vbr_bounded_pinned_ring_core::pump_stats pump_stats;
-    const auto pumped = vbr_capture_stream_status(
-        impl_->core->pump(source.lane, callbacks, pump_stats));
+    const auto pumped = vbr_capture_stream_status(operation
+        ? impl_->core->pump_reserved(
+              *operation, source.lane, callbacks, pump_stats)
+        : impl_->core->pump(source.lane, callbacks, pump_stats));
     stats.bytes = pump_stats.bytes;
     stats.chunks = pump_stats.chunks;
     stats.submitted_bytes = pump_stats.submitted_bytes;
@@ -1836,7 +1862,8 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
         const vbr_capture_unit_snapshot_provider & snapshots,
         vbr_pinned_chunk_ring & ring,
         vbr_capture_projected_unit & output,
-        vbr_capture_stream_stats * attempted) noexcept {
+        vbr_capture_stream_stats * attempted,
+        const vbr_pinned_ring_operation * operation) noexcept {
     output = {};
     if (attempted) {
         *attempted = {};
@@ -2133,8 +2160,11 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
                 VBR_CAPTURE_RANGE_CHUNK_BYTES,
                 shard_authenticated_chunks[shard_index]);
             vbr_capture_stream_stats stats;
-            const auto streamed = ring.stream_ranges(
-                shard->source, ranges, *chain, stats);
+            const auto streamed = operation
+                ? ring.stream_ranges_reserved(
+                      *operation, shard->source, ranges, *chain, stats)
+                : ring.stream_ranges(
+                      shard->source, ranges, *chain, stats);
             if (attempted) {
                 if (stats.bytes > UINT64_MAX - attempted->bytes ||
                     stats.chunks > UINT64_MAX - attempted->chunks ||

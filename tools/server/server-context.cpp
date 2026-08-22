@@ -10466,10 +10466,10 @@ private:
             auto * self =
                 static_cast<server_context_impl *>(opaque);
             // Planning can include controller settlement, projection and
-            // recurrent sizing. Recheck the scheduler queue at the exact
-            // pre-D2H boundary so capture does not begin behind work already
-            // queued. Later arrivals cancel between bounded recurrent writes
-            // or attention ring chunks.
+            // recurrent sizing. The store now holds the exact transfer-
+            // staging claim while this final queue check runs, so capture
+            // cannot begin behind work already queued. Later arrivals cancel
+            // between bounded recurrent writes or attention ring chunks.
             return self && !self->queue_tasks.has_pending_tasks();
         };
         admission.continue_transfer = [](void * opaque) noexcept {

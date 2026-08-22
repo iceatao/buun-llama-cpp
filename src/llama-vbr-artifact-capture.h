@@ -427,6 +427,10 @@ public:
     size_t chunk_bytes() const noexcept;
     size_t lane_count() const noexcept;
 
+    // Reserves the direction-neutral transport for a complete projected
+    // batch. The move-only token releases on destruction.
+    vbr_pinned_ring_operation try_begin_operation() noexcept;
+
     vbr_capture_stream_status stream(
         const vbr_capture_stream_source & source,
         artifact_segment_chain & destination,
@@ -441,10 +445,18 @@ public:
         artifact_segment_chain & destination,
         vbr_capture_stream_stats & stats) noexcept;
 
+    vbr_capture_stream_status stream_ranges_reserved(
+        const vbr_pinned_ring_operation & operation,
+        const vbr_capture_stream_source & source,
+        const std::vector<vbr_capture_stream_range> & ranges,
+        artifact_segment_chain & destination,
+        vbr_capture_stream_stats & stats) noexcept;
+
 private:
     struct impl;
     explicit vbr_pinned_chunk_ring(std::unique_ptr<impl> state) noexcept;
     vbr_capture_stream_status stream_ranges_impl(
+        const vbr_pinned_ring_operation * operation,
         const vbr_capture_stream_source & source,
         const vbr_capture_stream_range * ranges,
         size_t range_count,
@@ -553,7 +565,8 @@ class vbr_capture_projected_unit {
         const vbr_capture_unit_snapshot_provider &,
         vbr_pinned_chunk_ring &,
         vbr_capture_projected_unit &,
-        vbr_capture_stream_stats *) noexcept;
+        vbr_capture_stream_stats *,
+        const vbr_pinned_ring_operation *) noexcept;
 };
 
 // A controller-authenticated representation target for one projected child.
@@ -708,7 +721,8 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
     const vbr_capture_unit_snapshot_provider & snapshots,
     vbr_pinned_chunk_ring & ring,
     vbr_capture_projected_unit & output,
-    vbr_capture_stream_stats * attempted = nullptr) noexcept;
+    vbr_capture_stream_stats * attempted = nullptr,
+    const vbr_pinned_ring_operation * operation = nullptr) noexcept;
 
 struct vbr_verified_segment {
     uint32_t unit_index = UINT32_MAX;

@@ -566,6 +566,33 @@ static void test_projected_unit_transfer() {
         captured.transfer().streaming_digest.begin(),
         captured.transfer().streaming_digest.end(),
         [](uint8_t value) { return value != 0; }));
+    // One batch-owned ring operation can serve multiple projected units
+    // without reacquiring the direction-neutral transport mutex.
+    auto batch_operation = ring->try_begin_operation();
+    CHECK(batch_operation);
+    projected_snapshot_fixture reserved_snapshot;
+    reserved_snapshot.snapshot = captured.snapshot();
+    vbr_capture_projected_unit reserved_capture;
+    vbr_capture_stream_stats reserved_attempted;
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, {},
+              reserved_snapshot.provider(), *ring, reserved_capture,
+              &reserved_attempted, &batch_operation) ==
+          vbr_capture_stream_status::ok);
+    CHECK(reserved_snapshot.acquired == 1);
+    CHECK(reserved_snapshot.released == 1);
+    CHECK(reserved_attempted.bytes == captured.transfer().bytes);
+    reserved_snapshot = {};
+    reserved_snapshot.snapshot = captured.snapshot();
+    reserved_capture = {};
+    CHECK(vbr_capture_projected_unit_transfer(
+              projection, 0, 0, 7, sources, {},
+              reserved_snapshot.provider(), *ring, reserved_capture,
+              nullptr, &batch_operation) ==
+          vbr_capture_stream_status::ok);
+    CHECK(reserved_snapshot.acquired == 1);
+    CHECK(reserved_snapshot.released == 1);
+    batch_operation = {};
     auto rebound_sources = sources;
     rebound_sources[0].source.context = &first;
     uint32_t rebound_count = 0;
@@ -2148,10 +2175,14 @@ static void test_h2d_bounded_streaming() {
     CHECK(blocked_destination.valid);
     CHECK(blocked_destination.bytes == h2d_input.size);
 
+    auto retained_operation = capture->try_begin_operation();
+    CHECK(retained_operation);
     capture.reset();
     adoption.reset();
     CHECK(vbr_pinned_ring_live_capacity_bytes() == live_before + 16);
     core.reset();
+    CHECK(vbr_pinned_ring_live_capacity_bytes() == live_before + 16);
+    retained_operation = {};
     CHECK(vbr_pinned_ring_live_capacity_bytes() == live_before);
 }
 
@@ -2473,8 +2504,12 @@ static void test_projected_host_batch_store_adapter() {
             ledger, staging_budget, staging_bindings,
             staging_quote, shrink_quote, growth_quote, lifecycle));
     CHECK(lifecycle.scheduler_calls == 1);
+    CHECK(lifecycle.budget_samples == 1);
     CHECK(lifecycle.preparation.status ==
           llama_cache_prepare_status::prepared);
+    CHECK(reserved(lifecycle.scheduler, device) == 32);
+    CHECK(reserved(lifecycle.scheduler, pageable) == 16);
+    CHECK(lifecycle.scheduler.live_ops == baseline_ops + 2);
     CHECK(reserved(lifecycle.initial, device) == 32);
     CHECK(reserved(lifecycle.initial, pageable) == 16);
     CHECK(lifecycle.initial.live_ops == baseline_ops + 2);
@@ -2512,7 +2547,15 @@ static void test_projected_host_batch_store_adapter() {
               server_vbr_projected_host_capture_diagnostics::
                   staging_status::scheduler_refused);
         CHECK(refused.scheduler_calls == 1);
-        CHECK(refused.budget_samples == 0);
+        CHECK(refused.budget_samples == 1);
+        CHECK(refused.preparation.status ==
+              llama_cache_prepare_status::prepared);
+        CHECK(refused.preparation.admission_status ==
+              llama_cache_admission_status::admitted);
+        CHECK(reserved(refused.scheduler, device) == 32);
+        CHECK(reserved(refused.scheduler, pageable) == 16);
+        CHECK(refused.scheduler.live_ops == baseline_ops + 2);
+        CHECK(refused.initial.live_ops == baseline_ops);
         CHECK(refused.after.live_ops == baseline_ops);
     }
     {
@@ -2529,6 +2572,9 @@ static void test_projected_host_batch_store_adapter() {
               llama_cache_prepare_status::admission_refused);
         CHECK(refused.preparation.admission_status ==
               llama_cache_admission_status::exceeds_budget);
+        CHECK(refused.scheduler_calls == 0);
+        CHECK(refused.budget_samples == 1);
+        CHECK(refused.after.live_ops == baseline_ops);
     }
     CHECK(ledger.snapshot().live_ops == baseline_ops);
 

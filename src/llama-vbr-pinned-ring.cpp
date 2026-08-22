@@ -76,7 +76,7 @@ struct vbr_bounded_pinned_ring_core::impl {
 
 vbr_pinned_ring_operation::vbr_pinned_ring_operation(
         vbr_pinned_ring_operation && other) noexcept
-    : owner_(other.owner_) {
+    : owner_(other.owner_), keepalive_(std::move(other.keepalive_)) {
     other.owner_ = nullptr;
 }
 
@@ -85,6 +85,7 @@ vbr_pinned_ring_operation & vbr_pinned_ring_operation::operator=(
     if (this != &other) {
         reset();
         owner_ = other.owner_;
+        keepalive_ = std::move(other.keepalive_);
         other.owner_ = nullptr;
     }
     return *this;
@@ -99,6 +100,7 @@ void vbr_pinned_ring_operation::reset() noexcept {
         owner_->end_operation();
         owner_ = nullptr;
     }
+    keepalive_.reset();
 }
 
 vbr_pinned_chunk_lease::vbr_pinned_chunk_lease(
@@ -506,6 +508,20 @@ uint32_t vbr_bounded_pinned_ring_core::pump(
     auto operation = try_begin_operation();
     if (!operation) {
         return callbacks.ring_unavailable;
+    }
+
+    return pump_reserved(operation, lane, callbacks, stats);
+}
+
+uint32_t vbr_bounded_pinned_ring_core::pump_reserved(
+        const vbr_pinned_ring_operation & operation,
+        uint32_t lane, const pump_callbacks & callbacks,
+        pump_stats & stats) noexcept {
+    stats = {};
+    if (!impl_ || operation.owner_ != this ||
+        lane >= impl_->lanes.size() || !callbacks.more ||
+        !callbacks.fill || !callbacks.consume) {
+        return callbacks.internal_error;
     }
 
     struct pending_step {

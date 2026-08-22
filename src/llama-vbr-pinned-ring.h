@@ -81,11 +81,13 @@ public:
 
 private:
     vbr_bounded_pinned_ring_core * owner_ = nullptr;
+    std::shared_ptr<vbr_bounded_pinned_ring_core> keepalive_;
     explicit vbr_pinned_ring_operation(
         vbr_bounded_pinned_ring_core * owner) noexcept : owner_(owner) {}
     void reset() noexcept;
 
     friend class vbr_bounded_pinned_ring_core;
+    friend class vbr_pinned_chunk_ring;
 };
 
 // Move-only ownership of one ring chunk between acquire and release. The
@@ -184,6 +186,10 @@ private:
     };
 
     uint32_t pump(
+        uint32_t lane, const pump_callbacks & callbacks,
+        pump_stats & stats) noexcept;
+    uint32_t pump_reserved(
+        const vbr_pinned_ring_operation & operation,
         uint32_t lane, const pump_callbacks & callbacks,
         pump_stats & stats) noexcept;
 

@@ -1069,7 +1069,8 @@ public:
             void * continue_context = nullptr,
             vbr_projected_capture_batch_request::continue_transfer_fn
                 continue_transfer = nullptr,
-            vbr_capture_stream_stats * attempted = nullptr) noexcept {
+            vbr_capture_stream_stats * attempted = nullptr,
+            const vbr_pinned_ring_operation * operation = nullptr) noexcept {
         if (!value.cache) {
             return vbr_capture_stream_status::snapshot_unavailable;
         }
@@ -1088,7 +1089,8 @@ public:
         }
         return vbr_capture_projected_unit_transfer(
             projection, value.child_id, 0, plan.logical_unit,
-            sources, {}, session.provider(), ring, output, attempted);
+            sources, {}, session.provider(), ring, output, attempted,
+            operation);
     }
 
     struct representation_cache_entry {
@@ -2038,6 +2040,20 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             }
         }
 
+        vbr_pinned_ring_operation ring_operation;
+        if (result.planned_packed_bytes != 0) {
+            ++result.ring_operation_attempts;
+            ring_operation = request.ring->try_begin_operation();
+            if (!ring_operation) {
+                ++result.ring_operation_refusals;
+                result.inner_stream_status =
+                    vbr_capture_stream_status::ring_unavailable;
+                result.status = vbr_explicit_capture_status::ring_unavailable;
+                return result;
+            }
+            ++result.ring_operation_acquires;
+        }
+
         // Payload runway is proven before the first companion D2H byte. A
         // locally stale/failed companion removes only its manifest; rebuild
         // the physical union and re-cap it before attention transfer.
@@ -2169,7 +2185,8 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                         child, plan, projection, result.source_namespace,
                         *request.ring, captured,
                         request.continue_context,
-                        request.continue_transfer, &attempted);
+                        request.continue_transfer, &attempted,
+                        ring_operation ? &ring_operation : nullptr);
                 if (transferred != vbr_capture_stream_status::ok) {
                     if (attempted.bytes >
                             UINT64_MAX - result.transfer.bytes ||
@@ -2261,6 +2278,9 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 projected_units.push_back(std::move(captured));
             }
         }
+        // Transport ownership ends with the final D2H chunk. Metadata
+        // rechecks, assembly, and catalog publication never hold the ring.
+        ring_operation = {};
 
         // Successful preflight companions remain immutable while attention
         // bytes transfer. A changed recurrent frontier is a violated idle

@@ -1114,6 +1114,9 @@ static bool h2_projected_capture_batch_exact(
         admission.quote.manifests != manifest_count ||
         admission.quote.projected_units == 0 ||
         admission.continuation_calls == 0 ||
+        captured.ring_operation_attempts != 1 ||
+        captured.ring_operation_acquires != 1 ||
+        captured.ring_operation_refusals != 0 ||
         captured.unit_transfer_calls == 0 ||
         captured.transferred_units != captured.unit_transfer_calls ||
         captured.transfer.submitted_bytes != captured.transfer.bytes ||
@@ -1176,6 +1179,7 @@ static bool h2_projected_capture_batch_exact(
             refused_admission.calls != 1 ||
             refused_admission.continuation_calls != 0 ||
             refused_admission.quote.planned_packed_bytes == 0 ||
+            admission_refused.ring_operation_attempts != 0 ||
             admission_refused.unit_transfer_calls != 0 ||
             admission_refused.transferred_units != 0 ||
             admission_refused.transfer.bytes != 0 ||
@@ -1183,6 +1187,31 @@ static bool h2_projected_capture_batch_exact(
             !admission_refused.publications.empty()) {
             return false;
         }
+        auto held_operation = ring->try_begin_operation();
+        if (!held_operation) {
+            return false;
+        }
+        h2_pretransfer_admission busy_admission;
+        auto busy_request = request;
+        busy_request.pretransfer_context = &busy_admission;
+        busy_request.continue_context = &busy_admission;
+        const auto busy = vbr_capture_projected_batch(memory, busy_request);
+        if (busy.status != vbr_explicit_capture_status::ring_unavailable ||
+            busy.phase !=
+                vbr_explicit_capture_phase::reservation_preparation ||
+            busy.inner_stream_status !=
+                vbr_capture_stream_status::ring_unavailable ||
+            busy_admission.calls != 1 ||
+            busy_admission.continuation_calls != 0 ||
+            busy.ring_operation_attempts != 1 ||
+            busy.ring_operation_acquires != 0 ||
+            busy.ring_operation_refusals != 1 ||
+            busy.companion_d2h_reads != 0 ||
+            busy.unit_transfer_calls != 0 || busy.transfer.bytes != 0 ||
+            busy.assembly || !busy.publications.empty()) {
+            return false;
+        }
+        held_operation = {};
         auto cancelled_request = request;
         h2_pretransfer_admission cancelled_admission;
         cancelled_admission.continuations_allowed = 0;
@@ -1196,6 +1225,9 @@ static bool h2_projected_capture_batch_exact(
                 vbr_explicit_capture_phase::companion_capture ||
             cancelled_admission.calls != 1 ||
             cancelled_admission.continuation_calls != 1 ||
+            cancelled.ring_operation_attempts != 1 ||
+            cancelled.ring_operation_acquires != 1 ||
+            cancelled.ring_operation_refusals != 0 ||
             cancelled.unit_transfer_calls != 0 ||
             cancelled.transferred_units != 0 ||
             cancelled.transfer.bytes != 0 || cancelled.assembly ||

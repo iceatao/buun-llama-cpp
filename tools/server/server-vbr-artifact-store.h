@@ -208,6 +208,9 @@ struct server_vbr_projected_host_capture_diagnostics {
     uint32_t transferred_units = 0;
     uint64_t companion_d2h_bytes = 0;
     uint64_t companion_d2h_reads = 0;
+    uint32_t ring_operation_attempts = 0;
+    uint32_t ring_operation_acquires = 0;
+    uint32_t ring_operation_refusals = 0;
     enum class staging_status : uint8_t {
         not_called,
         zero_work_admitted,
@@ -229,9 +232,9 @@ struct server_vbr_projected_host_capture_diagnostics {
 };
 
 // Scheduler-owned last-mile admission at the exact pre-D2H boundary. The
-// store/core retain all topology and byte-authority details; this callback
-// can only accept or refuse the immutable scalar quote. It must not retain
-// the quote or mutate source memory.
+// store holds the exact transfer-staging claim while this callback runs; the
+// callback can only accept or refuse the immutable scalar quote. It must not
+// retain the quote or mutate source memory.
 struct server_vbr_projected_capture_admission {
     using quote = vbr_projected_capture_batch_request::pretransfer_quote;
     void * context = nullptr;
@@ -458,6 +461,7 @@ struct server_vbr_artifact_store_test_door {
                 staging_status::not_called;
         llama_cache_prepare_result preparation;
         llama_cache_acct_snapshot initial;
+        llama_cache_acct_snapshot scheduler;
         llama_cache_acct_snapshot shrunk;
         llama_cache_acct_snapshot publication;
         llama_cache_acct_snapshot after;

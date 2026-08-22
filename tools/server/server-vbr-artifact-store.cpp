@@ -471,6 +471,7 @@ public:
             }
             prepared_ = llama_cache_prepare_reservation_transaction(
                 ledger_, budget, leaves_);
+            preparation_ = prepared_.preparation();
             if (!prepared_.ready()) {
                 return false;
             }
@@ -530,7 +531,11 @@ public:
         return preparation_attempted_;
     }
     const llama_cache_prepare_result & preparation() const noexcept {
-        return prepared_.preparation();
+        return preparation_;
+    }
+    void cancel() noexcept {
+        prepared_ = {};
+        bytes_ = 0;
     }
 
 private:
@@ -592,6 +597,7 @@ private:
     std::vector<uint64_t> current_bytes_;
     std::vector<uint64_t> shrink_bytes_;
     llama_cache_prepared_claim_group prepared_;
+    llama_cache_prepare_result preparation_;
     uint64_t bytes_ = 0;
     bool initialized_ = false;
     bool preparation_attempted_ = false;
@@ -634,11 +640,6 @@ public:
                     : status::invalid_quote;
                 return accepted;
             }
-            if (scheduler_ && scheduler_->admit &&
-                !scheduler_->admit(scheduler_->context, value)) {
-                status_ = status::scheduler_refused;
-                return false;
-            }
             scheduler_checked_ = true;
             try {
                 llama_cache_budget_config budget;
@@ -647,10 +648,18 @@ public:
                     return false;
                 }
                 const bool accepted = session_.admit_initial(budget, value);
-                status_ = accepted
-                    ? status::prepared
-                    : status::preparation_refused;
-                return accepted;
+                if (!accepted) {
+                    status_ = status::preparation_refused;
+                    return false;
+                }
+                if (scheduler_ && scheduler_->admit &&
+                    !scheduler_->admit(scheduler_->context, value)) {
+                    session_.cancel();
+                    status_ = status::scheduler_refused;
+                    return false;
+                }
+                status_ = status::prepared;
+                return true;
             } catch (...) {
                 status_ = status::preparation_refused;
                 return false;
@@ -708,7 +717,9 @@ bool server_vbr_artifact_store_test_door::projected_staging_lifecycle(
         } budget_context { &budget, &result.budget_samples };
         struct scheduler_context {
             uint32_t calls = 0;
-        } scheduler_state;
+            llama_cache_acct_ledger * ledger = nullptr;
+            llama_cache_acct_snapshot * observed = nullptr;
+        } scheduler_state { 0, &ledger, &result.scheduler };
         server_vbr_projected_capture_admission scheduler;
         scheduler.context = &scheduler_state;
         scheduler.admit = +[](
@@ -720,6 +731,9 @@ bool server_vbr_artifact_store_test_door::projected_staging_lifecycle(
                 return false;
             }
             state->calls++;
+            if (state->ledger && state->observed) {
+                *state->observed = state->ledger->snapshot();
+            }
             return true;
         };
         {
@@ -784,7 +798,11 @@ bool server_vbr_artifact_store_test_door::projected_staging_initial(
         struct scheduler_context {
             bool accept = false;
             uint32_t calls = 0;
-        } scheduler_state { scheduler_accept, 0 };
+            llama_cache_acct_ledger * ledger = nullptr;
+            llama_cache_acct_snapshot * observed = nullptr;
+        } scheduler_state {
+            scheduler_accept, 0, &ledger, &result.scheduler,
+        };
         server_vbr_projected_capture_admission scheduler;
         scheduler.context = &scheduler_state;
         scheduler.admit = +[](
@@ -796,6 +814,9 @@ bool server_vbr_artifact_store_test_door::projected_staging_initial(
                 return false;
             }
             state->calls++;
+            if (state->ledger && state->observed) {
+                *state->observed = state->ledger->snapshot();
+            }
             return state->accept;
         };
         bool accepted = false;
@@ -1581,6 +1602,12 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         measured.transferred_units = captured.transferred_units;
         measured.companion_d2h_bytes = captured.companion_d2h_bytes;
         measured.companion_d2h_reads = captured.companion_d2h_reads;
+        measured.ring_operation_attempts =
+            captured.ring_operation_attempts;
+        measured.ring_operation_acquires =
+            captured.ring_operation_acquires;
+        measured.ring_operation_refusals =
+            captured.ring_operation_refusals;
         measured.staging = staging.terminal();
         auto & staging_reservation = staging.session();
         if (staging_reservation.preparation_required()) {

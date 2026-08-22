@@ -402,6 +402,9 @@ struct vbr_projected_capture_batch_result {
     uint32_t transferred_units = 0;
     uint64_t companion_d2h_bytes = 0;
     uint64_t companion_d2h_reads = 0;
+    uint32_t ring_operation_attempts = 0;
+    uint32_t ring_operation_acquires = 0;
+    uint32_t ring_operation_refusals = 0;
     vbr_capture_stream_stats transfer;
 };
 
