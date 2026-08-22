@@ -1883,20 +1883,6 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
 
         std::vector<vbr_projected_capture_batch_request::
             pretransfer_quote::staging_row> staging_rows;
-        const auto portable_domain_less = [](
-                const vbr_artifact_portable_domain & lhs,
-                const vbr_artifact_portable_domain & rhs) {
-            if (lhs.residency != rhs.residency) {
-                return lhs.residency < rhs.residency;
-            }
-            if (lhs.kind != rhs.kind) {
-                return lhs.kind < rhs.kind;
-            }
-            if (lhs.topology_index != rhs.topology_index) {
-                return lhs.topology_index < rhs.topology_index;
-            }
-            return lhs.device_ordinal < rhs.device_ordinal;
-        };
         const auto preflight_projection_bytes = [&]() {
             result.planned_packed_bytes = 0;
             staging_rows.clear();
@@ -1920,7 +1906,8 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 const auto found = std::lower_bound(
                     staging_rows.begin(), staging_rows.end(), domain,
                     [&](const auto & row, const auto & key) {
-                        return portable_domain_less(row.domain, key);
+                        return vbr_artifact_portable_domain_less(
+                            row.domain, key);
                     });
                 if (found != staging_rows.end()) {
                     if (found->domain != domain) {

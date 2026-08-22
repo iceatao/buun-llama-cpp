@@ -811,6 +811,14 @@ private:
 
 } // namespace
 
+struct llama_vbr_projected_publication_claim::impl {
+    std::vector<vbr_artifact_portable_accounting_row> rows;
+    std::vector<llama_cache_acct_op_id> committed_ops;
+    std::vector<llama_cache_acct_alloc_id> allocations;
+    llama_cache_prepared_claim_group prepared;
+    llama_cache_prepare_result evidence;
+};
+
 class llama_vbr_artifact_catalog_stream_build final
         : public vbr_capture_build {
 public:
@@ -974,6 +982,31 @@ private:
 llama_vbr_artifact_catalog::llama_vbr_artifact_catalog(
         llama_cache_acct_ledger & ledger)
     : impl_(new impl(ledger)) {}
+
+llama_vbr_projected_publication_claim::
+llama_vbr_projected_publication_claim() noexcept = default;
+llama_vbr_projected_publication_claim::
+~llama_vbr_projected_publication_claim() = default;
+llama_vbr_projected_publication_claim::
+llama_vbr_projected_publication_claim(
+        llama_vbr_projected_publication_claim &&) noexcept = default;
+llama_vbr_projected_publication_claim &
+llama_vbr_projected_publication_claim::operator=(
+        llama_vbr_projected_publication_claim &&) noexcept = default;
+llama_vbr_projected_publication_claim::
+llama_vbr_projected_publication_claim(
+        std::unique_ptr<impl> state) noexcept
+    : impl_(std::move(state)) {}
+
+bool llama_vbr_projected_publication_claim::ready() const noexcept {
+    return impl_ && impl_->prepared.ready();
+}
+
+const llama_cache_prepare_result &
+llama_vbr_projected_publication_claim::preparation() const noexcept {
+    static const llama_cache_prepare_result invalid;
+    return impl_ ? impl_->evidence : invalid;
+}
 
 vbr_artifact_prepared_retire::vbr_artifact_prepared_retire() noexcept =
     default;
@@ -1476,6 +1509,91 @@ bool llama_vbr_artifact_catalog::prepare_capture_package(
         return configure_accounting(package);
     } catch (...) {
         return false;
+    }
+}
+
+llama_vbr_projected_publication_claim
+llama_vbr_artifact_catalog::prepare_projected_publication_claim(
+        const std::vector<vbr_artifact_portable_accounting_row> & rows,
+        const llama_cache_budget_config & budget) noexcept {
+    std::unique_ptr<llama_vbr_projected_publication_claim::impl> state;
+    try {
+        state.reset(new llama_vbr_projected_publication_claim::impl);
+        state->evidence.status =
+            llama_cache_prepare_status::invalid_argument;
+        if (rows.empty()) {
+            return llama_vbr_projected_publication_claim(
+                std::move(state));
+        }
+
+        vbr_artifact_package accounting;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            accounting.topologies = impl_->topologies;
+        }
+        if (!vbr_artifact_validate_portable_accounting(
+                accounting.topologies, rows) ||
+            std::any_of(rows.begin(), rows.end(), [](const auto & row) {
+                return row.logical_bytes != row.resident_bytes;
+            })) {
+            return llama_vbr_projected_publication_claim(
+                std::move(state));
+        }
+        accounting.manifest.accounting = rows;
+        if (!configure_accounting(accounting)) {
+            state->evidence.status =
+                llama_cache_prepare_status::internal_fault;
+            return llama_vbr_projected_publication_claim(
+                std::move(state));
+        }
+
+        state->rows = rows;
+        state->committed_ops.resize(rows.size());
+        state->allocations.resize(rows.size());
+        std::vector<llama_cache_transaction_leaf> leaves(rows.size());
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            llama_cache_acct_artifact_id provisional;
+            if (!impl_->issue_artifact(provisional)) {
+                state->evidence.status =
+                    llama_cache_prepare_status::internal_fault;
+                return llama_vbr_projected_publication_claim(
+                    std::move(state));
+            }
+            for (size_t i = 0; i < rows.size(); ++i) {
+                llama_cache_acct_resource_domain domain;
+                if (!impl_->resolve_domain(rows[i].domain, domain)) {
+                    state->evidence.status =
+                        llama_cache_prepare_status::invalid_argument;
+                    state->evidence.failed_leaf = i;
+                    return llama_vbr_projected_publication_claim(
+                        std::move(state));
+                }
+                auto & leaf = leaves[i];
+                leaf.category =
+                    vbr_artifact_accounting_category(rows[i].role);
+                leaf.domain = domain;
+                leaf.attribution = {
+                    llama_cache_acct_attr_kind::artifact, -1, provisional,
+                };
+                leaf.expected_logical = rows[i].logical_bytes;
+                leaf.reserve_resident = rows[i].resident_bytes;
+                leaf.stage_resident = rows[i].resident_bytes;
+                leaf.committed_op = &state->committed_ops[i];
+                leaf.allocation_out = &state->allocations[i];
+            }
+        }
+        state->prepared = llama_cache_prepare_reservation_transaction(
+            impl_->ledger, budget, leaves);
+        state->evidence = state->prepared.preparation();
+        return llama_vbr_projected_publication_claim(std::move(state));
+    } catch (...) {
+        if (!state) {
+            return {};
+        }
+        state->evidence.status =
+            llama_cache_prepare_status::internal_fault;
+        return llama_vbr_projected_publication_claim(std::move(state));
     }
 }
 

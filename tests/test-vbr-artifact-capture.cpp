@@ -1233,6 +1233,162 @@ static vbr_projected_manifest_publication projected_publication(
     return out;
 }
 
+static void test_projected_publication_claim_preparation() {
+    llama_cache_acct_ledger ledger;
+    llama_vbr_artifact_catalog catalog(ledger);
+    const auto topology = capture_test_topology();
+    std::vector<llama_vbr_artifact_domain_binding> bindings;
+    CHECK(catalog.bind_topologies({ topology }, bindings));
+    CHECK(bindings.size() == 1);
+    const auto device = bindings.front().domain;
+    const auto host = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+    const llama_cache_acct_completeness_requirement requirements[] {
+        { device, llama_cache_acct_producer::live_memory },
+        { host, llama_cache_acct_producer::retention_sidecar },
+    };
+    CHECK(ledger.configure_required_producers(requirements, 2));
+    for (const auto category : {
+            llama_cache_acct_category::live_attention_state,
+            llama_cache_acct_category::live_recurrent_state,
+            llama_cache_acct_category::recurrent_rollback_planes,
+            llama_cache_acct_category::rolling_window_tape }) {
+        for (const auto measure : {
+                llama_cache_acct_measure::logical_payload,
+                llama_cache_acct_measure::resident_allocated,
+                llama_cache_acct_measure::reserved }) {
+            ledger.gauge_set(category, device, measure, 0);
+        }
+    }
+    for (const auto category : {
+            llama_cache_acct_category::full_snapshot_payload,
+            llama_cache_acct_category::checkpoint_state_payload,
+            llama_cache_acct_category::typed_accelerator_payload }) {
+        for (const auto measure : {
+                llama_cache_acct_measure::logical_payload,
+                llama_cache_acct_measure::resident_allocated,
+                llama_cache_acct_measure::reserved }) {
+            ledger.gauge_set(category, host, measure, 0);
+        }
+    }
+    CHECK(ledger.certify_complete(
+        device, llama_cache_acct_producer::live_memory));
+    CHECK(ledger.certify_complete(
+        host, llama_cache_acct_producer::retention_sidecar));
+
+    const vbr_artifact_portable_domain portable_device {
+        llama_cache_acct_residency::device,
+        llama_cache_acct_domain_kind::device_topology,
+        0, 0,
+    };
+    const vbr_artifact_portable_domain portable_host {
+        llama_cache_acct_residency::pageable_host,
+        llama_cache_acct_domain_kind::not_applicable,
+        UINT32_MAX, UINT16_MAX,
+    };
+    std::vector<vbr_artifact_portable_accounting_row> rows {
+        { vbr_artifact_accounting_role::unit_payload,
+          portable_device, 64, 64,
+          llama_cache_acct_attr_kind::artifact },
+        { vbr_artifact_accounting_role::descriptor_metadata,
+          portable_host, 16, 16,
+          llama_cache_acct_attr_kind::artifact },
+        { vbr_artifact_accounting_role::reference_metadata,
+          portable_host, 8, 8,
+          llama_cache_acct_attr_kind::artifact },
+    };
+    llama_cache_budget_config budget;
+    llama_cache_budget_device_input input;
+    input.backend_device = reinterpret_cast<const void *>(uintptr_t(1));
+    input.domain = device;
+    input.physical_total = 1ull << 30;
+    input.physical_free = 1ull << 29;
+    input.phys_state = llama_cache_budget_capacity_state::known;
+    input.current_compute_allocated = 0;
+    input.configured_compute_reserve = 0;
+    input.compute_state = llama_cache_budget_capacity_state::known;
+    input.cache_cap_state = llama_cache_budget_capacity_state::unbounded;
+    budget.devices.push_back(input);
+    const auto baseline = ledger.snapshot().live_ops;
+    auto claim = catalog.prepare_projected_publication_claim(rows, budget);
+    CHECK(claim.ready());
+    CHECK(claim.preparation().status ==
+          llama_cache_prepare_status::prepared);
+    CHECK(ledger.snapshot().live_ops == baseline + rows.size());
+
+    llama_vbr_projected_publication_claim moved(std::move(claim));
+    CHECK(!claim.ready());
+    CHECK(moved.ready());
+    moved = {};
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    auto duplicate_rows = rows;
+    duplicate_rows.push_back(rows.front());
+    auto duplicate = catalog.prepare_projected_publication_claim(
+        duplicate_rows, budget);
+    CHECK(!duplicate.ready());
+    CHECK(duplicate.preparation().status ==
+          llama_cache_prepare_status::invalid_argument);
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    std::vector<vbr_artifact_portable_accounting_row> duplicate_scale(
+        16384, rows.front());
+    auto duplicate_scale_claim =
+        catalog.prepare_projected_publication_claim(
+            duplicate_scale, budget);
+    CHECK(!duplicate_scale_claim.ready());
+    CHECK(duplicate_scale_claim.preparation().status ==
+          llama_cache_prepare_status::invalid_argument);
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    auto mismatched_rows = rows;
+    mismatched_rows.front().resident_bytes--;
+    auto mismatched = catalog.prepare_projected_publication_claim(
+        mismatched_rows, budget);
+    CHECK(!mismatched.ready());
+    CHECK(mismatched.preparation().status ==
+          llama_cache_prepare_status::invalid_argument);
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    auto wrong_kind_rows = rows;
+    wrong_kind_rows.front().domain.kind =
+        llama_cache_acct_domain_kind::not_applicable;
+    auto wrong_kind = catalog.prepare_projected_publication_claim(
+        wrong_kind_rows, budget);
+    CHECK(!wrong_kind.ready());
+    CHECK(wrong_kind.preparation().status ==
+          llama_cache_prepare_status::invalid_argument);
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    auto wrong_topology_rows = rows;
+    wrong_topology_rows.front().domain.topology_index = 1;
+    auto wrong_topology = catalog.prepare_projected_publication_claim(
+        wrong_topology_rows, budget);
+    CHECK(!wrong_topology.ready());
+    CHECK(wrong_topology.preparation().status ==
+          llama_cache_prepare_status::invalid_argument);
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    auto malformed_host_rows = rows;
+    malformed_host_rows[1].domain.topology_index = 0;
+    auto malformed_host = catalog.prepare_projected_publication_claim(
+        malformed_host_rows, budget);
+    CHECK(!malformed_host.ready());
+    CHECK(malformed_host.preparation().status ==
+          llama_cache_prepare_status::invalid_argument);
+    CHECK(ledger.snapshot().live_ops == baseline);
+
+    auto overflow_rows = rows;
+    overflow_rows[1].logical_bytes = UINT64_MAX;
+    overflow_rows[1].resident_bytes = UINT64_MAX;
+    auto overflow = catalog.prepare_projected_publication_claim(
+        overflow_rows, budget);
+    CHECK(!overflow.ready());
+    CHECK(overflow.preparation().status ==
+          llama_cache_prepare_status::invalid_argument);
+    CHECK(ledger.snapshot().live_ops == baseline);
+}
+
 static void test_dependency_scoped_projected_catalog_publication() {
     static_assert(!std::is_copy_constructible_v<
         vbr_capture_sealed_companion>);
@@ -3398,6 +3554,7 @@ int main(int argc, char ** argv) {
     test_projected_unit_transfer();
     test_preflight_unavailable_projection_rows();
     test_manifest_coherent_assembly();
+    test_projected_publication_claim_preparation();
     test_dependency_scoped_projected_catalog_publication();
     test_h2d_bounded_streaming();
     test_ring_accounting_once();

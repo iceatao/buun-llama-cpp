@@ -55,6 +55,36 @@ struct llama_vbr_artifact_reference_tokens {
     llama_cache_acct_lineage_id lineage;
 };
 
+// Catalog-owned split-phase durable-publication fence. Preparation resolves
+// portable accounting through this catalog and admits the complete bounded
+// row set before projected D2H. The opaque move-only owner is later
+// repartitioned onto content-addressed publication leaves; dropping it aborts
+// every still-live reservation.
+class llama_vbr_projected_publication_claim {
+public:
+    llama_vbr_projected_publication_claim() noexcept;
+    ~llama_vbr_projected_publication_claim();
+    llama_vbr_projected_publication_claim(
+        const llama_vbr_projected_publication_claim &) = delete;
+    llama_vbr_projected_publication_claim & operator=(
+        const llama_vbr_projected_publication_claim &) = delete;
+    llama_vbr_projected_publication_claim(
+        llama_vbr_projected_publication_claim &&) noexcept;
+    llama_vbr_projected_publication_claim & operator=(
+        llama_vbr_projected_publication_claim &&) noexcept;
+
+    bool ready() const noexcept;
+    const llama_cache_prepare_result & preparation() const noexcept;
+
+private:
+    struct impl;
+    explicit llama_vbr_projected_publication_claim(
+        std::unique_ptr<impl> state) noexcept;
+    std::unique_ptr<impl> impl_;
+
+    friend class llama_vbr_artifact_catalog;
+};
+
 enum class vbr_artifact_resolve_status : uint8_t {
     ok = 0,
     not_found,
@@ -269,6 +299,15 @@ public:
     // package topology set and creates every measured-zero accounting cell.
     bool prepare_capture_package(
         const vbr_artifact_package & package) noexcept;
+
+    // Prepare the conservative durable rows that a projected batch may
+    // publish. Rows must be nonzero, canonical (unique role/domain), and use
+    // equal logical/resident bytes. This performs the only budget admission;
+    // content dedup later may only repartition the fence downward.
+    llama_vbr_projected_publication_claim
+    prepare_projected_publication_claim(
+        const std::vector<vbr_artifact_portable_accounting_row> & rows,
+        const llama_cache_budget_config & budget) noexcept;
 
     // F3.1 streaming path and the abstract F3.2 capture sink entry point.
     std::unique_ptr<vbr_capture_build> begin_capture(

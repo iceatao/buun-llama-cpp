@@ -653,6 +653,26 @@ static void test_prepared_transaction_downward_repartition() {
     }
     CHECK(scale_ledger.snapshot().live_ops == 0);
     CHECK(host_reserved(scale_ledger) == 0);
+
+    llama_cache_acct_ledger direct_scale_ledger;
+    configure_fitting_host(direct_scale_ledger);
+    std::vector<llama_cache_acct_op_id> direct_operations(16384);
+    std::vector<llama_cache_acct_alloc_id> direct_allocations(16384);
+    std::vector<llama_cache_transaction_leaf> direct_leaves;
+    direct_leaves.reserve(16384);
+    for (size_t i = 0; i < 16384; ++i) {
+        direct_leaves.push_back(transaction_leaf(
+            PAYLOAD, 1, direct_operations[i], direct_allocations[i]));
+    }
+    {
+        auto direct = llama_cache_prepare_reservation_transaction(
+            direct_scale_ledger, config, direct_leaves);
+        CHECK(direct.ready());
+        CHECK(direct_scale_ledger.snapshot().live_ops == 16384);
+        CHECK(host_reserved(direct_scale_ledger) == 16384);
+    }
+    CHECK(direct_scale_ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(direct_scale_ledger) == 0);
 }
 
 static void test_prepared_transaction_partition_owned_groups() {

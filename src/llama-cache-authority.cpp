@@ -445,6 +445,10 @@ llama_cache_prepare_reservation_transaction(
             return llama_cache_prepared_claim_group(
                 std::move(state));
         }
+        std::unordered_set<const void *> operation_outputs;
+        std::unordered_set<const void *> allocation_outputs;
+        operation_outputs.reserve(leaves.size());
+        allocation_outputs.reserve(leaves.size());
         for (size_t i = 0; i < leaves.size(); ++i) {
             const auto & leaf = leaves[i];
             if (!leaf.committed_op ||
@@ -452,25 +456,15 @@ llama_cache_prepare_reservation_transaction(
                  leaf.reserve_resident != 0) ||
                 (!leaf.existing_allocation &&
                  leaf.stage_resident !=
-                     leaf.reserve_resident)) {
+                     leaf.reserve_resident) ||
+                !operation_outputs.insert(leaf.committed_op).second ||
+                (leaf.allocation_out &&
+                 !allocation_outputs.insert(leaf.allocation_out).second)) {
                 state->preparation.status =
                     llama_cache_prepare_status::invalid_argument;
                 state->preparation.failed_leaf = i;
                 return llama_cache_prepared_claim_group(
                     std::move(state));
-            }
-            for (size_t j = 0; j < i; ++j) {
-                if (leaves[j].committed_op ==
-                        leaf.committed_op ||
-                    (leaf.allocation_out &&
-                     leaves[j].allocation_out ==
-                         leaf.allocation_out)) {
-                    state->preparation.status =
-                        llama_cache_prepare_status::invalid_argument;
-                    state->preparation.failed_leaf = i;
-                    return llama_cache_prepared_claim_group(
-                        std::move(state));
-                }
             }
         }
 

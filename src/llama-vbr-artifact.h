@@ -228,6 +228,20 @@ inline bool operator!=(const vbr_artifact_portable_domain & lhs,
                        const vbr_artifact_portable_domain & rhs) {
     return !(lhs == rhs);
 }
+inline bool vbr_artifact_portable_domain_less(
+        const vbr_artifact_portable_domain & lhs,
+        const vbr_artifact_portable_domain & rhs) {
+    if (lhs.residency != rhs.residency) {
+        return lhs.residency < rhs.residency;
+    }
+    if (lhs.kind != rhs.kind) {
+        return lhs.kind < rhs.kind;
+    }
+    if (lhs.topology_index != rhs.topology_index) {
+        return lhs.topology_index < rhs.topology_index;
+    }
+    return lhs.device_ordinal < rhs.device_ordinal;
+}
 
 struct vbr_artifact_portable_accounting_row {
     vbr_artifact_accounting_role role = vbr_artifact_accounting_role::unit_payload;

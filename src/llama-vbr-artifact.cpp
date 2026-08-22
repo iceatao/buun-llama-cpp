@@ -3124,13 +3124,23 @@ bool vbr_artifact_validate_portable_accounting(
                 !checked_add(total_resident, row.resident_bytes, total_resident)) {
                 return false;
             }
-            for (const auto & prior : seen) {
-                if (prior.role == row.role &&
-                    prior.domain == row.domain) {
-                    return false;
-                }
-            }
             seen.push_back({ row.role, row.domain });
+        }
+        std::sort(seen.begin(), seen.end(), [&](const accounting_key & lhs,
+                                                const accounting_key & rhs) {
+            if (lhs.role != rhs.role) {
+                return lhs.role < rhs.role;
+            }
+            return vbr_artifact_portable_domain_less(
+                lhs.domain, rhs.domain);
+        });
+        if (std::adjacent_find(
+                seen.begin(), seen.end(), [](const accounting_key & lhs,
+                                             const accounting_key & rhs) {
+                    return lhs.role == rhs.role &&
+                           lhs.domain == rhs.domain;
+                }) != seen.end()) {
+            return false;
         }
         return true;
     } catch (...) {
