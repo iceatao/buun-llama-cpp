@@ -543,6 +543,37 @@ bool server_tokens::retention_token_digest(
     return true;
 }
 
+bool server_tokens::retention_token_prefix_digest(
+        size_t coverage_tokens,
+        std::array<uint8_t, 32> & out) const noexcept {
+    out = {};
+    if (coverage_tokens == 0 || coverage_tokens > tokens.size() ||
+        coverage_tokens > size_t(INT64_MAX)) {
+        return false;
+    }
+    try {
+        std::string media_identity;
+        if (!media_content_identity(
+                int64_t(coverage_tokens), media_identity)) {
+            return false;
+        }
+        llama_sha256_writer hash;
+        static constexpr char DOMAIN[] =
+            "buun.server.retention-token-prefix-identity/v1";
+        hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+        hash.u64(coverage_tokens);
+        for (size_t i = 0; i < coverage_tokens; ++i) {
+            hash.u32(uint32_t(tokens[i]));
+        }
+        hash.string(media_identity.data(), media_identity.size());
+        out = hash.finish();
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
 llama_tokens server_tokens::get_text_tokens() const {
     llama_tokens res;
     res.reserve(tokens.size());

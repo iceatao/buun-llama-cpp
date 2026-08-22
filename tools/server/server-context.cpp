@@ -742,6 +742,14 @@ struct server_slot {
     bool vbr_idle_capture_terminal = false;
     std::array<uint8_t, 32> vbr_idle_capture_published_identity = {};
     bool vbr_idle_capture_representation_valid = false;
+    // A stem is independently durable but cannot authorize clearing the full
+    // live frontier. Bind its retry/completion state to the complete source
+    // attempt so any token, epoch, or representation change reopens capture.
+    std::array<uint8_t, 32> vbr_idle_stem_source_identity = {};
+    uint64_t vbr_idle_stem_coverage_tokens = 0;
+    llama_cache_acct_artifact_id vbr_idle_stem_host_artifact;
+    bool vbr_idle_stem_source_valid = false;
+    bool vbr_idle_stem_retry = false;
     std::string vbr_adapter_config_identity;
     bool vbr_adapter_config_identity_valid = false;
 
@@ -2621,6 +2629,7 @@ private:
         vbr_idle_frontier_queries;
     std::vector<uint32_t> vbr_exclusive_cells_by_seq;
     std::vector<uint8_t> vbr_durable_sources_by_seq;
+    std::vector<uint8_t> vbr_durable_stems_by_seq;
     std::vector<uint8_t> vbr_reclaim_refused_by_seq;
     size_t vbr_retention_candidate_count = 0;
     uint64_t vbr_retention_projection_epoch = 0;
@@ -6382,6 +6391,7 @@ private:
             vbr_exclusive_cells_by_seq.resize(slots.size());
             if (params_base.vbr_prompt_cache) {
                 vbr_durable_sources_by_seq.resize(slots.size());
+                vbr_durable_stems_by_seq.resize(slots.size());
                 vbr_reclaim_refused_by_seq.resize(slots.size());
                 vbr_idle_parent_values.resize(slots.size());
                 vbr_idle_parent_values.clear();
@@ -10184,11 +10194,16 @@ private:
     bool build_capture_identity_fields(
             server_slot & slot,
             vbr_artifact_identity_block & identity,
-            server_vbr_artifact_capture_status & status) {
-        const int64_t token_count = slot.prompt.n_tokens();
-        const llama_pos next_position = slot.prompt.tokens.pos_next();
+            server_vbr_artifact_capture_status & status,
+            int64_t coverage_tokens = -1) {
+        const int64_t token_count = coverage_tokens < 0
+            ? slot.prompt.n_tokens() : coverage_tokens;
+        const llama_pos next_position = coverage_tokens < 0
+            ? slot.prompt.tokens.pos_next()
+            : slot.prompt.tokens.pos_next(size_t(coverage_tokens));
         identity.media_content_identity.clear();
-        if (token_count <= 0 || next_position <= 0 ||
+        if (token_count <= 0 || token_count > slot.prompt.n_tokens() ||
+            next_position <= 0 ||
             !slot.prompt.tokens.media_content_identity(
                 token_count, identity.media_content_identity)) {
             status =
@@ -10473,9 +10488,13 @@ private:
             server_slot * slot = nullptr;
             uint64_t manifest_id = 0;
             std::array<uint8_t, 32> attempt_identity = {};
+            std::array<uint8_t, 32> full_source_identity = {};
             uint64_t tier_epoch = 0;
             uint64_t tier_epoch_swa = 0;
             bool refresh = false;
+            bool stem_requested = false;
+            bool stemmed = false;
+            uint64_t selected_tokens = 0;
             server_prompt_cache_vbr_publication_metadata publication;
         };
         std::vector<candidate> candidates;
@@ -10601,6 +10620,12 @@ private:
         // the complete token block before calling a row durable.
         size_t frontier_query_count = 0;
         try {
+            if (vbr_durable_stems_by_seq.size() != slots.size()) {
+                return 0;
+            }
+            std::fill(
+                vbr_durable_stems_by_seq.begin(),
+                vbr_durable_stems_by_seq.end(), uint8_t(0));
             for (size_t order = 0; order < durability_order_count; ++order) {
                 if (!capture_session.continue_capture()) {
                     return 0;
@@ -10624,6 +10649,11 @@ private:
                     continue;
                 }
                 query.durable = false;
+                query.expected_stem_artifact =
+                    selected->vbr_idle_stem_source_valid
+                    ? selected->vbr_idle_stem_host_artifact
+                    : llama_cache_acct_artifact_id {};
+                query.stem_durable = false;
                 frontier_query_count++;
             }
             if (!prompt_cache->mark_vbr_frontiers(
@@ -10640,6 +10670,8 @@ private:
                 }
                 vbr_durable_sources_by_seq[size_t(query.slot_id)] =
                     query.durable ? 1 : 0;
+                vbr_durable_stems_by_seq[size_t(query.slot_id)] =
+                    query.stem_durable ? 1 : 0;
             }
         } catch (...) {
             return 0;
@@ -10719,6 +10751,9 @@ private:
                     idle, manifest.identity, identity_status)) {
                 continue;
             }
+            manifest.text_only = !idle.prompt.tokens.has_media() &&
+                manifest.identity.next_position ==
+                    manifest.identity.token_count;
             const auto attempt_identity =
                 vbr_idle_capture_attempt_digest(
                     manifest.identity,
@@ -10726,13 +10761,47 @@ private:
                     representation.tier_epoch,
                     representation.tier_epoch_swa);
 
-            if (idle.vbr_idle_capture_attempt_identity == attempt_identity &&
+            bool stem_retry = false;
+            if (!durable && n_swa == 0 &&
+                !idle.prompt.tokens.has_media()) {
+                if (idle.vbr_idle_stem_source_valid &&
+                    idle.vbr_idle_stem_source_identity == attempt_identity) {
+                    if (idle.vbr_idle_stem_coverage_tokens != 0 &&
+                        idle.id >= 0 &&
+                        size_t(idle.id) <
+                            vbr_durable_stems_by_seq.size() &&
+                        vbr_durable_stems_by_seq[size_t(idle.id)] != 0) {
+                        continue;
+                    }
+                    idle.vbr_idle_stem_source_valid = false;
+                    idle.vbr_idle_stem_host_artifact = {};
+                    idle.vbr_idle_stem_retry = true;
+                }
+                stem_retry = idle.vbr_idle_stem_retry &&
+                    idle.vbr_idle_stem_source_identity ==
+                        attempt_identity;
+            }
+
+            if (stem_retry &&
+                ggml_time_ms() < idle.vbr_idle_capture_retry_after_ms) {
+                continue;
+            }
+
+            // A stem retry owns a singleton projection because it changes the
+            // frontier of the complete physical union. Earlier exact rows
+            // finish first; a later quiet tick then isolates this source.
+            if (stem_retry && !manifests.empty()) {
+                continue;
+            }
+
+            if (!stem_retry &&
+                idle.vbr_idle_capture_attempt_identity == attempt_identity &&
                 (idle.vbr_idle_capture_terminal ||
                  ggml_time_ms() < idle.vbr_idle_capture_retry_after_ms)) {
                 continue;
             }
             server_prompt_cache_vbr_publication_metadata publication;
-            if (!representation_changed &&
+            if (!representation_changed && !stem_retry &&
                 !prompt_cache->prepare_vbr_publication_metadata(
                     idle.prompt,
                     manifest.identity.execution_identity,
@@ -10750,13 +10819,17 @@ private:
                 manifests.push_back(std::move(manifest));
                 candidates.push_back({
                     &idle, uint64_t(idle.id) + 1, attempt_identity,
+                    attempt_identity,
                     representation.tier_epoch,
                     representation.tier_epoch_swa,
-                    representation_changed,
+                    representation_changed, stem_retry, false, 0,
                     std::move(publication),
                 });
                 total_token_references += token_references;
                 refresh_selected |= representation_changed;
+                if (stem_retry) {
+                    break;
+                }
             } catch (...) {
                 return 0;
             }
@@ -10843,6 +10916,7 @@ private:
         }
         server_prompt_cache_vbr_capacity_claim capacity_claim;
         struct idle_admission_context {
+            server_context_impl * owner = nullptr;
             server_queue::idle_capture_session * session = nullptr;
             server_prompt_cache * cache = nullptr;
             std::vector<candidate> * candidates = nullptr;
@@ -10851,16 +10925,109 @@ private:
             server_prompt_cache_vbr_capacity_claim * capacity = nullptr;
             bool has_refresh = false;
             bool has_fresh = false;
+            uint64_t tier_epoch = 0;
+            uint64_t tier_epoch_swa = 0;
             server_prompt_cache_vbr_capacity_status capacity_status =
                 server_prompt_cache_vbr_capacity_status::invalid;
             uint64_t capacity_retry_manifest_id = 0;
         } admission_state {
-            &capture_session, prompt_cache.get(), &candidates,
+            this, &capture_session, prompt_cache.get(), &candidates,
             &admitted_publications, &capacity_claim,
             has_refresh_candidate, has_fresh_candidate,
+            representation.tier_epoch, representation.tier_epoch_swa,
         };
         server_vbr_projected_capture_admission admission;
         admission.context = &admission_state;
+        admission.frontier = candidates.size() == 1 &&
+                candidates.front().stem_requested
+            ? vbr_projected_capture_frontier_policy {
+                vbr_projected_capture_frontier_mode::
+                    longest_attention_stem,
+                SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS,
+                prompt_cache->limit_size,
+                prompt_cache->limit_size == 0
+                    ? prompt_cache->limit_tokens : 0,
+            }
+            : vbr_projected_capture_frontier_policy {};
+        admission.prepare = [](
+                void * opaque,
+                const server_vbr_projected_capture_admission::quote & quote)
+                noexcept {
+            auto * context = static_cast<idle_admission_context *>(opaque);
+            auto * session = context ? context->session : nullptr;
+            if (!context || !context->cache || !context->candidates ||
+                !session || !session->continue_capture()) {
+                return false;
+            }
+            if (context->has_refresh) {
+                return !context->has_fresh && session->continue_capture();
+            }
+            for (const auto & durable : quote.durable) {
+                auto found = std::find_if(
+                    context->candidates->begin(),
+                    context->candidates->end(),
+                    [&](const candidate & value) {
+                        return !value.refresh &&
+                            value.manifest_id == durable.manifest_id;
+                    });
+                if (found == context->candidates->end() || !found->slot ||
+                    durable.selected_token_count == 0 ||
+                    durable.selected_token_count > uint64_t(INT64_MAX) ||
+                    durable.requested_token_count !=
+                        uint64_t(found->slot->prompt.n_tokens()) ||
+                    durable.selected_token_count >
+                        durable.requested_token_count) {
+                    return false;
+                }
+                if (found->publication.ready()) {
+                    if (durable.stemmed || found->stem_requested) {
+                        return false;
+                    }
+                    continue;
+                }
+                if (!found->stem_requested) {
+                    return false;
+                }
+                vbr_artifact_identity_block selected_identity;
+                server_vbr_artifact_capture_status identity_status;
+                if (!context->owner ||
+                    !context->owner->build_capture_identity_fields(
+                        *found->slot, selected_identity, identity_status,
+                        int64_t(durable.selected_token_count)) ||
+                    selected_identity.next_position !=
+                        durable.selected_next_position) {
+                    return false;
+                }
+                std::array<uint8_t, 32> selected_token_digest = {};
+                if (!found->slot->prompt.tokens.
+                        retention_token_prefix_digest(
+                            size_t(durable.selected_token_count),
+                            selected_token_digest)) {
+                    return false;
+                }
+                found->attempt_identity = vbr_idle_capture_attempt_digest(
+                    selected_identity, selected_token_digest,
+                    context->tier_epoch, context->tier_epoch_swa);
+                found->stemmed = durable.stemmed;
+                found->selected_tokens = durable.selected_token_count;
+                const bool prepared = durable.stemmed
+                    ? context->cache->prepare_vbr_stem_publication_metadata(
+                        found->slot->prompt,
+                        int64_t(durable.selected_token_count),
+                        selected_identity.execution_identity,
+                        selected_identity.adapter_config_identity,
+                        found->slot->id, found->publication)
+                    : context->cache->prepare_vbr_publication_metadata(
+                        found->slot->prompt,
+                        selected_identity.execution_identity,
+                        selected_identity.adapter_config_identity,
+                        found->slot->id, found->publication);
+                if (!prepared) {
+                    return false;
+                }
+            }
+            return session->continue_capture();
+        };
         admission.admit = [](
                 void * opaque,
                 const server_vbr_projected_capture_admission::quote & quote)
@@ -10976,20 +11143,55 @@ private:
                 diagnostics.capture_status ==
                     vbr_explicit_capture_status::accounting_failed &&
                 diagnostics.planned_packed_bytes > runway;
+            const bool incoming_over_host_cap =
+                admission_state.capacity_status ==
+                    server_prompt_cache_vbr_capacity_status::
+                        incoming_exceeds_hard_limit;
+            const bool stem_permanently_unavailable =
+                diagnostics.frontier_status ==
+                    vbr_projected_capture_frontier_status::
+                        stem_below_minimum ||
+                (diagnostics.frontier_status ==
+                     vbr_projected_capture_frontier_status::stem_unsupported &&
+                 (diagnostics.capture_status ==
+                      vbr_explicit_capture_status::unsupported_layout ||
+                  diagnostics.capture_status ==
+                      vbr_explicit_capture_status::identity_unavailable ||
+                  diagnostics.capture_status ==
+                      vbr_explicit_capture_status::
+                          required_companion_unavailable));
             const int64_t retry_after_ms = ggml_time_ms() + 5000;
             for (size_t i = 0; i < candidates.size(); ++i) {
                 const auto & candidate = candidates[i];
                 candidate.slot->vbr_idle_capture_attempt_identity =
                     candidate.attempt_identity;
+                const bool begin_stem_retry = !candidate.refresh &&
+                    !candidate.stem_requested && candidates.size() == 1 &&
+                    (aggregate_over_cap || incoming_over_host_cap) &&
+                    n_swa == 0 &&
+                    !candidate.slot->prompt.tokens.has_media();
+                if (begin_stem_retry || candidate.stem_requested) {
+                    candidate.slot->vbr_idle_stem_source_identity =
+                        candidate.full_source_identity;
+                    candidate.slot->vbr_idle_stem_source_valid = false;
+                    candidate.slot->vbr_idle_stem_host_artifact = {};
+                    candidate.slot->vbr_idle_stem_retry =
+                        !stem_permanently_unavailable;
+                    candidate.slot->vbr_idle_stem_coverage_tokens =
+                        diagnostics.selected_frontier_tokens;
+                }
                 // Aggregate admission is not a property of any one frontier.
                 // Reopen one row immediately and cool down its siblings so
                 // the next idle tick isolates it. A singleton overflow also
                 // remains transient: dynamic retiering can reduce its packed
                 // representation without changing the semantic frontier.
                 candidate.slot->vbr_idle_capture_terminal =
-                    terminal;
+                    terminal ||
+                    (candidate.stem_requested &&
+                     stem_permanently_unavailable);
                 candidate.slot->vbr_idle_capture_retry_after_ms =
-                    terminal ? 0 :
+                    begin_stem_retry ? 0 :
+                    candidate.slot->vbr_idle_capture_terminal ? 0 :
                     vbr_idle_retry_immediately(
                         terminal, aggregate_over_cap,
                         admission_state.capacity_status,
@@ -11110,13 +11312,16 @@ private:
                     ggml_time_ms() + 5000;
                 continue;
             }
+            server_prompt_cache::iterator published_host =
+                prompt_cache->states.end();
             if (!found->publication.ready() ||
                 !prompt_cache->publish_vbr(
                     found->publication,
                     server_prompt_cache_payload::from_vbr(
                         std::move(row.payload)),
                     source.cache_family,
-                    !source.task || !source.task->is_child(), nullptr,
+                    !source.task || !source.task->is_child(),
+                    &published_host,
                     capacity_claim.requires_publication_revalidation()
                         ? &capacity_claim : nullptr)) {
                 source.vbr_idle_capture_attempt_identity =
@@ -11127,6 +11332,38 @@ private:
                 continue;
             }
             ++published_count;
+            if (found->stemmed) {
+                // A stem is an independently sealed, non-consuming host
+                // frontier. It cannot certify or clear the longer live
+                // source; remember only enough to suppress duplicate work
+                // while that exact host stem remains present.
+                source.vbr_idle_stem_source_identity =
+                    found->full_source_identity;
+                source.vbr_idle_stem_coverage_tokens =
+                    found->selected_tokens;
+                source.vbr_idle_stem_host_artifact =
+                    prompt_cache->vbr_host_artifact_id(published_host);
+                if (source.vbr_idle_stem_host_artifact.v == 0) {
+                    source.vbr_idle_stem_source_valid = false;
+                    source.vbr_idle_stem_retry = true;
+                    source.vbr_idle_capture_terminal = false;
+                    source.vbr_idle_capture_retry_after_ms =
+                        ggml_time_ms() + 5000;
+                    continue;
+                }
+                source.vbr_idle_stem_source_valid = true;
+                source.vbr_idle_stem_retry = false;
+                source.vbr_idle_capture_attempt_identity =
+                    found->attempt_identity;
+                source.vbr_idle_capture_terminal = true;
+                source.vbr_idle_capture_retry_after_ms = 0;
+                SLT_DBG(source, "%s",
+                        "__TEST_TAG_VBR_IDLE_STEM_PUBLISHED__\n");
+                continue;
+            }
+            source.vbr_idle_stem_retry = false;
+            source.vbr_idle_stem_source_valid = false;
+            source.vbr_idle_stem_host_artifact = {};
             source.vbr_idle_capture_published_identity =
                 publication_identity;
             source.vbr_idle_capture_representation_valid =

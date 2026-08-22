@@ -1,5 +1,6 @@
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-artifact-stage.h"
+#include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-identity-digest.h"
 #include "llama-vbr-operation.h"
 #include "server-prompt-cache-payload.h"
@@ -71,6 +72,153 @@ static std::vector<uint8_t> read_chain(
     std::vector<uint8_t> out(chain.size());
     CHECK(chain.read(0, out.data(), out.size()));
     return out;
+}
+
+static void test_attention_stem_prefix_planner() {
+    const auto cell = [](uint32_t physical, llama_pos logical) {
+        return vbr_artifact_cell_placement {
+            physical, logical, 0, 0,
+        };
+    };
+    const std::vector<vbr_artifact_cell_placement> ordered {
+        cell(0, 0), cell(1, 1), cell(2, 2), cell(3, 3),
+    };
+    const auto policy = [](uint64_t minimum_tokens,
+                           uint64_t max_host_bytes = 0,
+                           uint64_t max_host_tokens = 0) {
+        return vbr_projected_capture_frontier_policy {
+            vbr_projected_capture_frontier_mode::longest_attention_stem,
+            minimum_tokens,
+            max_host_bytes,
+            max_host_tokens,
+        };
+    };
+    vbr_attention_stem_prefix_plan plan;
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40, 1, policy(1), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::exact);
+    CHECK(plan.selected_token_count == 4);
+    CHECK(plan.selected_next_position == 4);
+    CHECK(plan.planned_packed_bytes == 40);
+    CHECK(plan.projected_host_resident_bytes == 424);
+    CHECK(plan.surveyed_cells == 4);
+
+    // Pin the inclusive cap comparison: one byte less must lose exactly one
+    // complete row, not accept an over-cap frontier or lose two rows.
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 39, 1, policy(1), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::stem_selected);
+    CHECK(plan.selected_token_count == 3);
+    CHECK(plan.planned_packed_bytes == 30);
+
+    const std::vector<vbr_artifact_cell_placement> out_of_order {
+        cell(0, 2), cell(1, 0), cell(2, 3), cell(3, 1),
+    };
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, out_of_order.data(), out_of_order.size(), 10, 40, 1,
+        policy(4), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::exact);
+    CHECK(plan.selected_token_count == 4);
+
+    const std::vector<vbr_artifact_cell_placement> duplicate {
+        cell(0, 0), cell(1, 1), cell(2, 1), cell(3, 3),
+    };
+    CHECK(!vbr_plan_attention_stem_prefix(
+        4, duplicate.data(), duplicate.size(), 10, 40, 1,
+        policy(1), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::stem_unsupported);
+    const std::vector<vbr_artifact_cell_placement> out_of_range {
+        cell(0, 0), cell(1, 1), cell(2, 2), cell(3, 4),
+    };
+    CHECK(!vbr_plan_attention_stem_prefix(
+        4, out_of_range.data(), out_of_range.size(), 10, 40, 1,
+        policy(1), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::stem_unsupported);
+
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 29, 1, policy(3), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::stem_below_minimum);
+    CHECK(plan.selected_token_count == 2);
+    CHECK(plan.planned_packed_bytes == 20);
+
+    // One projected unit contributes exactly 256 descriptor bytes and 128
+    // reference bytes. The inclusive host cap accepts all four payload rows;
+    // one byte less loses exactly one complete row.
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40, 1,
+        policy(1, 424), plan));
+    CHECK(plan.status == vbr_projected_capture_frontier_status::exact);
+    CHECK(plan.selected_token_count == 4);
+    CHECK(plan.projected_host_resident_bytes == 424);
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40, 1,
+        policy(1, 423), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::stem_selected);
+    CHECK(plan.selected_token_count == 3);
+    CHECK(plan.projected_host_resident_bytes == 414);
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40, 2,
+        policy(1, 808), plan));
+    CHECK(plan.status == vbr_projected_capture_frontier_status::exact);
+    CHECK(plan.projected_host_resident_bytes == 808);
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40, 2,
+        policy(1, 807), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::stem_selected);
+    CHECK(plan.selected_token_count == 3);
+    CHECK(plan.projected_host_resident_bytes == 798);
+
+    // Token-only cache limits are exact. With a byte limit, cache semantics
+    // derive the effective token limit from bytes, so max_host_tokens is not a
+    // second independent ceiling.
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40, 1,
+        policy(1, 0, 4), plan));
+    CHECK(plan.status == vbr_projected_capture_frontier_status::exact);
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40, 1,
+        policy(1, 0, 3), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::stem_selected);
+    CHECK(plan.selected_token_count == 3);
+    CHECK(vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40, 1,
+        policy(1, 424, 1), plan));
+    CHECK(plan.status == vbr_projected_capture_frontier_status::exact);
+
+    std::vector<vbr_artifact_cell_placement> maximum(
+        VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS);
+    for (uint32_t i = 0; i < maximum.size(); ++i) {
+        maximum[i] = cell(
+            i, llama_pos(VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS - 1 - i));
+    }
+    CHECK(vbr_plan_attention_stem_prefix(
+        VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS,
+        maximum.data(), maximum.size(), 1,
+        VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS,
+        1, policy(VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS), plan));
+    CHECK(plan.status ==
+          vbr_projected_capture_frontier_status::exact);
+    CHECK(plan.selected_token_count ==
+          VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS);
+    CHECK(plan.surveyed_cells ==
+          VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS);
+    CHECK(!vbr_plan_attention_stem_prefix(
+        uint64_t(VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS) + 1,
+        maximum.data(), maximum.size(), 1,
+        uint64_t(VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS) + 1,
+        1, policy(1), plan));
+    CHECK(!vbr_plan_attention_stem_prefix(
+        4, ordered.data(), ordered.size(), 10, 40,
+        UINT64_MAX/256, policy(1), plan));
 }
 
 static void test_segment_chain_offsets() {
@@ -3826,6 +3974,7 @@ int main(int argc, char ** argv) {
         benchmark_fragmented_range_packing();
         return failures == 0 ? 0 : 1;
     }
+    test_attention_stem_prefix_planner();
     test_segment_chain_offsets();
     test_authenticated_range_tree();
     test_registry_quiescence_query();

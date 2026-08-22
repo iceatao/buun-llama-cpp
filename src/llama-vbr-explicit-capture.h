@@ -350,6 +350,62 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
 // identity and token storage are owned values; no caller-owned string pointer
 // is retained by the sealed projection.
 constexpr uint32_t VBR_PROJECTED_CAPTURE_MAX_MANIFESTS = 8;
+constexpr uint32_t VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS = 1048576;
+
+enum class vbr_projected_capture_frontier_mode : uint8_t {
+    exact = 0,
+    // Select the longest complete dense-attention prefix that fits the
+    // caller's packed-byte runway. This first implementation is deliberately
+    // limited to one text-only manifest, one unified attention child, and no
+    // recurrent companion state.
+    longest_attention_stem,
+    _count,
+};
+
+enum class vbr_projected_capture_frontier_status : uint8_t {
+    exact = 0,
+    stem_selected,
+    stem_below_minimum,
+    stem_unsupported,
+    _count,
+};
+
+struct vbr_projected_capture_frontier_policy {
+    vbr_projected_capture_frontier_mode mode =
+        vbr_projected_capture_frontier_mode::exact;
+    // A stem shorter than this is refused before projection or D2H.
+    uint64_t minimum_tokens = 0;
+    // Hard prompt-cache limits used only to choose a feasible stem frontier.
+    // Zero means unlimited. When a byte limit is configured, the cache derives
+    // its effective token limit from resident bytes; max_host_tokens is the
+    // independent ceiling only for a token-only cache.
+    uint64_t max_host_resident_bytes = 0;
+    uint64_t max_host_tokens = 0;
+};
+
+struct vbr_attention_stem_prefix_plan {
+    vbr_projected_capture_frontier_status status =
+        vbr_projected_capture_frontier_status::stem_unsupported;
+    uint64_t selected_token_count = 0;
+    llama_pos selected_next_position = -1;
+    uint64_t planned_packed_bytes = 0;
+    uint64_t projected_host_resident_bytes = 0;
+    uint64_t surveyed_cells = 0;
+};
+
+// Pure bounded planner shared by production capture and its CPU scale tests.
+// Placement order is irrelevant; duplicate or out-of-frontier logical rows
+// fail closed. A structurally valid prefix below minimum_tokens returns true
+// with stem_below_minimum so the caller can preserve typed diagnostics.
+bool vbr_plan_attention_stem_prefix(
+    uint64_t requested_token_count,
+    const vbr_artifact_cell_placement * cells,
+    size_t cell_count,
+    uint64_t bytes_per_logical_row,
+    uint64_t max_packed_bytes,
+    uint64_t projected_units,
+    const vbr_projected_capture_frontier_policy & policy,
+    vbr_attention_stem_prefix_plan & output) noexcept;
 
 struct vbr_projected_capture_manifest_request {
     uint64_t manifest_id = 0;
@@ -359,6 +415,10 @@ struct vbr_projected_capture_manifest_request {
     // Zero derives the canonical frontier/policy digest. A nonzero value must
     // match, exactly as in explicit capture.
     std::array<uint8_t, 32> identity_policy_order_digest = {};
+    // Asserted by the trusted caller from the source token representation.
+    // Stem planning refuses media-bearing prefixes; exact capture ignores
+    // this field for backward compatibility.
+    bool text_only = false;
 };
 
 struct vbr_projected_capture_batch_request {
@@ -382,6 +442,10 @@ struct vbr_projected_capture_batch_request {
             // placeholders and reserve no duplicate physical capacity.
             std::vector<vbr_artifact_portable_accounting_row>
                 reserve_accounting;
+            uint64_t requested_token_count = 0;
+            uint64_t selected_token_count = 0;
+            llama_pos selected_next_position = -1;
+            bool stemmed = false;
         };
 
         uint64_t planned_packed_bytes = 0;
@@ -402,6 +466,8 @@ struct vbr_projected_capture_batch_request {
         // this inventory; final assembly partitions independent terminals.
         std::vector<durable_manifest> durable;
     };
+    using pretransfer_prepare_fn = bool (*)(
+        void * context, const pretransfer_quote & quote) noexcept;
     using pretransfer_admit_fn = bool (*)(
         void * context, const pretransfer_quote & quote) noexcept;
     using pretransfer_shrink_fn = bool (*)(
@@ -412,12 +478,18 @@ struct vbr_projected_capture_batch_request {
     // Scheduler-admitted aggregate pageable payload runway for this batch.
     // Required and checked before the first D2H byte.
     uint64_t max_packed_bytes = 0;
+    vbr_projected_capture_frontier_policy frontier;
     std::vector<vbr_projected_capture_manifest_request> manifests;
     vbr_pinned_chunk_ring * ring = nullptr;
     std::vector<vbr_artifact_portable_topology> topologies;
     std::vector<vbr_explicit_capture_pool_binding> pool_bindings;
     const void * representation_context = nullptr;
     representation_identity_fn representation_identity = nullptr;
+    // Optional fallible preparation before the persistent ring operation is
+    // acquired. It is invoked at most once with the final selected frontier
+    // and physical quote; refusal performs no D2H and acquires no ring token.
+    void * pretransfer_prepare_context = nullptr;
+    pretransfer_prepare_fn pretransfer_prepare = nullptr;
     // Invoked exactly once after the initial bounded projection is priced and
     // before companion or attention D2H begins. For nonzero work the
     // batch-long ring operation is already held; the canonical zero-work quote
@@ -459,6 +531,14 @@ struct vbr_projected_capture_batch_result {
     uint64_t first_available_manifest_id = 0;
     uint64_t union_cells = 0;
     uint64_t planned_packed_bytes = 0;
+    vbr_projected_capture_frontier_status frontier_status =
+        vbr_projected_capture_frontier_status::_count;
+    uint64_t requested_frontier_tokens = 0;
+    uint64_t selected_frontier_tokens = 0;
+    llama_pos selected_frontier_next_position = -1;
+    uint64_t frontier_survey_cells = 0;
+    uint32_t frontier_survey_calls = 0;
+    uint32_t frontier_recapture_calls = 0;
     uint32_t size_pass_calls = 0;
     uint32_t projection_calls = 0;
     uint32_t unit_transfer_calls = 0;

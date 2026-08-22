@@ -203,6 +203,14 @@ struct server_vbr_projected_host_capture_diagnostics {
     uint64_t first_available_manifest_id = 0;
     uint64_t union_cells = 0;
     uint64_t planned_packed_bytes = 0;
+    vbr_projected_capture_frontier_status frontier_status =
+        vbr_projected_capture_frontier_status::_count;
+    uint64_t requested_frontier_tokens = 0;
+    uint64_t selected_frontier_tokens = 0;
+    llama_pos selected_frontier_next_position = -1;
+    uint64_t frontier_survey_cells = 0;
+    uint32_t frontier_survey_calls = 0;
+    uint32_t frontier_recapture_calls = 0;
     uint32_t size_pass_calls = 0;
     uint32_t projection_calls = 0;
     uint32_t unit_transfer_calls = 0;
@@ -235,16 +243,19 @@ struct server_vbr_projected_host_capture_diagnostics {
     server_vbr_projected_host_publish_diagnostics publication;
 };
 
-// Scheduler-owned last-mile admission at the exact pre-D2H boundary. The
-// store holds both the exact transfer-staging claim and every conservative
-// durable-publication claim while this callback runs. The projected capture
-// core also holds the one persistent ring operation, so acceptance observes
-// queue, capacity and transport ownership at the same checkpoint. The
-// callback can only accept or refuse the immutable quote; it must not retain
-// it or mutate source memory.
+// Scheduler-owned preparation and last-mile admission at the exact pre-D2H
+// boundary. `prepare` runs on the final quote before the core acquires the ring
+// operation or the store reserves resources, so any state it creates must
+// remain rollback-safe if a later step refuses. While `admit` runs, the store
+// holds both the exact transfer-staging claim and every conservative durable-
+// publication claim, and the core holds the persistent ring operation.
+// Callbacks may only accept or refuse the immutable quote; they must not
+// retain it or mutate source memory.
 struct server_vbr_projected_capture_admission {
     using quote = vbr_projected_capture_batch_request::pretransfer_quote;
+    vbr_projected_capture_frontier_policy frontier;
     void * context = nullptr;
+    bool (*prepare)(void * context, const quote & quote) noexcept = nullptr;
     bool (*admit)(void * context, const quote & quote) noexcept = nullptr;
     // Optional whole-capture checkpoint. It bounds recurrent/ring transfer
     // cancellation and is checked once more before catalog publication.

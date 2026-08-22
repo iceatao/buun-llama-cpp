@@ -2018,6 +2018,27 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
         incoming_tokens += size_t(tokens);
     }
 
+    const auto fits = [&](size_t bytes, size_t tokens) {
+        if (limit_size > 0 && bytes > limit_size) {
+            return false;
+        }
+        const size_t effective = server_prompt_cache_effective_token_limit(
+            limit_size, limit_tokens, bytes, tokens);
+        return limit_tokens == 0 || tokens <= effective;
+    };
+    // No victim can make a singleton fit if the incoming artifact itself
+    // exceeds the empty-cache byte/token envelope. Keep this typed refusal
+    // ahead of both the incumbent scan and pressure planning so the idle
+    // coordinator can retry a smaller authenticated stem.
+    if (prepared_count == 1 &&
+        !fits(size_t(incoming_compact_bytes), incoming_tokens)) {
+        if (status) {
+            *status = server_prompt_cache_vbr_capacity_status::
+                incoming_exceeds_hard_limit;
+        }
+        return false;
+    }
+
     size_t naive_bytes = 0;
     size_t current_tokens = 0;
     for (const auto & state : states) {
@@ -2042,15 +2063,6 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
     const size_t projected_tokens = current_tokens + incoming_tokens;
     const size_t projected_naive = naive_bytes +
         size_t(incoming_compact_bytes);
-    const auto fits = [&](size_t bytes, size_t tokens) {
-        if (limit_size > 0 && bytes > limit_size) {
-            return false;
-        }
-        const size_t effective = server_prompt_cache_effective_token_limit(
-            limit_size, limit_tokens, bytes, tokens);
-        return limit_tokens == 0 || tokens <= effective;
-    };
-
     size_t projected_bytes = projected_naive;
     if (!fits(projected_bytes, projected_tokens)) {
         // The allocation-free per-entry sum is conservative. Only a byte
@@ -2434,8 +2446,12 @@ bool server_prompt_cache::contains_vbr_frontier(
 
 bool server_prompt_cache::mark_vbr_frontiers(
         server_prompt_cache_vbr_frontier_query * queries,
-        size_t query_count)
+        size_t query_count,
+        server_prompt_cache_vbr_frontier_batch_diagnostics * diagnostics)
         const noexcept {
+    if (diagnostics) {
+        *diagnostics = {};
+    }
     const auto identity_less = [](const auto & lhs, const auto & rhs) {
         return std::tie(
                    lhs.sequence_epoch, lhs.token_count, lhs.next_position,
@@ -2454,11 +2470,14 @@ bool server_prompt_cache::mark_vbr_frontiers(
         if (query_count == 0) {
             return true;
         }
+        vbr_stem_witness_arena.clear();
+        bool has_stem_witness = false;
         for (size_t i = 0; i < query_count; ++i) {
             auto & query = queries[i];
             query.durable = false;
             query.token_identity_digest = {};
             query.token_identity_ready = false;
+            query.stem_durable = false;
             const auto & identity = query.identity;
             if (query.slot_id < 0 ||
                 !query.prompt ||
@@ -2469,6 +2488,12 @@ bool server_prompt_cache::mark_vbr_frontiers(
                 identity.token_count <= 0 ||
                 identity.next_position <= 0) {
                 return false;
+            }
+            if (query.expected_stem_artifact.v != 0) {
+                if (!retention_obs) {
+                    return false;
+                }
+                has_stem_witness = true;
             }
         }
         std::sort(queries, queries + query_count, [&](const auto & lhs,
@@ -2481,10 +2506,36 @@ bool server_prompt_cache::mark_vbr_frontiers(
             }
             return lhs.slot_id < rhs.slot_id;
         });
+        // Sorting moves query objects in place. Capture their final addresses
+        // only after identity ordering so each pointer retains its witness.
+        if (has_stem_witness &&
+            vbr_stem_witness_arena.capacity() < query_count) {
+            vbr_stem_witness_arena.reserve(query_count);
+        }
+        for (size_t i = 0; i < query_count; ++i) {
+            if (queries[i].expected_stem_artifact.v != 0) {
+                vbr_stem_witness_arena.push_back(&queries[i]);
+            }
+        }
+        std::sort(
+            vbr_stem_witness_arena.begin(),
+            vbr_stem_witness_arena.end(),
+            [](const auto * lhs, const auto * rhs) {
+                return std::tie(
+                           lhs->expected_stem_artifact.v, lhs->slot_id) <
+                       std::tie(
+                           rhs->expected_stem_artifact.v, rhs->slot_id);
+            });
         for (const auto & state : states) {
+            if (diagnostics) {
+                ++diagnostics->states_visited;
+            }
             if (state.payload.kind() !=
                     server_prompt_cache_payload_kind::vbr_artifact) {
                 continue;
+            }
+            if (diagnostics) {
+                ++diagnostics->vbr_states_visited;
             }
             const auto * artifact = state.payload.vbr_artifact();
             if (!artifact || !artifact->package()) {
@@ -2521,14 +2572,49 @@ bool server_prompt_cache::mark_vbr_frontiers(
                     current->durable = true;
                 }
             }
+            if (!vbr_stem_witness_arena.empty()) {
+                if (diagnostics) {
+                    ++diagnostics->stem_artifact_lookups;
+                }
+                const auto host_artifact = retention_obs->artifact_id(
+                    server_retention_instance_key::for_host_entry(&state));
+                const auto found = std::lower_bound(
+                    vbr_stem_witness_arena.begin(),
+                    vbr_stem_witness_arena.end(),
+                    host_artifact.v,
+                    [](const auto * witness, uint64_t value) {
+                        return witness->expected_stem_artifact.v < value;
+                    });
+                for (auto current_stem = found;
+                     current_stem != vbr_stem_witness_arena.end() &&
+                     (*current_stem)->expected_stem_artifact == host_artifact;
+                     ++current_stem) {
+                    (*current_stem)->stem_durable = true;
+                    if (diagnostics) {
+                        ++diagnostics->stem_matches;
+                    }
+                }
+            }
         }
         return true;
     } catch (...) {
         for (size_t i = 0; i < query_count; ++i) {
             queries[i].durable = false;
+            queries[i].stem_durable = false;
         }
         return false;
     }
+}
+
+llama_cache_acct_artifact_id server_prompt_cache::vbr_host_artifact_id(
+        const_iterator host) const noexcept {
+    if (!retention_obs || host == states.cend() ||
+        host->payload.kind() !=
+            server_prompt_cache_payload_kind::vbr_artifact) {
+        return {};
+    }
+    return retention_obs->artifact_id(
+        server_retention_instance_key::for_host_entry(&*host));
 }
 
 server_prompt_cache_vbr_publication_metadata::
@@ -2545,7 +2631,11 @@ server_prompt_cache_vbr_publication_metadata(
       source_(other.source_),
       source_slot_(other.source_slot_),
       source_artifact_(other.source_artifact_),
-      destination_artifact_(other.destination_artifact_) {
+      destination_artifact_(other.destination_artifact_),
+      source_sequence_epoch_(other.source_sequence_epoch_),
+      coverage_tokens_(other.coverage_tokens_),
+      source_prefix_digest_(other.source_prefix_digest_),
+      stem_(other.stem_) {
     entry_.splice(entry_.end(), other.entry_);
     other.clear();
 }
@@ -2564,6 +2654,10 @@ server_prompt_cache_vbr_publication_metadata::operator=(
     source_slot_ = other.source_slot_;
     source_artifact_ = other.source_artifact_;
     destination_artifact_ = other.destination_artifact_;
+    source_sequence_epoch_ = other.source_sequence_epoch_;
+    coverage_tokens_ = other.coverage_tokens_;
+    source_prefix_digest_ = other.source_prefix_digest_;
+    stem_ = other.stem_;
     entry_.splice(entry_.end(), other.entry_);
     other.clear();
     return *this;
@@ -2572,7 +2666,9 @@ server_prompt_cache_vbr_publication_metadata::operator=(
 bool server_prompt_cache_vbr_publication_metadata::ready() const noexcept {
     return cache_ && source_ && source_slot_ >= 0 &&
         source_artifact_.v != 0 && destination_artifact_.v != 0 &&
-        entry_.size() == 1;
+        coverage_tokens_ != 0 && entry_.size() == 1 &&
+        entry_.front().prompt.n_tokens() >= 0 &&
+        uint64_t(entry_.front().prompt.n_tokens()) == coverage_tokens_;
 }
 
 void server_prompt_cache_vbr_publication_metadata::clear() noexcept {
@@ -2581,6 +2677,10 @@ void server_prompt_cache_vbr_publication_metadata::clear() noexcept {
     source_slot_ = -1;
     source_artifact_ = {};
     destination_artifact_ = {};
+    source_sequence_epoch_ = 0;
+    coverage_tokens_ = 0;
+    source_prefix_digest_ = {};
+    stem_ = false;
     entry_.clear();
 }
 
@@ -3282,6 +3382,7 @@ static void server_prompt_cache_mirror_lease(
 enum class server_prompt_cache_prefix_clone_mode : uint8_t {
     publish_from_prompt = 0,
     share_source,
+    publish_stem,
 };
 
 static bool server_prompt_cache_mirror_artifact_clone(
@@ -3296,14 +3397,24 @@ static bool server_prompt_cache_mirror_artifact_clone(
         const std::string & adapter_identity,
         int64_t coverage_tokens,
         server_prompt_cache_prefix_clone_mode prefix_mode =
-            server_prompt_cache_prefix_clone_mode::publish_from_prompt)
+            server_prompt_cache_prefix_clone_mode::publish_from_prompt,
+        int64_t source_turn_tokens = -1)
         noexcept {
     if (!cache.retention_obs) {
         return true;
     }
 
-    const bool cloned = cache.retention_obs->clone(
-        source_key, destination_key);
+    common_chat_msg_spans no_spans;
+    const bool cloned = prefix_mode ==
+            server_prompt_cache_prefix_clone_mode::publish_stem
+        ? source_turn_tokens > 0 && coverage_tokens > 0 &&
+          coverage_tokens < source_turn_tokens &&
+          cache.retention_obs->publish(
+              destination_key, common_retention_pool::attention,
+              no_spans, true, uint64_t(source_turn_tokens),
+              uint64_t(coverage_tokens), true,
+              nullptr, nullptr, &source_key)
+        : cache.retention_obs->clone(source_key, destination_key);
     const bool indexed = cloned &&
         (destination_kind == common_retention_artifact_kind::checkpoint ||
          (prefix_mode == server_prompt_cache_prefix_clone_mode::share_source
@@ -3334,12 +3445,48 @@ bool server_prompt_cache::prepare_vbr_publication_metadata(
         std::string adapter_config_key,
         int32_t source_slot,
         server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
+    return prepare_vbr_publication_metadata_impl(
+        source_prompt, source_prompt.n_tokens(), false,
+        execution_identity, std::move(adapter_config_key), source_slot,
+        prepared);
+}
+
+bool server_prompt_cache::prepare_vbr_stem_publication_metadata(
+        const server_prompt & source_prompt,
+        int64_t coverage_tokens,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
+    return prepare_vbr_publication_metadata_impl(
+        source_prompt, coverage_tokens, true, execution_identity,
+        std::move(adapter_config_key), source_slot, prepared);
+}
+
+bool server_prompt_cache::prepare_vbr_publication_metadata_impl(
+        const server_prompt & source_prompt,
+        int64_t coverage_tokens,
+        bool stem,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
     if (prepared.ready() || !acct || !retention_obs || source_slot < 0 ||
         execution_identity.empty() || adapter_config_key.empty() ||
         source_prompt.tokens.empty() ||
+        coverage_tokens <= 0 ||
+        coverage_tokens > source_prompt.n_tokens() ||
+        (stem && (coverage_tokens == source_prompt.n_tokens() ||
+                  source_prompt.sequence_epoch == 0)) ||
         !retention_obs->prefix_tracking_enabled() ||
         !retention_obs->prefix_tracking_available() ||
         !vbr_retention_source_available(source_slot)) {
+        return false;
+    }
+    std::array<uint8_t, 32> source_prefix_digest = {};
+    if (stem &&
+        !source_prompt.tokens.retention_token_prefix_digest(
+            size_t(coverage_tokens), source_prefix_digest)) {
         return false;
     }
     std::list<server_prompt_cache_state> entry;
@@ -3347,6 +3494,9 @@ bool server_prompt_cache::prepare_vbr_publication_metadata(
         entry.emplace_back();
         auto & state = entry.front();
         state.prompt.tokens = source_prompt.tokens.clone();
+        if (stem) {
+            state.prompt.tokens.keep_first(size_t(coverage_tokens));
+        }
         state.prompt.sequence_epoch = source_prompt.sequence_epoch;
         state.adapter_config_key = std::move(adapter_config_key);
         state.vbr_execution_identity = execution_identity;
@@ -3368,7 +3518,9 @@ bool server_prompt_cache::prepare_vbr_publication_metadata(
             -1,
             state.prompt, state.adapter_config_key,
             state.prompt.n_tokens(),
-            server_prompt_cache_prefix_clone_mode::share_source);
+            stem ? server_prompt_cache_prefix_clone_mode::publish_stem
+                 : server_prompt_cache_prefix_clone_mode::share_source,
+            source_prompt.n_tokens());
     if (!mirrored) {
         retention_obs->retire(destination_key);
         return false;
@@ -3385,6 +3537,10 @@ bool server_prompt_cache::prepare_vbr_publication_metadata(
     prepared.source_slot_ = source_slot;
     prepared.source_artifact_ = source_artifact;
     prepared.destination_artifact_ = destination_artifact;
+    prepared.source_sequence_epoch_ = source_prompt.sequence_epoch;
+    prepared.coverage_tokens_ = uint64_t(coverage_tokens);
+    prepared.source_prefix_digest_ = source_prefix_digest;
+    prepared.stem_ = stem;
     prepared.entry_.splice(prepared.entry_.end(), entry);
     return true;
 }
@@ -3415,6 +3571,47 @@ bool server_prompt_cache::publish_vbr(
     if (!prepared.ready() || prepared.cache_ != this ||
         payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
         !payload.publishable()) {
+        return false;
+    }
+    auto & staged = prepared.entry_.front();
+    const auto source_prefix_matches = [&]() noexcept {
+        if (!prepared.stem_) {
+            return true;
+        }
+        try {
+            if (!prepared.source_ ||
+                prepared.source_->sequence_epoch !=
+                    prepared.source_sequence_epoch_ ||
+                staged.prompt.sequence_epoch !=
+                    prepared.source_sequence_epoch_ ||
+                prepared.coverage_tokens_ > uint64_t(INT64_MAX) ||
+                prepared.source_->n_tokens() < 0 ||
+                uint64_t(prepared.source_->n_tokens()) <
+                    prepared.coverage_tokens_ ||
+                staged.prompt.n_tokens() < 0 ||
+                uint64_t(staged.prompt.n_tokens()) !=
+                    prepared.coverage_tokens_ ||
+                !server_prompt_cache_vbr_frontier_matches(
+                    staged.prompt, payload,
+                    staged.vbr_execution_identity,
+                    staged.adapter_config_key)) {
+                return false;
+            }
+            std::array<uint8_t, 32> live_digest = {};
+            std::array<uint8_t, 32> staged_digest = {};
+            return prepared.source_->tokens.retention_token_prefix_digest(
+                       size_t(prepared.coverage_tokens_), live_digest) &&
+                   staged.prompt.tokens.retention_token_prefix_digest(
+                       size_t(prepared.coverage_tokens_), staged_digest) &&
+                   live_digest == prepared.source_prefix_digest_ &&
+                   staged_digest == prepared.source_prefix_digest_ &&
+                   prepared.source_->tokens.get_common_prefix(
+                       staged.prompt.tokens) == prepared.coverage_tokens_;
+        } catch (...) {
+            return false;
+        }
+    };
+    if (!source_prefix_matches()) {
         return false;
     }
     server_prompt_cache_vbr_pressure_citation required_victims;
@@ -3448,7 +3645,6 @@ bool server_prompt_cache::publish_vbr(
         }
         capacity->clear();
     }
-    auto & staged = prepared.entry_.front();
     const auto source_key =
         server_retention_instance_key::for_slot(prepared.source_slot_);
     const auto destination_key =
@@ -3465,13 +3661,15 @@ bool server_prompt_cache::publish_vbr(
         staged, family, automatic_main_family);
     const auto * source = prepared.source_;
     const int32_t source_slot = prepared.source_slot_;
+    const int64_t source_vbr_coverage_tokens = prepared.stem_
+        ? int64_t(prepared.coverage_tokens_) : -1;
     std::list<server_prompt_cache_state> entry;
     entry.splice(entry.end(), prepared.entry_);
     prepared.clear();
     try {
         if (publish_impl(
                 std::move(entry), source, source_slot, published, true,
-                required_victims)) {
+                required_victims, source_vbr_coverage_tokens)) {
             return true;
         }
     } catch (...) {
@@ -7126,7 +7324,8 @@ bool server_prompt_cache::publish_impl(
         int32_t source_slot,
         iterator * published,
         bool vbr_retention_prepared,
-        server_prompt_cache_vbr_pressure_citation required_victims) {
+        server_prompt_cache_vbr_pressure_citation required_victims,
+        int64_t source_vbr_coverage_tokens) {
     if (published) {
         *published = states.end();
     }
@@ -7139,6 +7338,28 @@ bool server_prompt_cache::publish_impl(
     auto & staged = entry.front();
     const bool is_vbr = staged.payload.kind() ==
         server_prompt_cache_payload_kind::vbr_artifact;
+    const auto source_matches_staged_vbr = [&]() noexcept {
+        if (!source_prompt) {
+            return false;
+        }
+        if (source_vbr_coverage_tokens < 0) {
+            return server_prompt_cache_vbr_frontier_matches(
+                *source_prompt, staged.payload,
+                staged.vbr_execution_identity,
+                staged.adapter_config_key);
+        }
+        try {
+            return staged.prompt.n_tokens() == source_vbr_coverage_tokens &&
+                   source_prompt->n_tokens() >= source_vbr_coverage_tokens &&
+                   source_prompt->sequence_epoch ==
+                       staged.prompt.sequence_epoch &&
+                   source_prompt->tokens.get_common_prefix(
+                       staged.prompt.tokens) ==
+                       size_t(source_vbr_coverage_tokens);
+        } catch (...) {
+            return false;
+        }
+    };
 
     // A sealed VBR capability is already charged in the cache's canonical
     // ledger. Borrowed/manual views remain publishable only when they fit
@@ -7150,11 +7371,7 @@ bool server_prompt_cache::publish_impl(
                 staged.prompt, staged.payload,
                 staged.vbr_execution_identity,
                 staged.adapter_config_key) ||
-            !source_prompt ||
-            !server_prompt_cache_vbr_frontier_matches(
-                *source_prompt, staged.payload,
-                staged.vbr_execution_identity,
-                staged.adapter_config_key) ||
+            !source_matches_staged_vbr() ||
             !acct || !staged.payload.accounted_by(acct) ||
             !retention_obs || source_slot < 0 ||
             !retention_obs->prefix_tracking_enabled() ||

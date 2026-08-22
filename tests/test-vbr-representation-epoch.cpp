@@ -996,14 +996,52 @@ static bool h2_test_representation_identity(
 }
 
 struct h2_pretransfer_admission {
-    uint32_t calls = 0;
+    uint32_t prepare_calls = 0;
+    bool prepare_accept = true;
+    bool ring_available_at_prepare = false;
+    uint32_t admit_calls = 0;
     bool accept = true;
     vbr_pinned_chunk_ring * ring = nullptr;
+    bool prepared_before_admission = false;
     bool ring_owned_at_admission = false;
+    vbr_projected_capture_batch_request::pretransfer_quote prepare_quote;
     vbr_projected_capture_batch_request::pretransfer_quote quote;
     uint32_t continuation_calls = 0;
     uint32_t continuations_allowed = UINT32_MAX;
 };
+
+static bool h2_ring_operation_available(
+        vbr_pinned_chunk_ring * ring) noexcept {
+    if (!ring) {
+        return false;
+    }
+    bool acquired = false;
+    try {
+        std::thread competing([&]() {
+            auto operation = ring->try_begin_operation();
+            acquired = bool(operation);
+        });
+        competing.join();
+    } catch (...) {
+        acquired = false;
+    }
+    return acquired;
+}
+
+static bool h2_pretransfer_prepare(
+        void * opaque,
+        const vbr_projected_capture_batch_request::pretransfer_quote & quote)
+        noexcept {
+    auto * state = static_cast<h2_pretransfer_admission *>(opaque);
+    if (!state) {
+        return false;
+    }
+    ++state->prepare_calls;
+    state->prepare_quote = quote;
+    state->ring_available_at_prepare =
+        h2_ring_operation_available(state->ring);
+    return state->prepare_accept;
+}
 
 static bool h2_pretransfer_admit(
         void * opaque,
@@ -1013,21 +1051,11 @@ static bool h2_pretransfer_admit(
     if (!state) {
         return false;
     }
-    ++state->calls;
+    ++state->admit_calls;
+    state->prepared_before_admission = state->prepare_calls == 1;
     state->quote = quote;
-    if (state->ring) {
-        bool competing_acquired = false;
-        try {
-            std::thread competing([&]() {
-                auto operation = state->ring->try_begin_operation();
-                competing_acquired = bool(operation);
-            });
-            competing.join();
-            state->ring_owned_at_admission = !competing_acquired;
-        } catch (...) {
-            state->ring_owned_at_admission = false;
-        }
-    }
+    state->ring_owned_at_admission =
+        state->ring && !h2_ring_operation_available(state->ring);
     return state->accept;
 }
 
@@ -1096,6 +1124,8 @@ static bool h2_projected_capture_batch_exact(
     request.representation_identity = h2_test_representation_identity;
     h2_pretransfer_admission admission;
     admission.ring = ring.get();
+    request.pretransfer_prepare_context = &admission;
+    request.pretransfer_prepare = h2_pretransfer_prepare;
     request.pretransfer_context = &admission;
     request.pretransfer_admit = h2_pretransfer_admit;
     request.continue_context = &admission;
@@ -1124,8 +1154,13 @@ static bool h2_projected_capture_batch_exact(
         captured.projection_calls != 1 || captured.union_cells != 1 ||
         captured.planned_packed_bytes == 0 ||
         captured.planned_packed_bytes > request.max_packed_bytes ||
-        admission.calls != 1 || !admission.accept ||
+        admission.prepare_calls != 1 || !admission.prepare_accept ||
+        !admission.ring_available_at_prepare ||
+        admission.admit_calls != 1 || !admission.accept ||
+        !admission.prepared_before_admission ||
         !admission.ring_owned_at_admission ||
+        admission.prepare_quote.planned_packed_bytes !=
+            captured.planned_packed_bytes ||
         admission.quote.planned_packed_bytes !=
             captured.planned_packed_bytes ||
         admission.quote.projected_host_resident_bytes == 0 ||
@@ -1227,10 +1262,45 @@ static bool h2_projected_capture_batch_exact(
         }
     }
     if (manifest_count == 1) {
+        auto preparation_refused_request = request;
+        h2_pretransfer_admission preparation_refused_admission;
+        preparation_refused_admission.prepare_accept = false;
+        preparation_refused_admission.ring = ring.get();
+        preparation_refused_request.pretransfer_prepare_context =
+            &preparation_refused_admission;
+        preparation_refused_request.pretransfer_context =
+            &preparation_refused_admission;
+        preparation_refused_request.continue_context =
+            &preparation_refused_admission;
+        const auto preparation_refused = vbr_capture_projected_batch(
+            memory, preparation_refused_request);
+        if (preparation_refused.status !=
+                vbr_explicit_capture_status::admission_refused ||
+            preparation_refused.phase !=
+                vbr_explicit_capture_phase::reservation_preparation ||
+            preparation_refused_admission.prepare_calls != 1 ||
+            preparation_refused_admission.prepare_accept ||
+            !preparation_refused_admission.ring_available_at_prepare ||
+            preparation_refused_admission.admit_calls != 0 ||
+            preparation_refused_admission.continuation_calls != 0 ||
+            preparation_refused_admission.prepare_quote.planned_packed_bytes ==
+                0 ||
+            preparation_refused.ring_operation_attempts != 0 ||
+            preparation_refused.ring_operation_acquires != 0 ||
+            preparation_refused.ring_operation_refusals != 0 ||
+            preparation_refused.unit_transfer_calls != 0 ||
+            preparation_refused.transferred_units != 0 ||
+            preparation_refused.transfer.bytes != 0 ||
+            preparation_refused.assembly ||
+            !preparation_refused.publications.empty()) {
+            return false;
+        }
         auto admission_refused_request = request;
         h2_pretransfer_admission refused_admission;
         refused_admission.accept = false;
         refused_admission.ring = ring.get();
+        admission_refused_request.pretransfer_prepare_context =
+            &refused_admission;
         admission_refused_request.pretransfer_context = &refused_admission;
         admission_refused_request.continue_context = &refused_admission;
         const auto admission_refused = vbr_capture_projected_batch(
@@ -1239,7 +1309,10 @@ static bool h2_projected_capture_batch_exact(
                 vbr_explicit_capture_status::admission_refused ||
             admission_refused.phase !=
                 vbr_explicit_capture_phase::reservation_preparation ||
-            refused_admission.calls != 1 ||
+            refused_admission.prepare_calls != 1 ||
+            !refused_admission.ring_available_at_prepare ||
+            refused_admission.admit_calls != 1 ||
+            !refused_admission.prepared_before_admission ||
             refused_admission.continuation_calls != 0 ||
             refused_admission.quote.planned_packed_bytes == 0 ||
             !refused_admission.ring_owned_at_admission ||
@@ -1265,6 +1338,7 @@ static bool h2_projected_capture_batch_exact(
         h2_pretransfer_admission busy_admission;
         busy_admission.ring = ring.get();
         auto busy_request = request;
+        busy_request.pretransfer_prepare_context = &busy_admission;
         busy_request.pretransfer_context = &busy_admission;
         busy_request.continue_context = &busy_admission;
         const auto busy = vbr_capture_projected_batch(memory, busy_request);
@@ -1273,7 +1347,9 @@ static bool h2_projected_capture_batch_exact(
                 vbr_explicit_capture_phase::reservation_preparation ||
             busy.inner_stream_status !=
                 vbr_capture_stream_status::ring_unavailable ||
-            busy_admission.calls != 0 ||
+            busy_admission.prepare_calls != 1 ||
+            busy_admission.ring_available_at_prepare ||
+            busy_admission.admit_calls != 0 ||
             busy_admission.ring_owned_at_admission ||
             busy_admission.continuation_calls != 0 ||
             busy.ring_operation_attempts != 1 ||
@@ -1288,6 +1364,8 @@ static bool h2_projected_capture_batch_exact(
         auto cancelled_request = request;
         h2_pretransfer_admission cancelled_admission;
         cancelled_admission.continuations_allowed = 0;
+        cancelled_request.pretransfer_prepare_context =
+            &cancelled_admission;
         cancelled_request.pretransfer_context = &cancelled_admission;
         cancelled_request.continue_context = &cancelled_admission;
         const auto cancelled = vbr_capture_projected_batch(
@@ -1296,7 +1374,9 @@ static bool h2_projected_capture_batch_exact(
                 vbr_explicit_capture_status::cancelled ||
             cancelled.phase !=
                 vbr_explicit_capture_phase::companion_capture ||
-            cancelled_admission.calls != 1 ||
+            cancelled_admission.prepare_calls != 1 ||
+            !cancelled_admission.prepared_before_admission ||
+            cancelled_admission.admit_calls != 1 ||
             cancelled_admission.continuation_calls != 1 ||
             cancelled.ring_operation_attempts != 1 ||
             cancelled.ring_operation_acquires != 1 ||
@@ -1310,6 +1390,8 @@ static bool h2_projected_capture_batch_exact(
         auto companion_mid_cancelled_request = request;
         h2_pretransfer_admission companion_mid_cancelled_admission;
         companion_mid_cancelled_admission.continuations_allowed = 1;
+        companion_mid_cancelled_request.pretransfer_prepare_context =
+            &companion_mid_cancelled_admission;
         companion_mid_cancelled_request.pretransfer_context =
             &companion_mid_cancelled_admission;
         companion_mid_cancelled_request.continue_context =
@@ -1320,7 +1402,9 @@ static bool h2_projected_capture_batch_exact(
                 vbr_explicit_capture_status::cancelled ||
             companion_mid_cancelled.phase !=
                 vbr_explicit_capture_phase::companion_capture ||
-            companion_mid_cancelled_admission.calls != 1 ||
+            companion_mid_cancelled_admission.prepare_calls != 1 ||
+            !companion_mid_cancelled_admission.prepared_before_admission ||
+            companion_mid_cancelled_admission.admit_calls != 1 ||
             companion_mid_cancelled_admission.continuation_calls != 2 ||
             companion_mid_cancelled.companion_d2h_reads != 1 ||
             companion_mid_cancelled.companion_d2h_bytes == 0 ||
@@ -1336,6 +1420,8 @@ static bool h2_projected_capture_batch_exact(
         h2_pretransfer_admission attention_cancelled_admission;
         attention_cancelled_admission.continuations_allowed =
             admission.continuation_calls - 1;
+        attention_cancelled_request.pretransfer_prepare_context =
+            &attention_cancelled_admission;
         attention_cancelled_request.pretransfer_context =
             &attention_cancelled_admission;
         attention_cancelled_request.continue_context =
@@ -1348,7 +1434,9 @@ static bool h2_projected_capture_batch_exact(
                 vbr_explicit_capture_phase::unit_transfer ||
             attention_cancelled.inner_stream_status !=
                 vbr_capture_stream_status::cancelled ||
-            attention_cancelled_admission.calls != 1 ||
+            attention_cancelled_admission.prepare_calls != 1 ||
+            !attention_cancelled_admission.prepared_before_admission ||
+            attention_cancelled_admission.admit_calls != 1 ||
             attention_cancelled.unit_transfer_calls == 0 ||
             attention_cancelled.transfer.submitted_chunks == 0 ||
             attention_cancelled.transfer.submitted_bytes == 0 ||
@@ -1364,13 +1452,15 @@ static bool h2_projected_capture_batch_exact(
         refused_request.max_packed_bytes =
             captured.planned_packed_bytes - 1;
         h2_pretransfer_admission over_cap_admission;
+        refused_request.pretransfer_prepare_context = &over_cap_admission;
         refused_request.pretransfer_context = &over_cap_admission;
         refused_request.continue_context = &over_cap_admission;
         const auto refused = vbr_capture_projected_batch(
             memory, refused_request);
         if (refused.status !=
                 vbr_explicit_capture_status::accounting_failed ||
-            over_cap_admission.calls != 0 ||
+            over_cap_admission.prepare_calls != 0 ||
+            over_cap_admission.admit_calls != 0 ||
             refused.unit_transfer_calls != 0 || refused.assembly ||
             !refused.publications.empty()) {
             return false;

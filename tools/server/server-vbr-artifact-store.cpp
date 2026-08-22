@@ -1829,6 +1829,9 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         vbr_projected_capture_batch_request request;
         request.idle_decode_thread = true;
         request.max_packed_bytes = max_packed_bytes;
+        if (admission) {
+            request.frontier = admission->frontier;
+        }
         request.manifests = std::move(manifests);
         request.ring = impl_->ring.get();
         request.topologies = impl_->topologies;
@@ -1841,6 +1844,10 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         request.representation_context = &representation_policy;
         request.representation_identity =
             vbr_explicit_capture_representation_identity;
+        if (admission && admission->prepare) {
+            request.pretransfer_prepare_context = admission->context;
+            request.pretransfer_prepare = admission->prepare;
+        }
         request.pretransfer_context = &staging;
         request.pretransfer_admit = +[](
                 void * opaque,
@@ -1866,6 +1873,16 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
             captured.first_available_manifest_id;
         measured.union_cells = captured.union_cells;
         measured.planned_packed_bytes = captured.planned_packed_bytes;
+        measured.frontier_status = captured.frontier_status;
+        measured.requested_frontier_tokens =
+            captured.requested_frontier_tokens;
+        measured.selected_frontier_tokens =
+            captured.selected_frontier_tokens;
+        measured.selected_frontier_next_position =
+            captured.selected_frontier_next_position;
+        measured.frontier_survey_cells = captured.frontier_survey_cells;
+        measured.frontier_survey_calls = captured.frontier_survey_calls;
+        measured.frontier_recapture_calls = captured.frontier_recapture_calls;
         measured.size_pass_calls = captured.size_pass_calls;
         measured.projection_calls = captured.projection_calls;
         measured.unit_transfer_calls = captured.unit_transfer_calls;

@@ -252,6 +252,15 @@ public:
     bool retention_token_digest(
         std::array<uint8_t, 32> & out) const noexcept;
 
+    // Stable identity for one exact logical prefix. Unlike the whole-token
+    // cache above, this deliberately includes the media-prefix identity and
+    // refuses a boundary that cuts through a media chunk. Stem publication
+    // uses it as a bounded source witness while the live suffix may continue
+    // to change independently.
+    bool retention_token_prefix_digest(
+        size_t coverage_tokens,
+        std::array<uint8_t, 32> & out) const noexcept;
+
     llama_tokens get_text_tokens() const;
 
     // for compatibility with speculative decoding

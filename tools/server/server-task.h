@@ -851,6 +851,19 @@ struct server_prompt_cache_vbr_frontier_query {
     std::array<uint8_t, 32> token_identity_digest = {};
     bool token_identity_ready = false;
     bool durable = false;
+    // Optional immutable host-node witness for a previously published stem.
+    // The scheduler separately binds this artifact to the unchanged full
+    // source attempt and selected coverage; this batch only proves that exact
+    // destination association remains live.
+    llama_cache_acct_artifact_id expected_stem_artifact;
+    bool stem_durable = false;
+};
+
+struct server_prompt_cache_vbr_frontier_batch_diagnostics {
+    uint64_t states_visited = 0;
+    uint64_t vbr_states_visited = 0;
+    uint64_t stem_artifact_lookups = 0;
+    uint64_t stem_matches = 0;
 };
 
 struct server_prompt_cache;
@@ -896,6 +909,10 @@ private:
     int32_t source_slot_ = -1;
     llama_cache_acct_artifact_id source_artifact_;
     llama_cache_acct_artifact_id destination_artifact_;
+    uint64_t source_sequence_epoch_ = 0;
+    uint64_t coverage_tokens_ = 0;
+    std::array<uint8_t, 32> source_prefix_digest_ = {};
+    bool stem_ = false;
     std::list<server_prompt_cache_state> entry_;
     friend struct server_prompt_cache;
 };
@@ -943,6 +960,7 @@ struct server_prompt_cache_vbr_pressure_citation {
 enum class server_prompt_cache_vbr_capacity_status : uint8_t {
     invalid,
     fit,
+    incoming_exceeds_hard_limit,
     pressure_cited,
     pressure_batch_unsupported,
 };
@@ -1253,14 +1271,23 @@ struct server_prompt_cache {
         const server_prompt & prompt,
         const std::string & execution_identity,
         const std::string & adapter_config_key) const noexcept;
-
+    // Read-only suppression check for an already-durable shorter frontier.
+    // The host package must be exact for coverage and the current live prompt
+    // must still carry that exact prefix under the same source epoch.
     // Sorts the populated prefix of the caller-owned query arena and marks
     // immutable identity matches in one bounded pass over host states. This
     // is selection evidence, not permission to clear a live source.
     bool mark_vbr_frontiers(
         server_prompt_cache_vbr_frontier_query * queries,
-        size_t query_count)
+        size_t query_count,
+        server_prompt_cache_vbr_frontier_batch_diagnostics * diagnostics =
+            nullptr)
         const noexcept;
+
+    // Stable destination witness for an already-published VBR host iterator.
+    // Retirement or address reuse yields a different/zero artifact ID.
+    llama_cache_acct_artifact_id vbr_host_artifact_id(
+        const_iterator host) const noexcept;
 
     // Replace one exact logical node's compact representation in place. A
     // lower-quality recapture preserves the prior best owner as an optional
@@ -1277,6 +1304,17 @@ struct server_prompt_cache {
     // Dropping the move-only metadata rolls back its retention association.
     bool prepare_vbr_publication_metadata(
         const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
+    // Prepare a shorter immutable host frontier from an exact prefix of a
+    // longer live prompt. Coverage is a logical-token boundary and must be
+    // strictly inside the source; the full-frontier API above retains its
+    // historical source-prefix sharing behavior.
+    bool prepare_vbr_stem_publication_metadata(
+        const server_prompt & source_prompt,
+        int64_t coverage_tokens,
         const std::string & execution_identity,
         std::string adapter_config_key,
         int32_t source_slot,
@@ -1428,6 +1466,19 @@ struct server_prompt_cache {
             server_cache_destruction_reason reason);
 
 private:
+    // Reused by the scheduler-owned durability classifier. Durable stems
+    // accumulate across capture waves, so this arena follows the full host
+    // candidate bound rather than the <=8 manifests admitted by one wave.
+    mutable std::vector<server_prompt_cache_vbr_frontier_query *>
+        vbr_stem_witness_arena;
+    bool prepare_vbr_publication_metadata_impl(
+        const server_prompt & source_prompt,
+        int64_t coverage_tokens,
+        bool stem,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
     void abandon_vbr_publication_metadata(
         server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
     bool publish_impl(
@@ -1436,7 +1487,8 @@ private:
         int32_t source_slot,
         iterator * published,
         bool vbr_retention_prepared,
-        server_prompt_cache_vbr_pressure_citation required_victims = {});
+        server_prompt_cache_vbr_pressure_citation required_victims = {},
+        int64_t source_vbr_coverage_tokens = -1);
     void release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
     friend class server_prompt_cache_vbr_publication_metadata;

@@ -4356,12 +4356,43 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_publication_metadata * batch[] = {
             &prepared_pressure,
         };
+        server_prompt_cache_vbr_capacity_status capacity_status;
+        cache.limit_size = size_t(owner->resident_bytes());
+        server_prompt_cache_vbr_capacity_claim exact_byte_capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 1, owner->resident_bytes(), exact_byte_capacity,
+            &capacity_status));
+        CHECK(capacity_status ==
+            server_prompt_cache_vbr_capacity_status::fit);
+        CHECK(cache.consume_vbr_publication_capacity(exact_byte_capacity));
         cache.limit_size = size_t(owner->resident_bytes() - 1);
         server_prompt_cache_vbr_capacity_claim refused_capacity;
         CHECK(!cache.prepare_vbr_publication_capacity(
-            batch, 1, owner->resident_bytes(), refused_capacity));
+            batch, 1, owner->resident_bytes(), refused_capacity,
+            &capacity_status));
+        CHECK(capacity_status ==
+            server_prompt_cache_vbr_capacity_status::
+                incoming_exceeds_hard_limit);
         CHECK(!refused_capacity.ready());
         cache.limit_size = 0;
+        cache.limit_tokens = size_t(prompt.n_tokens());
+        server_prompt_cache_vbr_capacity_claim exact_token_capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(
+            batch, 1, owner->resident_bytes(), exact_token_capacity,
+            &capacity_status));
+        CHECK(capacity_status ==
+            server_prompt_cache_vbr_capacity_status::fit);
+        CHECK(cache.consume_vbr_publication_capacity(exact_token_capacity));
+        cache.limit_tokens = size_t(prompt.n_tokens() - 1);
+        server_prompt_cache_vbr_capacity_claim refused_token_capacity;
+        CHECK(!cache.prepare_vbr_publication_capacity(
+            batch, 1, owner->resident_bytes(), refused_token_capacity,
+            &capacity_status));
+        CHECK(capacity_status ==
+            server_prompt_cache_vbr_capacity_status::
+                incoming_exceeds_hard_limit);
+        CHECK(!refused_token_capacity.ready());
+        cache.limit_tokens = 0;
     }
     CHECK(fixture.ledger.snapshot().live_ops == live_ops_before);
 
@@ -4408,6 +4439,146 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         CHECK(fixture.ledger.snapshot().live_ops == live_ops_before + 1);
     }
     CHECK(fixture.ledger.snapshot().live_ops == live_ops_before);
+
+    // A stem is a new exact-prefix node, not a full-source prefix alias. Its
+    // move-only preparation binds the live source artifact, epoch, coverage,
+    // and prefix digest while allowing the suffix beyond coverage to evolve.
+    {
+        server_prompt stem_source;
+        stem_source.tokens = server_tokens(
+            llama_tokens { 101, 102, 103 }, false);
+        stem_source.sequence_epoch = prompt.sequence_epoch;
+        std::array<uint8_t, 32> prefix_digest = {};
+        std::array<uint8_t, 32> same_prefix_digest = {};
+        std::array<uint8_t, 32> full_digest = {};
+        server_tokens same_prefix(
+            llama_tokens { 101, 102, 999 }, false);
+        CHECK(stem_source.tokens.retention_token_prefix_digest(
+            2, prefix_digest));
+        CHECK(same_prefix.retention_token_prefix_digest(
+            2, same_prefix_digest));
+        CHECK(prefix_digest == same_prefix_digest);
+        CHECK(stem_source.tokens.retention_token_prefix_digest(
+            3, full_digest));
+        CHECK(full_digest != prefix_digest);
+        CHECK(!stem_source.tokens.retention_token_prefix_digest(
+            0, same_prefix_digest));
+        CHECK(!stem_source.tokens.retention_token_prefix_digest(
+            4, same_prefix_digest));
+
+        constexpr int32_t stem_source_slot = 14;
+        const auto stem_source_key =
+            server_retention_instance_key::for_slot(stem_source_slot);
+        common_chat_msg_spans stem_spans;
+        stem_spans.add(
+            COMMON_CHAT_ROLE_USER, 0, stem_source.n_tokens());
+        CHECK(retention.publish(
+            stem_source_key, common_retention_pool::attention,
+            stem_spans, true, stem_source.n_tokens(),
+            stem_source.n_tokens(), true));
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            retention, stem_source_key, stem_source,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_source.n_tokens()));
+
+        server_prompt_cache stem_cache(0, 0);
+        stem_cache.acct = &fixture.ledger;
+        stem_cache.retention_obs = &retention;
+        server_prompt_cache_vbr_publication_metadata invalid;
+        CHECK(!stem_cache.prepare_vbr_stem_publication_metadata(
+            stem_source, 0,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_source_slot, invalid));
+        CHECK(!stem_cache.prepare_vbr_stem_publication_metadata(
+            stem_source, stem_source.n_tokens(),
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_source_slot, invalid));
+        CHECK(!stem_cache.prepare_vbr_stem_publication_metadata(
+            stem_source, stem_source.n_tokens() + 1,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_source_slot, invalid));
+
+        // The staged prefix and sealed package must still describe exactly the
+        // same frontier; merely being a prefix of the live source is not enough.
+        CHECK(stem_cache.prepare_vbr_stem_publication_metadata(
+            stem_source, 1,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_source_slot, invalid));
+        CHECK(!stem_cache.publish_vbr(
+            invalid, payload, {}, false));
+        CHECK(invalid.ready());
+        invalid = {};
+
+        server_prompt_cache_vbr_publication_metadata stem_metadata;
+        CHECK(stem_cache.prepare_vbr_stem_publication_metadata(
+            stem_source, 2,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_source_slot, stem_metadata));
+        CHECK(stem_metadata.ready());
+        stem_source.sequence_epoch++;
+        CHECK(!stem_cache.publish_vbr(
+            stem_metadata, payload, {}, false));
+        CHECK(stem_metadata.ready());
+        stem_source.sequence_epoch--;
+        stem_source.tokens.set_token(0, 201);
+        CHECK(!stem_cache.publish_vbr(
+            stem_metadata, payload, {}, false));
+        CHECK(stem_metadata.ready());
+        stem_source.tokens.set_token(0, 101);
+
+        // A same-key source retirement/republication is an ABA even when its
+        // epoch and exact prefix are unchanged.
+        const auto old_stem_source = retention.artifact_id(stem_source_key);
+        retention.retire(stem_source_key);
+        CHECK(retention.publish(
+            stem_source_key, common_retention_pool::attention,
+            stem_spans, true, stem_source.n_tokens(),
+            stem_source.n_tokens(), true));
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            retention, stem_source_key, stem_source,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_source.n_tokens()));
+        CHECK(retention.artifact_id(stem_source_key) != old_stem_source);
+        CHECK(!stem_cache.publish_vbr(
+            stem_metadata, payload, {}, false));
+        CHECK(stem_metadata.ready());
+        stem_metadata = {};
+
+        CHECK(stem_cache.prepare_vbr_stem_publication_metadata(
+            stem_source, 2,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_source_slot, stem_metadata));
+        // Suffix-only drift is outside the authenticated stem and is allowed.
+        stem_source.tokens.set_token(2, 104);
+        server_prompt_cache::iterator stem_logical;
+        CHECK(stem_cache.publish_vbr(
+            stem_metadata, payload, {}, false, &stem_logical));
+        CHECK(!stem_metadata.ready());
+        CHECK(stem_logical != stem_cache.states.end());
+        CHECK(stem_logical->prompt.n_tokens() == 2);
+        CHECK(stem_logical->prompt.tokens.retention_token_ids() ==
+            fixture.package.manifest.token_block.tokens);
+        CHECK(stem_logical->prompt.sequence_epoch ==
+            stem_source.sequence_epoch);
+        // Prefix lookup proves the destination was indexed at coverage two;
+        // sharing the source's three-token prefix block would miss this hit.
+        server_tokens stem_request(
+            llama_tokens { 101, 102, 777 }, false);
+        server_prompt_cache_vbr_restore_candidate stem_restore;
+        CHECK(stem_cache.prepare_vbr_restore(
+            stem_request,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stem_restore));
+        CHECK(stem_restore.prefix_tokens() == 2);
+        retention.retire(stem_source_key);
+    }
 
     // A live-slot association may retire and reuse the same scheduler key
     // while D2H is in flight. The prepared metadata binds the exact source
@@ -4508,18 +4679,61 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     for (size_t i = 0; i < scale_queries.size(); ++i) {
         fill_query(scale_queries[i]);
         scale_queries[i].slot_id = int32_t(i);
-        scale_queries[i].identity.sequence_epoch += i + 1;
+        scale_queries[i].identity.sequence_epoch +=
+            scale_queries.size() - i;
     }
     scale_queries.back().identity.sequence_epoch =
         fixture.package.manifest.identity.sequence_epoch;
+    const auto stem_artifact = cache.vbr_host_artifact_id(logical);
+    CHECK(stem_artifact.v != 0);
+    size_t expected_stem_matches = 0;
+    for (size_t i = 0; i < scale_queries.size(); ++i) {
+        if (i % 2 == 0) {
+            scale_queries[i].expected_stem_artifact = stem_artifact;
+            ++expected_stem_matches;
+        }
+    }
+    while (cache.states.size() < SERVER_RETENTION_MAX_CANDIDATES) {
+        cache.states.emplace_back();
+    }
+    server_prompt_cache_vbr_frontier_batch_diagnostics frontier_diagnostics;
     CHECK(cache.mark_vbr_frontiers(
-        scale_queries.data(), scale_queries.size()));
+        scale_queries.data(), scale_queries.size(), &frontier_diagnostics));
+    CHECK(frontier_diagnostics.states_visited ==
+        SERVER_RETENTION_MAX_CANDIDATES);
+    CHECK(frontier_diagnostics.vbr_states_visited == 1);
+    CHECK(frontier_diagnostics.stem_artifact_lookups == 1);
+    CHECK(frontier_diagnostics.stem_matches == expected_stem_matches);
     CHECK(std::count_if(
         scale_queries.begin(), scale_queries.end(),
         [](const auto & query) { return query.durable; }) == 1);
     CHECK(std::count_if(
         scale_queries.begin(), scale_queries.end(),
         [](const auto & query) { return query.token_identity_ready; }) == 1);
+    CHECK(size_t(std::count_if(
+        scale_queries.begin(), scale_queries.end(),
+        [](const auto & query) { return query.stem_durable; })) ==
+        expected_stem_matches);
+    const auto changed_witness = std::find_if(
+        scale_queries.begin(), scale_queries.end(),
+        [](const auto & query) {
+            return query.expected_stem_artifact.v != 0;
+        });
+    CHECK(changed_witness != scale_queries.end());
+    changed_witness->expected_stem_artifact =
+        llama_cache_acct_artifact_id { UINT64_MAX };
+    CHECK(cache.mark_vbr_frontiers(
+        scale_queries.data(), scale_queries.size(), &frontier_diagnostics));
+    CHECK(frontier_diagnostics.states_visited ==
+        SERVER_RETENTION_MAX_CANDIDATES);
+    CHECK(frontier_diagnostics.vbr_states_visited == 1);
+    CHECK(frontier_diagnostics.stem_artifact_lookups == 1);
+    CHECK(frontier_diagnostics.stem_matches == expected_stem_matches - 1);
+    CHECK(size_t(std::count_if(
+        scale_queries.begin(), scale_queries.end(),
+        [](const auto & query) { return query.stem_durable; })) ==
+        expected_stem_matches - 1);
+    cache.states.erase(std::next(cache.states.begin()), cache.states.end());
     CHECK(logical->payload.vbr_artifact() == owner.get());
     CHECK(logical->release_ops().empty());
     // The catalog already owns every physical VBR allocation. Logical host

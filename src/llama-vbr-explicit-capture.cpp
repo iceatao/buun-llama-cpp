@@ -1713,10 +1713,117 @@ bool vbr_explicit_capture_runtime_pools(
     }
 }
 
+static bool vbr_projected_host_metadata_bytes(
+        uint64_t projected_units,
+        uint64_t & descriptor_bytes,
+        uint64_t & reference_bytes) noexcept {
+    descriptor_bytes = 0;
+    reference_bytes = 0;
+    if (projected_units == 0 || projected_units > UINT64_MAX/256) {
+        return false;
+    }
+    descriptor_bytes = std::max<uint64_t>(1, projected_units*256);
+    reference_bytes = std::max<uint64_t>(1, projected_units*128);
+    return reference_bytes <= UINT64_MAX - descriptor_bytes;
+}
+
+bool vbr_plan_attention_stem_prefix(
+        uint64_t requested_token_count,
+        const vbr_artifact_cell_placement * cells,
+        size_t cell_count,
+        uint64_t bytes_per_logical_row,
+        uint64_t max_packed_bytes,
+        uint64_t projected_units,
+        const vbr_projected_capture_frontier_policy & policy,
+        vbr_attention_stem_prefix_plan & output) noexcept {
+    output = {};
+    if (requested_token_count == 0 ||
+        requested_token_count > VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS ||
+        bytes_per_logical_row == 0 ||
+        cell_count > requested_token_count ||
+        (cell_count != 0 && cells == nullptr)) {
+        return false;
+    }
+    uint64_t descriptor_bytes = 0;
+    uint64_t reference_bytes = 0;
+    if (!vbr_projected_host_metadata_bytes(
+            projected_units, descriptor_bytes, reference_bytes)) {
+        return false;
+    }
+    const uint64_t metadata_bytes = descriptor_bytes + reference_bytes;
+    uint64_t payload_cap = std::min(
+        max_packed_bytes, UINT64_MAX - metadata_bytes);
+    if (policy.max_host_resident_bytes != 0) {
+        payload_cap = policy.max_host_resident_bytes > metadata_bytes
+            ? std::min(
+                payload_cap,
+                policy.max_host_resident_bytes - metadata_bytes)
+            : 0;
+    }
+    const uint64_t token_cap = policy.max_host_resident_bytes == 0 &&
+            policy.max_host_tokens != 0
+        ? std::min(requested_token_count, policy.max_host_tokens)
+        : requested_token_count;
+    try {
+        std::vector<uint8_t> present(
+            size_t(requested_token_count), 0);
+        for (size_t i = 0; i < cell_count; ++i) {
+            const auto position = cells[i].logical_position;
+            if (position < 0 ||
+                uint64_t(position) >= requested_token_count ||
+                present[size_t(position)] != 0) {
+                return false;
+            }
+            present[size_t(position)] = 1;
+            ++output.surveyed_cells;
+        }
+        for (uint64_t position = 0;
+             position < token_cap; ++position) {
+            if (present[size_t(position)] == 0 ||
+                bytes_per_logical_row >
+                    payload_cap - output.planned_packed_bytes) {
+                break;
+            }
+            output.planned_packed_bytes += bytes_per_logical_row;
+            output.selected_token_count = position + 1;
+        }
+        output.projected_host_resident_bytes = metadata_bytes +
+            output.planned_packed_bytes;
+        output.selected_next_position =
+            llama_pos(output.selected_token_count);
+        if (output.selected_token_count <
+                std::max<uint64_t>(1, policy.minimum_tokens)) {
+            output.status =
+                vbr_projected_capture_frontier_status::stem_below_minimum;
+        } else if (output.selected_token_count == requested_token_count) {
+            output.status =
+                vbr_projected_capture_frontier_status::exact;
+        } else {
+            output.status =
+                vbr_projected_capture_frontier_status::stem_selected;
+        }
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
 vbr_projected_capture_batch_result vbr_capture_projected_batch(
         llama_memory_i & memory,
         const vbr_projected_capture_batch_request & request) noexcept {
     vbr_projected_capture_batch_result result;
+    if (request.frontier.mode ==
+            vbr_projected_capture_frontier_mode::exact) {
+        result.frontier_status =
+            vbr_projected_capture_frontier_status::exact;
+    } else if (request.frontier.mode !=
+            vbr_projected_capture_frontier_mode::longest_attention_stem) {
+        result.frontier_status =
+            vbr_projected_capture_frontier_status::stem_unsupported;
+        result.status = vbr_explicit_capture_status::identity_unavailable;
+        return result;
+    }
     if (!request.idle_decode_thread || request.manifests.empty() ||
         request.manifests.size() > VBR_PROJECTED_CAPTURE_MAX_MANIFESTS ||
         request.ring == nullptr || request.topologies.empty() ||
@@ -1830,6 +1937,135 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             }
         }
 
+        // Stem planning is deliberately absent from exact capture. For its
+        // narrow singleton mode, survey the authenticated live placement once
+        // and price each complete logical row from the already validated
+        // physical unit geometry. The selected prefix is recaptured at most
+        // once below; the final union therefore remains the sole projection
+        // and transfer authority.
+        uint64_t selected_frontier_tokens = 0;
+        llama_pos selected_frontier_next_position = -1;
+        vbr_checkpoint_generation_controller surveyed_generation;
+        vbr_artifact_stream_placement surveyed_placement;
+        bool surveyed_full_frontier = false;
+        if (request.frontier.mode ==
+                vbr_projected_capture_frontier_mode::longest_attention_stem) {
+            if (request.manifests.size() != 1 || children.size() != 1 ||
+                !recurrent_children.empty()) {
+                result.frontier_status =
+                    vbr_projected_capture_frontier_status::stem_unsupported;
+                result.status = recurrent_children.empty()
+                    ? vbr_explicit_capture_status::unsupported_layout
+                    : vbr_explicit_capture_status::
+                        required_companion_unavailable;
+                return result;
+            }
+            const auto & manifest = request.manifests.front();
+            const auto & identity = manifest.identity;
+            if (manifest.manifest_id == 0 || manifest.sequence < 0 ||
+                identity.execution_identity.empty() ||
+                identity.adapter_config_identity.empty() ||
+                identity.media_content_identity.empty() ||
+                identity.sequence_epoch == 0 || !manifest.text_only ||
+                identity.token_count <= 0 ||
+                identity.next_position != identity.token_count ||
+                uint64_t(identity.token_count) >
+                    VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS ||
+                manifest.token_block.size() !=
+                    size_t(identity.token_count) ||
+                digest_nonzero(manifest.identity_policy_order_digest) ||
+                std::any_of(
+                    children.front().units.begin(),
+                    children.front().units.end(),
+                    [](const auto & unit) {
+                        return unit.n_stream != 1 || !unit.unified;
+                    })) {
+                result.frontier_status =
+                    vbr_projected_capture_frontier_status::stem_unsupported;
+                result.status =
+                    vbr_explicit_capture_status::unsupported_layout;
+                return result;
+            }
+            result.requested_frontier_tokens =
+                uint64_t(identity.token_count);
+            uint64_t bytes_per_logical_row = 0;
+            for (const auto & unit : children.front().units) {
+                for (const auto & shard : unit.shards) {
+                    if (shard.row_bytes == 0 ||
+                        shard.row_bytes >
+                            UINT64_MAX - bytes_per_logical_row) {
+                        result.status =
+                            vbr_explicit_capture_status::size_overflow;
+                        return result;
+                    }
+                    bytes_per_logical_row += shard.row_bytes;
+                }
+            }
+            if (bytes_per_logical_row == 0) {
+                result.frontier_status =
+                    vbr_projected_capture_frontier_status::stem_unsupported;
+                result.status =
+                    vbr_explicit_capture_status::unsupported_layout;
+                return result;
+            }
+            ++result.frontier_survey_calls;
+            if (!vbr_live_capture_adapter::capture_generation(
+                    children.front(), manifest.sequence,
+                    identity.next_position, surveyed_generation,
+                    surveyed_placement, result.generation_failure)) {
+                result.status =
+                    vbr_explicit_capture_status::generation_unavailable;
+                return result;
+            }
+            surveyed_full_frontier = true;
+            vbr_attention_stem_prefix_plan prefix;
+            if (!vbr_plan_attention_stem_prefix(
+                    result.requested_frontier_tokens,
+                    surveyed_placement.cells.data(),
+                    surveyed_placement.cells.size(),
+                    bytes_per_logical_row, request.max_packed_bytes,
+                    schemas.front().descriptors.size(), request.frontier,
+                    prefix)) {
+                result.status =
+                    vbr_explicit_capture_status::generation_unavailable;
+                return result;
+            }
+            selected_frontier_tokens = prefix.selected_token_count;
+            selected_frontier_next_position =
+                prefix.selected_next_position;
+            result.frontier_status = prefix.status;
+            result.selected_frontier_tokens =
+                prefix.selected_token_count;
+            result.selected_frontier_next_position =
+                prefix.selected_next_position;
+            result.frontier_survey_cells = prefix.surveyed_cells;
+            if (prefix.status ==
+                    vbr_projected_capture_frontier_status::
+                        stem_below_minimum) {
+                result.status =
+                    vbr_explicit_capture_status::accounting_failed;
+                return result;
+            }
+            if (result.frontier_status ==
+                    vbr_projected_capture_frontier_status::stem_selected) {
+                // The selected recapture is authoritative. Drop the full
+                // survey arenas before allocating that smaller generation.
+                surveyed_generation = {};
+                surveyed_placement = {};
+                surveyed_full_frontier = false;
+            }
+        } else if (request.manifests.size() == 1) {
+            const auto & identity = request.manifests.front().identity;
+            if (identity.token_count > 0) {
+                result.requested_frontier_tokens =
+                    uint64_t(identity.token_count);
+                result.selected_frontier_tokens =
+                    uint64_t(identity.token_count);
+                result.selected_frontier_next_position =
+                    identity.next_position;
+            }
+        }
+
         llama_sha256_writer namespace_hash;
         static constexpr char NAMESPACE_DOMAIN[] =
             "buun.vbr.projected-capture/tree-namespace/v1";
@@ -1866,7 +2102,23 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
         recurrent_plans.reserve(request.manifests.size());
         manifest_dependency_available.reserve(request.manifests.size());
         for (const auto & manifest_request : request.manifests) {
-            const auto & identity = manifest_request.identity;
+            vbr_artifact_identity_block selected_identity;
+            const vbr_artifact_identity_block * identity_ptr =
+                &manifest_request.identity;
+            const bool stemmed = request.frontier.mode ==
+                    vbr_projected_capture_frontier_mode::
+                        longest_attention_stem &&
+                selected_frontier_tokens !=
+                    result.requested_frontier_tokens;
+            if (stemmed) {
+                selected_identity = manifest_request.identity;
+                selected_identity.token_count =
+                    int64_t(selected_frontier_tokens);
+                selected_identity.next_position =
+                    selected_frontier_next_position;
+                identity_ptr = &selected_identity;
+            }
+            const auto & identity = *identity_ptr;
             if (manifest_request.manifest_id == 0 ||
                 manifest_request.sequence < 0 ||
                 identity.execution_identity.empty() ||
@@ -1875,7 +2127,7 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 identity.sequence_epoch == 0 || identity.token_count <= 0 ||
                 identity.next_position <= 0 ||
                 manifest_request.token_block.size() !=
-                    size_t(identity.token_count) ||
+                    size_t(manifest_request.identity.token_count) ||
                 std::find(
                     manifest_ids.begin(), manifest_ids.end(),
                     manifest_request.manifest_id) != manifest_ids.end()) {
@@ -1887,7 +2139,14 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             vbr_capture_projection_manifest projected;
             projected.manifest_id = manifest_request.manifest_id;
             projected.identity = identity;
-            projected.token_block.tokens = manifest_request.token_block;
+            if (stemmed) {
+                projected.token_block.tokens.assign(
+                    manifest_request.token_block.begin(),
+                    manifest_request.token_block.begin() +
+                        size_t(identity.token_count));
+            } else {
+                projected.token_block.tokens = manifest_request.token_block;
+            }
             projected.generation.version = 1;
             projected.generation.status =
                 vbr_checkpoint_generation_status::complete;
@@ -1918,13 +2177,25 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 auto & child = children[child_index];
                 vbr_checkpoint_generation_controller generation;
                 vbr_artifact_stream_placement placement;
-                if (!vbr_live_capture_adapter::capture_generation(
-                        child, manifest_request.sequence,
-                        identity.next_position, generation, placement,
-                        result.generation_failure)) {
+                if (request.frontier.mode ==
+                        vbr_projected_capture_frontier_mode::
+                            longest_attention_stem &&
+                    !stemmed && child_index == 0 &&
+                    surveyed_full_frontier) {
+                    generation = std::move(surveyed_generation);
+                    placement = std::move(surveyed_placement);
+                    surveyed_full_frontier = false;
+                } else if (!vbr_live_capture_adapter::capture_generation(
+                               child, manifest_request.sequence,
+                               identity.next_position, generation, placement,
+                               result.generation_failure)) {
                     result.status =
                         vbr_explicit_capture_status::generation_unavailable;
                     return result;
+                } else if (request.frontier.mode ==
+                        vbr_projected_capture_frontier_mode::
+                            longest_attention_stem) {
+                    ++result.frontier_recapture_calls;
                 }
                 const llama_pos terminal_position =
                     identity.next_position - 1;
@@ -2254,21 +2525,45 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 vbr_projected_capture_batch_request::pretransfer_quote::
                     durable_manifest durable;
                 durable.manifest_id = manifest_ids[manifest_index];
+                const auto & requested_identity =
+                    request.manifests[manifest_index].identity;
+                durable.requested_token_count =
+                    requested_identity.token_count > 0
+                    ? uint64_t(requested_identity.token_count) : 0;
+                durable.selected_token_count =
+                    request.frontier.mode ==
+                            vbr_projected_capture_frontier_mode::
+                                longest_attention_stem
+                        ? result.selected_frontier_tokens
+                        : durable.requested_token_count;
+                durable.selected_next_position =
+                    request.frontier.mode ==
+                            vbr_projected_capture_frontier_mode::
+                                longest_attention_stem
+                        ? result.selected_frontier_next_position
+                        : requested_identity.next_position;
+                durable.stemmed = durable.selected_token_count !=
+                    durable.requested_token_count;
                 durable.accounting = attention_accounting;
                 durable.reserve_accounting =
                     attention_reserve_accounting[manifest_index];
+                uint64_t descriptor_bytes = 0;
+                uint64_t reference_bytes = 0;
+                if (!vbr_projected_host_metadata_bytes(
+                        quote.projected_units, descriptor_bytes,
+                        reference_bytes)) {
+                    result.status =
+                        vbr_explicit_capture_status::size_overflow;
+                    return false;
+                }
                 add_accounting(
                     durable.accounting,
                     vbr_artifact_accounting_role::descriptor_metadata,
-                    host_domain,
-                    std::max<uint64_t>(
-                        1, uint64_t(quote.projected_units)*256));
+                    host_domain, descriptor_bytes);
                 add_accounting(
                     durable.accounting,
                     vbr_artifact_accounting_role::reference_metadata,
-                    host_domain,
-                    std::max<uint64_t>(
-                        1, uint64_t(quote.projected_units)*128));
+                    host_domain, reference_bytes);
                 for (const auto & companion :
                      recurrent_plans[manifest_index]) {
                     add_accounting(
@@ -2321,14 +2616,23 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             return result;
         }
 
+        result.phase =
+            vbr_explicit_capture_phase::reservation_preparation;
+        if (request.pretransfer_prepare &&
+            !request.pretransfer_prepare(
+                request.pretransfer_prepare_context, current_quote)) {
+            result.status =
+                vbr_explicit_capture_status::admission_refused;
+            return result;
+        }
+
         // A positive scheduler/resource admission is the final pre-D2H
-        // readiness checkpoint. For nonzero work, hold the persistent
+        // readiness checkpoint. Preparation above remains outside the ring;
+        // for nonzero work, hold the persistent
         // transport operation at that checkpoint as well: a busy ring then
         // refuses before budget sampling or reservation preparation, and an
         // admission refusal releases it without transferring a byte. The
         // canonical zero-work quote requires no transport operation.
-        result.phase =
-            vbr_explicit_capture_phase::reservation_preparation;
         vbr_pinned_ring_operation ring_operation;
         if (result.planned_packed_bytes != 0) {
             ++result.ring_operation_attempts;
