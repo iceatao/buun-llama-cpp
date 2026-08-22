@@ -1866,6 +1866,12 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 expectations.end());
         };
         apply_dependency_availability(projection_manifests);
+        for (size_t i = 0; i < manifest_ids.size(); ++i) {
+            if (manifest_dependency_available[i]) {
+                result.first_available_manifest_id = manifest_ids[i];
+                break;
+            }
+        }
 
         vbr_capture_projection projection;
         vbr_capture_projection_limits projection_limits;

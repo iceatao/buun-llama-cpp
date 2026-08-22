@@ -418,6 +418,9 @@ struct vbr_projected_capture_batch_result {
     vbr_capture_manifest_assembly assembly;
     std::vector<vbr_projected_manifest_publication> publications;
     uint64_t source_namespace = 0;
+    // First request-order manifest that survived dependency preparation.
+    // This is retry-selection evidence only; it authorizes no publication.
+    uint64_t first_available_manifest_id = 0;
     uint64_t union_cells = 0;
     uint64_t planned_packed_bytes = 0;
     uint32_t size_pass_calls = 0;

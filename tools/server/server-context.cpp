@@ -10278,6 +10278,43 @@ private:
         return published_hash.finish();
     }
 
+    static bool vbr_idle_retry_immediately(
+            bool terminal,
+            bool aggregate_over_cap,
+            server_prompt_cache_vbr_capacity_status capacity_status,
+            size_t candidate_count,
+            bool transfer_retry_candidate,
+            bool capacity_retry_candidate) noexcept {
+        const bool transfer_retry = aggregate_over_cap &&
+            transfer_retry_candidate;
+        const bool capacity_retry =
+            capacity_status == server_prompt_cache_vbr_capacity_status::
+                pressure_batch_unsupported && capacity_retry_candidate;
+        return !terminal && candidate_count > 1 &&
+            (transfer_retry || capacity_retry);
+    }
+
+    static uint64_t vbr_idle_capacity_retry_manifest(
+            const uint64_t * ranked,
+            size_t ranked_count,
+            const uint64_t * admitted,
+            size_t admitted_count) noexcept {
+        if (!ranked || !admitted) {
+            return 0;
+        }
+        for (size_t i = 0; i < ranked_count; ++i) {
+            if (ranked[i] == 0) {
+                continue;
+            }
+            for (size_t j = 0; j < admitted_count; ++j) {
+                if (ranked[i] == admitted[j]) {
+                    return ranked[i];
+                }
+            }
+        }
+        return 0;
+    }
+
     static bool automatic_vbr_restore_supported(
             const server_tokens & tokens,
             const std::vector<common_adapter_lora_info> & lora) {
@@ -10814,6 +10851,9 @@ private:
             server_prompt_cache_vbr_capacity_claim * capacity = nullptr;
             bool has_refresh = false;
             bool has_fresh = false;
+            server_prompt_cache_vbr_capacity_status capacity_status =
+                server_prompt_cache_vbr_capacity_status::invalid;
+            uint64_t capacity_retry_manifest_id = 0;
         } admission_state {
             &capture_session, prompt_cache.get(), &candidates,
             &admitted_publications, &capacity_claim,
@@ -10870,11 +10910,37 @@ private:
                 }
                 context->admitted->push_back(found);
             }
-            if (context->admitted->empty() ||
-                !context->cache->prepare_vbr_publication_capacity(
+            if (context->admitted->empty()) {
+                return false;
+            }
+            if (!context->cache->prepare_vbr_publication_capacity(
                     context->admitted->data(), context->admitted->size(),
                     quote.projected_host_resident_bytes,
-                    *context->capacity)) {
+                    *context->capacity, &context->capacity_status)) {
+                if (context->capacity_status ==
+                        server_prompt_cache_vbr_capacity_status::
+                            pressure_batch_unsupported) {
+                    std::array<uint64_t,
+                        VBR_PROJECTED_CAPTURE_MAX_MANIFESTS> ranked = {};
+                    std::array<uint64_t,
+                        VBR_PROJECTED_CAPTURE_MAX_MANIFESTS> admitted = {};
+                    size_t ranked_count = 0;
+                    size_t admitted_count = 0;
+                    for (const auto & candidate : *context->candidates) {
+                        if (ranked_count < ranked.size()) {
+                            ranked[ranked_count++] = candidate.manifest_id;
+                        }
+                    }
+                    for (const auto & durable : quote.durable) {
+                        if (admitted_count < admitted.size()) {
+                            admitted[admitted_count++] = durable.manifest_id;
+                        }
+                    }
+                    context->capacity_retry_manifest_id =
+                        vbr_idle_capacity_retry_manifest(
+                            ranked.data(), ranked_count,
+                            admitted.data(), admitted_count);
+                }
                 return false;
             }
             if (!session->continue_capture()) {
@@ -10924,7 +10990,14 @@ private:
                     terminal;
                 candidate.slot->vbr_idle_capture_retry_after_ms =
                     terminal ? 0 :
-                    aggregate_over_cap && candidates.size() > 1 && i == 0
+                    vbr_idle_retry_immediately(
+                        terminal, aggregate_over_cap,
+                        admission_state.capacity_status,
+                        candidates.size(),
+                        candidate.manifest_id ==
+                            diagnostics.first_available_manifest_id,
+                        candidate.manifest_id ==
+                            admission_state.capacity_retry_manifest_id)
                         ? 0 : retry_after_ms;
             }
             return 0;
@@ -15880,6 +15953,42 @@ server_vbr_reclaim_policy_for_test() {
                 identity, first_digest, 7, 11) !=
             server_context_impl::vbr_idle_capture_attempt_digest(
                 identity, divergent_digest, 7, 11);
+        result.multi_fresh_pressure_isolated =
+            server_context_impl::vbr_idle_retry_immediately(
+                false, false,
+                server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported,
+                2, false, true) &&
+            !server_context_impl::vbr_idle_retry_immediately(
+                false, false,
+                server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported,
+                2, false, false) &&
+            !server_context_impl::vbr_idle_retry_immediately(
+                true, false,
+                server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported,
+                2, false, true) &&
+            !server_context_impl::vbr_idle_retry_immediately(
+                false, false,
+                server_prompt_cache_vbr_capacity_status::invalid,
+                2, false, false) &&
+            !server_context_impl::vbr_idle_retry_immediately(
+                false, false,
+                server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported,
+                1, false, true) &&
+            server_context_impl::vbr_idle_retry_immediately(
+                false, true,
+                server_prompt_cache_vbr_capacity_status::invalid,
+                2, true, false) &&
+            [&]() {
+                const uint64_t ranked[] = { 10, 20, 30 };
+                const uint64_t admitted[] = { 20, 30 };
+                return server_context_impl::
+                    vbr_idle_capacity_retry_manifest(
+                        ranked, 3, admitted, 2) == 20;
+            }();
     }
     const auto run = [](
             bool complete_evidence, bool zero_yield = false,

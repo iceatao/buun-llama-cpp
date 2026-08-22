@@ -1119,6 +1119,7 @@ static bool h2_projected_capture_batch_exact(
         !captured.assembly ||
         captured.assembly.manifests().size() != manifest_count ||
         captured.publications.size() != manifest_count ||
+        captured.first_available_manifest_id != 100 ||
         captured.size_pass_calls != attention_children ||
         captured.projection_calls != 1 || captured.union_cells != 1 ||
         captured.planned_packed_bytes == 0 ||
@@ -1386,12 +1387,41 @@ static bool h2_projected_capture_batch_exact(
             inflated.assembly.manifests().front().state !=
                 vbr_capture_manifest_state::dependency_unavailable ||
             inflated.union_cells != 0 ||
+            inflated.first_available_manifest_id != 0 ||
             inflated.planned_packed_bytes != 0 ||
             inflated.unit_transfer_calls != 0 ||
             inflated.transferred_units != 0 ||
             inflated.publications.size() != 1 ||
             !inflated.publications.front().companions.empty() ||
             !inflated.publications.front().accounting.empty()) {
+            return false;
+        }
+    } else if (manifest_count == 4) {
+        // Retry evidence follows the dependency-available projected subset,
+        // not the raw ranked/request prefix. This kills starvation when the
+        // leading manifest disappears before an aggregate runway refusal.
+        auto partial_request = request;
+        partial_request.manifests.front().identity.token_count = 2;
+        partial_request.manifests.front().identity.next_position = 2;
+        partial_request.manifests.front().token_block = { 1, 2 };
+        const auto partial = vbr_capture_projected_batch(
+            memory, partial_request);
+        if (partial.status != vbr_explicit_capture_status::ok ||
+            partial.first_available_manifest_id != 101 ||
+            partial.planned_packed_bytes == 0 ||
+            partial.unit_transfer_calls == 0) {
+            return false;
+        }
+        partial_request.max_packed_bytes =
+            partial.planned_packed_bytes - 1;
+        const auto partial_over_cap = vbr_capture_projected_batch(
+            memory, partial_request);
+        if (partial_over_cap.status !=
+                vbr_explicit_capture_status::accounting_failed ||
+            partial_over_cap.first_available_manifest_id != 101 ||
+            partial_over_cap.unit_transfer_calls != 0 ||
+            partial_over_cap.assembly ||
+            !partial_over_cap.publications.empty()) {
             return false;
         }
     }

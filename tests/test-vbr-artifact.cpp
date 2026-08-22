@@ -4219,10 +4219,24 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
             duplicate, 2, owner->resident_bytes(), duplicate_capacity));
         CHECK(!duplicate_capacity.ready());
         CHECK(owner->resident_bytes() > 1);
+        cache.limit_size = size_t(owner->resident_bytes() - 1);
+        server_prompt_cache_vbr_capacity_claim pressure_batch;
+        server_prompt_cache_vbr_capacity_status pressure_status;
+        CHECK(!cache.prepare_vbr_publication_capacity(
+            batch, 2, owner->resident_bytes(), pressure_batch,
+            &pressure_status));
+        CHECK(pressure_status ==
+            server_prompt_cache_vbr_capacity_status::
+                pressure_batch_unsupported);
+        CHECK(!pressure_batch.ready());
         cache.limit_size = size_t(owner->resident_bytes());
         server_prompt_cache_vbr_capacity_claim capacity;
+        server_prompt_cache_vbr_capacity_status capacity_status;
         CHECK(cache.prepare_vbr_publication_capacity(
-            batch, 2, owner->resident_bytes(), capacity));
+            batch, 2, owner->resident_bytes(), capacity,
+            &capacity_status));
+        CHECK(capacity_status ==
+            server_prompt_cache_vbr_capacity_status::fit);
         CHECK(capacity.ready());
         server_prompt_cache_vbr_capacity_claim moved(
             std::move(capacity));

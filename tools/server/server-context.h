@@ -68,6 +68,7 @@ struct server_vbr_reclaim_policy_result {
     bool mixed_host_kept_hot = false;
     bool mixed_host_removed_cold = false;
     bool token_identity_distinguishes_attempt = false;
+    bool multi_fresh_pressure_isolated = false;
 };
 
 server_vbr_reclaim_policy_result

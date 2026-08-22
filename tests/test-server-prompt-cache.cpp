@@ -1662,6 +1662,7 @@ void test_lifecycle_df2_rollout_and_reuse_thresholds() {
     CHECK(vbr_reclaim.mixed_host_kept_hot);
     CHECK(vbr_reclaim.mixed_host_removed_cold);
     CHECK(vbr_reclaim.token_identity_distinguishes_attempt);
+    CHECK(vbr_reclaim.multi_fresh_pressure_isolated);
     available_host_fallback vbr_selection_fallback;
     const auto vbr_selection = server_vbr_slot_selection_for_test(
         &vbr_selection_fallback);

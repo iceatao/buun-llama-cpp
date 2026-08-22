@@ -1868,6 +1868,8 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         measured.capture_phase = captured.phase;
         measured.inner_stream_status = captured.inner_stream_status;
         measured.source_namespace = captured.source_namespace;
+        measured.first_available_manifest_id =
+            captured.first_available_manifest_id;
         measured.union_cells = captured.union_cells;
         measured.planned_packed_bytes = captured.planned_packed_bytes;
         measured.size_pass_calls = captured.size_pass_calls;

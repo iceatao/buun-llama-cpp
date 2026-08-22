@@ -200,6 +200,7 @@ struct server_vbr_projected_host_capture_diagnostics {
     vbr_capture_stream_status inner_stream_status =
         vbr_capture_stream_status::_count;
     uint64_t source_namespace = 0;
+    uint64_t first_available_manifest_id = 0;
     uint64_t union_cells = 0;
     uint64_t planned_packed_bytes = 0;
     uint32_t size_pass_calls = 0;

@@ -1967,7 +1967,11 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
         server_prompt_cache_vbr_publication_metadata * const * prepared,
         size_t prepared_count,
         uint64_t incoming_compact_bytes,
-        server_prompt_cache_vbr_capacity_claim & claim) noexcept {
+        server_prompt_cache_vbr_capacity_claim & claim,
+        server_prompt_cache_vbr_capacity_status * status) noexcept {
+    if (status) {
+        *status = server_prompt_cache_vbr_capacity_status::invalid;
+    }
     if (claim.ready() || !prepared || prepared_count == 0 ||
         prepared_count > VBR_PROJECTED_CAPTURE_MAX_MANIFESTS ||
         incoming_compact_bytes == 0 ||
@@ -2048,7 +2052,14 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
         }
     }
     if (!fits(projected_bytes, projected_tokens)) {
-        if (prepared_count != 1 ||
+        if (prepared_count != 1) {
+            if (status) {
+                *status = server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported;
+            }
+            return false;
+        }
+        if (
             !publish_authority || !acct || !retention_obs || !lease_obs ||
             !lease_execution_identity ||
             !server_prompt_cache_single_victim_pressure(
@@ -2070,6 +2081,11 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
     }
     claim.cache_ = this;
     claim.scheduler_owner_ = std::this_thread::get_id();
+    if (status) {
+        *status = claim.victim_
+            ? server_prompt_cache_vbr_capacity_status::pressure_cited
+            : server_prompt_cache_vbr_capacity_status::fit;
+    }
     return true;
 }
 

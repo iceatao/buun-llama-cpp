@@ -926,6 +926,13 @@ private:
     friend struct server_prompt_cache;
 };
 
+enum class server_prompt_cache_vbr_capacity_status : uint8_t {
+    invalid,
+    fit,
+    pressure_cited,
+    pressure_batch_unsupported,
+};
+
 // Move-only, non-consuming citation of one immutable VBR host entry. The
 // highest-quality same-frontier owner is preferred; compact current remains
 // available as a bounded fallback when destination negotiation refuses it.
@@ -1279,7 +1286,8 @@ struct server_prompt_cache {
         server_prompt_cache_vbr_publication_metadata * const * prepared,
         size_t prepared_count,
         uint64_t incoming_compact_bytes,
-        server_prompt_cache_vbr_capacity_claim & claim) noexcept;
+        server_prompt_cache_vbr_capacity_claim & claim,
+        server_prompt_cache_vbr_capacity_status * status = nullptr) noexcept;
     bool consume_vbr_publication_capacity(
         server_prompt_cache_vbr_capacity_claim & claim) noexcept;
 
