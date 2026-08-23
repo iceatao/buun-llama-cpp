@@ -31,6 +31,10 @@ expose a `vbr` object; the ordinary nonzero `--cache-ram` budget automatically e
 projected-artifact host caching on supported dynamic-VBR topologies (`--cache-ram 0`
 disables it). Fixed-layout cache reuse, slot save/restore and (on SWA models) context
 checkpoints remain disabled with warnings, and unified KV is forced when `-np > 1`.
+Automatic caching is currently live-only for active draft/MTP contexts, speculative
+slot state, media prompts, and aLoRA invocation boundaries; startup and debug logs use
+stable typed reasons for those fallbacks. The full matrix is in
+[docs/vbr.md](../../docs/vbr.md#automatic-host-cache-support-matrix).
 
 ## Usage
 

@@ -33,6 +33,8 @@ add_library(${TARGET} STATIC
     server-prompt-cache-payload.h
     server-vbr-artifact-store.cpp
     server-vbr-artifact-store.h
+    server-vbr-prompt-cache-support.cpp
+    server-vbr-prompt-cache-support.h
     server-retention-sidecar.cpp
     server-retention-sidecar.h
     server-queue.cpp

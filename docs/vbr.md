@@ -75,6 +75,34 @@ Notes:
   speculative **draft model** in the same process, the schedule also applies to the
   draft's cache (overriding `-ctkd/-ctvd`). Avoid `--vbr-policy` together with `-md`.
 
+### Automatic host-cache support matrix
+
+The default-on server route is intentionally narrower than the explicit artifact APIs.
+It currently supports text-only, non-aLoRA, non-speculative slots on a dynamic-VBR
+target whose artifact store can bind every attention child, device lane, and accounting
+domain. Ordinary LoRA identity, attention-only targets, ordinary hybrid/recurrent
+targets, SWA/iSWA full frontiers, single-GPU placement, and bound multi-GPU placement
+use that route. Shortened stem publication remains attention-only; unsupported stem
+shapes retain the complete live frontier.
+
+The following automatic cases are typed live-only fallbacks today:
+
+| Case | Typed reason | Behavior |
+| --- | --- | --- |
+| active draft/MTP context | `draft_context_unsupported` | automatic host caching is disabled before its cache/ring allocation |
+| per-slot speculative state | `speculative_slot_unsupported` | that live slot is neither captured nor displaced |
+| media prompt/projector state | `media_prompt_unsupported` | that live slot is neither captured nor displaced |
+| aLoRA invocation boundary | `alora_invocation_unsupported` | that live slot is neither captured nor displaced |
+| missing portable topology or pool/lane binding | `artifact_topology_unavailable` | automatic startup continues live-only |
+| incomplete accounting or budget evidence | `accounting_unavailable` | automatic startup continues live-only |
+| pinned-ring/store construction refusal | `artifact_store_unavailable` plus the store failure/status | automatic startup continues live-only |
+
+Automatic fallback never clears the live source. An explicit `--vbr-prompt-cache`
+request is strict instead: an unsupported global topology or unavailable store fails
+startup with the same typed reason. Transient capture/admission failures retain the live
+source and retry; permanent per-artifact incompatibilities are terminal only for that
+unchanged frontier.
+
 ## Degrade orders
 
 The price order — which (layer, side) to degrade next, per tier band — is measured per

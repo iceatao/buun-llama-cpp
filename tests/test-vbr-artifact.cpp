@@ -17,6 +17,7 @@
 #include "server-context.h"
 #include "server-task.h"
 #include "server-retention-sidecar.h"
+#include "server-vbr-prompt-cache-support.h"
 #endif
 
 #include <algorithm>
@@ -58,6 +59,62 @@ static_assert(std::is_trivially_copyable<
             failures++; \
         } \
     } while (0)
+
+#ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+static void test_vbr_prompt_cache_support_contract() {
+    using status = server_vbr_prompt_cache_support_status;
+    using action = server_vbr_prompt_cache_fallback_action;
+
+    CHECK(server_vbr_prompt_cache_support_for(
+              false, false, false, false) == status::supported);
+    CHECK(server_vbr_prompt_cache_support_for(
+              true, false, false, false) ==
+          status::draft_context_unsupported);
+    CHECK(server_vbr_prompt_cache_support_for(
+              false, true, false, false) ==
+          status::speculative_slot_unsupported);
+    CHECK(server_vbr_prompt_cache_support_for(
+              false, false, true, false) ==
+          status::media_prompt_unsupported);
+    CHECK(server_vbr_prompt_cache_support_for(
+              false, false, false, true) ==
+          status::alora_invocation_unsupported);
+
+    // The ordering is stable, so a topology with several unsupported facts
+    // reports one deterministic reason rather than depending on call order.
+    CHECK(server_vbr_prompt_cache_support_for(
+              true, true, true, true) ==
+          status::draft_context_unsupported);
+    CHECK(server_vbr_prompt_cache_support_for(
+              false, true, true, true) ==
+          status::speculative_slot_unsupported);
+    CHECK(server_vbr_prompt_cache_support_for(
+              false, false, true, true) ==
+          status::media_prompt_unsupported);
+
+    for (const auto unsupported : {
+             status::draft_context_unsupported,
+             status::speculative_slot_unsupported,
+             status::media_prompt_unsupported,
+             status::alora_invocation_unsupported,
+             status::artifact_topology_unavailable,
+             status::accounting_unavailable,
+             status::artifact_store_unavailable,
+         }) {
+        CHECK(server_vbr_prompt_cache_fallback_action_for(
+                  true, unsupported) == action::live_only);
+        CHECK(server_vbr_prompt_cache_fallback_action_for(
+                  false, unsupported) == action::startup_error);
+        CHECK(std::string(
+                  server_vbr_prompt_cache_support_status_name(
+                      unsupported)) != "invalid");
+    }
+    CHECK(server_vbr_prompt_cache_fallback_action_for(
+              true, status::supported) == action::enabled);
+    CHECK(server_vbr_prompt_cache_fallback_action_for(
+              false, status::supported) == action::enabled);
+}
+#endif
 
 static std::string hex(const std::array<uint8_t, 32> & bytes) {
     static constexpr char digits[] = "0123456789abcdef";
@@ -9172,6 +9229,7 @@ int main(int argc, char ** argv) {
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+    test_vbr_prompt_cache_support_contract();
     test_server_vbr_occupied_failure_terminal();
     test_prompt_cache_vbr_longest_feasible_restore_selection();
     test_prompt_cache_vbr_atomic_logical_publication();

@@ -8,6 +8,7 @@
 #include "server-cache-plan-preflight-internal.h"
 #include "server-cache-yield.h"
 #include "server-vbr-artifact-store.h"
+#include "server-vbr-prompt-cache-support.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-recurrent-expansion.h"
@@ -739,6 +740,8 @@ struct server_slot {
     std::array<uint8_t, 32> vbr_idle_capture_attempt_identity = {};
     int64_t vbr_idle_capture_retry_after_ms = 0;
     bool vbr_idle_capture_terminal = false;
+    server_vbr_prompt_cache_support_status vbr_idle_support_status =
+        server_vbr_prompt_cache_support_status::supported;
     std::array<uint8_t, 32> vbr_idle_capture_published_identity = {};
     bool vbr_idle_capture_representation_valid = false;
     // A stem is independently durable but cannot authorize clearing the full
@@ -2702,6 +2705,12 @@ private:
     // the frozen ledger but is destroyed before it. It exists only for an
     // armed dynamic-VBR memory after the one-shot manifest and ring admission.
     std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
+    server_vbr_prompt_cache_support_status vbr_prompt_cache_support =
+        server_vbr_prompt_cache_support_status::supported;
+    server_vbr_artifact_capture_status vbr_prompt_cache_store_status =
+        server_vbr_artifact_capture_status::unavailable;
+    server_vbr_artifact_store_create_diagnostics
+        vbr_prompt_cache_store_diagnostics;
     uint64_t vbr_automatic_restore_attempts = 0;
     uint64_t vbr_automatic_restore_succeeded = 0;
     uint64_t vbr_automatic_restore_quality_fallbacks = 0;
@@ -4492,8 +4501,10 @@ private:
             return false;
         }
         try {
-            return automatic_vbr_restore_supported(
-                       slot.prompt.tokens, slot.lora) &&
+            return automatic_vbr_cache_support(
+                       slot.prompt.tokens, slot.lora,
+                       slot.can_speculate()) ==
+                    server_vbr_prompt_cache_support_status::supported &&
                 prompt_cache->contains_vbr_frontier(
                     slot.prompt, frontier_execution_identity,
                     lora_config_identity(slot.lora));
@@ -6462,15 +6473,6 @@ private:
             vbr_retention_candidate_by_seq.resize(slots.size());
             vbr_retention_seen_by_seq.resize(slots.size());
             vbr_exclusive_cells_by_seq.resize(slots.size());
-            if (params_base.vbr_prompt_cache) {
-                vbr_durable_sources_by_seq.resize(slots.size());
-                vbr_durable_stems_by_seq.resize(slots.size());
-                vbr_reclaim_refused_by_seq.resize(slots.size());
-                vbr_idle_parent_values.resize(slots.size());
-                vbr_idle_parent_values.clear();
-                vbr_idle_durability_order.resize(slots.size());
-                vbr_idle_frontier_queries.resize(slots.size());
-            }
         }
 
         // try speculative decoding (shared multi-seq spec — not used by legacy fork types which init per-slot)
@@ -6559,6 +6561,52 @@ private:
                 SRV_ERR("speculative decoding disabled: hybrid/recurrent rollback needs n_seq_max >= %d, context has %u\n",
                         2 * n_parallel_user, llama_n_seq_max(ctx_tgt));
             }
+        }
+
+        if (params_base.vbr_prompt_cache) {
+            const bool all_slots_speculative = !slots.empty() &&
+                std::all_of(
+                    slots.begin(), slots.end(),
+                    [](const server_slot & slot) {
+                        return slot.can_speculate();
+                    });
+            vbr_prompt_cache_support =
+                server_vbr_prompt_cache_support_for(
+                    ctx_dft != nullptr, all_slots_speculative,
+                    false, false);
+            const auto fallback =
+                server_vbr_prompt_cache_fallback_action_for(
+                    vbr_prompt_cache_automatic,
+                    vbr_prompt_cache_support);
+            if (fallback ==
+                    server_vbr_prompt_cache_fallback_action::live_only) {
+                params_base.vbr_prompt_cache = false;
+                params_base.cache_idle_slots = false;
+                params_base.cache_ram_mib = 0;
+                SRV_WRN(
+                    "automatic dynamic VBR host caching fallback=live_only "
+                    "reason=%s; cache-ram disabled\n",
+                    server_vbr_prompt_cache_support_status_name(
+                        vbr_prompt_cache_support));
+            } else if (fallback ==
+                    server_vbr_prompt_cache_fallback_action::startup_error) {
+                SRV_ERR(
+                    "--vbr-prompt-cache is unsupported reason=%s\n",
+                    server_vbr_prompt_cache_support_status_name(
+                        vbr_prompt_cache_support));
+                return false;
+            }
+        }
+
+        if (server_vbr_dynamic_active(params_base) &&
+            params_base.vbr_prompt_cache) {
+            vbr_durable_sources_by_seq.resize(slots.size());
+            vbr_durable_stems_by_seq.resize(slots.size());
+            vbr_reclaim_refused_by_seq.resize(slots.size());
+            vbr_idle_parent_values.resize(slots.size());
+            vbr_idle_parent_values.clear();
+            vbr_idle_durability_order.resize(slots.size());
+            vbr_idle_frontier_queries.resize(slots.size());
         }
 
         {
@@ -7196,6 +7244,8 @@ private:
                 vbr_artifact_store =
                     server_vbr_artifact_store::create(
                         config, status, &diagnostics);
+                vbr_prompt_cache_store_status = status;
+                vbr_prompt_cache_store_diagnostics = diagnostics;
                 if (!vbr_artifact_store) {
                     SRV_WRN(
                         "VBR_ARTIFACT_CAPTURE store unavailable status=%s "
@@ -7217,6 +7267,8 @@ private:
                         diagnostics.attempted_ring_bytes,
                         diagnostics.chunk_bytes);
                 } else {
+                    vbr_prompt_cache_support =
+                        server_vbr_prompt_cache_support_status::supported;
                     SRV_INF(
                         "VBR_ARTIFACT_CAPTURE store ready "
                         "attention_children=%u lanes=%zu "
@@ -7231,18 +7283,56 @@ private:
                 }
             }
 
-            if (vbr_prompt_cache_automatic && !vbr_artifact_store) {
-                // Automatic H3 rollout must not turn a topology-specific typed
-                // miss into a server startup failure. Explicit requests retain
-                // the strict validation below. The live VBR cache remains the
-                // source of truth and ordinary processing continues uncached.
-                params_base.vbr_prompt_cache = false;
-                params_base.cache_idle_slots = false;
-                params_base.cache_ram_mib = 0;
-                prompt_cache.reset();
-                SRV_WRN("%s\n",
-                    "automatic dynamic VBR host caching is unavailable for "
-                    "this topology; continuing live-only (cache-ram disabled)");
+            if (params_base.vbr_prompt_cache && !vbr_artifact_store) {
+                // Classify failures that occur before the store constructor as
+                // explicitly as constructor-owned failures. Automatic H3
+                // activation continues live-only; an explicit request remains
+                // a strict startup contract.
+                if (!capture_manifest_enabled) {
+                    vbr_prompt_cache_support =
+                        server_vbr_prompt_cache_support_status::
+                            artifact_topology_unavailable;
+                } else if (!cache_authority->configured) {
+                    vbr_prompt_cache_support =
+                        server_vbr_prompt_cache_support_status::
+                            accounting_unavailable;
+                } else {
+                    vbr_prompt_cache_support =
+                        server_vbr_prompt_cache_support_status::
+                            artifact_store_unavailable;
+                }
+                const auto fallback =
+                    server_vbr_prompt_cache_fallback_action_for(
+                        vbr_prompt_cache_automatic,
+                        vbr_prompt_cache_support);
+                if (fallback ==
+                        server_vbr_prompt_cache_fallback_action::live_only) {
+                    params_base.vbr_prompt_cache = false;
+                    params_base.cache_idle_slots = false;
+                    params_base.cache_ram_mib = 0;
+                    prompt_cache.reset();
+                    SRV_WRN(
+                        "automatic dynamic VBR host caching "
+                        "fallback=live_only reason=%s store_status=%s "
+                        "store_failure=%s; cache-ram disabled\n",
+                        server_vbr_prompt_cache_support_status_name(
+                            vbr_prompt_cache_support),
+                        server_vbr_artifact_capture_status_name(
+                            vbr_prompt_cache_store_status),
+                        server_vbr_artifact_store_create_failure_name(
+                            vbr_prompt_cache_store_diagnostics.failure));
+                } else {
+                    SRV_ERR(
+                        "--vbr-prompt-cache is unavailable reason=%s "
+                        "store_status=%s store_failure=%s\n",
+                        server_vbr_prompt_cache_support_status_name(
+                            vbr_prompt_cache_support),
+                        server_vbr_artifact_capture_status_name(
+                            vbr_prompt_cache_store_status),
+                        server_vbr_artifact_store_create_failure_name(
+                            vbr_prompt_cache_store_diagnostics.failure));
+                    return false;
+                }
             }
 
             if (prompt_cache) {
@@ -9205,7 +9295,9 @@ private:
                 task.type != SERVER_TASK_TYPE_COMPLETION || task.is_child() ||
                 task.is_parent() || task.tokens.empty() ||
                 !task.params.cache_prompt ||
-                !automatic_vbr_restore_supported(task.tokens, slot.lora) ||
+                automatic_vbr_cache_support(
+                    task.tokens, slot.lora, slot.can_speculate()) !=
+                    server_vbr_prompt_cache_support_status::supported ||
                 slot.state != SLOT_STATE_IDLE || slot.is_processing()) {
                 return false;
             }
@@ -10583,14 +10675,19 @@ private:
         return 0;
     }
 
-    static bool automatic_vbr_restore_supported(
+    static server_vbr_prompt_cache_support_status
+    automatic_vbr_cache_support(
             const server_tokens & tokens,
-            const std::vector<common_adapter_lora_info> & lora) {
+            const std::vector<common_adapter_lora_info> & lora,
+            bool speculative_slot) noexcept {
         // H2 currently has no frontier-media lookup authority and cannot
         // resume through an aLoRA invocation boundary. Such artifacts remain
-        // useful to explicit control paths, but automatic displacement must
-        // retain their live source until the matching restore route exists.
-        return !tokens.has_media() && !lora_all_alora(lora);
+        // useful to explicit control paths. Speculative slot state likewise
+        // has no automatic publish/restore transaction yet. All three remain
+        // live-only until their matching restore routes exist.
+        return server_vbr_prompt_cache_support_for(
+            false, speculative_slot, tokens.has_media(),
+            lora_all_alora(lora));
     }
 
     bool build_capture_request(
@@ -10773,7 +10870,11 @@ private:
         const auto base_eligible = [&](const server_slot & idle) {
             return !idle.is_processing() &&
                 idle.state == SLOT_STATE_IDLE &&
-                idle.prompt.n_tokens() > 0 && !idle.can_speculate() &&
+                idle.prompt.n_tokens() > 0 &&
+                automatic_vbr_cache_support(
+                    idle.prompt.tokens, idle.lora,
+                    idle.can_speculate()) ==
+                    server_vbr_prompt_cache_support_status::supported &&
                 !idle.hard_lease_blocks_live_prefix() &&
                 !idle.cache_plan_destruction_recovery_pin.valid() &&
                 prompt_cache->vbr_retention_source_available(idle.id);
@@ -10783,13 +10884,26 @@ private:
         // displacement. Avoid walking its complete retention catalog on every
         // idle tick when no live source can produce capture work.
         bool any_live_source = false;
-        for (const auto & idle : slots) {
+        for (auto & idle : slots) {
             if (!capture_session.continue_capture()) {
                 return 0;
             }
+            const auto support = automatic_vbr_cache_support(
+                idle.prompt.tokens, idle.lora,
+                idle.can_speculate());
+            if (support != idle.vbr_idle_support_status) {
+                idle.vbr_idle_support_status = support;
+                if (support !=
+                        server_vbr_prompt_cache_support_status::supported) {
+                    SLT_DBG(
+                        idle,
+                        "VBR_IDLE_CAPTURE fallback=live_only reason=%s\n",
+                        server_vbr_prompt_cache_support_status_name(
+                            support));
+                }
+            }
             if (base_eligible(idle)) {
                 any_live_source = true;
-                break;
             }
         }
         if (!any_live_source) {
@@ -11117,8 +11231,10 @@ private:
                     idle.vbr_idle_capture_published_identity !=
                         current_publication_identity;
                 if (representation_changed ||
-                    !automatic_vbr_restore_supported(
-                        idle.prompt.tokens, idle.lora) ||
+                    automatic_vbr_cache_support(
+                        idle.prompt.tokens, idle.lora,
+                        idle.can_speculate()) !=
+                        server_vbr_prompt_cache_support_status::supported ||
                     !capture_session.continue_capture() ||
                     !prompt_cache->contains_vbr_frontier(
                         idle.prompt, frontier_execution_identity,
@@ -11644,9 +11760,11 @@ private:
                     found->tier_epoch_swa) ==
                     found->attempt_identity && representation_stable;
             if (!source_unchanged || source.is_processing() ||
-                source.state != SLOT_STATE_IDLE || source.can_speculate() ||
-                !automatic_vbr_restore_supported(
-                    source.prompt.tokens, source.lora) ||
+                source.state != SLOT_STATE_IDLE ||
+                automatic_vbr_cache_support(
+                    source.prompt.tokens, source.lora,
+                    source.can_speculate()) !=
+                    server_vbr_prompt_cache_support_status::supported ||
                 source.hard_lease_blocks_live_prefix() ||
                 source.cache_plan_destruction_recovery_pin.valid() ||
                 !capture_session.continue_capture() ||
