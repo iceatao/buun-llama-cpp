@@ -1000,6 +1000,7 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                  policy.destination_sequence ||
              policy.occupied_replacement->incoming_artifact() !=
                  package.reference_artifact() ||
+             !policy.occupied_replacement->recovery_package() ||
              policy.occupied_representation_identity == nullptr)) {
             return terminal_result(
                 vbr_manifest_validation_status::unavailable);
@@ -1826,8 +1827,18 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             }
             const auto & guard_runs =
                 policy.occupied_replacement->relocation_runs();
+            const auto & recovery_runs =
+                policy.occupied_replacement->recovery_runs();
+            const auto strategy = policy.occupied_replacement->strategy();
             if (guard_runs.empty() || guard_runs.size() >
-                    VBR_OCCUPIED_REPLACEMENT_MAX_RUNS) {
+                    VBR_OCCUPIED_REPLACEMENT_MAX_RUNS ||
+                (strategy ==
+                     vbr_occupied_replacement_strategy::provisional_free_cells
+                    ? !recovery_runs.empty()
+                    : strategy ==
+                          vbr_occupied_replacement_strategy::recycle_incumbent_cells
+                        ? recovery_runs.empty()
+                        : true)) {
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }
@@ -1861,7 +1872,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 shard_count += plan.shards.size();
             }
             if (shard_count == 0 ||
-                guard_runs.size() > 4096/shard_count) {
+                recovery_runs.size() >
+                    VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-guard_runs.size() ||
+                guard_runs.size()+recovery_runs.size() > 4096/shard_count) {
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }

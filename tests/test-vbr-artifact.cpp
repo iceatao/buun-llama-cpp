@@ -5,6 +5,7 @@
 #include "server-cache-vbr-proof.h"
 #include "server-prompt-cache-payload.h"
 #include "llama-vbr-artifact-stage.h"
+#include "llama-vbr-artifact-adopt.h"
 #include "llama-vbr-artifact-validate.h"
 #include "llama-vbr-downward.h"
 #include "llama-vbr-upward.h"
@@ -13,6 +14,7 @@
 
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
 #include "server-cache-authority.h"
+#include "server-context.h"
 #include "server-task.h"
 #include "server-retention-sidecar.h"
 #endif
@@ -5024,6 +5026,17 @@ static void test_validated_manifest_staging() {
 }
 
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+static void test_server_vbr_occupied_failure_terminal() {
+    const auto slot_reset =
+        server_vbr_occupied_quarantine_reset_for_test();
+    CHECK(slot_reset.replay_preserved_prefix);
+    CHECK(slot_reset.replay_preserved_slot);
+    CHECK(slot_reset.quarantined);
+    CHECK(slot_reset.retained_prefix_zero);
+    CHECK(slot_reset.prompt_cleared);
+    CHECK(slot_reset.family_cleared);
+}
+
 static void test_prompt_cache_vbr_longest_feasible_restore_selection() {
     const auto run = [](size_t projected_lcp, bool projection_wins) {
         catalog_fixture fixture;
@@ -6448,8 +6461,8 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
 
     // Consume a fresh ticket through the exact scheduler/store split. The
     // fallible checkpoint leaves the incumbent intact; the no-fail publish
-    // changes two existing owners without an empty-slot interval, and commit
-    // publishes the request family rather than the selected host family.
+    // changes the existing owners and request family without an empty-slot
+    // interval; commit then releases the retained recovery authorities.
     server_prompt_cache_vbr_restore_candidate consumed_candidate;
     CHECK(cache.prepare_vbr_restore(
         extended,
@@ -9140,6 +9153,7 @@ int main(int argc, char ** argv) {
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+    test_server_vbr_occupied_failure_terminal();
     test_prompt_cache_vbr_longest_feasible_restore_selection();
     test_prompt_cache_vbr_atomic_logical_publication();
     test_prompt_cache_vbr_pressure_retires_physical_union();

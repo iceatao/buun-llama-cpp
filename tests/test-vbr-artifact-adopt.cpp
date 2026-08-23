@@ -787,6 +787,11 @@ static void test_closed_vocabularies() {
               "invalid");
     }
     for (uint8_t i = 0;
+         i < uint8_t(vbr_adopt_recovery_outcome::_count); ++i) {
+        CHECK(std::string(vbr_adopt_recovery_outcome_name(
+                  vbr_adopt_recovery_outcome(i))) != "invalid");
+    }
+    for (uint8_t i = 0;
          i < uint8_t(vbr_downward_reserve_status::_count); ++i) {
         CHECK(std::string(vbr_downward_reserve_status_name(
                   vbr_downward_reserve_status(i))) != "invalid");
@@ -1149,7 +1154,7 @@ struct child_state {
     std::vector<uint32_t> unmapped_ranges;
     uint64_t h2d_bytes = 0;
     std::set<uint32_t> completed_units;
-    std::array<uint8_t, 8> destination = {};
+    std::array<uint8_t, 24> destination = {};
 };
 
 struct recurrent_state {
@@ -1233,11 +1238,22 @@ struct seam final : vbr_adopt_test_seam {
     uint64_t upward_stash_rows = 0;
     uint32_t upward_syncs = 0;
     bool occupied_mode = false;
+    bool recycle_mode = false;
+    bool operation_quarantined = false;
+    bool fail_recovery_sync = false;
     uint32_t occupied_rechecks = 0;
     uint32_t relocated_prepares = 0;
     uint32_t relocated_images = 0;
+    uint32_t incoming_transfer_calls = 0;
+    uint32_t recovery_transfer_calls = 0;
+    uint32_t recovery_syncs = 0;
+    uint32_t fail_incoming_transfer_at = UINT32_MAX;
+    uint32_t fail_incoming_after_bytes = UINT32_MAX;
+    uint32_t fail_recovery_transfer_at = UINT32_MAX;
     std::vector<std::pair<uint64_t, uint64_t>> relocated_offsets;
     uint64_t incumbent_sentinel = UINT64_C(0xabcddcba11223344);
+    std::array<uint8_t, 24> incumbent_image = {};
+    std::vector<vbr_staged_read_kind> transfer_order;
     std::vector<upward_event> upward_events;
 
     seam() {
@@ -1308,7 +1324,9 @@ struct seam final : vbr_adopt_test_seam {
         return vbr_adopt_status::adopted;
     }
 
-    void operation_finish(vbr_operation_id, bool, bool) noexcept override {
+    void operation_finish(
+            vbr_operation_id, bool, bool quarantine) noexcept override {
+        operation_quarantined = quarantine;
         operation_opened = false;
         recovery_reserved = false;
     }
@@ -1419,6 +1437,14 @@ struct seam final : vbr_adopt_test_seam {
             }
         }
         auto & child = children[child_id];
+        const bool incoming =
+            read.kind == vbr_staged_read_kind::unit_payload;
+        const bool recovery =
+            read.kind == vbr_staged_read_kind::recovery_unit_payload;
+        const uint32_t transfer_ordinal = incoming
+            ? incoming_transfer_calls++
+            : recovery ? recovery_transfer_calls++ : UINT32_MAX;
+        transfer_order.push_back(read.kind);
         if (occupied_mode && read.kind == vbr_staged_read_kind::unit_payload) {
             if (!child.image_ready || read.projection_ranges.size() != 1) {
                 return false;
@@ -1428,20 +1454,48 @@ struct seam final : vbr_adopt_test_seam {
                 read.destination_offset,
             });
         }
-        for (size_t i = 0; i < bytes.size(); ++i) {
-            child.destination[i % child.destination.size()] ^= bytes[i];
+        size_t written = bytes.size();
+        bool fail_after_write = false;
+        if (incoming && transfer_ordinal == fail_incoming_transfer_at) {
+            written = std::min<size_t>(bytes.size(), fail_incoming_after_bytes);
+            fail_after_write = true;
+        } else if (recovery &&
+                   transfer_ordinal == fail_recovery_transfer_at) {
+            fail_after_write = true;
         }
-        child.h2d_bytes += read.size;
+        if (occupied_mode) {
+            const size_t base = size_t(read.shard_index)*8;
+            const size_t offset = size_t(read.destination_offset % 8);
+            if (base + offset > child.destination.size() ||
+                written > child.destination.size() - base - offset) {
+                return false;
+            }
+            std::copy_n(bytes.data(), written,
+                        child.destination.data() + base + offset);
+        } else {
+            for (size_t i = 0; i < written; ++i) {
+                child.destination[i % child.destination.size()] ^= bytes[i];
+            }
+        }
+        child.h2d_bytes += written;
         ++transfer_calls;
         if (read.kind == vbr_staged_read_kind::unit_payload) {
             upward_events.push_back(upward_event::unit_h2d);
         } else if (read.kind == vbr_staged_read_kind::clean_stash) {
             upward_events.push_back(upward_event::stash_h2d);
         }
-        stats.bytes = read.size;
+        stats.bytes = written;
         stats.chunks = 1;
         ++events;
-        return true;
+        return !fail_after_write;
+    }
+
+    bool session_synchronize_recovery(uint32_t child_id) noexcept override {
+        if (child_id >= children.size()) {
+            return false;
+        }
+        ++recovery_syncs;
+        return !fail_recovery_sync;
     }
 
     bool session_mark_complete(uint32_t child_id,
@@ -1685,7 +1739,9 @@ struct seam final : vbr_adopt_test_seam {
         child.mapped = 0;
         child.mapped_ranges.clear();
         child.h2d_bytes = 0;
-        child.destination.fill(0);
+        if (!recycle_mode) {
+            child.destination.fill(0);
+        }
         child.completed_units.clear();
         child.image_ready = false;
         child.receipts = false;
@@ -1743,6 +1799,10 @@ struct seam final : vbr_adopt_test_seam {
         publish_calls = 0;
         map_calls = 0;
         transfer_calls = 0;
+        incoming_transfer_calls = 0;
+        recovery_transfer_calls = 0;
+        recovery_syncs = 0;
+        transfer_order.clear();
         mark_calls = 0;
         downward_zero_inits = 0;
         downward_edges = 0;
@@ -1925,6 +1985,7 @@ struct fixture {
     ggml_type upward_target_type = GGML_TYPE_F16;
     bool mixed_exact_upward = false;
     bool occupied = false;
+    bool recycle = false;
     vbr_occupied_replacement_guard occupied_guard;
     vbr_downward_policy_projection downward_projection;
     vbr_import_destination_projection upward_destination;
@@ -1944,7 +2005,8 @@ struct fixture {
                          vbr_artifact_clean_stash_state::absent_at_source,
                      bool mixed_exact = false,
                      bool partial_stash = false,
-                     bool occupied_import = false)
+                     bool occupied_import = false,
+                     bool recycle_import = false)
         : source(package(
               bytes, companion,
               upward_import ? upward_source : GGML_TYPE_TURBO8_0,
@@ -1957,11 +2019,14 @@ struct fixture {
           with_companion(companion), downward(downward_import),
           upward(upward_import), upward_source_type(upward_source),
           upward_target_type(upward_target),
-          mixed_exact_upward(mixed_exact), occupied(occupied_import) {
+          mixed_exact_upward(mixed_exact), occupied(occupied_import),
+          recycle(recycle_import) {
         CHECK(!(downward && upward));
+        CHECK(!recycle || occupied);
         if (occupied) {
             target.live.resize(1);
             target.occupied_mode = true;
+            target.recycle_mode = recycle;
         }
         if (downward) {
             for (auto & controller : source.manifest.controller_policy) {
@@ -2094,15 +2159,30 @@ struct fixture {
               vbr_artifact_resolve_status::ok);
         CHECK(view.validate() == vbr_artifact_status::ok);
         if (occupied) {
+            storage recovery_bytes;
+            for (auto & payload : recovery_bytes.payload) {
+                for (auto & value : payload.bytes) {
+                    value ^= 0x5a;
+                }
+            }
+            auto recovery_source = package(
+                recovery_bytes, false,
+                ggml_type(source.unit_blobs.front().descriptor.current_type),
+                source.unit_blobs.front().descriptor.promote_hops,
+                vbr_artifact_clean_stash_state::absent_at_source,
+                false, 1);
+            CHECK(vbr_artifact_prepare(recovery_source) ==
+                  vbr_artifact_status::ok);
+            CHECK(catalog.configure_accounting(recovery_source));
             auto recovery_build = catalog.begin_capture(
-                source, budget, {}, stream_status);
+                recovery_source, budget, {}, stream_status);
             CHECK(recovery_build &&
                   stream_status == vbr_capture_stream_status::ok);
             if (!recovery_build) {
                 return;
             }
             for (uint32_t unit_index = 0;
-                 unit_index < source.unit_blobs.size(); ++unit_index) {
+                 unit_index < recovery_source.unit_blobs.size(); ++unit_index) {
                 auto unit = recovery_build->begin_unit(unit_index, stream_status);
                 CHECK(unit && stream_status == vbr_capture_stream_status::ok);
                 if (!unit) {
@@ -2110,8 +2190,9 @@ struct fixture {
                 }
                 for (uint32_t shard_index = 0; shard_index < 2; ++shard_index) {
                     CHECK(unit->accept_verified_segment(segment(
-                              unit_index, shard_index,
-                              bytes.payload[unit_index*2+shard_index])) ==
+                        unit_index, shard_index,
+                              recovery_bytes.payload[
+                                  unit_index*2+shard_index])) ==
                           vbr_capture_stream_status::ok);
                 }
                 CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
@@ -2128,6 +2209,14 @@ struct fixture {
                       recovery_reference, recovery_view) ==
                   vbr_artifact_resolve_status::ok);
             CHECK(recovery_view.validate() == vbr_artifact_status::ok);
+            for (uint32_t shard_index = 0; shard_index < 2; ++shard_index) {
+                const auto & payload = recovery_bytes.payload[shard_index].bytes;
+                std::copy(payload.begin(), payload.end(),
+                          target.incumbent_image.begin() + shard_index*8);
+            }
+            if (recycle) {
+                target.children[0].destination = target.incumbent_image;
+            }
         }
         catalog_live_ops = ledger.snapshot().live_ops;
 
@@ -2158,7 +2247,7 @@ struct fixture {
             const vbr_occupied_replacement_observation observation {
                 0, view.manifest().identity.sequence_epoch,
                 view.manifest().generation.controllers.front().global_generation,
-                snapshot.children.front().state_serial, 10,
+                snapshot.children.front().state_serial, recycle ? 5u : 10u,
                 cells.data(), cells.size(), &unit, 1,
             };
             CHECK(vbr_prepare_occupied_replacement_guard(
@@ -2168,6 +2257,10 @@ struct fixture {
             CHECK(occupied_guard.recovery_artifact() == recovery_reference);
             CHECK(occupied_guard.incoming_artifact() !=
                   occupied_guard.recovery_artifact());
+            CHECK(occupied_guard.strategy() ==
+                  (recycle
+                       ? vbr_occupied_replacement_strategy::recycle_incumbent_cells
+                       : vbr_occupied_replacement_strategy::provisional_free_cells));
             policy.occupied_replacement = &occupied_guard;
             policy.occupied_representation_context = this;
             policy.occupied_representation_identity = [](
@@ -2673,7 +2766,7 @@ static vbr_adopt_result adopt_occupied(
     if (!staged.manifest || !staged.staged) {
         return {};
     }
-    CHECK(staged.staged->read_count() == 2);
+    CHECK(staged.staged->read_count() == (f.recycle ? 4u : 2u));
     vbr_composite_publish_hooks hooks;
     hooks.context = &f.target.target;
     hooks.owner_token = &f.target.target;
@@ -2689,6 +2782,23 @@ static vbr_adopt_result adopt_occupied(
     return vbr_adopt_empty_manifest(
         f.target.target, 0, std::move(*staged.manifest),
         std::move(*staged.staged), f.ledger, hooks);
+}
+
+static uint64_t device_transfer_staging_reserved(
+        const llama_cache_acct_snapshot & snapshot) {
+    uint64_t total = 0;
+    for (const auto & row : snapshot.cells) {
+        if (row.category != llama_cache_acct_category::transfer_staging ||
+            row.domain.residency != llama_cache_acct_residency::device) {
+            continue;
+        }
+        const auto & value = row.cell.measures[
+            size_t(llama_cache_acct_measure::reserved)];
+        if (value.state == llama_cache_acct_known::known) {
+            total += value.value;
+        }
+    }
+    return total;
 }
 
 static void test_occupied_replacement_free_cell_adoption() {
@@ -2728,6 +2838,112 @@ static void test_occupied_replacement_fault_preserves_incumbent() {
         f.target.children[0].destination.begin(),
         f.target.children[0].destination.end(),
         [](uint8_t value) { return value == 0; }));
+}
+
+static void check_recycle_restored(
+        fixture & f, const vbr_adopt_result & result,
+        uint32_t expected_incoming) {
+    CHECK(result.status != vbr_adopt_status::adopted);
+    CHECK(result.recovery == vbr_adopt_recovery_outcome::replayed);
+    CHECK(result.recovery_h2d_bytes == 10);
+    CHECK(result.recovery_h2d_chunks == 2);
+    CHECK(f.target.incoming_transfer_calls == expected_incoming);
+    CHECK(f.target.recovery_transfer_calls == 2);
+    CHECK(f.target.recovery_syncs == 1);
+    CHECK(!f.target.operation_quarantined);
+    CHECK(f.target.publish_calls == 0);
+    CHECK(!f.target.children[0].published);
+    CHECK(f.target.children[0].destination == f.target.incumbent_image);
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+    CHECK(f.target.transfer_order.size() == size_t(expected_incoming + 2));
+    for (uint32_t i = 0; i < expected_incoming; ++i) {
+        CHECK(f.target.transfer_order[i] ==
+              vbr_staged_read_kind::unit_payload);
+    }
+    for (size_t i = expected_incoming;
+         i < f.target.transfer_order.size(); ++i) {
+        CHECK(f.target.transfer_order[i] ==
+              vbr_staged_read_kind::recovery_unit_payload);
+    }
+}
+
+static void test_occupied_recycle_success_and_zero_growth() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true, true);
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.staged);
+    if (!staged.manifest || !staged.staged) {
+        return;
+    }
+    CHECK(staged.staged->read_count() == 4);
+    CHECK(device_transfer_staging_reserved(f.ledger.snapshot()) == 0);
+
+    vbr_composite_publish_hooks hooks;
+    hooks.context = &f.target.target;
+    hooks.owner_token = &f.target.target;
+    hooks.validate_owner_token = owner_token_valid;
+    vbr_adopt_test_control test;
+    test.target = &f.target;
+    hooks.test = &test;
+    const auto result = vbr_adopt_empty_manifest(
+        f.target.target, 0, std::move(*staged.manifest),
+        std::move(*staged.staged), f.ledger, hooks);
+    CHECK(result.status == vbr_adopt_status::adopted);
+    CHECK(result.recovery == vbr_adopt_recovery_outcome::not_needed);
+    CHECK(result.recovery_h2d_bytes == 0);
+    CHECK(result.recovery_h2d_chunks == 0);
+    CHECK(f.target.incoming_transfer_calls == 2);
+    CHECK(f.target.recovery_transfer_calls == 0);
+    CHECK(f.target.recovery_syncs == 0);
+    CHECK(f.target.transfer_order ==
+          std::vector<vbr_staged_read_kind>({
+              vbr_staged_read_kind::unit_payload,
+              vbr_staged_read_kind::unit_payload,
+          }));
+    CHECK(f.target.children[0].destination != f.target.incumbent_image);
+    CHECK(f.target.children[0].published);
+}
+
+static void test_occupied_recycle_partial_write_and_late_fault_matrix() {
+    for (const uint32_t bytes_before_failure : { 1u, 3u, 5u }) {
+        fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+                  0, vbr_artifact_clean_stash_state::absent_at_source,
+                  false, false, true, true);
+        f.target.fail_incoming_transfer_at = 0;
+        f.target.fail_incoming_after_bytes = bytes_before_failure;
+        const auto result = adopt_occupied(f);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        check_recycle_restored(f, result, 1);
+    }
+
+    fixture late(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+                 0, vbr_artifact_clean_stash_state::absent_at_source,
+                 false, false, true, true);
+    const auto late_result = adopt_occupied(
+        late, vbr_adopt_phase::complete_tree_barrier, false);
+    CHECK(late_result.status != vbr_adopt_status::adopted);
+    check_recycle_restored(late, late_result, 2);
+}
+
+static void test_occupied_recycle_replay_failure_quarantines() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true, true);
+    f.target.fail_incoming_transfer_at = 0;
+    f.target.fail_incoming_after_bytes = 3;
+    f.target.fail_recovery_transfer_at = 1;
+    const auto result = adopt_occupied(f);
+    CHECK(result.status == vbr_adopt_status::quarantined);
+    CHECK(result.phase == vbr_adopt_phase::rollback);
+    CHECK(result.recovery == vbr_adopt_recovery_outcome::quarantined);
+    CHECK(result.recovery_h2d_bytes == 5);
+    CHECK(result.recovery_h2d_chunks == 1);
+    CHECK(f.target.recovery_transfer_calls == 2);
+    CHECK(f.target.recovery_syncs == 0);
+    CHECK(f.target.operation_quarantined);
+    CHECK(f.target.publish_calls == 0);
 }
 
 static void test_occupied_replacement_tracker_consumes_canonical_map() {
@@ -4484,9 +4700,6 @@ static bool h2_model_backed_occupied_store(
     if (incoming_tokens.size() < 4) {
         return false;
     }
-    if (incoming_tokens.size() > 32) {
-        incoming_tokens.resize(32);
-    }
     const int32_t vocab_size = llama_vocab_n_tokens(
         llama_model_get_vocab(model.get()));
     CHECK(vocab_size > 1);
@@ -4494,6 +4707,18 @@ static bool h2_model_backed_occupied_store(
         return false;
     }
     const llama_token continuation = incoming_tokens.back();
+    const uint32_t context_cells = llama_n_ctx(context.get());
+    CHECK(context_cells >= 8);
+    if (context_cells < 8 || incoming_tokens.size() >= context_cells) {
+        return false;
+    }
+    // Leave exactly one cache cell for the continuation. An equal-length
+    // occupied replacement cannot fit in the remaining free space and must
+    // therefore exercise authenticated incumbent-cell recycling.
+    incoming_tokens.resize(
+        size_t(context_cells)-1,
+        incoming_tokens.size() > 1 ? incoming_tokens[1]
+                                   : incoming_tokens.front());
     auto incumbent_tokens = incoming_tokens;
     incumbent_tokens.back() = llama_token(
         (uint32_t(incumbent_tokens.back()) + 1u) % uint32_t(vocab_size));
@@ -4629,6 +4854,9 @@ static bool h2_model_backed_occupied_store(
     llama_memory_clear(memory, true);
     CHECK(f42a_decode(context.get(), incumbent_tokens, 0));
     llama_synchronize(context.get());
+    CHECK(memory->seq_pos_min(0) == 0);
+    CHECK(memory->seq_pos_max(0) ==
+          llama_pos(incumbent_tokens.size()-1));
 
     std::shared_ptr<const server_prompt_cache_vbr_payload> recovery_owner;
     CHECK(capture_owner(incumbent_tokens, recovery_owner));
@@ -4890,6 +5118,9 @@ static bool f42b_parse_type(const std::string & name, ggml_type & output) {
 int main(int argc, char ** argv) {
     g2::test_occupied_replacement_free_cell_adoption();
     g2::test_occupied_replacement_fault_preserves_incumbent();
+    g2::test_occupied_recycle_success_and_zero_growth();
+    g2::test_occupied_recycle_partial_write_and_late_fault_matrix();
+    g2::test_occupied_recycle_replay_failure_quarantines();
     g2::test_occupied_replacement_tracker_consumes_canonical_map();
     test_epoch_capacity_preflight();
     test_closed_vocabularies();

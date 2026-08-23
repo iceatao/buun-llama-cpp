@@ -334,6 +334,8 @@ struct server_vbr_artifact_import_output {
     vbr_downward_reserve_status downward_reserve_status =
         vbr_downward_reserve_status::not_attempted;
     vbr_adopt_status adopt_status = vbr_adopt_status::internal_error;
+    vbr_adopt_recovery_outcome recovery =
+        vbr_adopt_recovery_outcome::not_needed;
     bool adopt_attempted = false;
     vbr_adopt_phase phase = vbr_adopt_phase::consume_capabilities;
     vbr_downward_adopt_subphase downward_subphase =

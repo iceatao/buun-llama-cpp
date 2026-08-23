@@ -2002,7 +2002,8 @@ vbr_explicit_prepare_occupied_replacement_guard(
         uint64_t accounting_serial,
         const void * representation_context,
         vbr_explicit_representation_identity_fn representation_identity,
-        vbr_occupied_replacement_guard & output) noexcept {
+        vbr_occupied_replacement_guard & output,
+        const vbr_import_schedule_quote * authenticated_incoming) noexcept {
     output.reset();
     try {
         std::vector<llama_memory_tree_child> tree;
@@ -2011,11 +2012,12 @@ vbr_explicit_prepare_occupied_replacement_guard(
             return vbr_occupied_replacement_guard_status::unsupported_tree;
         }
         vbr_target_validation_snapshot target;
+        vbr_import_schedule_quote recovery_quote;
         if (!import_target_snapshot_core(
                 memory, destination, recovery, bindings, false,
                 accounting_serial, representation_context,
                 representation_identity, target,
-                nullptr, nullptr, nullptr, nullptr, nullptr, &tree) ||
+                nullptr, nullptr, &recovery_quote, nullptr, nullptr, &tree) ||
             target.destination_sequence_absent) {
             return vbr_occupied_replacement_guard_status::unsupported_tree;
         }
@@ -2029,7 +2031,8 @@ vbr_explicit_prepare_occupied_replacement_guard(
             return vbr_occupied_replacement_guard_status::unsupported_layout;
         }
         const auto status = vbr_prepare_occupied_replacement_guard(
-            target, incoming, recovery, observation, output);
+            target, incoming, recovery, observation, output,
+            authenticated_incoming, &recovery_quote);
         if (status != vbr_occupied_replacement_guard_status::ready) {
             return status;
         }

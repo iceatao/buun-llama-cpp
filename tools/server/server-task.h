@@ -648,6 +648,7 @@ enum class vbr_manifest_validation_status : uint8_t;
 enum class vbr_adopt_stage_status : uint8_t;
 enum class vbr_downward_reserve_status : uint8_t;
 enum class vbr_adopt_status : uint8_t;
+enum class vbr_adopt_recovery_outcome : uint8_t;
 enum class vbr_adopt_phase : uint8_t;
 enum class vbr_downward_adopt_subphase : uint8_t;
 enum class vbr_import_decision : uint8_t;
@@ -696,6 +697,7 @@ struct server_task_result_cache_import : server_task_result {
     vbr_adopt_stage_status stage_status {};
     vbr_downward_reserve_status downward_reserve_status {};
     vbr_adopt_status adopt_status {};
+    vbr_adopt_recovery_outcome recovery {};
     bool adopt_attempted = false;
     vbr_adopt_phase phase {};
     vbr_downward_adopt_subphase downward_subphase {};

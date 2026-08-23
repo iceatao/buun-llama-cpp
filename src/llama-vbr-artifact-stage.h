@@ -161,6 +161,7 @@ enum class vbr_staged_read_kind : uint8_t {
     unit_payload = 0,
     clean_stash,
     companion,
+    recovery_unit_payload,
     _count,
 };
 

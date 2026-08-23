@@ -1043,7 +1043,12 @@ struct server_slot {
             retention_obs->retire_slot(id);
         }
 
-        mem.seq_rm(id, -1, -1);
+        // A default-constructed slot exists only in model-free ownership
+        // tests. Production slots always carry ctx_tgt and remove their live
+        // sequence here before clearing the scheduler image.
+        if (mem.ctx_tgt) {
+            mem.seq_rm(id, -1, -1);
+        }
 
         if (lifecycle_authority && !prompt.checkpoints.empty()) {
             checkpoint_ring_changed();
@@ -2300,6 +2305,63 @@ struct server_slot {
         return try_decode();
     }
 };
+
+static bool server_vbr_apply_occupied_restore_failure_to_slot(
+        vbr_adopt_status adopt_status,
+        vbr_adopt_recovery_outcome recovery,
+        size_t incumbent_prefix,
+        size_t & retained_prefix,
+        server_slot & slot) noexcept {
+    const bool quarantined = adopt_status == vbr_adopt_status::quarantined ||
+        recovery == vbr_adopt_recovery_outcome::quarantined;
+    retained_prefix = quarantined ? 0 : incumbent_prefix;
+    if (quarantined) {
+        slot.mandatory_recovery_reset(
+            server_cache_destruction_reason::restore_failure);
+    }
+    return quarantined;
+}
+
+server_vbr_occupied_quarantine_reset_result
+server_vbr_occupied_quarantine_reset_for_test() {
+    const common_cache_family_binding family {
+        common_cache_family_id { 41 }, common_cache_family_role::branch,
+    };
+    server_slot replay_slot {};
+    replay_slot.id = 0;
+    replay_slot.prompt.tokens = server_tokens(
+        llama_tokens { 1, 2, 3 }, false);
+    replay_slot.prompt.sequence_epoch = 7;
+    replay_slot.cache_family = family;
+    size_t retained_prefix = 3;
+    server_vbr_occupied_quarantine_reset_result result;
+    result.replay_preserved_prefix =
+        !server_vbr_apply_occupied_restore_failure_to_slot(
+            vbr_adopt_status::transfer_failed,
+            vbr_adopt_recovery_outcome::replayed,
+            retained_prefix, retained_prefix, replay_slot) &&
+        retained_prefix == 3;
+    result.replay_preserved_slot = replay_slot.prompt.n_tokens() == 3 &&
+        replay_slot.prompt.sequence_epoch == 7 &&
+        replay_slot.cache_family == family;
+
+    server_slot slot {};
+    slot.id = 0;
+    slot.prompt.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+    slot.prompt.sequence_epoch = 7;
+    slot.cache_family = family;
+    result.quarantined =
+        server_vbr_apply_occupied_restore_failure_to_slot(
+            vbr_adopt_status::transfer_failed,
+            vbr_adopt_recovery_outcome::quarantined,
+            retained_prefix, retained_prefix, slot);
+    result.retained_prefix_zero = retained_prefix == 0;
+    result.prompt_cleared = slot.prompt.tokens.empty() &&
+        slot.prompt.sequence_epoch == 0;
+    result.family_cleared = slot.cache_family ==
+        common_cache_family_binding {};
+    return result;
+}
 
 server_cache_family_slot_round_trip_result
 server_cache_family_slot_round_trip_for_test(
@@ -9220,10 +9282,22 @@ private:
                         server_vbr_artifact_import_status::ok) {
                     GGML_ASSERT(!state.published);
                     vbr_automatic_restore_occupied_fallbacks++;
+                    size_t failure_prefix = size_t(incumbent_lcp);
+                    const bool quarantined =
+                        server_vbr_apply_occupied_restore_failure_to_slot(
+                            imported.adopt_status, imported.recovery,
+                            size_t(incumbent_lcp), failure_prefix, slot);
+                    if (restored_prefix) {
+                        *restored_prefix = failure_prefix;
+                    }
                     SLT_DBG(
                         slot,
-                        "automatic occupied VBR restore refused: status=%s\n",
-                        server_vbr_artifact_import_status_name(imported.status));
+                        "automatic occupied VBR restore refused: status=%s "
+                        "adopt=%s recovery=%s reset=%s\n",
+                        server_vbr_artifact_import_status_name(imported.status),
+                        vbr_adopt_status_name(imported.adopt_status),
+                        vbr_adopt_recovery_outcome_name(imported.recovery),
+                        quarantined ? "true" : "false");
                     return false;
                 }
                 GGML_ASSERT(state.published);
@@ -12239,6 +12313,7 @@ private:
                         res->downward_reserve_status =
                             imported.downward_reserve_status;
                         res->adopt_status = imported.adopt_status;
+                        res->recovery = imported.recovery;
                         res->adopt_attempted = imported.adopt_attempted;
                         res->phase = imported.phase;
                         res->downward_subphase = imported.downward_subphase;
@@ -12408,7 +12483,7 @@ private:
                         SRV_INF(
                             "VBR_ARTIFACT_IMPORT end task=%d slot=%d status=%s "
                             "validation=%s stage=%s downward_reserve=%s "
-                            "adopt=%s phase=%s subphase=%s edge=%s "
+                            "adopt=%s recovery=%s phase=%s subphase=%s edge=%s "
                             "schedule=%s decision=%s consistency=%s "
                             "units=%u companions=%u "
                             "payload=%" PRIu64 " companion_bytes=%" PRIu64
@@ -12426,6 +12501,7 @@ private:
                             vbr_downward_reserve_status_name(
                                 imported.downward_reserve_status),
                             vbr_adopt_status_name(imported.adopt_status),
+                            vbr_adopt_recovery_outcome_name(imported.recovery),
                             phase_name, subphase_name,
                             edge_name.c_str(),
                             vbr_import_schedule_status_name(

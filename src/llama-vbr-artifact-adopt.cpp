@@ -109,6 +109,17 @@ const char * vbr_adopt_status_name(vbr_adopt_status status) noexcept {
     return "invalid";
 }
 
+const char * vbr_adopt_recovery_outcome_name(
+        vbr_adopt_recovery_outcome outcome) noexcept {
+    switch (outcome) {
+        case vbr_adopt_recovery_outcome::not_needed: return "not_needed";
+        case vbr_adopt_recovery_outcome::replayed: return "replayed";
+        case vbr_adopt_recovery_outcome::quarantined: return "quarantined";
+        case vbr_adopt_recovery_outcome::_count: break;
+    }
+    return "invalid";
+}
+
 const char * vbr_downward_adopt_subphase_name(
         vbr_downward_adopt_subphase subphase) noexcept {
     switch (subphase) {
@@ -393,6 +404,7 @@ class vbr_kv_import_session {
             unit_by_pool_.clear();
             final_unit_indices_.clear();
             transform_backends_.clear();
+            transfer_backends_.clear();
             for (size_t i = 0; i < cache_->vbr_pools_.size(); ++i) {
                 pool_indices_[&cache_->vbr_pools_[i]] = i;
             }
@@ -481,6 +493,11 @@ class vbr_kv_import_session {
                             transform_backends_.end(), pool->backend) ==
                                 transform_backends_.end()) {
                         transform_backends_.push_back(pool->backend);
+                    }
+                    if (std::find(
+                            transfer_backends_.begin(), transfer_backends_.end(),
+                            pool->backend) == transfer_backends_.end()) {
+                        transfer_backends_.push_back(pool->backend);
                     }
                     const auto prefix = extent_prefix_indices_.emplace(
                         unit.second, extent_prefixes_.size());
@@ -709,7 +726,9 @@ class vbr_kv_import_session {
             } };
         if (!read.projection_ranges.empty()) {
             if (!ring_operation || !*ring_operation ||
-                read.kind != vbr_staged_read_kind::unit_payload) {
+                (read.kind != vbr_staged_read_kind::unit_payload &&
+                 read.kind !=
+                     vbr_staged_read_kind::recovery_unit_payload)) {
                 return false;
             }
             vbr_h2d_packed_transfer transfer;
@@ -737,6 +756,23 @@ class vbr_kv_import_session {
         transfer.destination_offset = destination_offset;
         transfer.fail_completion_at = fail_completion;
         return ring->stream(transfer, stats) == vbr_h2d_status::ok;
+    }
+
+    bool synchronize_recovery() noexcept {
+        if (test_seam_) {
+            return armed_ &&
+                test_seam_->session_synchronize_recovery(child_id_);
+        }
+        if (!armed_) {
+            return false;
+        }
+        for (auto * backend : transfer_backends_) {
+            if (!backend) {
+                return false;
+            }
+            ggml_backend_synchronize(backend);
+        }
+        return true;
     }
 
     bool mark_complete(uint32_t unit) noexcept {
@@ -1097,7 +1133,11 @@ class vbr_kv_import_session {
         }
         const bool source_ready = manifest.is_prefix_projection()
             ? manifest.projection_transfer_ready()
-            : manifest.source_package().validate() == vbr_artifact_status::ok;
+            : manifest.is_occupied_replacement()
+                ? manifest.occupied_replacement() != nullptr &&
+                    manifest.occupied_replacement()->ready()
+                : manifest.source_package().validate() ==
+                    vbr_artifact_status::ok;
         if (!armed_ || !image_ready_ || !cache_->vbr_import_in_progress_ ||
             cache_->vbr_import_operation_ != operation_ || !source_ready ||
             !cache_->vbr_generation_tracker_get()->import_image_installable(
@@ -1395,6 +1435,7 @@ class vbr_kv_import_session {
     std::map<uint32_t, size_t> final_unit_indices_;
     std::map<uint32_t, ggml_type> source_types_;
     std::vector<ggml_backend_t> transform_backends_;
+    std::vector<ggml_backend_t> transfer_backends_;
     std::vector<uint32_t> final_watermarks_;
     std::vector<llama_kv_cells> final_cells_;
     std::vector<uint32_t> final_heads_;
@@ -1775,13 +1816,57 @@ vbr_adopt_result vbr_adopt_empty_manifest(
     std::vector<uint32_t> transform_stash_valid;
     bool claims_committed = false;
     bool published = false;
+    bool recycle = false;
+    bool destructive_started = false;
     uint64_t post_commit_serial = 0;
     std::shared_ptr<vbr_import_receipt_group> receipt_group;
+    vbr_h2d_ring_operation packed_operation;
 
     const auto fail = [&](vbr_adopt_status status) {
         out.status = status;
         if (!published) {
             bool rollback_ok = true;
+            if (destructive_started) {
+                bool replay_ok = recycle && staged &&
+                    (test_target(server_hooks) || packed_operation);
+                uint64_t recovery_reads = 0;
+                if (replay_ok) {
+                    for (const auto & read : staged->reads()) {
+                        if (read.kind !=
+                                vbr_staged_read_kind::recovery_unit_payload) {
+                            continue;
+                        }
+                        ++recovery_reads;
+                        const auto child = children.find(read.child_id);
+                        vbr_h2d_stats stats;
+                        if (child == children.end() || !child->second.session ||
+                            !child->second.session->transfer(
+                                read, staged->adoption_ring(),
+                                test_target(server_hooks)
+                                    ? nullptr : &packed_operation,
+                                UINT64_MAX, stats)) {
+                            replay_ok = false;
+                            break;
+                        }
+                        out.recovery_h2d_bytes += stats.bytes;
+                        out.recovery_h2d_chunks += stats.chunks;
+                    }
+                }
+                replay_ok = replay_ok && recovery_reads != 0;
+                if (replay_ok) {
+                    for (auto & entry : children) {
+                        replay_ok = entry.second.session &&
+                            entry.second.session->synchronize_recovery() && replay_ok;
+                    }
+                }
+                if (replay_ok) {
+                    out.recovery = vbr_adopt_recovery_outcome::replayed;
+                } else {
+                    out.recovery = vbr_adopt_recovery_outcome::quarantined;
+                    rollback_ok = false;
+                }
+                destructive_started = false;
+            }
             for (auto it = children.rbegin(); it != children.rend(); ++it) {
                 if (it->second.session) {
                     rollback_ok = it->second.session->rollback(
@@ -1805,6 +1890,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             rollback_ok = operation.finish(false, !rollback_ok) && rollback_ok;
             if (!rollback_ok) {
                 out.status = vbr_adopt_status::quarantined;
+                if (recycle) {
+                    out.recovery = vbr_adopt_recovery_outcome::quarantined;
+                }
                 out.phase = vbr_adopt_phase::rollback;
             }
         }
@@ -1838,6 +1926,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         out.decision = manifest->decision();
         const bool occupied_replacement =
             manifest->is_occupied_replacement();
+        recycle = occupied_replacement &&
+            manifest->occupied_replacement()->strategy() ==
+                vbr_occupied_replacement_strategy::recycle_incumbent_cells;
         if (out.decision == vbr_import_decision::downward_rebase ||
             out.decision == vbr_import_decision::upward_reconstruct) {
             transform_stash_valid.assign(manifest->children().size(), 0);
@@ -2026,11 +2117,10 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         if (prefix_projection && !manifest->projection_transfer_ready()) {
             return fail(vbr_adopt_status::source_changed);
         }
-        vbr_h2d_ring_operation projection_operation;
         if (packed_transfer && !test_target(server_hooks)) {
-            projection_operation =
+            packed_operation =
                 staged->adoption_ring()->try_begin_operation();
-            if (!projection_operation) {
+            if (!packed_operation) {
                 return fail(vbr_adopt_status::operation_unavailable);
             }
         }
@@ -2057,10 +2147,11 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             }
             vbr_h2d_stats stats;
             auto * ring = staged->adoption_ring();
+            destructive_started = destructive_started || recycle;
             if (!child->second.session->transfer(
                     read, ring,
                     packed_transfer && !test_target(server_hooks)
-                        ? &projection_operation : nullptr,
+                        ? &packed_operation : nullptr,
                     server_hooks.test != nullptr &&
                             completion == server_hooks.test->fault.fail_h2d_completion
                         ? 0 : UINT64_MAX, stats)) {
@@ -2095,7 +2186,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         // Projection owns the shared transport only across its selected H2D
         // bytes; all later validation and publication work is CPU-local.
-        projection_operation = {};
+        if (!recycle) {
+            packed_operation = {};
+        }
         if (out.decision == vbr_import_decision::downward_rebase ||
             out.decision == vbr_import_decision::upward_reconstruct) {
             const auto status = transform_all(
@@ -2263,8 +2356,10 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             !operation_quiescent(operation, server_hooks) ||
             (manifest->is_prefix_projection()
                 ? !manifest->projection_transfer_ready()
-                : manifest->source_package().validate() !=
-                    vbr_artifact_status::ok)) {
+                : occupied_replacement
+                    ? !manifest->occupied_replacement()->ready()
+                    : manifest->source_package().validate() !=
+                        vbr_artifact_status::ok)) {
             return fail(vbr_adopt_status::barrier_failed);
         }
         std::vector<llama_memory_tree_child> barrier_tree;
@@ -2347,6 +2442,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         // END VBR_IMPORT_NOFAIL_PUBLISH
         published = true;
+        destructive_started = false;
+        packed_operation = {};
 
         out.phase = vbr_adopt_phase::close;
         // Retain every committed reference in the imported target until its

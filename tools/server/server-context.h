@@ -13,6 +13,18 @@
 struct server_context_impl; // private implementation
 class server_cache_control_authority;
 
+struct server_vbr_occupied_quarantine_reset_result {
+    bool replay_preserved_prefix = false;
+    bool replay_preserved_slot = false;
+    bool quarantined = false;
+    bool retained_prefix_zero = false;
+    bool prompt_cleared = false;
+    bool family_cleared = false;
+};
+
+server_vbr_occupied_quarantine_reset_result
+server_vbr_occupied_quarantine_reset_for_test();
+
 // TEST-ONLY E1.1b door. It constructs the private server_slot, resolves a
 // scheduler family token, exercises the real no-restore cache load, and then
 // verifies that host/checkpoint carriers are sourced from that same slot.

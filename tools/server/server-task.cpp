@@ -1699,6 +1699,7 @@ json server_task_result_cache_import::to_json() {
         { "downward_reserve_status",
           vbr_downward_reserve_status_name(downward_reserve_status) },
         { "adopt_status", vbr_adopt_status_name(adopt_status) },
+        { "recovery", vbr_adopt_recovery_outcome_name(recovery) },
         { "phase", adopt_attempted
               ? json(vbr_adopt_phase_name(phase)) : json(nullptr) },
         { "downward_subphase",

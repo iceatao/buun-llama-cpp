@@ -11,6 +11,9 @@
 struct vbr_occupied_replacement_guard::map {
     std::vector<vbr_occupied_replacement_cell_mapping> mappings;
     std::vector<vbr_occupied_replacement_relocation_run> relocation_runs;
+    std::vector<vbr_occupied_replacement_relocation_run> recovery_runs;
+    vbr_occupied_replacement_strategy strategy =
+        vbr_occupied_replacement_strategy::_count;
     uint64_t packed_rows_expanded = 0;
 };
 
@@ -457,9 +460,30 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
             return vbr_occupied_replacement_guard_status::unsupported_layout;
         }
     }
+    const size_t free_cells = observation.cell_capacity-observation.cell_count;
+    const auto strategy = incoming_tokens <= free_cells
+        ? vbr_occupied_replacement_strategy::provisional_free_cells
+        : incoming_tokens == recovery_tokens
+            ? vbr_occupied_replacement_strategy::recycle_incumbent_cells
+            : vbr_occupied_replacement_strategy::_count;
+    if (strategy == vbr_occupied_replacement_strategy::_count) {
+        return vbr_occupied_replacement_guard_status::capacity_unavailable;
+    }
+    if (build) {
+        build->strategy = strategy;
+    } else if (!expected || expected->strategy != strategy) {
+        return vbr_occupied_replacement_guard_status::currency_changed;
+    }
+
     std::vector<uint64_t> packed_rows;
-    if (build && !occupied_projected_packed_rows(
-            incoming, incoming_placement, packed_rows)) {
+    std::vector<uint64_t> recovery_packed_rows;
+    if (build && (!occupied_projected_packed_rows(
+                      incoming, incoming_placement, packed_rows) ||
+                  (strategy ==
+                       vbr_occupied_replacement_strategy::recycle_incumbent_cells &&
+                   !occupied_projected_packed_rows(
+                       recovery, recovery_placement,
+                       recovery_packed_rows)))) {
         return vbr_occupied_replacement_guard_status::unsupported_layout;
     }
     uint32_t previous_physical = 0;
@@ -482,9 +506,77 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
             return vbr_occupied_replacement_guard_status::ownership_mismatch;
         }
     }
-    if (incoming_tokens > observation.cell_capacity-observation.cell_count) {
-        return vbr_occupied_replacement_guard_status::capacity_unavailable;
+    const auto append_run = [](
+            std::vector<vbr_occupied_replacement_relocation_run> & runs,
+            uint64_t source_packed_row,
+            uint32_t destination_physical_cell) {
+        if (!runs.empty()) {
+            auto & run = runs.back();
+            if (run.cell_count != UINT32_MAX &&
+                run.first_source_packed_row <= UINT64_MAX-run.cell_count &&
+                run.first_source_packed_row+run.cell_count == source_packed_row &&
+                uint64_t(run.first_destination_physical_cell)+run.cell_count ==
+                    destination_physical_cell) {
+                ++run.cell_count;
+                return true;
+            }
+        }
+        if (runs.size() >= VBR_OCCUPIED_REPLACEMENT_MAX_RUNS) {
+            return false;
+        }
+        runs.push_back({ source_packed_row, destination_physical_cell, 1 });
+        return true;
+    };
+    const auto mapping_matches = [](
+            const vbr_occupied_replacement_cell_mapping & lhs,
+            const vbr_occupied_replacement_cell_mapping & rhs) {
+        return lhs.source_stream == rhs.source_stream &&
+               lhs.source_physical_cell == rhs.source_physical_cell &&
+               lhs.source_packed_row == rhs.source_packed_row &&
+               lhs.destination_physical_cell == rhs.destination_physical_cell &&
+               lhs.logical_position == rhs.logical_position &&
+               lhs.ext_x == rhs.ext_x && lhs.ext_y == rhs.ext_y;
+    };
+
+    if (strategy ==
+            vbr_occupied_replacement_strategy::recycle_incumbent_cells) {
+        for (size_t logical = 0; logical < incoming_tokens; ++logical) {
+            const auto & source = incoming_placement.cells[logical];
+            const auto & incumbent = recovery_placement.cells[logical];
+            const uint64_t source_packed_row = build
+                ? packed_rows[logical]
+                : expected && logical < expected->mappings.size()
+                    ? expected->mappings[logical].source_packed_row
+                    : UINT64_MAX;
+            const vbr_occupied_replacement_cell_mapping value {
+                0, source.physical_cell, source_packed_row,
+                incumbent.physical_cell, source.logical_position,
+                source.ext_x, source.ext_y,
+            };
+            if (build) {
+                build->mappings.push_back(value);
+                if (!append_run(
+                        build->relocation_runs, source_packed_row,
+                        incumbent.physical_cell) ||
+                    !append_run(
+                        build->recovery_runs, recovery_packed_rows[logical],
+                        incumbent.physical_cell)) {
+                    return vbr_occupied_replacement_guard_status::run_limit_exceeded;
+                }
+            } else if (!expected || logical >= expected->mappings.size() ||
+                       !mapping_matches(expected->mappings[logical], value)) {
+                return vbr_occupied_replacement_guard_status::currency_changed;
+            }
+        }
+        if (!build && (!expected ||
+                expected->mappings.size() != incoming_tokens ||
+                expected->relocation_runs.empty() ||
+                expected->recovery_runs.empty())) {
+            return vbr_occupied_replacement_guard_status::currency_changed;
+        }
+        return vbr_occupied_replacement_guard_status::ready;
     }
+
     size_t occupied_index = 0;
     size_t mapped = 0;
     size_t run_index = 0;
@@ -513,42 +605,16 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
                 return vbr_occupied_replacement_guard_status::currency_changed;
             } else {
                 const auto & old = expected->mappings[mapped];
-                if (old.source_stream != value.source_stream ||
-                    old.source_physical_cell != value.source_physical_cell ||
-                    old.source_packed_row != value.source_packed_row ||
-                    old.destination_physical_cell !=
-                        value.destination_physical_cell ||
-                    old.logical_position != value.logical_position ||
-                    old.ext_x != value.ext_x || old.ext_y != value.ext_y) {
+                if (!mapping_matches(old, value)) {
                     return vbr_occupied_replacement_guard_status::currency_changed;
                 }
             }
 
             if (build) {
-                if (!build->relocation_runs.empty()) {
-                    auto & run = build->relocation_runs.back();
-                    if (run.cell_count != UINT32_MAX &&
-                        run.first_source_packed_row <=
-                            UINT64_MAX-run.cell_count &&
-                        run.first_source_packed_row+run.cell_count ==
-                            source_packed_row &&
-                        uint64_t(run.first_destination_physical_cell)+
-                            run.cell_count == physical) {
-                        ++run.cell_count;
-                    } else {
-                        if (build->relocation_runs.size() >=
-                                VBR_OCCUPIED_REPLACEMENT_MAX_RUNS) {
-                            return vbr_occupied_replacement_guard_status::
-                                run_limit_exceeded;
-                        }
-                        build->relocation_runs.push_back({
-                            source_packed_row, physical, 1,
-                        });
-                    }
-                } else {
-                    build->relocation_runs.push_back({
-                        source_packed_row, physical, 1,
-                    });
+                if (!append_run(
+                        build->relocation_runs, source_packed_row, physical)) {
+                    return vbr_occupied_replacement_guard_status::
+                        run_limit_exceeded;
                 }
             } else {
                 if (!expected || run_index >= expected->relocation_runs.size()) {
@@ -572,7 +638,7 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
     if (mapped != incoming_tokens || occupied_index != observation.cell_count ||
         (!build && (!expected || expected->mappings.size() != mapped ||
                     expected->relocation_runs.size() != run_index ||
-                    run_offset != 0))) {
+                    run_offset != 0 || !expected->recovery_runs.empty()))) {
         return vbr_occupied_replacement_guard_status::currency_changed;
     }
     return vbr_occupied_replacement_guard_status::ready;
@@ -590,6 +656,11 @@ vbr_occupied_replacement_guard::operator=(
 
 bool vbr_occupied_replacement_guard::ready() const noexcept {
     return map_ && incoming_ && recovery_ && destination_ >= 0 &&
+        map_->strategy != vbr_occupied_replacement_strategy::_count &&
+        !map_->mappings.empty() && !map_->relocation_runs.empty() &&
+        (map_->strategy !=
+             vbr_occupied_replacement_strategy::recycle_incumbent_cells ||
+        !map_->recovery_runs.empty()) &&
         accounting_serial_ != 0 && vbr_digest_nonzero(currency_digest_);
 }
 
@@ -613,6 +684,11 @@ vbr_occupied_replacement_guard::recovery_artifact() const noexcept {
                      : llama_cache_acct_artifact_id {};
 }
 
+vbr_occupied_replacement_strategy
+vbr_occupied_replacement_guard::strategy() const noexcept {
+    return map_ ? map_->strategy : vbr_occupied_replacement_strategy::_count;
+}
+
 const std::vector<vbr_occupied_replacement_cell_mapping> &
 vbr_occupied_replacement_guard::cell_mapping() const noexcept {
     static const std::vector<vbr_occupied_replacement_cell_mapping> empty;
@@ -623,6 +699,17 @@ const std::vector<vbr_occupied_replacement_relocation_run> &
 vbr_occupied_replacement_guard::relocation_runs() const noexcept {
     static const std::vector<vbr_occupied_replacement_relocation_run> empty;
     return map_ ? map_->relocation_runs : empty;
+}
+
+const std::vector<vbr_occupied_replacement_relocation_run> &
+vbr_occupied_replacement_guard::recovery_runs() const noexcept {
+    static const std::vector<vbr_occupied_replacement_relocation_run> empty;
+    return map_ ? map_->recovery_runs : empty;
+}
+
+const vbr_artifact_package_view &
+vbr_occupied_replacement_guard::recovery_package() const noexcept {
+    return recovery_;
 }
 
 uint64_t vbr_occupied_replacement_guard::packed_rows_expanded() const noexcept {
@@ -647,27 +734,43 @@ vbr_prepare_occupied_replacement_guard(
         const vbr_artifact_package_view & incoming,
         const vbr_artifact_package_view & recovery,
         const vbr_occupied_replacement_observation & observation,
-        vbr_occupied_replacement_guard & output) noexcept {
+        vbr_occupied_replacement_guard & output,
+        const vbr_import_schedule_quote * authenticated_incoming,
+        const vbr_import_schedule_quote * authenticated_recovery) noexcept {
     output.reset();
     try {
-        if (incoming.validate() != vbr_artifact_status::ok ||
-            recovery.validate() != vbr_artifact_status::ok) {
-            return vbr_occupied_replacement_guard_status::invalid_argument;
-        }
         vbr_import_schedule_quote recovery_quote;
         vbr_import_schedule_quote incoming_quote;
-        if (!vbr_quote_import_schedule(target, recovery, recovery_quote) ||
-            !vbr_quote_import_schedule(target, incoming, incoming_quote) ||
-            recovery_quote.status() != vbr_import_schedule_status::exact ||
-            incoming_quote.status() != vbr_import_schedule_status::exact ||
-            !vbr_import_schedule_quote_matches(recovery_quote, target, recovery) ||
-            !vbr_import_schedule_quote_matches(incoming_quote, target, incoming)) {
+        const auto * incoming_authority = authenticated_incoming;
+        const auto * recovery_authority = authenticated_recovery;
+        if ((!recovery_authority &&
+             !vbr_quote_import_schedule(target, recovery, recovery_quote)) ||
+            (!incoming_authority &&
+             !vbr_quote_import_schedule(target, incoming, incoming_quote))) {
+            return vbr_occupied_replacement_guard_status::representation_mismatch;
+        }
+        if (!recovery_authority) {
+            recovery_authority = &recovery_quote;
+        }
+        if (!incoming_authority) {
+            incoming_authority = &incoming_quote;
+        }
+        if (
+            recovery_authority->status() != vbr_import_schedule_status::exact ||
+            incoming_authority->status() != vbr_import_schedule_status::exact ||
+            !vbr_import_schedule_quote_matches(
+                *recovery_authority, target, recovery) ||
+            !vbr_import_schedule_quote_matches(
+                *incoming_authority, target, incoming)) {
             return vbr_occupied_replacement_guard_status::representation_mismatch;
         }
         auto shared = std::make_shared<vbr_occupied_replacement_guard::map>();
         shared->mappings.reserve(
             incoming.manifest().stream_placements.front().cells.size());
         shared->relocation_runs.reserve(std::min<size_t>(
+            VBR_OCCUPIED_REPLACEMENT_MAX_RUNS,
+            observation.cell_count + 1));
+        shared->recovery_runs.reserve(std::min<size_t>(
             VBR_OCCUPIED_REPLACEMENT_MAX_RUNS,
             observation.cell_count + 1));
         const auto status = occupied_guard_validate(

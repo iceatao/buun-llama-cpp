@@ -2165,6 +2165,7 @@ server_vbr_artifact_store::complete_validated_import(
             *impl_->ledger, hooks);
         output.adopt_attempted = true;
         output.adopt_status = adopted.status;
+        output.recovery = adopted.recovery;
         output.phase = adopted.phase;
         output.downward_subphase = adopted.downward_subphase;
         output.downward_edge = adopted.downward_edge;
@@ -2376,22 +2377,6 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
         context.representation_identity =
             vbr_explicit_capture_representation_identity;
         vbr_occupied_replacement_guard occupied_guard;
-        if (recovery) {
-            const auto guard_status =
-                vbr_explicit_prepare_occupied_replacement_guard(
-                    *request.memory, request.destination, package, *recovery,
-                    impl_->domain_bindings, accounting_snapshot.serial,
-                    &representation_policy,
-                    vbr_explicit_capture_representation_identity,
-                    occupied_guard);
-            if (guard_status !=
-                    vbr_occupied_replacement_guard_status::ready) {
-                output.validation_status =
-                    vbr_manifest_validation_status::unavailable;
-                return fail(server_vbr_artifact_import_status::unavailable,
-                            impl_->counters.imports_unavailable);
-            }
-        }
         vbr_downward_policy_projection downward_projection;
         bool downward = false;
         vbr_import_schedule_quote schedule_quote;
@@ -2459,6 +2444,22 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
                 vbr_manifest_validation_status::representation_mismatch;
             return fail(server_vbr_artifact_import_status::validation_failed,
                         impl_->counters.imports_refused);
+        }
+        if (recovery) {
+            const auto guard_status =
+                vbr_explicit_prepare_occupied_replacement_guard(
+                    *request.memory, request.destination, package, *recovery,
+                    impl_->domain_bindings, accounting_snapshot.serial,
+                    &representation_policy,
+                    vbr_explicit_capture_representation_identity,
+                    occupied_guard, &schedule_quote);
+            if (guard_status !=
+                    vbr_occupied_replacement_guard_status::ready) {
+                output.validation_status =
+                    vbr_manifest_validation_status::unavailable;
+                return fail(server_vbr_artifact_import_status::unavailable,
+                            impl_->counters.imports_unavailable);
+            }
         }
         // Idleness is the SCHEDULER's fact to assert, not the library's: the
         // route handler admits imports only on an idle, deferred-safe slot, so

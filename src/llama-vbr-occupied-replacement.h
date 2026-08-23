@@ -14,6 +14,7 @@ class llama_kv_cache;
 class llama_memory_i;
 class vbr_live_capture_adapter;
 struct vbr_explicit_representation_identity;
+class vbr_import_schedule_quote;
 struct vbr_target_validation_snapshot;
 
 using vbr_explicit_representation_identity_fn = bool (*)(
@@ -44,6 +45,12 @@ enum class vbr_occupied_replacement_guard_status : uint8_t {
     capacity_unavailable,
     currency_changed,
     internal_error,
+    _count,
+};
+
+enum class vbr_occupied_replacement_strategy : uint8_t {
+    provisional_free_cells = 0,
+    recycle_incumbent_cells,
     _count,
 };
 
@@ -116,10 +123,16 @@ public:
     uint64_t accounting_serial() const noexcept;
     llama_cache_acct_artifact_id incoming_artifact() const noexcept;
     llama_cache_acct_artifact_id recovery_artifact() const noexcept;
+    vbr_occupied_replacement_strategy strategy() const noexcept;
     const std::vector<vbr_occupied_replacement_cell_mapping> &
         cell_mapping() const noexcept;
     const std::vector<vbr_occupied_replacement_relocation_run> &
         relocation_runs() const noexcept;
+    const std::vector<vbr_occupied_replacement_relocation_run> &
+        recovery_runs() const noexcept;
+    // Internal stage authority. The guard retains this immutable capability
+    // through validation/adoption; callers must not resolve a second package.
+    const vbr_artifact_package_view & recovery_package() const noexcept;
     uint64_t packed_rows_expanded() const noexcept;
     void reset() noexcept;
 
@@ -141,7 +154,9 @@ private:
         const vbr_artifact_package_view &,
         const vbr_artifact_package_view &,
         const vbr_occupied_replacement_observation &,
-        vbr_occupied_replacement_guard &) noexcept;
+        vbr_occupied_replacement_guard &,
+        const vbr_import_schedule_quote *,
+        const vbr_import_schedule_quote *) noexcept;
     friend vbr_occupied_replacement_guard_status
     vbr_recheck_occupied_replacement_guard(
         vbr_occupied_replacement_guard &,
@@ -155,7 +170,8 @@ private:
         const std::vector<llama_vbr_artifact_domain_binding> &,
         uint64_t, const void *,
         vbr_explicit_representation_identity_fn,
-        vbr_occupied_replacement_guard &) noexcept;
+        vbr_occupied_replacement_guard &,
+        const vbr_import_schedule_quote *) noexcept;
     friend vbr_occupied_replacement_guard_status
     vbr_explicit_recheck_occupied_replacement_guard(
         llama_memory_i &, llama_seq_id, uint64_t,
@@ -176,7 +192,9 @@ vbr_prepare_occupied_replacement_guard(
     const vbr_artifact_package_view & incoming,
     const vbr_artifact_package_view & recovery,
     const vbr_occupied_replacement_observation & observation,
-    vbr_occupied_replacement_guard & output) noexcept;
+    vbr_occupied_replacement_guard & output,
+    const vbr_import_schedule_quote * authenticated_incoming = nullptr,
+    const vbr_import_schedule_quote * authenticated_recovery = nullptr) noexcept;
 
 // Allocation-free recheck against already-collected caller storage.
 vbr_occupied_replacement_guard_status

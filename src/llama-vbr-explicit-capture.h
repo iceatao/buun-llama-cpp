@@ -17,7 +17,7 @@ struct vbr_target_empty_fingerprint;
 struct vbr_downward_policy_projection;
 struct vbr_downward_stage_reservation;
 struct vbr_validated_child_plan;
-struct vbr_import_schedule_quote;
+class vbr_import_schedule_quote;
 struct vbr_import_schedule_unit;
 struct vbr_explicit_representation_identity;
 enum class vbr_import_schedule_status : uint8_t;
@@ -35,7 +35,8 @@ vbr_explicit_prepare_occupied_replacement_guard(
     uint64_t accounting_serial,
     const void * representation_context,
     vbr_explicit_representation_identity_fn representation_identity,
-    vbr_occupied_replacement_guard & output) noexcept;
+    vbr_occupied_replacement_guard & output,
+    const vbr_import_schedule_quote * authenticated_incoming = nullptr) noexcept;
 
 vbr_occupied_replacement_guard_status
 vbr_explicit_recheck_occupied_replacement_guard(

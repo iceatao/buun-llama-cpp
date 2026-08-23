@@ -766,16 +766,42 @@ template<class AppendRead>
 bool stage_relocated_child(
         const vbr_validated_child_plan & child,
         const std::vector<vbr_occupied_replacement_relocation_run> & runs,
+        vbr_staged_read_kind kind,
+        const vbr_artifact_unit_view * recovery_unit,
         const std::vector<vbr_h2d_lane_binding> & lanes,
         AppendRead && append_read,
         vbr_adopt_stage_status & failure) {
+    if (kind != vbr_staged_read_kind::unit_payload &&
+        kind != vbr_staged_read_kind::recovery_unit_payload) {
+        failure = vbr_adopt_stage_status::invalid_proof;
+        return false;
+    }
+    if (recovery_unit &&
+        (kind != vbr_staged_read_kind::recovery_unit_payload ||
+         recovery_unit->descriptor.child_id != child.child_id ||
+         recovery_unit->descriptor.logical_unit_id != child.logical_unit_id ||
+         recovery_unit->payload_shards.size() != child.shards.size())) {
+        failure = vbr_adopt_stage_status::invalid_proof;
+        return false;
+    }
     for (const auto & shard : child.shards) {
         const uint32_t lane = find_lane(lanes, shard.domain);
-        if (lane >= lanes.size() || !shard.source || shard.row_bytes == 0) {
+        if (shard.shard_index >= child.shards.size() ||
+            (recovery_unit &&
+             shard.shard_index >= recovery_unit->payload_shards.size())) {
             failure = vbr_adopt_stage_status::source_unavailable;
             return false;
         }
-        const auto digest = vbr_capture_stream_digest(*shard.source);
+        const auto source = recovery_unit
+            ? recovery_unit->payload_shards[shard.shard_index]
+            : shard.source;
+        const uint64_t source_bytes = recovery_unit && source
+            ? source->size() : shard.payload_bytes;
+        if (lane >= lanes.size() || !source || shard.row_bytes == 0) {
+            failure = vbr_adopt_stage_status::source_unavailable;
+            return false;
+        }
+        const auto digest = vbr_capture_stream_digest(*source);
         if (!digest_nonzero(digest)) {
             failure = vbr_adopt_stage_status::source_hash_mismatch;
             return false;
@@ -793,19 +819,19 @@ bool stage_relocated_child(
             const uint64_t destination_offset =
                 uint64_t(run.first_destination_physical_cell)*shard.row_bytes;
             const uint64_t size = uint64_t(run.cell_count)*shard.row_bytes;
-            if (run.cell_count == 0 || source_offset > shard.payload_bytes ||
-                size > shard.payload_bytes-source_offset) {
+            if (run.cell_count == 0 || source_offset > source_bytes ||
+                size > source_bytes-source_offset) {
                 failure = vbr_adopt_stage_status::source_unavailable;
                 return false;
             }
             vbr_staged_read_descriptor read;
-            read.kind = vbr_staged_read_kind::unit_payload;
+            read.kind = kind;
             read.child_id = child.child_id;
             read.logical_unit_id = child.logical_unit_id;
             read.shard_index = shard.shard_index;
             read.lane = lane;
             read.size = size;
-            read.source = shard.source;
+            read.source = source;
             read.verified_digest = digest;
             read.destination_offset = destination_offset;
             read.projection_ranges.push_back({ source_offset, size });
@@ -885,7 +911,8 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                 out.status = vbr_adopt_stage_status::invalid_proof;
                 return out;
             }
-        } else if (out.manifest->source_package().validate() !=
+        } else if (!occupied_replacement &&
+                   out.manifest->source_package().validate() !=
                        vbr_artifact_status::ok) {
             out.status = vbr_adopt_stage_status::source_hash_mismatch;
             return out;
@@ -959,13 +986,36 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                     child, policy.lanes, append_read, out.status)
                 : occupied_replacement
                     ? stage_relocated_child(
-                        child, out.manifest->relocation_runs(), policy.lanes,
+                        child, out.manifest->relocation_runs(),
+                        vbr_staged_read_kind::unit_payload, nullptr, policy.lanes,
                         append_read, out.status)
                 : stage_child(
                     child, out.manifest->source_package(), policy.lanes,
                     append_read, out.status);
             if (!staged) {
                 return out;
+            }
+        }
+        const auto * replacement = out.manifest->occupied_replacement();
+        const bool recycle = replacement && replacement->strategy() ==
+            vbr_occupied_replacement_strategy::recycle_incumbent_cells;
+        if (recycle) {
+            const auto & recovery = replacement->recovery_package();
+            const auto & runs = replacement->recovery_runs();
+            if (!recovery || runs.empty()) {
+                out.status = vbr_adopt_stage_status::source_unavailable;
+                return out;
+            }
+            const auto & recovery_units = recovery.units();
+            for (const auto & child : out.manifest->children()) {
+                if (child.logical_unit_id >= recovery_units.size() ||
+                    !stage_relocated_child(
+                        child, runs,
+                        vbr_staged_read_kind::recovery_unit_payload,
+                        &recovery_units[child.logical_unit_id], policy.lanes,
+                        append_read, out.status)) {
+                    return out;
+                }
             }
         }
         for (uint32_t i = 0; i < out.manifest->companions().size(); ++i) {
@@ -1011,11 +1061,16 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             out.status = vbr_adopt_stage_status::accounting_unavailable;
             return out;
         }
-        for (const auto & read : state->read_plan) {
-            if (read.lane != UINT32_MAX &&
-                !add_transfer(policy.lanes[read.lane].domain, read.size)) {
-                out.status = vbr_adopt_stage_status::accounting_unavailable;
-                return out;
+        // Recycle overwrites already-backed incumbent cells and reuses the
+        // store-owned persistent ring for both the incoming write and any
+        // recovery replay. Neither byte stream is new device residency.
+        if (!recycle) {
+            for (const auto & read : state->read_plan) {
+                if (read.lane != UINT32_MAX &&
+                    !add_transfer(policy.lanes[read.lane].domain, read.size)) {
+                    out.status = vbr_adopt_stage_status::accounting_unavailable;
+                    return out;
+                }
             }
         }
         for (const auto & total : transfer_totals) {

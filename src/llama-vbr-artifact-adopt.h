@@ -61,6 +61,16 @@ enum class vbr_adopt_status : uint8_t {
 };
 static_assert(uint8_t(vbr_adopt_status::_count) == 25);
 
+enum class vbr_adopt_recovery_outcome : uint8_t {
+    not_needed = 0,
+    replayed,
+    quarantined,
+    _count,
+};
+
+const char * vbr_adopt_recovery_outcome_name(
+    vbr_adopt_recovery_outcome outcome) noexcept;
+
 enum class vbr_downward_adopt_subphase : uint8_t {
     none = 0,
     source_h2d,
@@ -179,6 +189,9 @@ class vbr_adopt_test_seam {
     virtual bool session_transfer(
         uint32_t child_id, const vbr_staged_read_descriptor & read,
         uint64_t fail_completion, vbr_h2d_stats & stats) noexcept = 0;
+    virtual bool session_synchronize_recovery(uint32_t) noexcept {
+        return true;
+    }
     virtual bool session_mark_complete(
         uint32_t child_id, uint32_t logical_unit) noexcept = 0;
     virtual bool session_initialize_downward_backing(
@@ -318,6 +331,10 @@ struct vbr_adopt_result {
     uint32_t companions = 0;
     uint64_t h2d_bytes = 0;
     uint64_t h2d_chunks = 0;
+    vbr_adopt_recovery_outcome recovery =
+        vbr_adopt_recovery_outcome::not_needed;
+    uint64_t recovery_h2d_bytes = 0;
+    uint64_t recovery_h2d_chunks = 0;
     uint64_t rollback_count = 0;
     llama_cache_transaction_status accounting_status =
         llama_cache_transaction_status::internal_fault;
