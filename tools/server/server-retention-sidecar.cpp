@@ -2275,6 +2275,58 @@ bool server_retention_sidecar_store::prepared_for_launch(
     return item != catalog.end() && item->second.prepared_source.valid();
 }
 
+bool server_retention_sidecar_store::prepared_launch_destination_swappable(
+        const server_retention_instance_key & prepared,
+        const server_retention_instance_key & occupied) const noexcept {
+    if (prepared == occupied ||
+        prepared.kind != common_retention_artifact_kind::live_slot ||
+        occupied.kind != common_retention_artifact_kind::live_slot ||
+        prepared.owner_slot < 0 || prepared.owner_slot != occupied.owner_slot ||
+        prepared.instance == 0 || occupied.instance == 0) {
+        return false;
+    }
+    const auto prepared_association = associations.find(prepared);
+    const auto occupied_association = associations.find(occupied);
+    if (prepared_association == associations.end() ||
+        occupied_association == associations.end() ||
+        prepared_association->second.v == 0 ||
+        occupied_association->second.v == 0 ||
+        prepared_association->second == occupied_association->second) {
+        return false;
+    }
+    const auto prepared_entry = catalog.find(prepared_association->second.v);
+    const auto occupied_entry = catalog.find(occupied_association->second.v);
+    return prepared_entry != catalog.end() && occupied_entry != catalog.end() &&
+        prepared_entry->second.record.kind ==
+            common_retention_artifact_kind::live_slot &&
+        occupied_entry->second.record.kind ==
+            common_retention_artifact_kind::live_slot &&
+        prepared_entry->second.prepared_source.valid() &&
+        occupied_entry->second.recovery_pins == 0 &&
+        occupied_entry->second.release_ops.empty();
+}
+
+bool server_retention_sidecar_store::swap_prepared_launch_destination(
+        const server_retention_instance_key & prepared,
+        const server_retention_instance_key & occupied) noexcept {
+    if (!prepared_launch_destination_swappable(prepared, occupied)) {
+        return false;
+    }
+    const auto prepared_association = associations.find(prepared);
+    const auto occupied_association = associations.find(occupied);
+    const auto displaced = occupied_association->second;
+    const auto displaced_entry = catalog.find(displaced.v);
+    // Every lookup and fallible condition was resolved above. Both hash nodes
+    // already exist, so publication requires no insertion or allocation.
+    occupied_association->second = prepared_association->second;
+    associations.erase(prepared_association);
+    if (leases) {
+        leases->artifact_retired(displaced);
+    }
+    retire_catalog_entry(displaced_entry);
+    return true;
+}
+
 bool server_retention_sidecar_store::consume_prepared_launch(
         const server_retention_instance_key & destination,
         server_retention_lineage_ticket & source) noexcept {

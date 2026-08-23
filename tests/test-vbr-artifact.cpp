@@ -5136,6 +5136,24 @@ static void test_prompt_cache_vbr_longest_feasible_restore_selection() {
         }
         CHECK(exact->recovery_pins == 0);
         CHECK(projected->recovery_pins == 0);
+        {
+            // Occupied replacement is exact-only: even a longer divergent
+            // parent must not displace the complete host artifact.
+            server_prompt_cache_vbr_restore_candidate exact_only;
+            CHECK(cache.prepare_vbr_restore(
+                request,
+                fixture.package.manifest.identity.execution_identity,
+                fixture.package.manifest.identity.adapter_config_identity,
+                exact_only, false));
+            CHECK(exact_only.ready());
+            CHECK(!exact_only.requires_prefix_projection());
+            CHECK(exact_only.prefix_tokens() == 20);
+            CHECK(exact_only.payload().get() == exact->payload.vbr_artifact());
+            CHECK(exact->recovery_pins == 1);
+            CHECK(projected->recovery_pins == 0);
+        }
+        CHECK(exact->recovery_pins == 0);
+        CHECK(projected->recovery_pins == 0);
         for (auto & state : cache.states) {
             retention.retire(
                 server_retention_instance_key::for_host_entry(&state));
@@ -5787,6 +5805,14 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         ineligible_longer.n_tokens()));
     server_tokens divergent_request(
         llama_tokens { 101, 777, 999 }, false);
+    server_prompt_cache_vbr_restore_candidate projected_only_refused;
+    CHECK(!cache.prepare_vbr_restore(
+        divergent_request,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        projected_only_refused, false));
+    CHECK(!projected_only_refused.ready());
+    CHECK(logical->recovery_pins == pins_before);
     server_prompt_cache_vbr_restore_candidate projected;
     CHECK(cache.prepare_vbr_restore(
         divergent_request,
@@ -5904,7 +5930,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
             extended,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
-            prepared));
+            prepared, false));
         CHECK(prepared.ready());
         CHECK(prepared.payload().get() == owner.get());
         CHECK(prepared.prefix_tokens() == 2);
@@ -6037,6 +6063,9 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     common_cache_family_binding incumbent_family {
         common_cache_family_id { 88 }, common_cache_family_role::branch,
     };
+    const common_cache_family_binding incoming_replacement_family {
+        common_cache_family_id { 99 }, common_cache_family_role::background,
+    };
     constexpr int32_t recovery_source_slot = 30;
     constexpr int32_t replacement_slot = 31;
     const auto recovery_source_key =
@@ -6094,7 +6123,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_replacement_ticket refused;
         CHECK(!cache.prepare_vbr_occupied_replacement(
             std::move(missing_recovery), incumbent_prompt,
-            incumbent_family, replacement_slot,
+            incumbent_family, incoming_replacement_family, replacement_slot,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
             refused));
@@ -6167,7 +6196,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_replacement_diagnostics diagnostics;
         CHECK(!cache.prepare_vbr_occupied_replacement(
             std::move(mismatched_recovery), incumbent_prompt,
-            incumbent_family, replacement_slot,
+            incumbent_family, incoming_replacement_family, replacement_slot,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
             refused, &diagnostics));
@@ -6211,6 +6240,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_replacement_diagnostics diagnostics;
         CHECK(cache.prepare_vbr_occupied_replacement(
             std::move(scale_candidate), incumbent_prompt, incumbent_family,
+            incoming_replacement_family,
             replacement_slot,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
@@ -6236,7 +6266,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_replacement_ticket refused;
         CHECK(!cache.prepare_vbr_occupied_replacement(
             std::move(stale_recovery), incumbent_prompt,
-            incumbent_family, replacement_slot,
+            incumbent_family, incoming_replacement_family, replacement_slot,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
             refused));
@@ -6257,6 +6287,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_replacement_ticket refused;
         CHECK(!cache.prepare_vbr_occupied_replacement(
             std::move(equal), equal_prompt, incumbent_family,
+            incoming_replacement_family,
             replacement_slot,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
@@ -6273,6 +6304,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
             worse));
         CHECK(!cache.prepare_vbr_occupied_replacement(
             std::move(worse), worse_prompt, incumbent_family,
+            incoming_replacement_family,
             replacement_slot,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
@@ -6292,7 +6324,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     server_prompt_cache_vbr_replacement_ticket replacement_ticket;
     CHECK(cache.prepare_vbr_occupied_replacement(
         std::move(replacement_candidate), incumbent_prompt,
-        incumbent_family, replacement_slot,
+        incumbent_family, incoming_replacement_family, replacement_slot,
         fixture.package.manifest.identity.execution_identity,
         fixture.package.manifest.identity.adapter_config_identity,
         replacement_ticket));
@@ -6356,7 +6388,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_replacement_ticket refused;
         CHECK(!cache.prepare_vbr_occupied_replacement(
             std::move(hard_blocked), incumbent_prompt,
-            incumbent_family, replacement_slot,
+            incumbent_family, incoming_replacement_family, replacement_slot,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
             refused));
@@ -6395,7 +6427,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_replacement_ticket pinned_ticket;
         CHECK(cache.prepare_vbr_occupied_replacement(
             std::move(pinned_candidate), incumbent_prompt,
-            incumbent_family, replacement_slot,
+            incumbent_family, incoming_replacement_family, replacement_slot,
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
             pinned_ticket));
@@ -6414,7 +6446,63 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(incumbent_prompt.tokens.retention_token_ids() ==
         original_incumbent_tokens);
 
-    CHECK(authority.leases.release(incumbent_soft));
+    // Consume a fresh ticket through the exact scheduler/store split. The
+    // fallible checkpoint leaves the incumbent intact; the no-fail publish
+    // changes two existing owners without an empty-slot interval, and commit
+    // publishes the request family rather than the selected host family.
+    server_prompt_cache_vbr_restore_candidate consumed_candidate;
+    CHECK(cache.prepare_vbr_restore(
+        extended,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        consumed_candidate));
+    const uint64_t consume_ops_before = fixture.ledger.snapshot().live_ops;
+    server_prompt_cache_vbr_replacement_ticket consumed_ticket;
+    CHECK(cache.prepare_vbr_occupied_replacement(
+        std::move(consumed_candidate), incumbent_prompt,
+        incumbent_family, incoming_replacement_family, replacement_slot,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        consumed_ticket));
+    CHECK(consumed_ticket.incoming_payload());
+    CHECK(consumed_ticket.recovery_payload());
+    CHECK(consumed_ticket.incoming_payload()->reference_artifact() ==
+          consumed_ticket.incoming_owner_artifact());
+    CHECK(consumed_ticket.recovery_payload()->reference_artifact() ==
+          consumed_ticket.recovery_owner_artifact());
+    const auto consumed_provisional = consumed_ticket.provisional_artifact();
+    const auto consumed_incumbent = consumed_ticket.incumbent_artifact();
+    CHECK(consumed_provisional.v != 0);
+    CHECK(consumed_provisional != consumed_incumbent);
+    CHECK(fixture.ledger.snapshot().live_ops == consume_ops_before + 1);
+    CHECK(!retention.swap_prepared_launch_destination(
+        replacement_slot_key, replacement_slot_key));
+    CHECK(retention.artifact_id(replacement_slot_key) == consumed_incumbent);
+    CHECK(cache.prepare_vbr_occupied_replacement_publish(consumed_ticket));
+    CHECK(incumbent_prompt.tokens.retention_token_ids() ==
+          original_incumbent_tokens);
+    CHECK(retention.artifact_id(replacement_slot_key) == consumed_incumbent);
+    cache.publish_vbr_occupied_replacement(consumed_ticket);
+    CHECK(!consumed_ticket.ready());
+    CHECK(incumbent_prompt.tokens.retention_token_ids() ==
+          prompt.tokens.retention_token_ids());
+    CHECK(consumed_ticket.replacement_prompt().tokens.retention_token_ids() ==
+          original_incumbent_tokens);
+    CHECK(retention.artifact_id(replacement_slot_key) == consumed_provisional);
+    CHECK(retention.prepared_for_launch(replacement_slot_key));
+    CHECK(fixture.ledger.snapshot().live_ops == consume_ops_before);
+    CHECK(logical->recovery_pins == incoming_pins_before + 1);
+    CHECK(recovery_logical->recovery_pins == recovery_pins_before + 1);
+    CHECK(incumbent_family == incoming_replacement_family);
+    cache.commit_vbr_occupied_replacement(
+        consumed_ticket, incumbent_prompt, incumbent_family, replacement_slot);
+    CHECK(incumbent_family == incoming_replacement_family);
+    CHECK(!consumed_ticket.ready());
+    CHECK(logical->recovery_pins == incoming_pins_before);
+    CHECK(recovery_logical->recovery_pins == recovery_pins_before);
+    // Publication retired the incumbent artifact and its soft lease.
+    incumbent_soft = {};
+
     retention.retire(replacement_slot_key);
     retention.retire(recovery_source_key);
     retention.retire(recovery_host_key);

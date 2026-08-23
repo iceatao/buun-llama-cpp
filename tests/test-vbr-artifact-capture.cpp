@@ -4570,6 +4570,29 @@ static void test_projected_host_batch_store_adapter() {
     }
     CHECK(diagnostics.catalog.published_manifests == 2);
     CHECK(diagnostics.host_payloads_retained == 2);
+    if (adopted_owners.size() == 2 && adopted_owners[0].payload &&
+        adopted_owners[1].payload) {
+        const auto occupied_authenticated_before =
+            store->counters().host_imports_authenticated;
+        server_vbr_artifact_import_target empty_occupied;
+        const auto occupied_import =
+            store->import_host_occupied_replacement(
+                std::move(empty_occupied), adopted_owners[0].payload,
+                adopted_owners[1].payload);
+        CHECK(occupied_import.status ==
+              server_vbr_artifact_import_status::unavailable);
+        CHECK(store->counters().host_imports_authenticated ==
+              occupied_authenticated_before + 1);
+        server_vbr_artifact_import_target duplicate_occupied;
+        const auto duplicate_import =
+            store->import_host_occupied_replacement(
+                std::move(duplicate_occupied), adopted_owners[0].payload,
+                adopted_owners[0].payload);
+        CHECK(duplicate_import.status ==
+              server_vbr_artifact_import_status::unavailable);
+        CHECK(store->counters().host_imports_authenticated ==
+              occupied_authenticated_before + 1);
+    }
     const uint64_t adopted_ops = ledger.snapshot().live_ops;
     CHECK(adopted_ops > baseline_ops);
     first_owners.clear();

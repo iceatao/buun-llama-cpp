@@ -176,4 +176,13 @@ if (LLAMA_BUILD_TESTS)
             USES_TERMINAL
             COMMENT "Run the CPU-deterministic VBR-H1 capstone gate")
     endif()
+
+    # The deferred occupied-destination hardware gate composes the real store,
+    # prompt-cache ticket, and model-backed adopter. Its default CPU execution
+    # remains the existing model-free test and does not enter this CLI arm.
+    if (TARGET test-vbr-artifact-adopt)
+        target_link_libraries(test-vbr-artifact-adopt PRIVATE server-context mtmd)
+        target_include_directories(test-vbr-artifact-adopt PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/tools/mtmd)
+    endif()
 endif()

@@ -444,6 +444,15 @@ public:
         std::shared_ptr<const server_prompt_cache_vbr_payload> payload)
         noexcept;
 
+    // Trusted scheduler replacement of one occupied attention destination.
+    // Incoming supplies the new rows; recovery independently authenticates the
+    // incumbent until the shared adoption transaction reaches no-fail publish.
+    server_vbr_artifact_import_output import_host_occupied_replacement(
+        server_vbr_artifact_import_target request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> incoming,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> recovery)
+        noexcept;
+
     // Scheduler-only derivation/import of a shorter attention prefix from a
     // cache-owned immutable parent. The move-only projection keeps the parent
     // catalog reference borrowed through validation, proof-aware H2D, and the
@@ -502,6 +511,10 @@ private:
     server_vbr_artifact_import_output import_package(
         server_vbr_artifact_import_target request,
         const vbr_artifact_package_view & package) noexcept;
+    server_vbr_artifact_import_output import_package_impl(
+        server_vbr_artifact_import_target request,
+        const vbr_artifact_package_view & package,
+        const vbr_artifact_package_view * recovery) noexcept;
     struct impl;
     explicit server_vbr_artifact_store(std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;

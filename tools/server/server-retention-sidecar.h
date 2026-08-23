@@ -306,6 +306,17 @@ public:
         const server_retention_instance_key & destination) noexcept;
     bool prepared_for_launch(
         const server_retention_instance_key & destination) const noexcept;
+    // Occupied restore prepares a second live-slot association under a private
+    // instance key.  The read half proves that replacing the canonical slot is
+    // an allocation-free terminal; the write half only changes an existing
+    // association value, erases the private alias, and retires the displaced
+    // descriptor. A refusal leaves both associations untouched.
+    bool prepared_launch_destination_swappable(
+        const server_retention_instance_key & prepared,
+        const server_retention_instance_key & occupied) const noexcept;
+    bool swap_prepared_launch_destination(
+        const server_retention_instance_key & prepared,
+        const server_retention_instance_key & occupied) noexcept;
     bool consume_prepared_launch(
         const server_retention_instance_key & destination,
         server_retention_lineage_ticket & source) noexcept;

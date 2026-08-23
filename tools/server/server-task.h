@@ -1019,11 +1019,11 @@ private:
 
 class server_cache_recovery_pin;
 
-// Move-only preparation for replacing an occupied live prompt after an
-// incoming VBR import is already complete. The capability owns both durable
-// host pins and a provisional launch association, but deliberately owns no
-// live-slot mutation: destruction or move-overwrite leaves the incumbent
-// prompt and its canonical sidecar association untouched.
+// Move-only pre-import capability for replacing an occupied live prompt. It
+// owns both durable host pins and the provisional prompt/launch association
+// through the core import transaction. The adopter's no-fail callback performs
+// publication; destruction or move-overwrite before then leaves the incumbent
+// prompt and canonical sidecar association untouched.
 class server_prompt_cache_vbr_replacement_ticket {
 public:
     server_prompt_cache_vbr_replacement_ticket() = default;
@@ -1041,6 +1041,8 @@ public:
     // recovery pin, and current lease classification bound by preparation.
     bool ready() const noexcept;
     const server_prompt & replacement_prompt() const noexcept;
+    const server_prompt_cache_vbr_owner & incoming_payload() const noexcept;
+    const server_prompt_cache_vbr_owner & recovery_payload() const noexcept;
     int32_t destination_slot() const noexcept;
     uint64_t incoming_prefix_tokens() const noexcept;
     uint64_t incumbent_tokens() const noexcept;
@@ -1060,7 +1062,7 @@ private:
     std::unique_ptr<server_cache_recovery_pin> recovery_pin_;
     std::vector<llama_cache_acct_op_id> recovery_ops_;
     server_prompt * incumbent_ = nullptr;
-    const common_cache_family_binding * incumbent_family_current_ = nullptr;
+    common_cache_family_binding * incumbent_family_current_ = nullptr;
     common_cache_family_binding incumbent_family_;
     common_cache_family_binding incoming_family_;
     std::string execution_identity_;
@@ -1074,11 +1076,15 @@ private:
     uint64_t incumbent_sequence_epoch_ = 0;
     std::array<uint8_t, 32> incoming_token_digest_ = {};
     std::array<uint8_t, 32> incumbent_token_digest_ = {};
+    server_cache_lease_identity incumbent_lease_identity_;
     llama_cache_acct_artifact_id incumbent_artifact_;
     uint64_t incumbent_lineage_ = 0;
     llama_cache_acct_artifact_id incoming_owner_artifact_;
     llama_cache_acct_artifact_id recovery_owner_artifact_;
     llama_cache_acct_artifact_id recovery_host_artifact_;
+    llama_cache_acct_artifact_id provisional_artifact_;
+    bool publish_prepared_ = false;
+    bool published_ = false;
     friend struct server_prompt_cache;
 };
 
@@ -1439,7 +1445,8 @@ struct server_prompt_cache {
         const server_tokens & request_tokens,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        bool allow_prefix_projection = true) noexcept;
     // Fallible retention/lease preparation for a construction-empty live
     // destination. Cancellation rolls this provisional association back;
     // commit consumes it only after successful artifact adoption.
@@ -1465,19 +1472,34 @@ struct server_prompt_cache {
     // CPU-only preparation for an occupied destination. The incoming
     // candidate must be exact (not a parent projection) and must improve the
     // live common prefix. Preparation clones all replacement metadata into a
-    // private provisional launch association; it never mutates or retires the
-    // incumbent slot. A later slice will consume this ticket inside one
-    // allocation-free live/KV replacement terminal.
+    // private provisional launch association without mutating or retiring the
+    // incumbent slot. The occupied importer consumes the ticket through its
+    // allocation-free composite KV/prompt/retention publication callback.
     bool prepare_vbr_occupied_replacement(
         server_prompt_cache_vbr_restore_candidate && incoming,
         server_prompt & incumbent,
-        const common_cache_family_binding & incumbent_family,
+        common_cache_family_binding & incumbent_family,
+        const common_cache_family_binding & incoming_family,
         int32_t id_slot,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
         server_prompt_cache_vbr_replacement_ticket & ticket,
         server_prompt_cache_vbr_replacement_diagnostics * diagnostics =
             nullptr) noexcept;
+    // The scheduler calls the fallible read half before entering the adopter's
+    // no-fail terminal. Publication swaps the already-existing sidecar
+    // association and prompt storage without first clearing the incumbent.
+    bool prepare_vbr_occupied_replacement_publish(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept;
+    void publish_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept;
+    // Post-adopt metadata terminal. The replacement is a request branch and
+    // therefore publishes the separately bound incoming request family.
+    void commit_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket,
+        server_prompt & destination,
+        common_cache_family_binding & destination_family,
+        int32_t id_slot) noexcept;
 
     // Resolve the exact durable host state used by prompt_save's durability
     // predicate and pin its three-payload accounting source. D-A5 calls this

@@ -11,6 +11,11 @@
 #include "llama-vbr-identity-digest.h"
 #include "llama-vbr-upward.h"
 
+#include "server-cache-authority.h"
+#include "server-retention-sidecar.h"
+#include "server-task.h"
+#include "server-vbr-artifact-store.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -502,6 +507,21 @@ static llama_cache_budget_config f42a_budget(
     budget.host.pinned_state = llama_cache_budget_capacity_state::unbounded;
     budget.host.total_state = llama_cache_budget_capacity_state::unbounded;
     return budget;
+}
+
+struct h2_occupied_budget_source {
+    llama_cache_budget_config budget;
+};
+
+static bool h2_occupied_sample_budget(
+        void * opaque, llama_cache_budget_config & output) noexcept {
+    try {
+        output = static_cast<h2_occupied_budget_source *>(opaque)->budget;
+        return true;
+    } catch (...) {
+        output = {};
+        return false;
+    }
 }
 
 static vbr_checkpoint_generation_controller source_controller(
@@ -4422,6 +4442,402 @@ static bool f42a_model_backed_adoption(
     return failures == 0;
 }
 
+static bool h2_model_backed_occupied_store(
+        const char * model_path, ggml_type entry_type) {
+    ggml_backend_load_all();
+    setenv("VBR_FORCE_GENERIC", "1", 1);
+    setenv("VBR_PROMOTE", "0", 1);
+    setenv("VBR_STASH_ROWS", "0", 1);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = 99;
+    llama_model_ptr model(llama_model_load_from_file(model_path, model_params));
+    CHECK(model != nullptr);
+    if (!model) {
+        return false;
+    }
+
+    llama_context_params context_params = llama_context_default_params();
+    context_params.n_ctx = 256;
+    context_params.n_batch = 64;
+    context_params.n_ubatch = 64;
+    context_params.n_seq_max = 1;
+    context_params.n_threads = 2;
+    context_params.n_threads_batch = 2;
+    context_params.type_k = entry_type;
+    context_params.type_v = entry_type;
+    context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    context_params.vbr_dynamic = true;
+    context_params.vbr_budget_explicit = true;
+    context_params.vbr_vram_budget_bytes = 4ull*1024*1024*1024;
+    auto context = llama_context_ptr(
+        llama_init_from_model(model.get(), context_params));
+    CHECK(context != nullptr);
+    if (!context) {
+        return false;
+    }
+
+    auto incoming_tokens = common_tokenize(
+        context.get(), "Occupied restore production composition fixture.",
+        true, false);
+    CHECK(incoming_tokens.size() >= 4);
+    if (incoming_tokens.size() < 4) {
+        return false;
+    }
+    if (incoming_tokens.size() > 32) {
+        incoming_tokens.resize(32);
+    }
+    const int32_t vocab_size = llama_vocab_n_tokens(
+        llama_model_get_vocab(model.get()));
+    CHECK(vocab_size > 1);
+    if (vocab_size <= 1) {
+        return false;
+    }
+    const llama_token continuation = incoming_tokens.back();
+    auto incumbent_tokens = incoming_tokens;
+    incumbent_tokens.back() = llama_token(
+        (uint32_t(incumbent_tokens.back()) + 1u) % uint32_t(vocab_size));
+    if (incumbent_tokens.back() == incoming_tokens.back()) {
+        incumbent_tokens.back() = llama_token(
+            (uint32_t(incumbent_tokens.back()) + 1u) % uint32_t(vocab_size));
+    }
+
+    CHECK(f42a_decode(context.get(), incoming_tokens, 0));
+    llama_synchronize(context.get());
+    llama_memory_i * memory = llama_get_memory(context.get());
+    std::vector<vbr_explicit_capture_runtime_pool> pools;
+    uint32_t attention_children = 0;
+    CHECK(memory && vbr_explicit_capture_runtime_pools(
+        *memory, pools, attention_children));
+    CHECK(attention_children == 1 && !pools.empty());
+    if (!memory || attention_children != 1 || pools.empty()) {
+        return false;
+    }
+
+    const auto & first_pool = pools.front();
+    CHECK(first_pool.backend_device != nullptr && first_pool.backend != nullptr);
+    if (!first_pool.backend_device || !first_pool.backend) {
+        return false;
+    }
+    vbr_artifact_portable_topology topology;
+    const std::vector<std::string> identities = {
+        std::string(ggml_backend_dev_name(first_pool.backend_device)) + "\n" +
+        ggml_backend_dev_description(first_pool.backend_device),
+    };
+    const float split[] = { 1.0f };
+    CHECK(llama_cache_acct_build_shard_topology(
+        identities, LLAMA_SPLIT_MODE_LAYER, 0, split, topology));
+
+    llama_cache_acct_ledger ledger;
+    llama_cache_acct_resource_domain device_domain;
+    CHECK(ledger.make_device_domain(
+        topology, llama_cache_acct_device_ordinal { 0 }, device_domain));
+    const auto host_domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+    const auto pinned_domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pinned_host);
+    CHECK(f42a_initialize_accounting(
+        ledger, { device_domain, host_domain, pinned_domain }));
+    h2_occupied_budget_source budget_source {
+        f42a_budget(first_pool.backend_device, device_domain),
+    };
+    server_vbr_artifact_store_config store_config;
+    store_config.ledger = &ledger;
+    store_config.pinned_domain = pinned_domain;
+    store_config.topologies = { topology };
+    for (const auto & pool : pools) {
+        store_config.pool_bindings.push_back({
+            pool.instance_id, pool.device, 0, 0, 0,
+        });
+    }
+    store_config.lanes = {
+        { first_pool.backend_device, first_pool.backend, false },
+    };
+    store_config.attention_children = attention_children;
+    store_config.ring_bytes = 64ull*1024*1024;
+    store_config.chunk_bytes = 8ull*1024*1024;
+    store_config.budget_context = &budget_source;
+    store_config.sample_budget = h2_occupied_sample_budget;
+    server_vbr_artifact_capture_status store_status;
+    auto store = server_vbr_artifact_store::create(
+        store_config, store_status);
+    CHECK(store && store_status == server_vbr_artifact_capture_status::ok);
+    if (!store) {
+        return false;
+    }
+
+    static constexpr char execution_identity[] = "h2:occupied:model";
+    static constexpr char adapter_identity[] = "h2:occupied:no-adapter";
+    static constexpr char tenant[] = "h2:occupied:test-tenant";
+    const auto capture_owner = [&] (
+            const llama_tokens & tokens,
+            std::shared_ptr<const server_prompt_cache_vbr_payload> & owner) {
+        server_prompt prompt;
+        prompt.tokens = server_tokens(tokens, false);
+        prompt.sequence_epoch = 1;
+        std::string media_identity;
+        if (!prompt.tokens.media_content_identity(
+                prompt.n_tokens(), media_identity)) {
+            return false;
+        }
+        vbr_explicit_capture_request request;
+        request.sequence = 0;
+        request.identity = {
+            execution_identity, adapter_identity, media_identity,
+            prompt.sequence_epoch, int64_t(tokens.size()),
+            llama_pos(tokens.size()),
+        };
+        request.token_block = tokens;
+        request.frontier.execution_identity =
+            request.identity.execution_identity.data();
+        request.frontier.execution_identity_len =
+            request.identity.execution_identity.size();
+        request.frontier.adapter_config_identity =
+            request.identity.adapter_config_identity.data();
+        request.frontier.adapter_config_identity_len =
+            request.identity.adapter_config_identity.size();
+        request.frontier.media_content_identity =
+            request.identity.media_content_identity.data();
+        request.frontier.media_content_identity_len =
+            request.identity.media_content_identity.size();
+        request.frontier.sequence_epoch = request.identity.sequence_epoch;
+        request.frontier.token_count = request.identity.token_count;
+        request.frontier.next_position = request.identity.next_position;
+        request.idle_decode_thread = true;
+        const auto captured = store->capture(*memory, std::move(request), tenant);
+        return captured.status == server_vbr_artifact_capture_status::ok &&
+            !captured.reference.empty() &&
+            store->retain_host_payload(captured.reference, tenant, owner) &&
+            owner && owner->package();
+    };
+
+    std::shared_ptr<const server_prompt_cache_vbr_payload> incoming_owner;
+    CHECK(capture_owner(incoming_tokens, incoming_owner));
+    if (!incoming_owner) {
+        return false;
+    }
+    CHECK(f42a_decode(
+        context.get(), { continuation }, llama_pos(incoming_tokens.size())));
+    float * expected_logits_ptr = llama_get_logits_ith(context.get(), -1);
+    CHECK(expected_logits_ptr != nullptr);
+    if (!expected_logits_ptr) {
+        return false;
+    }
+    std::vector<float> expected_logits(
+        expected_logits_ptr, expected_logits_ptr + vocab_size);
+    llama_synchronize(context.get());
+    llama_memory_clear(memory, true);
+    CHECK(f42a_decode(context.get(), incumbent_tokens, 0));
+    llama_synchronize(context.get());
+
+    std::shared_ptr<const server_prompt_cache_vbr_payload> recovery_owner;
+    CHECK(capture_owner(incumbent_tokens, recovery_owner));
+    CHECK(recovery_owner);
+    CHECK(incoming_owner && recovery_owner &&
+          incoming_owner->reference_artifact() !=
+              recovery_owner->reference_artifact());
+    if (!recovery_owner ||
+        incoming_owner->reference_artifact() ==
+            recovery_owner->reference_artifact()) {
+        return false;
+    }
+
+    server_cache_authority authority;
+    server_retention_sidecar_store retention;
+    retention.configure(&ledger, host_domain, &authority.leases);
+    CHECK(retention.enable_prefix_tracking());
+    server_prompt_cache cache(0, 0);
+    cache.acct = &ledger;
+    cache.retention_obs = &retention;
+    cache.lease_obs = &authority.leases;
+    const std::string execution_key = execution_identity;
+    const std::string adapter_key = adapter_identity;
+    cache.lease_execution_identity = &execution_key;
+
+    server_prompt incoming_prompt;
+    incoming_prompt.tokens = server_tokens(incoming_tokens, false);
+    incoming_prompt.sequence_epoch = 1;
+    server_prompt incumbent_prompt;
+    incumbent_prompt.tokens = server_tokens(incumbent_tokens, false);
+    incumbent_prompt.sequence_epoch = 1;
+    const common_cache_family_binding incumbent_family_initial {
+        common_cache_family_id { 41 }, common_cache_family_role::branch,
+    };
+    const common_cache_family_binding incoming_family {
+        common_cache_family_id { 42 }, common_cache_family_role::background,
+    };
+    common_cache_family_binding incumbent_family = incumbent_family_initial;
+    constexpr int32_t incoming_source_slot = 4;
+    constexpr int32_t destination_slot = 0;
+    const auto publish_live_source = [&] (
+            int32_t slot, const server_prompt & prompt) {
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+        const auto key = server_retention_instance_key::for_slot(slot);
+        return retention.publish(
+                   key, common_retention_pool::attention, spans, true,
+                   prompt.n_tokens(), prompt.n_tokens(), true) &&
+            server_prompt_retention_publish_exact_prefix(
+                retention, key, prompt, adapter_key, prompt.n_tokens());
+    };
+    CHECK(publish_live_source(incoming_source_slot, incoming_prompt));
+    CHECK(publish_live_source(destination_slot, incumbent_prompt));
+
+    server_cache_lease_identity incumbent_lease_identity;
+    CHECK(server_cache_lease_build_identity(
+        execution_key, adapter_key, incumbent_prompt.tokens,
+        incumbent_prompt.n_tokens(), incumbent_lease_identity));
+    const server_cache_lease_subject incumbent_subject {
+        retention.artifact_id(
+            server_retention_instance_key::for_slot(destination_slot)),
+        common_retention_artifact_kind::live_slot, destination_slot,
+    };
+    auto incumbent_lease = authority.leases.grant_soft(
+        incumbent_subject,
+        server_cache_lease_scope::from(authority.leases.new_context_scope()),
+        incumbent_lease_identity, UINT64_MAX/2);
+    CHECK(incumbent_lease);
+
+    const auto publish_host = [&] (
+            int32_t source_slot, const server_prompt & prompt,
+            const std::shared_ptr<const server_prompt_cache_vbr_payload> & owner,
+            const common_cache_family_binding & family) {
+        server_prompt_cache_vbr_publication_metadata metadata;
+        if (!cache.prepare_vbr_publication_metadata(
+                prompt, execution_key, adapter_key, source_slot, metadata)) {
+            return false;
+        }
+        auto payload = server_prompt_cache_payload::from_vbr(owner);
+        return cache.publish_vbr(metadata, payload, family, false);
+    };
+    CHECK(publish_host(
+        incoming_source_slot, incoming_prompt, incoming_owner,
+        incoming_family));
+    CHECK(publish_host(
+        destination_slot, incumbent_prompt, recovery_owner,
+        incumbent_family));
+    CHECK(cache.states.size() == 2);
+
+    std::vector<llama_memory_tree_child> occupied_tree;
+    CHECK(llama_memory_tree_collect(memory, occupied_tree));
+    const auto occupied_attention = std::find_if(
+        occupied_tree.begin(), occupied_tree.end(),
+        [](const llama_memory_tree_child & child) {
+            return child.attention != nullptr;
+        });
+    CHECK(occupied_attention != occupied_tree.end());
+    if (occupied_attention == occupied_tree.end()) {
+        return false;
+    }
+    auto * occupied_cache = occupied_attention->attention;
+
+    llama_tokens request_tokens = incoming_tokens;
+    request_tokens.push_back(continuation);
+    struct publish_state {
+        server_prompt_cache * cache = nullptr;
+        server_prompt_cache_vbr_replacement_ticket * ticket = nullptr;
+        bool published = false;
+    };
+    const auto import_request = [&] (publish_state & state) {
+        server_vbr_artifact_import_target request;
+        request.memory = memory;
+        request.destination = destination_slot;
+        request.execution_identity = execution_key;
+        request.adapter_config_identity = adapter_key;
+        request.previously_observed = true;
+        request.publish_context = &state;
+        request.prepare_publish = [] (
+                void * opaque, const std::vector<llama_token> & tokens,
+                uint64_t sequence_epoch) noexcept {
+            auto * current = static_cast<publish_state *>(opaque);
+            return current && current->cache && current->ticket &&
+                current->ticket->ready() &&
+                tokens.size() == current->ticket->incoming_prefix_tokens() &&
+                sequence_epoch ==
+                    current->ticket->replacement_prompt().sequence_epoch &&
+                current->cache->prepare_vbr_occupied_replacement_publish(
+                    *current->ticket);
+        };
+        request.publish = [] (void * opaque) noexcept {
+            auto * current = static_cast<publish_state *>(opaque);
+            GGML_ASSERT(current && current->cache && current->ticket);
+            current->cache->publish_vbr_occupied_replacement(
+                *current->ticket);
+            current->published = true;
+        };
+        return request;
+    };
+    const auto prepare_ticket = [&] (
+            server_prompt_cache_vbr_replacement_ticket & ticket) {
+        server_prompt_cache_vbr_restore_candidate candidate;
+        return cache.prepare_vbr_restore(
+                   server_tokens(request_tokens, false), execution_key,
+                   adapter_key, candidate, false) &&
+            cache.prepare_vbr_occupied_replacement(
+                std::move(candidate), incumbent_prompt, incumbent_family,
+                incoming_family, destination_slot, execution_key,
+                adapter_key, ticket);
+    };
+
+    const auto incumbent_artifact = retention.artifact_id(
+        server_retention_instance_key::for_slot(destination_slot));
+    server_prompt_cache_vbr_replacement_ticket refused_ticket;
+    CHECK(prepare_ticket(refused_ticket));
+    publish_state refused_state { &cache, &refused_ticket, false };
+    incumbent_family = {
+        common_cache_family_id { 77 }, common_cache_family_role::main,
+    };
+    const auto refused = store->import_host_occupied_replacement(
+        import_request(refused_state), refused_ticket.incoming_payload(),
+        refused_ticket.recovery_payload());
+    CHECK(refused.status == server_vbr_artifact_import_status::unavailable);
+    CHECK(!refused.adopt_attempted && !refused_state.published);
+    CHECK(incumbent_prompt.tokens.retention_token_ids() == incumbent_tokens);
+    CHECK(retention.artifact_id(
+              server_retention_instance_key::for_slot(destination_slot)) ==
+          incumbent_artifact);
+    CHECK(llama_kv_cache_vbr_epoch_test::adopted_matches(
+        occupied_cache, recovery_owner->package(),
+        recovery_owner->package().manifest(), destination_slot));
+    refused_ticket = {};
+    incumbent_family = incumbent_family_initial;
+
+    server_prompt_cache_vbr_replacement_ticket ticket;
+    CHECK(prepare_ticket(ticket));
+    publish_state state { &cache, &ticket, false };
+    const auto imported = store->import_host_occupied_replacement(
+        import_request(state), ticket.incoming_payload(),
+        ticket.recovery_payload());
+    CHECK(imported.status == server_vbr_artifact_import_status::ok);
+    CHECK(imported.adopt_status == vbr_adopt_status::adopted);
+    CHECK(state.published);
+    CHECK(incumbent_prompt.tokens.retention_token_ids() == incoming_tokens);
+    CHECK(incumbent_family == incoming_family);
+    CHECK(retention.prepared_for_launch(
+        server_retention_instance_key::for_slot(destination_slot)));
+    CHECK(llama_kv_cache_vbr_epoch_test::adopted_matches(
+        occupied_cache, incoming_owner->package(),
+        incoming_owner->package().manifest(), destination_slot));
+    cache.commit_vbr_occupied_replacement(
+        ticket, incumbent_prompt, incumbent_family, destination_slot);
+    CHECK(!ticket.ready());
+
+    CHECK(f42a_decode(
+        context.get(), { continuation }, llama_pos(incoming_tokens.size())));
+    float * actual_logits = llama_get_logits_ith(context.get(), -1);
+    CHECK(actual_logits != nullptr);
+    if (actual_logits) {
+        CHECK(std::memcmp(
+            expected_logits.data(), actual_logits,
+            expected_logits.size()*sizeof(float)) == 0);
+    }
+    llama_synchronize(context.get());
+    // The no-fail sidecar swap retired the displaced live artifact and its
+    // soft lease. Drop the now-stale local handle without a second terminal.
+    incumbent_lease = {};
+    return failures == 0;
+}
+
 static void test_final_recheck_excludes_only_own_reservation() {
     vbr_generation_tracker tracker(1, 256, 1,
                                   vbr_lineage_uuid { 0xe1, 0xf2 });
@@ -4495,24 +4911,30 @@ int main(int argc, char ** argv) {
         (std::string(argv[1]) == "--f42a-cuda" ||
          std::string(argv[1]) == "--f42b-cuda" ||
          std::string(argv[1]) == "--f5-cuda" ||
-         std::string(argv[1]) == "--h2-destination-cuda")) {
+         std::string(argv[1]) == "--h2-destination-cuda" ||
+         std::string(argv[1]) == "--h2-occupied-cuda")) {
         const bool downward = std::string(argv[1]) == "--f42b-cuda";
         const bool f5 = std::string(argv[1]) == "--f5-cuda";
         const bool h2_destination =
             std::string(argv[1]) == "--h2-destination-cuda";
-        if ((!downward && !f5 && !h2_destination && argc != 3) ||
+        const bool h2_occupied =
+            std::string(argv[1]) == "--h2-occupied-cuda";
+        if ((!downward && !f5 && !h2_destination && !h2_occupied &&
+                 argc != 3) ||
             (f5 && argc != 6) ||
             (downward && argc != 3 && argc != 5) ||
-            (h2_destination && argc != 7)) {
+            (h2_destination && argc != 7) ||
+            (h2_occupied && argc != 4)) {
             std::fprintf(stderr,
                 "usage: %s --f42a-cuda MODEL\n"
                 "       %s --f42b-cuda MODEL [SOURCE TARGET]\n"
                 "       %s --h2-destination-cuda MODEL SOURCE ENTRY "
                 "EXPECTED BUDGET_MIB\n"
+                "       %s --h2-occupied-cuda MODEL ENTRY\n"
                 "       %s --f5-cuda MODEL BUDGET_MIB TOKENS "
                 "mixed|straddled\n"
                 "tiers: f16 t8 t4 t3 t2 t1\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
         ggml_type source_type = GGML_TYPE_F16;
@@ -4529,6 +4951,10 @@ int main(int argc, char ** argv) {
         ggml_type expected_destination_type = GGML_TYPE_COUNT;
         uint64_t destination_budget_mib = 0;
         bool destination_downward = downward;
+        if (h2_occupied && !f42b_parse_type(argv[3], target_type)) {
+            std::fprintf(stderr, "invalid H2 occupied entry tier: %s\n", argv[3]);
+            return 2;
+        }
         if (h2_destination) {
             char * budget_end = nullptr;
             if (!f42b_parse_type(argv[3], source_type) ||
@@ -4573,7 +4999,9 @@ int main(int argc, char ** argv) {
         test_packed_h2d_projection_max_ranges();
         test_cuda_h2d_adapter();
         if (failures == 0) {
-            if (h2_destination) {
+            if (h2_occupied) {
+                h2_model_backed_occupied_store(argv[2], target_type);
+            } else if (h2_destination) {
                 f42a_model_backed_adoption(
                     argv[2], destination_downward,
                     source_type, target_type, 0, 0, false,

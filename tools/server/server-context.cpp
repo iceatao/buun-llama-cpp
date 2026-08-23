@@ -2643,6 +2643,9 @@ private:
     uint64_t vbr_automatic_restore_attempts = 0;
     uint64_t vbr_automatic_restore_succeeded = 0;
     uint64_t vbr_automatic_restore_quality_fallbacks = 0;
+    uint64_t vbr_automatic_restore_occupied_attempts = 0;
+    uint64_t vbr_automatic_restore_occupied_succeeded = 0;
+    uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
     // E1.1a is lazily constructed by its scheduler-only task. destroy()
     // explicitly closes it before prompt_cache because host proofs point into
     // cache list nodes; this declaration after the F store is the secondary
@@ -9106,7 +9109,11 @@ private:
     bool try_automatic_vbr_restore(
             server_slot & slot,
             const server_task & task,
-            const common_cache_family_binding & incoming_family) noexcept {
+            const common_cache_family_binding & incoming_family,
+            size_t * restored_prefix = nullptr) noexcept {
+        if (restored_prefix) {
+            *restored_prefix = SIZE_MAX;
+        }
         try {
             if (!params_base.vbr_prompt_cache || !prompt_cache ||
                 !vbr_artifact_store || ctx_dft ||
@@ -9114,19 +9121,136 @@ private:
                 task.is_parent() || task.tokens.empty() ||
                 !task.params.cache_prompt ||
                 !automatic_vbr_restore_supported(task.tokens, slot.lora) ||
-                slot.state != SLOT_STATE_IDLE || slot.is_processing() ||
-                !slot.prompt.tokens.empty() ||
-                !slot.prompt.checkpoints.empty() ||
-                slot.prompt.sequence_epoch != 0) {
+                slot.state != SLOT_STATE_IDLE || slot.is_processing()) {
+                return false;
+            }
+            const bool construction_empty =
+                slot.prompt.tokens.empty() &&
+                slot.prompt.checkpoints.empty() &&
+                slot.prompt.sequence_epoch == 0;
+            const bool occupied_candidate =
+                !slot.prompt.tokens.empty() &&
+                !slot.prompt.tokens.has_media() &&
+                slot.prompt.checkpoints.empty() &&
+                slot.prompt.sequence_epoch != 0;
+            if (!construction_empty && !occupied_candidate) {
                 return false;
             }
             server_prompt_cache_vbr_restore_candidate candidate;
             const auto adapter_identity = lora_config_identity(slot.lora);
             if (!prompt_cache->prepare_vbr_restore(
                     task.tokens, frontier_execution_identity,
-                    adapter_identity, candidate)) {
+                    adapter_identity, candidate,
+                    construction_empty)) {
                 return false;
             }
+            llama_memory_i * memory = nullptr;
+            if (occupied_candidate) {
+                if (candidate.requires_prefix_projection()) {
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    return false;
+                }
+                memory = llama_get_memory(ctx_tgt);
+                if (!memory || !cache_plan_observe_live_memory(false)) {
+                    return false;
+                }
+                if (memory->seq_pos_min(slot.id) < 0 ||
+                    memory->seq_pos_max(slot.id) < 0) {
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    return false;
+                }
+                server_prompt_cache_vbr_replacement_ticket ticket;
+                if (!prompt_cache->prepare_vbr_occupied_replacement(
+                        std::move(candidate), slot.prompt, slot.cache_family,
+                        incoming_family, slot.id,
+                        frontier_execution_identity, adapter_identity,
+                        ticket)) {
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    return false;
+                }
+
+                struct occupied_publish_state {
+                    server_prompt_cache * cache = nullptr;
+                    server_prompt_cache_vbr_replacement_ticket * ticket = nullptr;
+                    bool published = false;
+                } state { prompt_cache.get(), &ticket, false };
+
+                server_vbr_artifact_import_target request;
+                request.memory = memory;
+                request.destination = slot.id;
+                request.execution_identity = frontier_execution_identity;
+                request.adapter_config_identity = adapter_identity;
+                request.previously_observed = true;
+                request.publish_context = &state;
+                request.prepare_publish = [](
+                    void * opaque,
+                    const std::vector<llama_token> & tokens,
+                    uint64_t sequence_epoch) noexcept {
+                    auto * current = static_cast<occupied_publish_state *>(opaque);
+                    return current && current->cache && current->ticket &&
+                        current->ticket->ready() &&
+                        tokens.size() ==
+                            current->ticket->incoming_prefix_tokens() &&
+                        sequence_epoch == current->ticket->
+                            replacement_prompt().sequence_epoch &&
+                        current->cache->prepare_vbr_occupied_replacement_publish(
+                            *current->ticket);
+                };
+                request.publish = [](void * opaque) noexcept {
+                    auto * current = static_cast<occupied_publish_state *>(opaque);
+                    GGML_ASSERT(current && current->cache && current->ticket);
+                    current->cache->publish_vbr_occupied_replacement(
+                        *current->ticket);
+                    current->published = true;
+                };
+
+                vbr_automatic_restore_attempts++;
+                vbr_automatic_restore_occupied_attempts++;
+                const int64_t started = ggml_time_us();
+                const uint64_t prefix_tokens = ticket.incoming_prefix_tokens();
+                const uint64_t incumbent_lcp = ticket.incumbent_live_lcp();
+                if (restored_prefix) {
+                    *restored_prefix = size_t(incumbent_lcp);
+                }
+                const auto imported =
+                    vbr_artifact_store->import_host_occupied_replacement(
+                        std::move(request), ticket.incoming_payload(),
+                        ticket.recovery_payload());
+                if (imported.status !=
+                        server_vbr_artifact_import_status::ok) {
+                    GGML_ASSERT(!state.published);
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    SLT_DBG(
+                        slot,
+                        "automatic occupied VBR restore refused: status=%s\n",
+                        server_vbr_artifact_import_status_name(imported.status));
+                    return false;
+                }
+                GGML_ASSERT(state.published);
+                prompt_cache->commit_vbr_occupied_replacement(
+                    ticket, slot.prompt, slot.cache_family, slot.id);
+                vbr_automatic_restore_succeeded++;
+                vbr_automatic_restore_occupied_succeeded++;
+                if (restored_prefix) {
+                    *restored_prefix = size_t(prefix_tokens);
+                }
+                SLT_INF(
+                    slot,
+                    "automatic occupied VBR restore old_lcp=%" PRIu64
+                    " prefix=%" PRIu64 " status=%s h2d_bytes=%" PRIu64
+                    " h2d_chunks=%" PRIu64 " duration_ms=%.3f "
+                    "occupied=%" PRIu64 "/%" PRIu64
+                    " fallbacks=%" PRIu64 "\n",
+                    incumbent_lcp, prefix_tokens,
+                    server_vbr_artifact_import_status_name(imported.status),
+                    imported.h2d_bytes, imported.h2d_chunks,
+                    (ggml_time_us() - started)/1000.0,
+                    vbr_automatic_restore_occupied_succeeded,
+                    vbr_automatic_restore_occupied_attempts,
+                    vbr_automatic_restore_occupied_fallbacks);
+                return true;
+            }
+
             vbr_artifact_attention_prefix_projection prefix_projection;
             const auto prepare_prefix_projection = [&]() noexcept {
                 if (!candidate.requires_prefix_projection()) {
@@ -9141,11 +9265,13 @@ private:
             if (!prepare_prefix_projection()) {
                 return false;
             }
-            auto * memory = llama_get_memory(ctx_tgt);
+            memory = llama_get_memory(ctx_tgt);
+            if (!memory || !cache_plan_observe_live_memory(false)) {
+                return false;
+            }
             const bool target_ready =
                 memory && memory->seq_pos_min(slot.id) < 0 &&
-                memory->seq_pos_max(slot.id) < 0 &&
-                cache_plan_observe_live_memory(false);
+                memory->seq_pos_max(slot.id) < 0;
             if (!target_ready ||
                 !prompt_cache->prepare_vbr_restore_destination(
                     candidate, slot.prompt, slot.id)) {
@@ -9239,6 +9365,9 @@ private:
                 vbr_automatic_restore_quality_fallbacks++;
             }
             vbr_automatic_restore_succeeded++;
+            if (restored_prefix) {
+                *restored_prefix = size_t(prefix_tokens);
+            }
             SLT_INF(
                 slot,
                 "automatic VBR host restore source=%d prefix=%" PRIu64
@@ -9404,11 +9533,13 @@ private:
         // automatic import can atomically publish live KV/prompt metadata.
         auto launched_task =
             std::make_unique<const server_task>(std::move(task));
+        size_t restored_prefix = SIZE_MAX;
         (void) try_automatic_vbr_restore(
-            slot, *launched_task, incoming_family);
+            slot, *launched_task, incoming_family, &restored_prefix);
 
-        const size_t retained_prefix =
-            slot.prompt.tokens.get_common_prefix(launched_task->tokens);
+        const size_t retained_prefix = restored_prefix != SIZE_MAX
+            ? restored_prefix
+            : slot.prompt.tokens.get_common_prefix(launched_task->tokens);
 
         if (reclaim_before_launch &&
             server_vbr_dynamic_active(params_base) &&

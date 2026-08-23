@@ -2044,6 +2044,40 @@ server_vbr_artifact_store::import_host_payload(
 }
 
 server_vbr_artifact_import_output
+server_vbr_artifact_store::import_host_occupied_replacement(
+        server_vbr_artifact_import_target request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> incoming,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> recovery)
+        noexcept {
+    server_vbr_artifact_import_output output;
+    impl_->counters.imports_requested++;
+    const auto structurally_owned = [&](const auto & payload) {
+        return payload && payload->retirement_owned() &&
+            payload->accounted_by(impl_->ledger) && payload->package();
+    };
+    if (!structurally_owned(incoming) || !structurally_owned(recovery) ||
+        incoming == recovery ||
+        incoming->reference_artifact() == recovery->reference_artifact()) {
+        output.status = server_vbr_artifact_import_status::unavailable;
+        impl_->counters.imports_unavailable++;
+        return output;
+    }
+    if (!impl_->catalog.owns_host_package(incoming->package()) ||
+        !impl_->catalog.owns_host_package(recovery->package())) {
+        output.status = server_vbr_artifact_import_status::not_found;
+        impl_->counters.imports_not_found++;
+        return output;
+    }
+    impl_->counters.host_imports_authenticated++;
+    auto imported = import_package_impl(
+        std::move(request), incoming->package(), &recovery->package());
+    if (imported.status == server_vbr_artifact_import_status::ok) {
+        impl_->counters.host_imports_succeeded++;
+    }
+    return imported;
+}
+
+server_vbr_artifact_import_output
 server_vbr_artifact_store::complete_validated_import(
         server_vbr_artifact_import_target request,
         vbr_manifest_validation_result validated,
@@ -2294,6 +2328,13 @@ server_vbr_artifact_store::import_host_prefix_payload(
 server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         server_vbr_artifact_import_target request,
         const vbr_artifact_package_view & package) noexcept {
+    return import_package_impl(std::move(request), package, nullptr);
+}
+
+server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl(
+        server_vbr_artifact_import_target request,
+        const vbr_artifact_package_view & package,
+        const vbr_artifact_package_view * recovery) noexcept {
     server_vbr_artifact_import_output output;
     const auto fail = [&](server_vbr_artifact_import_status status,
                           uint64_t & counter) {
@@ -2334,6 +2375,23 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         context.representation_context = &representation_policy;
         context.representation_identity =
             vbr_explicit_capture_representation_identity;
+        vbr_occupied_replacement_guard occupied_guard;
+        if (recovery) {
+            const auto guard_status =
+                vbr_explicit_prepare_occupied_replacement_guard(
+                    *request.memory, request.destination, package, *recovery,
+                    impl_->domain_bindings, accounting_snapshot.serial,
+                    &representation_policy,
+                    vbr_explicit_capture_representation_identity,
+                    occupied_guard);
+            if (guard_status !=
+                    vbr_occupied_replacement_guard_status::ready) {
+                output.validation_status =
+                    vbr_manifest_validation_status::unavailable;
+                return fail(server_vbr_artifact_import_status::unavailable,
+                            impl_->counters.imports_unavailable);
+            }
+        }
         vbr_downward_policy_projection downward_projection;
         bool downward = false;
         vbr_import_schedule_quote schedule_quote;
@@ -2395,6 +2453,13 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
             return fail(server_vbr_artifact_import_status::unavailable,
                         impl_->counters.imports_unavailable);
         }
+        if (recovery &&
+            schedule_quote.status() != vbr_import_schedule_status::exact) {
+            output.validation_status =
+                vbr_manifest_validation_status::representation_mismatch;
+            return fail(server_vbr_artifact_import_status::validation_failed,
+                        impl_->counters.imports_refused);
+        }
         // Idleness is the SCHEDULER's fact to assert, not the library's: the
         // route handler admits imports only on an idle, deferred-safe slot, so
         // the store vouches for it here on the snapshot the validator consumes.
@@ -2423,6 +2488,12 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
         policy.transform_budget_plan = &transform_budget;
         policy.allow_upward = true;
         policy.schedule_quote = &schedule_quote;
+        if (recovery) {
+            policy.occupied_replacement = &occupied_guard;
+            policy.occupied_representation_context = &representation_policy;
+            policy.occupied_representation_identity =
+                vbr_explicit_capture_representation_identity;
+        }
         policy.context = &context;
         policy.inspect_target = import_inspect_target;
         policy.parse_companion = import_parse_companion;
