@@ -752,6 +752,11 @@ struct server_slot {
     llama_cache_acct_artifact_id vbr_idle_stem_host_artifact;
     bool vbr_idle_stem_source_valid = false;
     bool vbr_idle_stem_retry = false;
+    // One-shot launch proof: an automatic artifact import installed complete
+    // attention state through this logical frontier. The first prompt update
+    // consumes it so SWA's legacy checkpoint fallback does not discard the
+    // freshly restored image merely because per-sequence removal is limited.
+    uint64_t vbr_imported_complete_frontier = 0;
     std::string vbr_adapter_config_identity;
     bool vbr_adapter_config_identity_valid = false;
 
@@ -1058,6 +1063,7 @@ struct server_slot {
         }
         prompt.clear();
         cache_family = {};
+        vbr_imported_complete_frontier = 0;
     }
 
     void prompt_clear_certified(
@@ -9569,8 +9575,13 @@ private:
             if (imported.status != server_vbr_artifact_import_status::ok) {
                 SLT_DBG(
                     slot,
-                    "automatic VBR host restore refused: status=%s\n",
-                    server_vbr_artifact_import_status_name(imported.status));
+                    "automatic VBR host restore refused: status=%s "
+                    "validation=%s schedule=%s decision=%s\n",
+                    server_vbr_artifact_import_status_name(imported.status),
+                    vbr_manifest_validation_status_name(
+                        imported.validation_status),
+                    vbr_import_schedule_status_name(imported.schedule_status),
+                    vbr_import_decision_name(imported.decision));
                 return false;
             }
             GGML_ASSERT(state.published);
@@ -9763,8 +9774,10 @@ private:
         auto launched_task =
             std::make_unique<const server_task>(std::move(task));
         size_t restored_prefix = SIZE_MAX;
-        (void) try_automatic_vbr_restore(
+        const bool automatically_restored = try_automatic_vbr_restore(
             slot, *launched_task, incoming_family, &restored_prefix);
+        slot.vbr_imported_complete_frontier = automatically_restored
+            ? uint64_t(restored_prefix) : 0;
 
         const size_t retained_prefix = restored_prefix != SIZE_MAX
             ? restored_prefix
@@ -11234,7 +11247,11 @@ private:
                 });
                 total_token_references += token_references;
                 refresh_selected |= representation_changed;
-                if (stem_retry) {
+                // A payload-complete iSWA child is one exact artifact-wide
+                // dependency. It cannot be partitioned across the projected
+                // <=8-manifest union, so capture one ranked source per idle
+                // wave through the exact host handoff below.
+                if (stem_retry || n_swa > 0) {
                     break;
                 }
             } catch (...) {
@@ -11242,6 +11259,13 @@ private:
             }
         }
         const auto displace_existing_sources = [&]() {
+            // iSWA owns one shared payload-complete child. Removing a single
+            // sequence cannot empty that child, so its live aliases are
+            // reclaimed atomically below only after every resident slot has
+            // a durable host frontier.
+            if (n_swa > 0) {
+                return;
+            }
             for (size_t order = 0;
                  order < durability_order_count &&
                  capture_attempts + displacement_attempts <
@@ -11310,20 +11334,101 @@ private:
 
         std::vector<server_vbr_projected_host_publish_result> captured;
         server_vbr_projected_host_capture_diagnostics diagnostics;
-        std::vector<server_prompt_cache_vbr_publication_metadata *>
-            admitted_publications;
+        server_prompt_cache_vbr_capacity_claim capacity_claim;
         bool has_refresh_candidate = false;
         bool has_fresh_candidate = false;
+        for (const auto & candidate : candidates) {
+            has_refresh_candidate |= candidate.refresh;
+            has_fresh_candidate |= !candidate.refresh;
+        }
+        const int64_t started = ggml_time_us();
+
+        if (n_swa > 0) {
+            if (candidates.size() != 1 || manifests.size() != 1 ||
+                !capture_session.continue_capture()) {
+                return 0;
+            }
+            auto & candidate = candidates.front();
+            vbr_explicit_capture_request exact_request;
+            server_vbr_artifact_capture_status request_status;
+            if (!candidate.slot || !build_capture_request(
+                    *candidate.slot, exact_request, request_status)) {
+                return 0;
+            }
+            std::shared_ptr<const server_prompt_cache_vbr_payload> payload;
+            const auto exact = vbr_artifact_store->capture_host_payload(
+                *memory, std::move(exact_request), payload);
+            uint64_t exact_bytes = exact.payload_bytes;
+            bool exact_size_ok =
+                exact.stash_bytes <= UINT64_MAX - exact_bytes;
+            if (exact_size_ok) {
+                exact_bytes += exact.stash_bytes;
+                exact_size_ok =
+                    exact.companion_bytes <= UINT64_MAX - exact_bytes;
+            }
+            if (exact_size_ok) {
+                exact_bytes += exact.companion_bytes;
+            }
+            if (exact.status != server_vbr_artifact_capture_status::ok ||
+                !payload || !exact_size_ok ||
+                !capture_session.continue_capture()) {
+                SRV_DBG(
+                    "VBR_IDLE_CAPTURE exact-complete refused status=%s "
+                    "library_status=%s phase=%s generation=%s bytes=%" PRIu64
+                    " duration_ms=%.3f\n",
+                    server_vbr_artifact_capture_status_name(exact.status),
+                    vbr_explicit_capture_status_name(exact.library_status),
+                    vbr_explicit_capture_phase_name(exact.phase),
+                    vbr_explicit_generation_failure_name(
+                        exact.generation_failure), exact_bytes,
+                    (ggml_time_us() - started)/1000.0);
+                candidate.slot->vbr_idle_capture_attempt_identity =
+                    candidate.attempt_identity;
+                candidate.slot->vbr_idle_capture_terminal =
+                    exact.library_status ==
+                        vbr_explicit_capture_status::unsupported_layout ||
+                    exact.library_status ==
+                        vbr_explicit_capture_status::not_armed;
+                candidate.slot->vbr_idle_capture_retry_after_ms =
+                    candidate.slot->vbr_idle_capture_terminal
+                        ? 0 : ggml_time_ms() + 5000;
+                return 0;
+            }
+            if (!candidate.refresh) {
+                auto * publication = &candidate.publication;
+                server_prompt_cache_vbr_capacity_status capacity_status =
+                    server_prompt_cache_vbr_capacity_status::invalid;
+                if (!publication->ready() ||
+                    !prompt_cache->prepare_vbr_publication_capacity(
+                        &publication, 1, payload->resident_bytes(),
+                        capacity_claim, &capacity_status)) {
+                    candidate.slot->vbr_idle_capture_attempt_identity =
+                        candidate.attempt_identity;
+                    candidate.slot->vbr_idle_capture_terminal = false;
+                    candidate.slot->vbr_idle_capture_retry_after_ms =
+                        ggml_time_ms() + 5000;
+                    return 0;
+                }
+            }
+            captured.push_back({
+                candidate.manifest_id,
+                exact.dedup
+                    ? vbr_projected_manifest_publish_status::adopted
+                    : vbr_projected_manifest_publish_status::published,
+                std::move(payload),
+            });
+            SRV_DBG(
+                "VBR_IDLE_CAPTURE exact-complete status=ok bytes=%" PRIu64
+                " duration_ms=%.3f\n",
+                exact_bytes, (ggml_time_us() - started)/1000.0);
+        } else {
+        std::vector<server_prompt_cache_vbr_publication_metadata *>
+            admitted_publications;
         try {
             admitted_publications.reserve(candidates.size());
-            for (const auto & candidate : candidates) {
-                has_refresh_candidate |= candidate.refresh;
-                has_fresh_candidate |= !candidate.refresh;
-            }
         } catch (...) {
             return 0;
         }
-        server_prompt_cache_vbr_capacity_claim capacity_claim;
         struct idle_admission_context {
             server_context_impl * owner = nullptr;
             server_queue::idle_capture_session * session = nullptr;
@@ -11530,7 +11635,6 @@ private:
             auto * session = context ? context->session : nullptr;
             return session && session->continue_capture();
         };
-        const int64_t started = ggml_time_us();
         if (!vbr_artifact_store->capture_projected_host_batch(
                 *memory, std::move(manifests), runway,
                 captured, &admission, &diagnostics)) {
@@ -11612,6 +11716,7 @@ private:
                         ? 0 : retry_after_ms;
             }
             return 0;
+        }
         }
 
         if (has_fresh_candidate &&
@@ -11814,11 +11919,13 @@ private:
                     adapter_key)) {
                 continue;
             }
-            if (!source.prompt_clear_after_vbr_publication()) {
-                continue;
+            if (n_swa == 0) {
+                if (!source.prompt_clear_after_vbr_publication()) {
+                    continue;
+                }
+                ++displaced_count;
+                SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_DISPLACED__\n");
             }
-            ++displaced_count;
-            SLT_DBG(source, "%s", "__TEST_TAG_VBR_IDLE_DISPLACED__\n");
         }
 
         // Spend any remaining per-wave operation budget on the coldest
@@ -11826,6 +11933,65 @@ private:
         // has completed. This preserves the source geometry of hotter rows
         // throughout projection and D2H.
         displace_existing_sources();
+
+        if (n_swa > 0) {
+            std::vector<server_slot *> reclaim;
+            bool all_durable = true;
+            try {
+                reclaim.reserve(slots.size());
+                for (auto & live : slots) {
+                    if (live.prompt.n_tokens() == 0) {
+                        continue;
+                    }
+                    const auto admission = live.observe_full_slot(
+                        server_cache_destruction_class::slot_drop,
+                        server_cache_destruction_reason::idle_reclaim);
+                    const bool safe = !live.is_processing() &&
+                        live.state == SLOT_STATE_IDLE &&
+                        automatic_vbr_cache_support(
+                            live.prompt.tokens, live.lora,
+                            live.can_speculate()) ==
+                            server_vbr_prompt_cache_support_status::supported &&
+                        !live.hard_lease_blocks_live_prefix() &&
+                        !live.cache_plan_destruction_recovery_pin.valid() &&
+                        !queue_tasks.has_deferred_for_slot(live.id) &&
+                        admission.verdict !=
+                            server_cache_destruction_verdict::
+                                would_refuse_hard_leased &&
+                        admission.verdict !=
+                            server_cache_destruction_verdict::unavailable &&
+                        prompt_cache->contains_vbr_frontier(
+                            live.prompt, frontier_execution_identity,
+                            lora_config_identity(live.lora));
+                    if (!safe) {
+                        all_durable = false;
+                        break;
+                    }
+                    reclaim.push_back(&live);
+                }
+            } catch (...) {
+                all_durable = false;
+            }
+            if (all_durable && !reclaim.empty() &&
+                capture_session.continue_capture()) {
+                // No per-sequence erase can empty the payload-complete SWA
+                // child. The scheduler has authenticated every resident
+                // sequence above, so clear the shared tree once and then
+                // consume each already-admitted live alias without another
+                // fallible operation in between.
+                llama_memory_clear(memory, false);
+                for (auto * live : reclaim) {
+                    const bool cleared =
+                        live->prompt_clear_after_vbr_publication();
+                    GGML_ASSERT(cleared);
+                    if (cleared) {
+                        ++displaced_count;
+                        SLT_DBG(*live, "%s",
+                                "__TEST_TAG_VBR_IDLE_DISPLACED__\n");
+                    }
+                }
+            }
+        }
 
         SRV_INF(
             "VBR_IDLE_CAPTURE manifests=%zu published=%zu refreshed=%zu displaced=%zu "
@@ -13737,6 +13903,10 @@ private:
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                const bool complete_vbr_import =
+                                    slot.vbr_imported_complete_frontier >=
+                                        uint64_t(n_past);
+                                slot.vbr_imported_complete_frontier = 0;
                                 if (pos_min == -1) {
                                     // [WS-1] fail-closed coordinated restore. The token ledger claims a
                                     // prefix (n_past > 0) but this sequence's KV is empty (pos_min == -1) --
@@ -13828,8 +13998,9 @@ private:
                                         pos_min, pos_min_thold);
                                 }
 
-                                if (pos_min >= pos_min_thold ||
-                                    slot.cache_plan_execution.restores_checkpoint()) {
+                                if (!complete_vbr_import &&
+                                    (pos_min >= pos_min_thold ||
+                                     slot.cache_plan_execution.restores_checkpoint())) {
                                     // [I9] current attention-content lineage epoch(s). A recurrent-only
                                     // checkpoint remains valid across a lossless in-place retier, but not
                                     // across occupied-cell reuse, clear/reset, or state adoption. All-zero

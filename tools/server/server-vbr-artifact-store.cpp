@@ -1528,10 +1528,30 @@ server_vbr_artifact_capture_output server_vbr_artifact_store::capture(
         llama_memory_i & memory,
         vbr_explicit_capture_request request,
         const std::string & tenant_key) noexcept {
+    return capture_impl(memory, std::move(request), &tenant_key, nullptr);
+}
+
+server_vbr_artifact_capture_output
+server_vbr_artifact_store::capture_host_payload(
+        llama_memory_i & memory,
+        vbr_explicit_capture_request request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        noexcept {
+    payload.reset();
+    return capture_impl(memory, std::move(request), nullptr, &payload);
+}
+
+server_vbr_artifact_capture_output server_vbr_artifact_store::capture_impl(
+        llama_memory_i & memory,
+        vbr_explicit_capture_request request,
+        const std::string * tenant_key,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> * payload)
+        noexcept {
     server_vbr_artifact_capture_output output;
     impl_->counters.requested++;
     try {
-        if (tenant_key.empty()) {
+        if ((tenant_key == nullptr) == (payload == nullptr) ||
+            (tenant_key && tenant_key->empty())) {
             output.status =
                 server_vbr_artifact_capture_status::unauthorized;
             impl_->counters.refused++;
@@ -1610,19 +1630,43 @@ server_vbr_artifact_capture_output server_vbr_artifact_store::capture(
         }
         const auto after = impl_->catalog.snapshot();
         output.dedup = result.sink.adopted;
-        output.reference = opaque_reference(
-            impl_->nonce, impl_->next_reference++,
-            result.sink.reference_artifact, tenant_key);
-        if (!impl_->references.publish(
-                output.reference, tenant_key,
-                result.sink.reference_artifact)) {
-            (void) impl_->catalog.retire(
-                result.sink.reference_artifact);
-            output.reference.clear();
-            output.status =
-                server_vbr_artifact_capture_status::internal_error;
-            impl_->counters.internal_error++;
-            return output;
+        if (payload) {
+            std::vector<llama_cache_acct_artifact_id> references {
+                result.sink.reference_artifact,
+            };
+            std::vector<vbr_artifact_package_view> packages;
+            if (!impl_->catalog.claim_fresh_host_batch(
+                    references, packages) || packages.size() != 1) {
+                (void) impl_->catalog.discard_unowned_reference(
+                    result.sink.reference_artifact);
+                output.status =
+                    server_vbr_artifact_capture_status::internal_error;
+                impl_->counters.internal_error++;
+                return output;
+            }
+            *payload = server_prompt_cache_vbr_payload::adopt(
+                std::move(packages.front()));
+            if (!*payload) {
+                output.status =
+                    server_vbr_artifact_capture_status::internal_error;
+                impl_->counters.internal_error++;
+                return output;
+            }
+        } else {
+            output.reference = opaque_reference(
+                impl_->nonce, impl_->next_reference++,
+                result.sink.reference_artifact, *tenant_key);
+            if (!impl_->references.publish(
+                    output.reference, *tenant_key,
+                    result.sink.reference_artifact)) {
+                (void) impl_->catalog.retire(
+                    result.sink.reference_artifact);
+                output.reference.clear();
+                output.status =
+                    server_vbr_artifact_capture_status::internal_error;
+                impl_->counters.internal_error++;
+                return output;
+            }
         }
         output.consistency = vbr_artifact_consistency_kind::capture_exact;
         impl_->counters.exact_published++;

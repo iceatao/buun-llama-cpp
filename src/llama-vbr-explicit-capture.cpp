@@ -1365,8 +1365,8 @@ public:
             return false;
         }
         vbr_artifact_stream_placement placement;
-        auto * placement_out = mode ==
-                checkpoint_child_dependency_mode::live_guarded ?
+        auto * placement_out = mode !=
+                checkpoint_child_dependency_mode::absent ?
             &placement : nullptr;
         if (!cache.vbr_capture_generation_record(
                 child_id, mode, sequence, frontier,

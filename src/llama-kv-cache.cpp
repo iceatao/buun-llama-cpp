@@ -7195,7 +7195,7 @@ bool llama_kv_cache::vbr_capture_generation_record(
         if (dependency_mode ==
                 checkpoint_child_dependency_mode::payload_complete) {
             const auto * tracker = vbr_generation_tracker_get();
-            if (tracker == nullptr) {
+            if (tracker == nullptr || n_stream != 1 || v_cells.size() != 1) {
                 if (failure != nullptr) {
                     *failure =
                         vbr_explicit_generation_failure::tracker_missing;
@@ -7209,12 +7209,77 @@ bool llama_kv_cache::vbr_capture_generation_record(
                 }
                 return false;
             }
-            // Payload-complete children serialize their bytes directly and
-            // therefore carry a vacuous ownership row. The unit payload
-            // descriptors retain their exact representation generations.
+            // A payload-complete child cannot be projected independently,
+            // but exact host restore still needs its physical ownership and
+            // generation image. Admit only a sole owner: serializing shared
+            // iSWA bytes into one sequence's artifact would otherwise grant
+            // that manifest authority over an unrelated live sequence.
+            const auto & cells = v_cells.front();
+            std::vector<uint32_t> dependency_cells;
+            vbr_artifact_stream_placement captured_placement;
+            captured_placement.child_id = child_id;
+            captured_placement.stream_index = 0;
+            captured_placement.source_sequence = sequence;
+            captured_placement.computation_frontier = frontier;
+            dependency_cells.reserve(cells.get_used());
+            captured_placement.cells.reserve(cells.get_used());
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.is_empty(cell)) {
+                    continue;
+                }
+                if (cells.seq_count(cell) != 1 ||
+                    !cells.seq_has(cell, sequence) ||
+                    cells.pos_get(cell) >= frontier ||
+                    cells.get_shift(cell) != 0) {
+                    if (failure != nullptr) {
+                        *failure = vbr_explicit_generation_failure::
+                            ownership_cardinality_mismatch;
+                    }
+                    return false;
+                }
+                const auto & ext = cells.ext_get(cell);
+                dependency_cells.push_back(cell);
+                captured_placement.cells.push_back({
+                    cell, cells.pos_get(cell), ext.x, ext.y,
+                });
+            }
+            if (dependency_cells.empty()) {
+                if (failure != nullptr) {
+                    *failure = vbr_explicit_generation_failure::
+                        ownership_cardinality_mismatch;
+                }
+                return false;
+            }
+            vbr_checkpoint_generation_stream captured_stream;
+            if (!vbr_generation_capture_stream(
+                    *tracker, 0, sequence, frontier, dependency_cells,
+                    captured_stream)) {
+                if (failure != nullptr) {
+                    *failure = vbr_explicit_generation_failure::
+                        stream_capture_failed;
+                }
+                return false;
+            }
             output.child_id = child_id;
             output.dependency_mode = dependency_mode;
             output.lineage_uuid = tracker->lineage_identity();
+            output.global_generation = tracker->controller_generation();
+            output.units.reserve(tracker->unit_count());
+            for (uint32_t unit = 0; unit < tracker->unit_count(); ++unit) {
+                const auto generation = tracker->unit_generation(unit);
+                output.units.push_back({
+                    generation.repr_gen,
+                    generation.current_type,
+                    generation.last_source_type,
+                    generation.domain,
+                    generation.promote_hops,
+                    generation.last_transition,
+                });
+            }
+            output.streams.push_back(std::move(captured_stream));
+            if (placement != nullptr) {
+                *placement = std::move(captured_placement);
+            }
             return tracker->stable() &&
                    vbr_lineage_uuid_is_set(output.lineage_uuid);
         }

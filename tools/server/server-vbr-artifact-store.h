@@ -411,6 +411,16 @@ public:
         vbr_explicit_capture_request request,
         const std::string & tenant_key) noexcept;
 
+    // Scheduler-only exact capture for memory trees whose complete artifact
+    // includes payload-complete attention children (notably bounded iSWA).
+    // The returned owner is claimed directly from the catalog; no tenant
+    // handle or reference-index row is created.
+    server_vbr_artifact_capture_output capture_host_payload(
+        llama_memory_i & memory,
+        vbr_explicit_capture_request request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        noexcept;
+
     // Publish an already sealed projected assembly through this store's
     // canonical catalog and current sampled budget. Structural failure clears
     // the complete output. Successfully published rows are returned as
@@ -491,6 +501,12 @@ public:
     uint32_t attention_children() const noexcept;
 
 private:
+    server_vbr_artifact_capture_output capture_impl(
+        llama_memory_i & memory,
+        vbr_explicit_capture_request request,
+        const std::string * tenant_key,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> * payload)
+        noexcept;
     server_vbr_artifact_import_output complete_validated_import(
         server_vbr_artifact_import_target request,
         vbr_manifest_validation_result validated,

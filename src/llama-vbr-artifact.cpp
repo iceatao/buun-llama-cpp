@@ -1110,11 +1110,20 @@ bool reference_metadata_absent(
 bool placement_valid(
         const vbr_artifact_reference_manifest & manifest,
         const vbr_artifact_decode_limits * limits) {
+    const auto carries_placement = [&](const auto & controller) {
+        return controller.dependency_mode ==
+                   checkpoint_child_dependency_mode::live_guarded ||
+            std::any_of(
+                manifest.stream_placements.begin(),
+                manifest.stream_placements.end(),
+                [&](const vbr_artifact_stream_placement & placement) {
+                    return placement.child_id == controller.child_id;
+                });
+    };
     size_t expected_streams = 0;
     uint64_t total_cells = 0;
     for (const auto & controller : manifest.generation.controllers) {
-        if (controller.dependency_mode ==
-            checkpoint_child_dependency_mode::live_guarded) {
+        if (carries_placement(controller)) {
             expected_streams += controller.streams.size();
         }
     }
@@ -1125,10 +1134,10 @@ bool placement_valid(
     }
 
     size_t next = 0;
-    std::map<llama_seq_id, std::set<llama_pos>> logical_positions;
+    std::map<std::pair<uint32_t, llama_seq_id>, std::set<llama_pos>>
+        logical_positions;
     for (const auto & controller : manifest.generation.controllers) {
-        if (controller.dependency_mode !=
-            checkpoint_child_dependency_mode::live_guarded) {
+        if (!carries_placement(controller)) {
             continue;
         }
         for (const auto & stream : controller.streams) {
@@ -1156,7 +1165,9 @@ bool placement_valid(
                 return false;
             }
             auto & source_positions =
-                logical_positions[placement.source_sequence];
+                logical_positions[{
+                    placement.child_id, placement.source_sequence,
+                }];
             for (size_t i = 0; i < placement.cells.size(); ++i) {
                 const auto & cell = placement.cells[i];
                 if (cell.physical_cell != expected_cells[i] ||
