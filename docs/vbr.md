@@ -69,6 +69,12 @@ Notes:
   carry tier-typed KV. If artifact construction is unavailable for a topology, startup
   reports the typed refusal and continues live-only. Context checkpoints stay enabled on
   hybrid models (recurrent state only) but are disabled on SWA models.
+- **Exact continuation**: complete-frontier artifacts also authenticate the terminal raw
+  vocabulary-logit row. Restoring an exact prompt therefore reports `prompt_n = 0`
+  instead of replaying its last token solely to regenerate logits. With MTP or DFlash2,
+  that cached first sample feeds the normal speculative loop; drafting is not disabled.
+  While VBR prompt caching is enabled, the target keeps a full raw row instead of using
+  backend-only sampling or the DFlash target-argmax shortcut.
 - Degrade progress lines are `INFO`-level: visible with `-v`. Greedy-identical output does
   NOT mean no degrades happened.
 - `--vbr-policy` exports its per-layer schedule through a process-global env: with a
@@ -78,20 +84,18 @@ Notes:
 ### Automatic host-cache support matrix
 
 The default-on server route is intentionally narrower than the explicit artifact APIs.
-It currently supports text-only, non-aLoRA, non-speculative slots on a dynamic-VBR
-target whose artifact store can bind every attention child, device lane, and accounting
-domain. Ordinary LoRA identity, attention-only targets, ordinary hybrid/recurrent
-targets with an exact companion frontier, single-GPU placement, and bound multi-GPU
-placement use that route. Shortened stem publication remains attention-only;
-unsupported stem shapes retain the complete live frontier.
+It supports text-only, non-aLoRA slots on a dynamic-VBR target whose artifact store can
+bind every attention child, device lane, and accounting domain. Ordinary LoRA identity,
+attention-only targets, hybrid/recurrent targets, SWA/iSWA trees, MTP, external draft
+models including DFlash2, single-GPU placement, and bound multi-GPU placement use that
+route. Stateful trees and speculative slots are captured as exact complete-frontier
+artifacts with their required companion state. Shortened stem publication remains
+attention-only; unsupported stem shapes retain the complete live frontier.
 
 The following automatic cases are typed live-only fallbacks today:
 
 | Case | Typed reason | Behavior |
 | --- | --- | --- |
-| active draft/MTP context | `draft_context_unsupported` | automatic host caching is disabled before its cache/ring allocation |
-| SWA/iSWA attention tree | capture `unsupported_layout` at `memory_tree` | the live source remains resident; `payload_complete` SWA-child capture is not yet enabled |
-| per-slot speculative state | `speculative_slot_unsupported` | that live slot is neither captured nor displaced |
 | media prompt/projector state | `media_prompt_unsupported` | that live slot is neither captured nor displaced |
 | aLoRA invocation boundary | `alora_invocation_unsupported` | that live slot is neither captured nor displaced |
 | missing portable topology or pool/lane binding | `artifact_topology_unavailable` | automatic startup continues live-only |

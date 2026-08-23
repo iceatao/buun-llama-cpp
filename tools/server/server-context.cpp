@@ -761,6 +761,13 @@ struct server_slot {
     // consumes it so SWA's legacy checkpoint fallback does not discard the
     // freshly restored image merely because per-sequence removal is limited.
     uint64_t vbr_imported_complete_frontier = 0;
+    // Full raw vocabulary logits produced at the exact retained prompt
+    // frontier. They are captured only at a successful generation stop and
+    // travel as an authenticated VBR companion with the same token/KV image.
+    std::vector<float> vbr_frontier_logits;
+    std::array<uint8_t, 32> vbr_frontier_logits_token_digest = {};
+    uint64_t vbr_frontier_logits_sequence_epoch = 0;
+    bool vbr_frontier_logits_pending = false;
     std::string vbr_adapter_config_identity;
     bool vbr_adapter_config_identity_valid = false;
 
@@ -1069,6 +1076,81 @@ struct server_slot {
         prompt.clear();
         cache_family = {};
         vbr_imported_complete_frontier = 0;
+        vbr_frontier_logits.clear();
+        vbr_frontier_logits_token_digest = {};
+        vbr_frontier_logits_sequence_epoch = 0;
+        vbr_frontier_logits_pending = false;
+    }
+
+    bool vbr_frontier_logits_matches() const noexcept {
+        try {
+            if (!ctx_tgt || prompt.n_tokens() <= 0 ||
+                prompt.tokens.has_media() ||
+                vbr_frontier_logits.size() != size_t(llama_vocab_n_tokens(
+                    llama_model_get_vocab(llama_get_model(ctx_tgt)))) ||
+                vbr_frontier_logits_sequence_epoch != prompt.sequence_epoch) {
+                return false;
+            }
+            std::array<uint8_t, 32> digest = {};
+            return prompt.tokens.retention_token_prefix_digest(
+                       size_t(prompt.n_tokens()), digest) &&
+                digest == vbr_frontier_logits_token_digest;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool vbr_capture_frontier_logits(int32_t output_index) noexcept {
+        try {
+            llama_synchronize(ctx_tgt);
+            const int32_t n_vocab = llama_vocab_n_tokens(
+                llama_model_get_vocab(llama_get_model(ctx_tgt)));
+            const float * logits = llama_get_logits_ith(ctx_tgt, output_index);
+            if (n_vocab <= 0 || !logits ||
+                prompt.n_tokens() <= 0 || prompt.tokens.has_media()) {
+                SLT_DBG(*this,
+                        "frontier logits unavailable: vocab=%d raw=%d prompt=%d media=%d\n",
+                        n_vocab, logits != nullptr,
+                        prompt.n_tokens(), prompt.tokens.has_media());
+                return false;
+            }
+            std::array<uint8_t, 32> digest = {};
+            if (!prompt.tokens.retention_token_prefix_digest(
+                    size_t(prompt.n_tokens()), digest)) {
+                return false;
+            }
+            std::vector<float> captured((size_t(n_vocab)));
+            std::memcpy(captured.data(), logits,
+                        captured.size()*sizeof(float));
+            vbr_frontier_logits.swap(captured);
+            vbr_frontier_logits_token_digest = digest;
+            vbr_frontier_logits_sequence_epoch = prompt.sequence_epoch;
+            return true;
+        } catch (...) {
+            vbr_frontier_logits.clear();
+            vbr_frontier_logits_token_digest = {};
+            vbr_frontier_logits_sequence_epoch = 0;
+            return false;
+        }
+    }
+
+    void vbr_bind_frontier_logits_to_prompt() noexcept {
+        if (vbr_frontier_logits.empty()) {
+            return;
+        }
+        try {
+            std::array<uint8_t, 32> digest = {};
+            if (prompt.tokens.retention_token_prefix_digest(
+                    size_t(prompt.n_tokens()), digest)) {
+                vbr_frontier_logits_token_digest = digest;
+                vbr_frontier_logits_sequence_epoch = prompt.sequence_epoch;
+                return;
+            }
+        } catch (...) {
+        }
+        vbr_frontier_logits.clear();
+        vbr_frontier_logits_token_digest = {};
+        vbr_frontier_logits_sequence_epoch = 0;
     }
 
     void prompt_clear_certified(
@@ -1537,6 +1619,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        vbr_frontier_logits_pending = false;
         if (retention_obs) {
             retention_obs->release_lineage_ticket(retention_reuse_source);
             retention_obs->release_lineage_ticket(retention_destination);
@@ -1750,6 +1833,11 @@ struct server_slot {
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
+        // Once the sampled token is decoded, the retained frontier advances
+        // and the previous terminal-logit capability no longer names it.
+        vbr_frontier_logits.clear();
+        vbr_frontier_logits_token_digest = {};
+        vbr_frontier_logits_sequence_epoch = 0;
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
@@ -1967,8 +2055,11 @@ struct server_slot {
 
         timings.prompt_n            = n_prompt_tokens_processed;
         timings.prompt_ms           = t_prompt_processing;
-        timings.prompt_per_token_ms = t_prompt_processing / n_prompt_tokens_processed;
-        timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        timings.prompt_per_token_ms = n_prompt_tokens_processed > 0
+            ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
+        timings.prompt_per_second   = n_prompt_tokens_processed > 0 &&
+                t_prompt_processing > 0.0
+            ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
 
         timings.predicted_n            = n_decoded;
         timings.predicted_ms           = t_token_generation;
@@ -2041,7 +2132,9 @@ struct server_slot {
     }
 
     void print_timings_pp() const {
-        const double n_prompt_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        const double n_prompt_second = n_prompt_tokens_processed > 0 &&
+                t_prompt_processing > 0.0
+            ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
         const double f_progress = (float) prompt.n_tokens() / task->n_tokens();
 
         if (t_prompt_processing < 3000.0) {
@@ -2053,8 +2146,11 @@ struct server_slot {
     }
 
     void print_timings() const {
-        const double t_prompt        =       t_prompt_processing / n_prompt_tokens_processed;
-        const double n_prompt_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        const double t_prompt = n_prompt_tokens_processed > 0
+            ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
+        const double n_prompt_second = n_prompt_tokens_processed > 0 &&
+                t_prompt_processing > 0.0
+            ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
 
         const double t_gen        =       t_token_generation / n_decoded;
         const double n_gen_second = 1e3 / t_token_generation * n_decoded;
@@ -9414,6 +9510,9 @@ private:
                 request.execution_identity = frontier_execution_identity;
                 request.adapter_config_identity = adapter_identity;
                 request.previously_observed = true;
+                request.frontier_logits = &slot.vbr_frontier_logits;
+                request.frontier_logits_count = uint32_t(
+                    llama_vocab_n_tokens(vocab));
                 request.publish_context = &state;
                 request.prepare_publish = [](
                     void * opaque,
@@ -9474,6 +9573,11 @@ private:
                 GGML_ASSERT(state.published);
                 prompt_cache->commit_vbr_occupied_replacement(
                     ticket, slot.prompt, slot.cache_family, slot.id);
+                slot.vbr_bind_frontier_logits_to_prompt();
+                SLT_DBG(slot,
+                        "restored frontier logits: count=%zu authenticated=%d\n",
+                        slot.vbr_frontier_logits.size(),
+                        slot.vbr_frontier_logits_matches());
                 vbr_automatic_restore_succeeded++;
                 vbr_automatic_restore_occupied_succeeded++;
                 const uint64_t delivered_payload_bytes =
@@ -9544,6 +9648,9 @@ private:
                 request.previously_observed = false;
                 request.draft_context = ctx_dft.get();
                 request.accelerator = slot.get_spec();
+                request.frontier_logits = &slot.vbr_frontier_logits;
+                request.frontier_logits_count = uint32_t(
+                    llama_vocab_n_tokens(vocab));
                 request.publish_context = &state;
                 request.prepare_publish = [](
                     void * opaque,
@@ -9619,6 +9726,11 @@ private:
             if (!committed) {
                 return false;
             }
+            slot.vbr_bind_frontier_logits_to_prompt();
+            SLT_DBG(slot,
+                    "restored frontier logits: count=%zu authenticated=%d\n",
+                    slot.vbr_frontier_logits.size(),
+                    slot.vbr_frontier_logits_matches());
             if (used_compact_fallback) {
                 vbr_automatic_restore_quality_fallbacks++;
             }
@@ -9769,6 +9881,10 @@ private:
             bool backend_sampling = true;
 
             backend_sampling &= task.params.sampling.backend_sampling;
+
+            // VBR exact-frontier reuse requires the complete raw vocabulary
+            // row. Backend sampling exposes only its selected/candidate tail.
+            backend_sampling &= !params_base.vbr_prompt_cache;
 
             // TODO: speculative decoding requires multiple samples per batch - not supported yet
             backend_sampling &= !(slot.can_speculate());
@@ -10083,6 +10199,121 @@ private:
                 });
             }
         }
+    }
+
+    void populate_token_probs_from_logits(
+            const server_slot & slot,
+            completion_token_output & result,
+            bool post_sampling,
+            bool special,
+            const std::vector<float> & logits) const {
+        const size_t n_probs_request = slot.task->params.sampling.n_probs;
+        if (post_sampling) {
+            const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
+            const size_t n_probs = std::min(cur_p->size, n_probs_request);
+            for (size_t i = 0; i < cur_p->size; ++i) {
+                if (cur_p->data[i].id == result.tok) {
+                    result.prob = cur_p->data[i].p;
+                    break;
+                }
+            }
+            result.probs.reserve(n_probs);
+            for (size_t i = 0; i < n_probs && cur_p->data[i].p != 0.0f; ++i) {
+                result.probs.push_back({
+                    cur_p->data[i].id,
+                    common_token_to_piece(ctx_tgt, cur_p->data[i].id, special),
+                    cur_p->data[i].p,
+                });
+            }
+            return;
+        }
+
+        auto cur = get_token_probabilities(
+            logits.data(), logits.size(), n_probs_request);
+        const size_t n_probs = std::min(cur.size(), n_probs_request);
+        for (const auto & item : cur) {
+            if (item.id == result.tok) {
+                result.prob = item.p;
+                break;
+            }
+        }
+        result.probs.reserve(n_probs);
+        for (size_t i = 0; i < n_probs; ++i) {
+            result.probs.push_back({
+                cur[i].id,
+                common_token_to_piece(ctx_tgt, cur[i].id, special),
+                cur[i].p,
+            });
+        }
+    }
+
+    void sample_vbr_frontier_logits(server_slot & slot) {
+        GGML_ASSERT(slot.state == SLOT_STATE_DONE_PROMPT);
+        GGML_ASSERT(slot.vbr_frontier_logits_pending);
+        GGML_ASSERT(slot.vbr_frontier_logits_matches());
+        GGML_ASSERT(slot.task && slot.task->need_sampling());
+
+        slot.vbr_frontier_logits_pending = false;
+        slot.state = SLOT_STATE_GENERATING;
+        if (slot.can_speculate()) {
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                llama_dflash_set_active_slot(ctx_tgt, slot.id);
+            }
+            if (slot.spec) {
+                common_speculative_begin(
+                    slot.get_spec(), slot.prompt.tokens.get_text_tokens());
+            } else if (spec) {
+                common_speculative_begin(
+                    spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+            }
+        }
+
+        llama_token id = LLAMA_TOKEN_NULL;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample_from_logits(
+                slot.smpl.get(), slot.vbr_frontier_logits.data(),
+                slot.vbr_frontier_logits.size());
+        }
+        if (id == LLAMA_TOKEN_NULL) {
+            throw std::runtime_error(
+                "authenticated frontier logits could not be sampled");
+        }
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        const int64_t t_now = ggml_time_us();
+        slot.n_decoded = 1;
+        slot.t_start_generation = t_now;
+        slot.t_print_last = t_now;
+        slot.n_decoded_last = 0;
+        slot.t_prompt_processing =
+            (slot.t_start_generation - slot.t_start_process_prompt)/1e3;
+        metrics.on_prompt_eval(slot);
+        cache_plan_finalize(slot);
+        slot.t_token_generation = 0.001;
+
+        completion_token_output result;
+        result.tok = id;
+        const bool special = params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(id) !=
+                slot.task->params.sampling.preserved_tokens.end();
+        result.text_to_send = common_token_to_piece(ctx_tgt, id, special);
+        result.prob = 1.0f;
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs_from_logits(
+                slot, result, slot.task->params.post_sampling_probs,
+                params_base.special, slot.vbr_frontier_logits);
+        }
+
+        vbr_frontier_logits_sampled_cycle = true;
+        if (!process_token(result, slot)) {
+            slot.print_timings();
+            send_final_response(slot);
+            metrics.on_prediction(slot);
+            slot.release();
+            return;
+        }
+        slot.print_timings_tg();
     }
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
@@ -10772,6 +11003,10 @@ private:
                 slot, request.identity, request.token_block, status)) {
             return false;
         }
+        // The first durable capture mints a nonzero sequence epoch. A raw
+        // frontier row retained at generation stop may therefore still be
+        // bound to epoch zero even though its token digest is exact.
+        slot.vbr_bind_frontier_logits_to_prompt();
         request.sequence = slot.id;
         request.frontier.execution_identity =
             request.identity.execution_identity.data();
@@ -10894,6 +11129,47 @@ private:
                 request.companions.push_back(accelerator);
             }
         }
+        vbr_explicit_companion_provider frontier_logits;
+        frontier_logits.kind = vbr_artifact_companion_kind::frontier_logits;
+        frontier_logits.build_identity_digest =
+            server_cache_capture_build_digest(
+                "buun.vbr.frontier-logits-codec/v1");
+        frontier_logits.domain = pageable_domain;
+        frontier_logits.required = false;
+        frontier_logits.context = &slot;
+        frontier_logits.size = [](
+                const void * context,
+                llama_seq_id,
+                uint64_t & output) noexcept {
+            const auto * owner = static_cast<const server_slot *>(context);
+            if (!owner || !owner->vbr_frontier_logits_matches() ||
+                owner->vbr_frontier_logits.size() >
+                    UINT64_MAX/sizeof(float)) {
+                output = 0;
+                return false;
+            }
+            output = uint64_t(owner->vbr_frontier_logits.size())*sizeof(float);
+            return output != 0;
+        };
+        frontier_logits.capture = [](
+                const void * context,
+                llama_seq_id,
+                std::vector<uint8_t> & output) noexcept {
+            try {
+                const auto * owner = static_cast<const server_slot *>(context);
+                if (!owner || !owner->vbr_frontier_logits_matches()) {
+                    return false;
+                }
+                output.resize(owner->vbr_frontier_logits.size()*sizeof(float));
+                std::memcpy(output.data(), owner->vbr_frontier_logits.data(),
+                            output.size());
+                return !output.empty();
+            } catch (...) {
+                output.clear();
+                return false;
+            }
+        };
+        request.companions.push_back(frontier_logits);
         status = server_vbr_artifact_capture_status::ok;
         return true;
     }
@@ -12009,6 +12285,11 @@ private:
                 // consume each already-admitted live alias without another
                 // fallible operation in between.
                 llama_memory_clear(memory, false);
+                // Publish an immediately importable empty frontier. Without
+                // this settle, the next idle tick eventually shrinks the VBR
+                // watermarks, but a request arriving first sees the old
+                // mapped frontier as target_not_empty and cold-prefills.
+                llama_memory_breathe(memory);
                 for (auto * live : reclaim) {
                     const bool cleared =
                         live->prompt_clear_after_vbr_publication();
@@ -13132,6 +13413,7 @@ private:
     // Target-side argmax for one pure-greedy DFlash verify batch.
     bool dflash_target_argmax_active = false;
     llama_seq_id dflash_target_argmax_slot = -1;
+    bool vbr_frontier_logits_sampled_cycle = false;
     // target can replay the tape losslessly on GPU after a partial accept; when false,
     // no tape is recorded and rollback re-decodes the accepted tokens instead
     bool dflash_tape_ok = false;
@@ -13219,7 +13501,7 @@ private:
         if (batch.size() == 0) {
             const bool has_diff_gen = std::any_of(slots.begin(), slots.end(),
                 [](const server_slot & s) { return s.diff_self_spec && s.state == SLOT_STATE_GENERATING; });
-            if (!has_diff_gen) {
+            if (!has_diff_gen && !vbr_frontier_logits_sampled_cycle) {
                 SRV_WRN("%s", "no tokens to decode\n");
                 if (++n_empty_consecutive > 3) {
                     GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
@@ -13305,6 +13587,7 @@ private:
     }
 
     void pre_decode() {
+        vbr_frontier_logits_sampled_cycle = false;
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -14639,21 +14922,32 @@ private:
 
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
-                            // The last token must really be re-evaluated for logits; preserving it
-                            // only in token bookkeeping would skip that decode.
-                            n_past_keep = std::min(n_past_keep, (size_t) n_past);
-                            SLT_WRN(slot, "n_past was set to %d\n", n_past);
-                            if (server_cache_plan_live_replay_lost_to_logits(
-                                    slot.cache_plan_execution, n_past)) {
-                                // A one-token exact hit becomes cold so logits
-                                // can be produced. The live plan was superseded,
-                                // not internally failed.
-                                cache_plan_fallback_legacy(
-                                    slot,
-                                    common_cache_plan_authority_fallback::
-                                        stale_capability);
+                            const bool cached_frontier_logits =
+                                slot.task->need_sampling() &&
+                                !slot.diff_self_spec &&
+                                slot.vbr_frontier_logits_matches();
+                            if (cached_frontier_logits) {
+                                slot.vbr_frontier_logits_pending = true;
+                                SLT_INF(slot,
+                                    "using authenticated frontier logits for exact prompt hit (n_past = %d)\n",
+                                    n_past);
+                            } else {
+                                SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                                n_past--;
+                                // The last token must really be re-evaluated for logits; preserving it
+                                // only in token bookkeeping would skip that decode.
+                                n_past_keep = std::min(n_past_keep, (size_t) n_past);
+                                SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                                if (server_cache_plan_live_replay_lost_to_logits(
+                                        slot.cache_plan_execution, n_past)) {
+                                    // A one-token exact hit becomes cold so logits
+                                    // can be produced. The live plan was superseded,
+                                    // not internally failed.
+                                    cache_plan_fallback_legacy(
+                                        slot,
+                                        common_cache_plan_authority_fallback::
+                                            stale_capability);
+                                }
                             }
                         }
 
@@ -14961,13 +15255,16 @@ private:
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
-                        GGML_ASSERT(batch.size() > 0);
-
-                        // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
-
                         slot.n_decoded = 0;
-                        slot.i_batch   = batch.size() - 1;
+                        if (slot.vbr_frontier_logits_pending) {
+                            slot.i_batch = -1;
+                        } else {
+                            GGML_ASSERT(batch.size() > 0);
+
+                            // extract the logits only for the last token
+                            batch.set_output(batch.size() - 1, true);
+                            slot.i_batch = batch.size() - 1;
+                        }
 
                         slot.init_sampler();
                     } else {
@@ -15495,6 +15792,17 @@ private:
             });
         }
 
+        // An exact VBR hit can finish prompt processing without adding a token
+        // to the decode batch. Sample its authenticated terminal row through
+        // the ordinary sampler/token pipeline before speculative post-cycle
+        // work begins.
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_DONE_PROMPT &&
+                slot.vbr_frontier_logits_pending) {
+                sample_vbr_frontier_logits(slot);
+            }
+        }
+
         // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback).
         // The state stays enabled across consecutive speculative cycles and is disabled by the
         // next pre-decode batch that does not need rollback.
@@ -15537,6 +15845,7 @@ private:
         if (params_base.n_parallel == 1 &&
             params_base.split_mode != LLAMA_SPLIT_MODE_TENSOR &&
             spec_type_target_argmax &&
+            !params_base.vbr_prompt_cache &&
             !params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE)) {
             server_slot * verify_slot = nullptr;
             for (auto & slot : slots) {
@@ -15996,6 +16305,13 @@ private:
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
+                if (params_base.vbr_prompt_cache) {
+                    SLT_DBG(slot,
+                            "frontier logits capture at output %d: %s\n",
+                            tok_idx,
+                            slot.vbr_capture_frontier_logits(tok_idx)
+                                ? "retained" : "unavailable");
+                }
                 slot.print_timings();
                 send_final_response(slot);
                 metrics.on_prediction(slot);
@@ -16103,6 +16419,11 @@ private:
                     slot.smpl.get(), ctx_tgt,
                     slot.spec_i_batch, slot.spec_draft);
             }
+
+            // Keep the small output-index table until token stop handling has
+            // had a chance to retain the exact terminal vocabulary row.
+            const std::vector<int32_t> verified_output_rows =
+                slot.spec_i_batch;
 
 
             // update DFlash hidden state ring + CopySpec prompt window with accepted tokens.
@@ -16287,6 +16608,11 @@ private:
                 slot.n_decoded += 1;
 
                 if (!process_token(result, slot)) {
+                    if (params_base.vbr_prompt_cache &&
+                        i < verified_output_rows.size()) {
+                        (void) slot.vbr_capture_frontier_logits(
+                            verified_output_rows[i]);
+                    }
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);

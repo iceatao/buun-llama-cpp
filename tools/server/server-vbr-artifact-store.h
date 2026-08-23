@@ -319,6 +319,8 @@ struct server_vbr_artifact_import_target {
     // as target KV state.
     llama_context * draft_context = nullptr;
     common_speculative * accelerator = nullptr;
+    std::vector<float> * frontier_logits = nullptr;
+    uint32_t frontier_logits_count = 0;
     void * publish_context = nullptr;
     prepare_publish_fn prepare_publish = nullptr;
     publish_fn publish = nullptr;

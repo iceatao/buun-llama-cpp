@@ -192,6 +192,89 @@ public:
     }
 };
 
+struct server_vbr_frontier_logits_target {
+    std::vector<float> * logits = nullptr;
+    uint32_t count = 0;
+    bool replace = false;
+};
+
+class server_vbr_frontier_logits_image final : public vbr_prepared_companion_image {
+public:
+    server_vbr_frontier_logits_target target;
+    std::vector<float> prepared;
+    std::vector<float> original;
+
+    static bool empty(const void * opaque) noexcept {
+        const auto * target =
+            static_cast<const server_vbr_frontier_logits_target *>(opaque);
+        return target && target->logits && target->count > 0 &&
+            (target->replace || target->logits->empty());
+    }
+    static bool prepare(
+            const void * opaque,
+            std::unique_ptr<vbr_parsed_companion_image> parsed_base,
+            llama_seq_id,
+            std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+        try {
+            output.reset();
+            const auto * target =
+                static_cast<const server_vbr_frontier_logits_target *>(opaque);
+            auto * parsed = dynamic_cast<server_vbr_parsed_bytes *>(parsed_base.get());
+            const uint64_t expected_bytes = target
+                ? uint64_t(target->count)*sizeof(float) : 0;
+            if (!target || !target->logits || target->count == 0 ||
+                !parsed || parsed->companion_kind !=
+                    vbr_artifact_companion_kind::frontier_logits ||
+                parsed->bytes.size() != expected_bytes || !empty(opaque)) {
+                return false;
+            }
+            auto image = std::make_unique<server_vbr_frontier_logits_image>();
+            image->target = *target;
+            image->original = *target->logits;
+            image->prepared.resize(target->count);
+            std::memcpy(image->prepared.data(), parsed->bytes.data(),
+                        parsed->bytes.size());
+            output = std::move(image);
+            return true;
+        } catch (...) {
+            output.reset();
+            return false;
+        }
+    }
+    static bool recheck(
+            const void * opaque,
+            const vbr_prepared_companion_image & base) noexcept {
+        const auto * target =
+            static_cast<const server_vbr_frontier_logits_target *>(opaque);
+        const auto & image =
+            static_cast<const server_vbr_frontier_logits_image &>(base);
+        return target && target->logits == image.target.logits &&
+            target->count == image.target.count &&
+            target->replace == image.target.replace &&
+            image.prepared.size() == target->count && empty(opaque) &&
+            *target->logits == image.original;
+    }
+    static void publish(
+            const void * opaque,
+            vbr_prepared_companion_image & base) noexcept {
+        const auto * target =
+            static_cast<const server_vbr_frontier_logits_target *>(opaque);
+        auto & image = static_cast<server_vbr_frontier_logits_image &>(base);
+        GGML_ASSERT(target && target->logits);
+        target->logits->swap(image.prepared);
+    }
+    static bool rollback(
+            const void * opaque,
+            vbr_prepared_companion_image & base) noexcept {
+        const auto * target =
+            static_cast<const server_vbr_frontier_logits_target *>(opaque);
+        const auto & image =
+            static_cast<const server_vbr_frontier_logits_image &>(base);
+        return target && target->logits &&
+            *target->logits == image.original;
+    }
+};
+
 bool capture_capacity_category_applies(
         llama_cache_acct_category category,
         const llama_cache_acct_resource_domain & domain,
@@ -382,7 +465,9 @@ bool import_parse_companion(
             (descriptor.kind !=
                  vbr_artifact_companion_kind::required_spec_payload &&
              descriptor.kind !=
-                 vbr_artifact_companion_kind::typed_accelerator)) {
+                 vbr_artifact_companion_kind::typed_accelerator &&
+             descriptor.kind !=
+                 vbr_artifact_companion_kind::frontier_logits)) {
             return false;
         }
         auto parsed = std::make_unique<server_vbr_parsed_bytes>();
@@ -2434,6 +2519,22 @@ server_vbr_artifact_store::complete_validated_import(
             provider.rollback = server_vbr_accelerator_image::rollback;
             hooks.companions.push_back(provider);
         }
+        server_vbr_frontier_logits_target frontier_logits_target {
+            request.frontier_logits, request.frontier_logits_count,
+            request.previously_observed,
+        };
+        if (request.frontier_logits && request.frontier_logits_count > 0) {
+            vbr_companion_adoption_provider provider;
+            provider.kind = vbr_artifact_companion_kind::frontier_logits;
+            provider.target_cookie = request.frontier_logits;
+            provider.context = &frontier_logits_target;
+            provider.prepare = server_vbr_frontier_logits_image::prepare;
+            provider.target_empty = server_vbr_frontier_logits_image::empty;
+            provider.recheck = server_vbr_frontier_logits_image::recheck;
+            provider.publish_swap = server_vbr_frontier_logits_image::publish;
+            provider.rollback = server_vbr_frontier_logits_image::rollback;
+            hooks.companions.push_back(provider);
+        }
         const auto adopted = vbr_adopt_empty_manifest(
             *request.memory, request.destination,
             std::move(*staged.manifest), std::move(*staged.staged),
@@ -2683,6 +2784,15 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
                     "buun.vbr.accelerator-ring-codec/v1"),
                 common_speculative_ring_state_empty(request.accelerator),
                 request.accelerator,
+            });
+        }
+        if (request.frontier_logits && request.frontier_logits_count > 0) {
+            context.snapshot.companions.push_back({
+                vbr_artifact_companion_kind::frontier_logits, 1,
+                companion_build_digest(
+                    "buun.vbr.frontier-logits-codec/v1"),
+                request.previously_observed || request.frontier_logits->empty(),
+                request.frontier_logits,
             });
         }
         if (snapshot_status ==

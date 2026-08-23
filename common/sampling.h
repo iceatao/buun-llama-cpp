@@ -66,6 +66,15 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// Sample from one complete raw vocabulary-logit row without requiring a
+// llama_context output slot. This is used by authenticated prompt-cache
+// frontiers whose KV state and terminal logits were restored together.
+llama_token common_sampler_sample_from_logits(
+        struct common_sampler * gsmpl,
+        const float * logits,
+        size_t n_logits,
+        bool grammar_first = false);
+
 // True when the sampler initialized for this request is exactly equivalent to
 // selecting the token with the largest unmodified model logit.
 bool common_sampler_raw_argmax_exact(const struct common_sampler * gsmpl);

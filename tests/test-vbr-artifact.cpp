@@ -1095,6 +1095,23 @@ static void test_companion_payload() {
         llama_cache_acct_attr_kind::artifact,
     });
 
+    memory_source frontier_logits {{ 0x00, 0x00, 0x80, 0x3f,
+                                     0x00, 0x00, 0x00, 0xbf }};
+    vbr_artifact_companion_payload frontier = companion;
+    frontier.kind = vbr_artifact_companion_kind::frontier_logits;
+    frontier.format_version = 1;
+    frontier.build_identity_digest = marker(0x92);
+    frontier.payload_bytes = frontier_logits.bytes.size();
+    frontier.payload = frontier_logits.source();
+    package.companions.push_back(frontier);
+    package.manifest.accounting.push_back({
+        vbr_artifact_accounting_role::typed_accelerator_payload,
+        frontier.domain,
+        frontier.payload_bytes,
+        frontier.payload_bytes,
+        llama_cache_acct_attr_kind::artifact,
+    });
+
     std::vector<uint8_t> encoded;
     CHECK(vbr_artifact_encode_vector(
               package, encoded, 1024*1024) ==
@@ -1103,11 +1120,15 @@ static void test_companion_payload() {
     CHECK(vbr_artifact_decode_vector(
               encoded, limits(1024*1024), decoded) ==
           vbr_artifact_status::ok);
-    CHECK(decoded.companions.size() == 1);
-    CHECK(decoded.manifest.companions.size() == 1);
+    CHECK(decoded.companions.size() == 2);
+    CHECK(decoded.manifest.companions.size() == 2);
     CHECK(decoded.companions[0].domain == companion.domain);
     CHECK(decoded.companions[0].payload_digest ==
           decoded.manifest.companions[0].payload_digest);
+    CHECK(decoded.companions[1].kind ==
+          vbr_artifact_companion_kind::frontier_logits);
+    CHECK(decoded.companions[1].payload_digest ==
+          decoded.manifest.companions[1].payload_digest);
 }
 
 struct discard_writer {
