@@ -123,6 +123,9 @@ struct live_import_context {
     const vbr_artifact_package_view * package = nullptr;
     const std::vector<llama_vbr_artifact_domain_binding> * bindings = nullptr;
     const vbr_import_schedule_quote * schedule_quote = nullptr;
+    const void * representation_context = nullptr;
+    vbr_explicit_capture_request::representation_identity_fn
+        representation_identity = nullptr;
     llama_seq_id destination = -1;
     vbr_target_validation_snapshot snapshot;
 };
@@ -180,7 +183,8 @@ bool import_transform_digest(
     return vbr_explicit_import_transform_projection_recheck(
             *context->memory, context->destination,
             *context->package, *context->bindings,
-            *context->schedule_quote, output);
+            *context->schedule_quote, context->representation_context,
+            context->representation_identity, output);
 }
 
 bool import_parse_companion(
@@ -369,7 +373,6 @@ struct server_vbr_artifact_store::impl {
     size_t import_chunk_bytes = 0;
     void * budget_context = nullptr;
     server_vbr_artifact_store_config::sample_budget_fn sample_budget = nullptr;
-    int turbo_meansub_id = 0;
     server_vbr_artifact_store_counters counters;
     uint64_t nonce = 0;
     uint64_t next_reference = 1;
@@ -1373,7 +1376,6 @@ server_vbr_artifact_store::create(
         state->import_chunk_bytes = config.chunk_bytes;
         state->budget_context = config.budget_context;
         state->sample_budget = config.sample_budget;
-        state->turbo_meansub_id = config.turbo_meansub_id;
         state->n_attention_children = config.attention_children;
         if (!state->catalog.bind_topologies(
                 config.topologies, state->domain_bindings)) {
@@ -1548,7 +1550,6 @@ server_vbr_artifact_capture_output server_vbr_artifact_store::capture(
         const char * build_identity = llama_commit();
         const vbr_explicit_representation_policy representation_policy {
             build_identity, strlen(build_identity),
-            impl_->turbo_meansub_id,
         };
         request.representation_context = &representation_policy;
         request.representation_identity =
@@ -1840,7 +1841,6 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         const char * build_identity = llama_commit();
         const vbr_explicit_representation_policy representation_policy {
             build_identity, strlen(build_identity),
-            impl_->turbo_meansub_id,
         };
         request.representation_context = &representation_policy;
         request.representation_identity =
@@ -2212,19 +2212,28 @@ server_vbr_artifact_store::import_host_prefix_payload(
                         impl_->counters.imports_unavailable);
         }
         const auto accounting_snapshot = impl_->ledger->snapshot();
+        const char * build_identity = llama_commit();
+        const vbr_explicit_representation_policy representation_policy {
+            build_identity, strlen(build_identity),
+        };
         live_import_context context;
         context.memory = request.memory;
         context.ledger = impl_->ledger;
         context.package = &payload->package();
         context.bindings = &impl_->domain_bindings;
         context.destination = request.destination;
+        context.representation_context = &representation_policy;
+        context.representation_identity =
+            vbr_explicit_capture_representation_identity;
         // The first projected-import slice is exact-representation only. The
         // legacy snapshot door therefore supplies the canonical empty target
         // geometry while refusing any destination that would need retiering.
         if (!vbr_explicit_import_target_snapshot(
                 *request.memory, request.destination, payload->package(),
                 impl_->domain_bindings, request.previously_observed,
-                accounting_snapshot.serial, context.snapshot, nullptr,
+                accounting_snapshot.serial, &representation_policy,
+                vbr_explicit_capture_representation_identity,
+                context.snapshot, nullptr,
                 nullptr)) {
             output.validation_status =
                 vbr_manifest_validation_status::unavailable;
@@ -2312,12 +2321,19 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
                         impl_->counters.imports_unavailable);
         }
         const auto accounting_snapshot = impl_->ledger->snapshot();
+        const char * build_identity = llama_commit();
+        const vbr_explicit_representation_policy representation_policy {
+            build_identity, strlen(build_identity),
+        };
         live_import_context context;
         context.memory = request.memory;
         context.ledger = impl_->ledger;
         context.package = &package;
         context.bindings = &impl_->domain_bindings;
         context.destination = request.destination;
+        context.representation_context = &representation_policy;
+        context.representation_identity =
+            vbr_explicit_capture_representation_identity;
         vbr_downward_policy_projection downward_projection;
         bool downward = false;
         vbr_import_schedule_quote schedule_quote;
@@ -2325,7 +2341,9 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package(
             vbr_explicit_import_target_schedule_snapshot(
                 *request.memory, request.destination, package,
                 impl_->domain_bindings, request.previously_observed,
-                accounting_snapshot.serial, context.snapshot,
+                accounting_snapshot.serial, &representation_policy,
+                vbr_explicit_capture_representation_identity,
+                context.snapshot,
                 downward_projection, downward, schedule_quote);
         if (snapshot_status ==
                 vbr_import_target_snapshot_status::unavailable) {

@@ -87,9 +87,10 @@ enum class vbr_import_transform_kind : uint8_t {
     none = 0,
     downward,
     upward_same_domain,
+    upward_cross_domain,
     _count,
 };
-static_assert(uint8_t(vbr_import_transform_kind::_count) == 3);
+static_assert(uint8_t(vbr_import_transform_kind::_count) == 4);
 
 const char * vbr_import_schedule_status_name(
     vbr_import_schedule_status status) noexcept;
@@ -217,6 +218,9 @@ struct vbr_target_unit_snapshot {
     std::array<uint8_t, 32> codebook_digest = {};
     std::array<uint8_t, 32> rotation_digest = {};
     std::array<uint8_t, 32> meansub_digest = {};
+    int32_t meansub_model_id = -1;
+    int32_t meansub_layer = -1;
+    bool meansub_baked = false;
     uint32_t n_stream = 0;
     bool unified = false;
     bool v_trans = false;
@@ -253,6 +257,8 @@ struct vbr_target_unit_snapshot {
     uint64_t upward_codec_workspace_bytes = 0;
     vbr_upward_recipe upward_recipe;
     int32_t upward_meansub_model_id = -1;
+    vbr_upward_representation_identity upward_source_identity;
+    vbr_upward_representation_identity upward_target_identity;
 };
 
 struct vbr_target_child_snapshot {
@@ -407,6 +413,7 @@ struct vbr_target_empty_fingerprint {
 
 enum class vbr_validated_stash_action : uint8_t {
     restore_exact = 0,
+    consume_exact_then_drop,
     omit_live_rebased,
     none_at_source,
     _count,
@@ -462,6 +469,8 @@ struct vbr_validated_child_plan {
     std::array<uint8_t, 32> transcode_policy_digest = {};
     std::array<uint8_t, 32> transcode_tree_digest = {};
     int32_t transcode_meansub_model_id = -1;
+    vbr_upward_representation_identity transcode_source_identity;
+    vbr_upward_representation_identity transcode_target_identity;
     uint64_t target_controller_cursor = 0;
     vbr_import_transform_kind transform_kind =
         vbr_import_transform_kind::none;

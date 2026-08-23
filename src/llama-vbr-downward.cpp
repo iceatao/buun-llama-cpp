@@ -544,8 +544,6 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
             // backend), but reserve_resources ends in a physical reserve whose
             // backend assert would abort AFTER the C row committed.
             if (workspace.owner == nullptr || workspace.iface == nullptr ||
-                workspace.iface->kv_transcode_workspace_memory == nullptr ||
-                workspace.iface->kv_transcode_workspace_reserve == nullptr ||
                 workspace.backend == nullptr ||
                 workspace.device < 0 || workspace.requests.empty()) {
                 out.status = vbr_downward_reserve_status::projection_unavailable;
@@ -562,9 +560,20 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
                         uint64_t & current, uint64_t & reserved) {
                     size_t c = 0;
                     size_t r = 0;
-                    if (!workspace.iface->kv_transcode_workspace_memory(
-                            workspace.backend, workspace.device, request.n_cells,
-                            request.ne0, request.stash_rows, &c, &r)) {
+                    const ggml_vbr_transcode_workspace_params_v2 v2 = {
+                        request.n_cells, request.ne0,
+                        request.stash_rows, request.mean_addback,
+                    };
+                    const bool projected = request.mean_addback
+                        ? workspace.cross_iface != nullptr &&
+                          workspace.cross_iface->kv_transcode_workspace_memory_v2 != nullptr &&
+                          workspace.cross_iface->kv_transcode_workspace_memory_v2(
+                              workspace.backend, workspace.device, &v2, &c, &r)
+                        : workspace.iface->kv_transcode_workspace_memory != nullptr &&
+                          workspace.iface->kv_transcode_workspace_memory(
+                              workspace.backend, workspace.device, request.n_cells,
+                              request.ne0, request.stash_rows, &c, &r);
+                    if (!projected) {
                         return false;
                     }
                     current = c;
@@ -655,9 +664,20 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
         for (const auto & reservation : workspace_reservations) {
             const auto & workspace = *reservation.endpoint;
             const auto & request = reservation.request;
-            if (!workspace.iface->kv_transcode_workspace_reserve(
-                    workspace.backend, request.n_cells, request.ne0,
-                    request.stash_rows)) {
+            const ggml_vbr_transcode_workspace_params_v2 v2 = {
+                request.n_cells, request.ne0,
+                request.stash_rows, request.mean_addback,
+            };
+            const bool reserved = request.mean_addback
+                ? workspace.cross_iface != nullptr &&
+                  workspace.cross_iface->kv_transcode_workspace_reserve_v2 != nullptr &&
+                  workspace.cross_iface->kv_transcode_workspace_reserve_v2(
+                      workspace.backend, &v2)
+                : workspace.iface->kv_transcode_workspace_reserve != nullptr &&
+                  workspace.iface->kv_transcode_workspace_reserve(
+                      workspace.backend, request.n_cells, request.ne0,
+                      request.stash_rows);
+            if (!reserved) {
                 out.status = vbr_downward_reserve_status::workspace_reserve_failed;
                 return out;
             }

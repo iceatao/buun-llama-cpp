@@ -5713,10 +5713,24 @@ const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
     return &iface;
 }
 
+const ggml_vbr_cross_domain_iface_v1 * ggml_backend_cuda_vbr_cross_domain_iface_v1(void) {
+    static const ggml_vbr_cross_domain_iface_v1 iface = {
+        /* .abi_version = */ GGML_VBR_CROSS_DOMAIN_IFACE_V1_VERSION,
+        /* .struct_size = */ sizeof(ggml_vbr_cross_domain_iface_v1),
+        /* .kv_cross_domain_reconstruct = */ ggml_backend_cuda_kv_cross_domain_reconstruct,
+        /* .kv_transcode_workspace_memory_v2 = */ ggml_backend_cuda_kv_transcode_workspace_memory_v2,
+        /* .kv_transcode_workspace_reserve_v2 = */ ggml_backend_cuda_kv_transcode_workspace_reserve_v2,
+    };
+    return &iface;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, GGML_VBR_BACKEND_IFACE_PROC) == 0) {
         return (void *)ggml_backend_cuda_vbr_iface;
+    }
+    if (strcmp(name, GGML_VBR_CROSS_DOMAIN_IFACE_V1_PROC) == 0) {
+        return (void *)ggml_backend_cuda_vbr_cross_domain_iface_v1;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

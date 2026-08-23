@@ -24,7 +24,6 @@
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
 #include "../../src/llama-context.h"
-#include "../../src/llama-model.h" // hparams.turbo_meansub_id for the capture identity digest
 #include "../../src/llama-sha256.h"
 #include "log.h"
 #include "sampling.h"
@@ -7098,8 +7097,6 @@ private:
                     VBR_CAPTURE_PINNED_RING_MAX_BYTES,
                     std::max<uint64_t>(RING_FLOOR, lane_floor));
                 config.chunk_bytes = RING_CHUNK;
-                config.turbo_meansub_id =
-                    ctx_tgt->get_model().hparams.turbo_meansub_id;
                 config.budget_context = cache_authority.get();
                 config.sample_budget = [](
                         void * context,

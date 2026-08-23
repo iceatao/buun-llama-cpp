@@ -12,12 +12,17 @@
 // Internal Phase-2 VBR artifact format. This is intentionally not part of public llama.h:
 // F2.1 defines only immutable value types and a fail-closed streaming codec.
 constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_MIN = 1;
-constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION = 2;
+constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION = 3;
 constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT = 2;
+constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_MEANSUB_REFERENCE = 3;
 constexpr uint32_t VBR_ARTIFACT_TOKEN_BLOCK_CODEC_VERSION = 1;
 
 constexpr bool artifact_has_reference_placement(uint32_t version) {
     return version >= VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT;
+}
+
+constexpr bool artifact_has_meansub_reference(uint32_t version) {
+    return version >= VBR_UNIT_ARTIFACT_FORMAT_VERSION_MEANSUB_REFERENCE;
 }
 
 struct vbr_unit_version_id_tag;
@@ -308,6 +313,15 @@ struct vbr_artifact_unit_descriptor {
     std::array<uint8_t, 32> codebook_digest = {};
     std::array<uint8_t, 32> rotation_digest = {};
     std::array<uint8_t, 32> meansub_digest = {};
+    // Exact calibrated row used when this unit was captured.  The full-table
+    // digest above authenticates bytes; this pair prevents a shared-KV layer
+    // mapping from silently selecting a different row during mean add-back.
+    int32_t meansub_model_id = -1;
+    int32_t meansub_layer = -1;
+    // Cross-domain reconstruction is intentionally limited to immutable baked
+    // tables. Override/off/inactive identities remain valid for exact and
+    // same-domain use, but are never executable mean-add evidence.
+    bool meansub_baked = false;
     std::vector<vbr_artifact_shard_descriptor> shards;
     vbr_artifact_clean_stash_state clean_stash_state =
         vbr_artifact_clean_stash_state::absent_at_source;

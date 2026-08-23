@@ -28,9 +28,14 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 // through ggml_backend_cuda_vbr_iface (resolved via GGML_VBR_BACKEND_IFACE_PROC), never
 // by direct link.
 GGML_BACKEND_API const struct ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void);
+GGML_BACKEND_API const struct ggml_vbr_cross_domain_iface_v1 *
+    ggml_backend_cuda_vbr_cross_domain_iface_v1(void);
 
 GGML_BACKEND_API void ggml_backend_cuda_kv_transcode(ggml_backend_t backend,
                                                      const struct ggml_vbr_transcode_params * params);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_cross_domain_reconstruct(
+        ggml_backend_t backend,
+        const struct ggml_vbr_cross_domain_reconstruct_params * params);
 GGML_BACKEND_API void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const struct ggml_tensor * src,
                                                          void * stash_f16, int64_t n_rows, bool is_v);
 GGML_BACKEND_API void ggml_backend_cuda_sync_device(int device);
@@ -83,6 +88,13 @@ GGML_BACKEND_API bool ggml_backend_cuda_kv_transcode_workspace_memory(
         size_t * physical_now, size_t * physical_if_reserved);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_transcode_workspace_reserve(
         ggml_backend_t backend, int64_t n_cells, int64_t ne0, int64_t stash_rows);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_transcode_workspace_memory_v2(
+        ggml_backend_t backend_or_null, int device,
+        const struct ggml_vbr_transcode_workspace_params_v2 * params,
+        size_t * physical_now, size_t * physical_if_reserved);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_transcode_workspace_reserve_v2(
+        ggml_backend_t backend,
+        const struct ggml_vbr_transcode_workspace_params_v2 * params);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);

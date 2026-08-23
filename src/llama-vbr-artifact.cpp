@@ -303,6 +303,7 @@ bool emit_shard_descriptor(
 bool emit_unit_descriptor_body(
         emitter & out,
         const vbr_artifact_unit_descriptor & descriptor,
+        uint32_t format_version,
         bool include_child_id = true) {
     if ((include_child_id && !out.u32(descriptor.child_id)) ||
         !out.i32(descriptor.current_type) ||
@@ -334,6 +335,10 @@ bool emit_unit_descriptor_body(
         !out.array_digest(descriptor.codebook_digest) ||
         !out.array_digest(descriptor.rotation_digest) ||
         !out.array_digest(descriptor.meansub_digest) ||
+        (artifact_has_meansub_reference(format_version) &&
+         (!out.i32(descriptor.meansub_model_id) ||
+          !out.i32(descriptor.meansub_layer) ||
+          !out.u32(descriptor.meansub_baked ? 1 : 0))) ||
         !out.u32(uint32_t(descriptor.shards.size()))) {
         return false;
     }
@@ -384,11 +389,13 @@ bool hash_sized(
 
 bool hash_sized_descriptor(
         llama_sha256_writer & hash,
-        const vbr_artifact_unit_descriptor & descriptor) {
+        const vbr_artifact_unit_descriptor & descriptor,
+        uint32_t format_version) {
     return hash_sized(
         hash, descriptor,
-        [](emitter & out, const vbr_artifact_unit_descriptor & value) {
-            return emit_unit_descriptor_body(out, value, false);
+        [format_version](emitter & out, const vbr_artifact_unit_descriptor & value) {
+            return emit_unit_descriptor_body(
+                out, value, format_version, false);
         });
 }
 
@@ -581,6 +588,7 @@ bool shard_metadata_valid(
 bool descriptor_metadata_valid(
         const vbr_artifact_unit_descriptor & descriptor,
         const std::vector<vbr_artifact_portable_topology> & topologies,
+        uint32_t format_version,
         bool require_source,
         bool allow_sparse_rows = false) {
     const bool current_type_supported =
@@ -620,7 +628,13 @@ bool descriptor_metadata_valid(
         descriptor.row_alignment == 0 ||
         descriptor.row_codec_version == 0 ||
         descriptor.shards.empty() ||
-        descriptor.clean_stash_state >= vbr_artifact_clean_stash_state::_count) {
+        descriptor.clean_stash_state >= vbr_artifact_clean_stash_state::_count ||
+        (artifact_has_meansub_reference(format_version)
+             ? (descriptor.meansub_model_id < 0 ||
+                descriptor.meansub_layer < 0)
+             : (descriptor.meansub_model_id != -1 ||
+                descriptor.meansub_layer != -1 ||
+                descriptor.meansub_baked))) {
         return false;
     }
     for (uint32_t i = 0; i < descriptor.rank; ++i) {
@@ -781,7 +795,7 @@ bool prepare_unit_id(vbr_artifact_unit_blob & blob, uint32_t format_version) {
     }
     hash.u32(descriptor.logical_unit_id);
     hash.u64(descriptor.repr_gen);
-    if (!hash_sized_descriptor(hash, descriptor)) {
+    if (!hash_sized_descriptor(hash, descriptor, format_version)) {
         return false;
     }
     hash.u32(uint32_t(descriptor.shards.size()));
@@ -1545,7 +1559,8 @@ bool package_metadata_valid(
             !blob.payload_digest.valid() ||
             !ids.insert(blob.unit_version_id.bytes()).second ||
             !descriptor_metadata_valid(
-                blob.descriptor, package.topologies, require_sources,
+                blob.descriptor, package.topologies, package.version,
+                require_sources,
                 allow_sparse_rows) ||
             (limits &&
              (blob.descriptor.shards.size() >
@@ -1703,14 +1718,15 @@ bool emit_topology_section(emitter & out, const vbr_artifact_package & package) 
 
 bool emit_unit_section(
         emitter & out,
-        const vbr_artifact_unit_blob & blob) {
+        const vbr_artifact_unit_blob & blob,
+        uint32_t format_version) {
     const auto & descriptor = blob.descriptor;
     if (!out.digest(blob.unit_version_id) ||
         !out.digest(blob.payload_digest) ||
         !emit_lineage(out, descriptor.lineage_uuid) ||
         !out.u32(descriptor.logical_unit_id) ||
         !out.u64(descriptor.repr_gen) ||
-        !emit_unit_descriptor_body(out, descriptor) ||
+        !emit_unit_descriptor_body(out, descriptor, format_version) ||
         !out.u32(uint32_t(descriptor.clean_stash_state)) ||
         (descriptor.clean_stash_state ==
              vbr_artifact_clean_stash_state::present &&
@@ -1760,7 +1776,7 @@ bool emit_unit_section_verified(
         !emit_lineage(out, descriptor.lineage_uuid) ||
         !out.u32(descriptor.logical_unit_id) ||
         !out.u64(descriptor.repr_gen) ||
-        !emit_unit_descriptor_body(out, descriptor) ||
+        !emit_unit_descriptor_body(out, descriptor, format_version) ||
         !out.u32(uint32_t(descriptor.clean_stash_state)) ||
         (descriptor.clean_stash_state ==
              vbr_artifact_clean_stash_state::present &&
@@ -1776,7 +1792,7 @@ bool emit_unit_section_verified(
     }
     unit_hash.u32(descriptor.logical_unit_id);
     unit_hash.u64(descriptor.repr_gen);
-    if (!hash_sized_descriptor(unit_hash, descriptor)) {
+    if (!hash_sized_descriptor(unit_hash, descriptor, format_version)) {
         return false;
     }
     unit_hash.u32(uint32_t(descriptor.shards.size()));
@@ -1929,7 +1945,9 @@ bool emit_section_body(
                    emit_topology_section(out, package);
         case vbr_artifact_section_kind::unit_blob:
             return section.index < package.unit_blobs.size() &&
-                   emit_unit_section(out, package.unit_blobs[section.index]);
+                   emit_unit_section(
+                       out, package.unit_blobs[section.index],
+                       package.version);
         case vbr_artifact_section_kind::companion_payload:
             return section.index < package.companions.size() &&
                    emit_companion_section(
@@ -2348,6 +2366,7 @@ bool read_shard_descriptor(
 bool read_unit_descriptor_body(
         bounded_reader & in,
         const vbr_artifact_decode_limits & limits,
+        uint32_t format_version,
         vbr_artifact_unit_descriptor & descriptor) {
     uint32_t promote_hops;
     uint32_t transition;
@@ -2357,6 +2376,7 @@ bool read_unit_descriptor_body(
     uint32_t layout;
     uint32_t unified;
     uint32_t n_shards;
+    uint32_t meansub_baked = 0;
     if (!in.u32(descriptor.child_id) ||
         !in.i32(descriptor.current_type) ||
         !in.i32(descriptor.last_source_type) ||
@@ -2387,6 +2407,10 @@ bool read_unit_descriptor_body(
         !in.fixed_digest(descriptor.codebook_digest) ||
         !in.fixed_digest(descriptor.rotation_digest) ||
         !in.fixed_digest(descriptor.meansub_digest) ||
+        (artifact_has_meansub_reference(format_version) &&
+         (!in.i32(descriptor.meansub_model_id) ||
+          !in.i32(descriptor.meansub_layer) ||
+          !in.u32(meansub_baked))) ||
         !in.u32(n_shards) ||
         promote_hops > UINT8_MAX ||
         transition > uint32_t(vbr_repr_transition::recovery_invalidate) ||
@@ -2394,7 +2418,7 @@ bool read_unit_descriptor_body(
         recoverability >= uint32_t(vbr_artifact_recoverability::_count) ||
         side >= uint32_t(vbr_artifact_side::_count) ||
         layout >= uint32_t(vbr_artifact_layout::_count) ||
-        unified > 1 ||
+        unified > 1 || meansub_baked > 1 ||
         n_shards > limits.max_shards_per_unit ||
         !in.declared_count_fits(n_shards, MIN_WIRE_SHARD)) {
         return false;
@@ -2407,6 +2431,7 @@ bool read_unit_descriptor_body(
     descriptor.side = vbr_artifact_side(side);
     descriptor.layout = vbr_artifact_layout(layout);
     descriptor.unified = unified != 0;
+    descriptor.meansub_baked = meansub_baked != 0;
     descriptor.shards.resize(n_shards);
     for (auto & shard : descriptor.shards) {
         if (!read_shard_descriptor(in, shard)) {
@@ -2580,7 +2605,8 @@ bool decode_unit_section(
         !read_lineage(in, blob.descriptor.lineage_uuid) ||
         !in.u32(blob.descriptor.logical_unit_id) ||
         !in.u64(blob.descriptor.repr_gen) ||
-        !read_unit_descriptor_body(in, limits, blob.descriptor)) {
+        !read_unit_descriptor_body(
+            in, limits, package.version, blob.descriptor)) {
         return false;
     }
     uint32_t stash_state;
@@ -2605,7 +2631,8 @@ bool decode_unit_section(
     }
     unit_hash.u32(blob.descriptor.logical_unit_id);
     unit_hash.u64(blob.descriptor.repr_gen);
-    if (!hash_sized_descriptor(unit_hash, blob.descriptor)) {
+    if (!hash_sized_descriptor(
+            unit_hash, blob.descriptor, package.version)) {
         return false;
     }
     unit_hash.u32(uint32_t(blob.descriptor.shards.size()));
@@ -3207,7 +3234,8 @@ vbr_artifact_status vbr_artifact_prepare(
             if (!prepare_payload_digest(blob) ||
                 !prepare_stash_digest(blob) ||
                 !descriptor_metadata_valid(
-                    blob.descriptor, package.topologies, true) ||
+                    blob.descriptor, package.topologies,
+                    package.version, true) ||
                 !prepare_unit_id(blob, package.version)) {
                 return vbr_artifact_status::content_id_mismatch;
             }
@@ -3308,7 +3336,8 @@ vbr_artifact_status vbr_artifact_prepare_projected_metadata(
                 blob.descriptor.clean_stash_state !=
                     vbr_artifact_clean_stash_state::absent_at_source ||
                 !descriptor_metadata_valid(
-                    blob.descriptor, package.topologies, false, true)) {
+                    blob.descriptor, package.topologies,
+                    package.version, false, true)) {
                 return vbr_artifact_status::content_id_mismatch;
             }
         }

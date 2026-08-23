@@ -283,6 +283,18 @@ bool upward_recipe_complete(
     const auto status = vbr_upward_resolve_recipe(
         static_cast<ggml_type>(source.current_type),
         static_cast<ggml_type>(target.current_type), resolved);
+    const vbr_upward_representation_identity source_identity = {
+        source.codebook_digest,
+        source.rotation_digest,
+        source.meansub_digest,
+        source.meansub_model_id,
+        source.meansub_layer,
+        source.meansub_baked,
+        source.representation.codec_id,
+        source.representation.codec_version,
+        source.representation.reference_digest,
+    };
+    const bool cross_domain = source_domain != target.current_domain;
     return target.upward_supported &&
            target.upward_type == target.current_type &&
            target.upward_domain == target.current_domain &&
@@ -296,7 +308,33 @@ bool upward_recipe_complete(
            target.upward_transfer_bytes != 0 &&
            target.upward_codec_workspace_bytes != 0 &&
            target.upward_meansub_model_id >= 0 &&
-           source_domain == target.current_domain &&
+           target.upward_source_identity == source_identity &&
+           target.upward_source_identity.meansub_model_id ==
+               target.upward_meansub_model_id &&
+           (!cross_domain ||
+            (resolved.edges[0].mean_action ==
+                 vbr_upward_mean_action::add_baked_source_mean &&
+             target.upward_source_identity.meansub_baked &&
+             target.upward_target_identity.meansub_baked &&
+             target.upward_source_identity.meansub_model_id > 0 &&
+             target.upward_source_identity.meansub_model_id ==
+                 target.upward_target_identity.meansub_model_id &&
+             target.upward_source_identity.meansub_layer ==
+                 target.upward_target_identity.meansub_layer &&
+             target.upward_source_identity.meansub_digest ==
+                 target.upward_target_identity.meansub_digest &&
+             digest_nonzero(
+                 target.upward_source_identity.codebook_digest) &&
+             digest_nonzero(
+                 target.upward_source_identity.rotation_digest) &&
+             digest_nonzero(
+                 target.upward_source_identity.meansub_digest) &&
+             digest_nonzero(
+                 target.upward_target_identity.codebook_digest) &&
+             digest_nonzero(
+                 target.upward_target_identity.rotation_digest) &&
+             digest_nonzero(
+                 target.upward_target_identity.meansub_digest))) &&
            (source_domain != vbr_repr_domain::tapped ||
             source.promote_hops < 2);
 }
@@ -904,8 +942,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 case vbr_import_schedule_status::exact:
                 case vbr_import_schedule_status::downward:
                 case vbr_import_schedule_status::upward_same_domain:
-                    break;
                 case vbr_import_schedule_status::upward_cross_domain:
+                    break;
                 case vbr_import_schedule_status::mixed_direction_unsupported:
                     return terminal_result(
                         vbr_manifest_validation_status::unavailable);
@@ -1014,6 +1052,7 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 vbr_artifact_consistency_kind::live_rebased;
         bool needs_downward = false;
         bool needs_upward = false;
+        bool needs_cross_domain_upward = false;
         for (size_t controller_index = 0;
              controller_index < manifest.generation.controllers.size();
              ++controller_index) {
@@ -1193,25 +1232,34 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                         vbr_manifest_validation_status::codebook_mismatch :
                         vbr_manifest_validation_status::representation_mismatch);
                 }
-                if (descriptor.codebook_digest != target_unit->codebook_digest ||
-                    descriptor.rotation_digest != target_unit->rotation_digest ||
-                    descriptor.meansub_digest != target_unit->meansub_digest) {
-                    return terminal_result(
-                        vbr_manifest_validation_status::codebook_mismatch);
-                }
                 if (policy.schedule_quote != nullptr &&
-                    policy.schedule_quote->status() ==
-                        vbr_import_schedule_status::upward_same_domain) {
+                    (policy.schedule_quote->status() ==
+                         vbr_import_schedule_status::upward_same_domain ||
+                     policy.schedule_quote->status() ==
+                         vbr_import_schedule_status::upward_cross_domain)) {
                     if (!policy.allow_upward ||
                         !upward_recipe_complete(
                             descriptor, source_domain, *target_unit)) {
                         return terminal_result(
                             vbr_manifest_validation_status::representation_mismatch);
                     }
-                    transform_kind =
-                        vbr_import_transform_kind::upward_same_domain;
+                    const bool cross_domain =
+                        source_domain != target_unit->current_domain;
+                    transform_kind = cross_domain
+                        ? vbr_import_transform_kind::upward_cross_domain
+                        : vbr_import_transform_kind::upward_same_domain;
                     needs_upward = true;
+                    needs_cross_domain_upward |= cross_domain;
                 } else {
+                    if (descriptor.codebook_digest !=
+                            target_unit->codebook_digest ||
+                        descriptor.rotation_digest !=
+                            target_unit->rotation_digest ||
+                        descriptor.meansub_digest !=
+                            target_unit->meansub_digest) {
+                        return terminal_result(
+                            vbr_manifest_validation_status::codebook_mismatch);
+                    }
                     if (!policy.allow_downward ||
                         !downward_recipe_complete(
                             descriptor, source_domain, *target_unit)) {
@@ -1311,7 +1359,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 plan.transcode_build_identity_digest =
                     target_unit->downward_build_identity_digest;
             } else if (transform_kind ==
-                    vbr_import_transform_kind::upward_same_domain) {
+                           vbr_import_transform_kind::upward_same_domain ||
+                       transform_kind ==
+                           vbr_import_transform_kind::upward_cross_domain) {
                 plan.transcode_recipe_id = target_unit->upward_recipe_id;
                 plan.transcode_recipe_version =
                     target_unit->upward_recipe_version;
@@ -1359,7 +1409,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                         vbr_manifest_validation_status::codebook_mismatch);
                 }
             } else if (transform_kind ==
-                    vbr_import_transform_kind::upward_same_domain) {
+                           vbr_import_transform_kind::upward_same_domain ||
+                       transform_kind ==
+                           vbr_import_transform_kind::upward_cross_domain) {
                 const auto & destination =
                     policy.schedule_quote->destination();
                 if (!destination.feasible() ||
@@ -1381,10 +1433,14 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 plan.transcode_tree_digest = destination.tree_digest;
                 plan.transcode_meansub_model_id =
                     target_unit->upward_meansub_model_id;
+                plan.transcode_source_identity =
+                    target_unit->upward_source_identity;
+                plan.transcode_target_identity =
+                    target_unit->upward_target_identity;
                 const auto build_identity = vbr_upward_build_identity(
                     target_unit->upward_recipe,
-                    target_unit->upward_meansub_model_id,
-                    target_unit->meansub_digest,
+                    target_unit->upward_source_identity,
+                    target_unit->upward_target_identity,
                     plan.transcode_policy_digest,
                     plan.transcode_tree_digest);
                 if (!digest_nonzero(build_identity) ||
@@ -1409,6 +1465,11 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 plan.target_last_source_type = descriptor.current_type;
                 plan.target_promote_hops = uint8_t(descriptor.promote_hops + 1);
             }
+            if (transform_kind ==
+                    vbr_import_transform_kind::upward_cross_domain) {
+                plan.target_last_source_type = descriptor.current_type;
+                plan.target_promote_hops = uint8_t(descriptor.promote_hops + 1);
+            }
             // Downward import regenerates the target-tier sink stash before
             // the canonical outgoing tapped edge. A source-tier stash is not a
             // target-tier byte image and must never be copied as if exact.
@@ -1422,6 +1483,14 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                  source_domain == vbr_repr_domain::full)
                 ? vbr_validated_stash_action::omit_live_rebased
                 : stash_action;
+            if (transform_kind ==
+                    vbr_import_transform_kind::upward_cross_domain) {
+                needs_live_rebase = true;
+                plan.stash_action = stash_action ==
+                        vbr_validated_stash_action::restore_exact
+                    ? vbr_validated_stash_action::consume_exact_then_drop
+                    : vbr_validated_stash_action::omit_live_rebased;
+            }
             if (transform_kind == vbr_import_transform_kind::downward) {
                 plan.target_row_bytes = target_unit->downward_row_bytes;
                 plan.target_mapped_bytes =
@@ -1430,7 +1499,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 plan.codec_workspace_bytes =
                     target_unit->downward_codec_workspace_bytes;
             } else if (transform_kind ==
-                    vbr_import_transform_kind::upward_same_domain) {
+                           vbr_import_transform_kind::upward_same_domain ||
+                       transform_kind ==
+                           vbr_import_transform_kind::upward_cross_domain) {
                 plan.target_row_bytes = target_unit->upward_row_bytes;
                 plan.target_mapped_bytes =
                     target_unit->upward_mapped_bytes;
@@ -1622,7 +1693,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             ((needs_downward && policy.schedule_quote->status() !=
                                   vbr_import_schedule_status::downward) ||
              (needs_upward && policy.schedule_quote->status() !=
-                                  vbr_import_schedule_status::upward_same_domain) ||
+                                  (needs_cross_domain_upward
+                                      ? vbr_import_schedule_status::upward_cross_domain
+                                      : vbr_import_schedule_status::upward_same_domain)) ||
              (!needs_transform && policy.schedule_quote->status() !=
                                    vbr_import_schedule_status::exact))) {
             return terminal_result(

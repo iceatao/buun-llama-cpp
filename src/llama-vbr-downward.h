@@ -217,6 +217,7 @@ vbr_downward_policy_projection vbr_downward_project_policy_prefix(
 struct vbr_downward_workspace_endpoint {
     const void * owner = nullptr;
     const ggml_vbr_backend_iface * iface = nullptr;
+    const ggml_vbr_cross_domain_iface_v1 * cross_iface = nullptr;
     ggml_backend_t backend = nullptr;
     int device = -1;
     llama_cache_acct_resource_domain domain;

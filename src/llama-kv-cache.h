@@ -46,6 +46,7 @@ struct vbr_capture_unit_snapshot_provider;
 enum class vbr_explicit_generation_failure : uint8_t;
 enum class vbr_explicit_size_failure : uint8_t;
 struct vbr_artifact_stream_placement;
+struct vbr_artifact_unit_descriptor;
 
 //
 // llama_kv_cache
@@ -434,6 +435,7 @@ private:
         uint32_t logical_unit = 0;
         uint32_t capture_index = UINT32_MAX;
         bool is_v = false;
+        llama_turbo_meansub_ref meansub_ref;
         vbr_unit_generation generation;
         uint32_t n_stream = 0;
         bool unified = false;
@@ -593,7 +595,10 @@ private:
         bool fail_closed, llama_vbr_policy::child & output,
         vbr_hard_seal_consult_session * seal_session = nullptr) const;
     bool vbr_import_bind_target_unit(
-        ggml_type source_type, ggml_type target_type,
+        const vbr_artifact_unit_descriptor & source,
+        ggml_type target_type,
+        const vbr_upward_representation_identity & selected_source_identity,
+        const vbr_upward_representation_identity & selected_target_identity,
         const vbr_downward_policy_projection & projection,
         uint32_t projection_child,
         vbr_target_unit_snapshot & output) const noexcept;
@@ -668,6 +673,9 @@ private:
         // backend VBR vtable that owns this pool's device (resolved from the buffer type's
         // registry at init; a pool only exists if the backend exports it)
         const ggml_vbr_backend_iface * be = nullptr;
+        // Optional versioned capability. Kept separate from the legacy object so a backend built
+        // before cross-domain reconstruction can still be queried without an out-of-bounds read.
+        const ggml_vbr_cross_domain_iface_v1 * cross_be = nullptr;
         // non-owning main compute backend whose context owns the fattn Q/K/V scratch. This is
         // intentionally distinct from `backend` below, which is a dedicated transcode stream.
         // Valid only while llama_context::backends is alive. llama_context declares `memory`

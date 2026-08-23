@@ -114,8 +114,6 @@ struct server_vbr_artifact_store_config {
     uint32_t attention_children = 0;
     uint64_t ring_bytes = 0;
     size_t chunk_bytes = 0;
-    // Baked-mean registry ID of the served model, for the representation identity digest.
-    int turbo_meansub_id = 0;
     void * budget_context = nullptr;
     sample_budget_fn sample_budget = nullptr;
 };

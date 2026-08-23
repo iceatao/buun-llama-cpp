@@ -14,6 +14,7 @@
 #include "llama-vbr-physical.h"
 #include "llama-vram-demand.h"
 #include "llama-vram-ledger.h"
+#include "ggml-turbo-meansub.h"
 
 #include <algorithm>
 #include <array>
@@ -308,10 +309,32 @@ static const ggml_vbr_backend_iface * llama_vbr_backend_iface_for_buft(ggml_back
     return get != nullptr ? get() : nullptr;
 }
 
+static const ggml_vbr_cross_domain_iface_v1 * llama_vbr_cross_domain_iface_for_buft(
+        ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    const auto get = (ggml_backend_vbr_cross_domain_iface_v1_fn_t)
+        ggml_backend_reg_get_proc_address(reg, GGML_VBR_CROSS_DOMAIN_IFACE_V1_PROC);
+    const auto * iface = get != nullptr ? get() : nullptr;
+    if (iface == nullptr ||
+        iface->abi_version != GGML_VBR_CROSS_DOMAIN_IFACE_V1_VERSION ||
+        iface->struct_size != sizeof(ggml_vbr_cross_domain_iface_v1)) {
+        return nullptr;
+    }
+    return iface;
+}
+
 // One VBR-capable device behind a KV buffer type: the backend vtable, the vtable's device
 // ordinal, and the device's own (simple) buffer type.
 struct llama_vbr_dev {
     const ggml_vbr_backend_iface * be     = nullptr;
+    const ggml_vbr_cross_domain_iface_v1 * cross_be = nullptr;
     int                            device = -1;
     ggml_backend_buffer_type_t     buft   = nullptr;
 };
@@ -328,6 +351,7 @@ static std::vector<llama_vbr_dev> llama_vbr_backend_devs_for_buft(ggml_backend_b
         llama_vbr_dev d;
         d.buft = is_meta ? ggml_backend_meta_buft_simple_buft(buft, i) : buft;
         d.be   = llama_vbr_backend_iface_for_buft(d.buft);
+        d.cross_be = llama_vbr_cross_domain_iface_for_buft(d.buft);
         if (d.be == nullptr) {
             return {};
         }
@@ -1362,6 +1386,7 @@ llama_kv_cache::llama_kv_cache(
             p.base        = base;
             p.size        = va_size;
             p.be          = be;
+            p.cross_be    = d.cross_be;
             p.compute_backend = compute_backends[idev];
             p.vmm         = pool;
             p.device      = device;
@@ -1592,6 +1617,7 @@ llama_kv_cache::llama_kv_cache(
                         const auto pdevs = llama_vbr_backend_devs_for_buft(ggml_backend_buffer_get_type(inst->buffer));
                         if (!pdevs.empty()) {
                             p.be     = pdevs[0].be;
+                            p.cross_be = pdevs[0].cross_be;
                             p.device = pdevs[0].device;
                             p.compute_backend = vbr_params_.compute_backend_for_buft
                                     ? vbr_params_.compute_backend_for_buft(
@@ -5280,6 +5306,7 @@ bool llama_kv_cache::vbr_import_transform_reserve(
             projection.pool = &pool;
             projection.workspace.owner = &pool;
             projection.workspace.iface = pool.be;
+            projection.workspace.cross_iface = pool.cross_be;
             projection.workspace.backend = pool.backend;
             projection.workspace.device = pool.device;
             projection.stash.cache = this;
@@ -5303,7 +5330,9 @@ bool llama_kv_cache::vbr_import_transform_reserve(
             if (!stash_only && plan->transform_kind !=
                     vbr_import_transform_kind::downward &&
                 plan->transform_kind !=
-                    vbr_import_transform_kind::upward_same_domain) {
+                    vbr_import_transform_kind::upward_same_domain &&
+                plan->transform_kind !=
+                    vbr_import_transform_kind::upward_cross_domain) {
                 output.status =
                     vbr_downward_reserve_status::projection_unavailable;
                 return false;
@@ -5330,12 +5359,16 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                     plan->transcode_recipe) && vbr_stash_rows_ > 0) {
                 plan_stash_rows = std::min<uint64_t>(
                     vbr_stash_rows_, plan->descriptor.wm_cells);
-            } else if (plan->stash_action ==
-                           vbr_validated_stash_action::restore_exact &&
+            } else if ((plan->stash_action ==
+                            vbr_validated_stash_action::restore_exact ||
+                        plan->stash_action ==
+                            vbr_validated_stash_action::consume_exact_then_drop) &&
                        (stash_only ||
                         (plan->transform_kind ==
                              vbr_import_transform_kind::upward_same_domain &&
-                         plan->source_domain == vbr_repr_domain::tapped))) {
+                         plan->source_domain == vbr_repr_domain::tapped) ||
+                        plan->transform_kind ==
+                            vbr_import_transform_kind::upward_cross_domain)) {
                 const auto & stash = plan->descriptor.clean_stash;
                 if (plan->descriptor.clean_stash_state !=
                         vbr_artifact_clean_stash_state::present ||
@@ -5361,6 +5394,8 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                 }
                 auto & projection = projections[pool_index->second];
                 auto & pool = *projection.pool;
+                const bool cross_domain = plan->transform_kind ==
+                    vbr_import_transform_kind::upward_cross_domain;
                 if (shard.shard_index >= units.size() ||
                     units[shard.shard_index].first != &pool ||
                     !units[shard.shard_index].second ||
@@ -5368,7 +5403,12 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                     pool.be == nullptr ||
                     (!stash_only &&
                      (pool.be->kv_transcode_workspace_memory == nullptr ||
-                      pool.be->kv_transcode_workspace_reserve == nullptr))) {
+                      pool.be->kv_transcode_workspace_reserve == nullptr)) ||
+                    (cross_domain &&
+                     (pool.cross_be == nullptr ||
+                      pool.cross_be->kv_cross_domain_reconstruct == nullptr ||
+                      pool.cross_be->kv_transcode_workspace_memory_v2 == nullptr ||
+                      pool.cross_be->kv_transcode_workspace_reserve_v2 == nullptr))) {
                     output.status =
                         vbr_downward_reserve_status::projection_unavailable;
                     return false;
@@ -5387,6 +5427,7 @@ bool llama_kv_cache::vbr_import_transform_reserve(
                         int64_t(plan->descriptor.wm_cells),
                         units[shard.shard_index].second->t->ne[0],
                         int64_t(plan_stash_rows),
+                        cross_domain,
                     });
                 }
                 if (plan_stash_rows > 0) {
@@ -5571,11 +5612,15 @@ bool llama_kv_cache::vbr_import_destination_input(
 }
 
 bool llama_kv_cache::vbr_import_bind_target_unit(
-        ggml_type source_type, ggml_type target_type,
+        const vbr_artifact_unit_descriptor & source,
+        ggml_type target_type,
+        const vbr_upward_representation_identity & selected_source_identity,
+        const vbr_upward_representation_identity & selected_target_identity,
         const vbr_downward_policy_projection & projection,
         uint32_t projection_child,
         vbr_target_unit_snapshot & output) const noexcept {
     try {
+        const auto source_type = static_cast<ggml_type>(source.current_type);
         const size_t ikv = output.logical_unit_id/2;
         const bool is_v = (output.logical_unit_id & 1u) != 0;
         if (ikv >= layers.size() || projection.status !=
@@ -5614,6 +5659,9 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
             vbr_upward_resolve_recipe(
                 source_type, target_type, upward_recipe) ==
                     vbr_upward_recipe_status::resolved;
+        const bool cross_domain = upward &&
+            vbr_downward_tier_domain(source_type) !=
+                vbr_downward_tier_domain(target_type);
         const bool transformed = downward || upward;
         const auto & units = vbr_units_of(ikv, is_v);
         if (units.empty() || units.size() != output.shards.size()) {
@@ -5630,7 +5678,12 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
             const auto * extent = units[i].second;
             if (!pool || !extent || !extent->t || !pool->be ||
                 (transformed &&
-                 !pool->be->kv_transcode_workspace_memory)) {
+                 !pool->be->kv_transcode_workspace_memory) ||
+                (cross_domain &&
+                 (pool->cross_be == nullptr ||
+                  pool->cross_be->kv_cross_domain_reconstruct == nullptr ||
+                  pool->cross_be->kv_transcode_workspace_memory_v2 == nullptr ||
+                  pool->cross_be->kv_transcode_workspace_reserve_v2 == nullptr))) {
                 return false;
             }
             const uint64_t target_row = ggml_row_size(
@@ -5654,10 +5707,18 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
             if (transformed) {
                 size_t now = 0;
                 size_t endpoint = 0;
-                if (!pool->be->kv_transcode_workspace_memory(
-                        pool->backend, pool->device,
-                        int64_t(output.wm_cells), extent->t->ne[0],
-                        stash_rows, &now, &endpoint) ||
+                const ggml_vbr_transcode_workspace_params_v2 request = {
+                    int64_t(output.wm_cells), extent->t->ne[0],
+                    stash_rows, cross_domain,
+                };
+                const bool quoted = cross_domain
+                    ? pool->cross_be->kv_transcode_workspace_memory_v2(
+                          pool->backend, pool->device, &request, &now, &endpoint)
+                    : pool->be->kv_transcode_workspace_memory(
+                          pool->backend, pool->device,
+                          request.n_cells, request.ne0, request.stash_rows,
+                          &now, &endpoint);
+                if (!quoted ||
                     endpoint > UINT64_MAX-workspace) {
                     return false;
                 }
@@ -5698,14 +5759,50 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
         output.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
         output.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
         output.upward_recipe = upward_recipe;
-        output.upward_meansub_model_id = hparams.turbo_meansub_id;
+        const auto meansub_ref = layers[ikv].turbo_meansub_ref;
+        output.upward_source_identity = selected_source_identity;
+        output.upward_target_identity = selected_target_identity;
+        output.upward_meansub_model_id =
+            output.upward_source_identity.meansub_model_id;
+        if (cross_domain) {
+            int max_l = 0;
+            int max_c = 0;
+            int live = 0;
+            if (!output.upward_source_identity.meansub_baked ||
+                !output.upward_target_identity.meansub_baked ||
+                output.upward_source_identity.meansub_model_id <= 0 ||
+                output.upward_source_identity.meansub_model_id !=
+                    output.upward_target_identity.meansub_model_id ||
+                output.upward_source_identity.meansub_layer < 0 ||
+                output.upward_source_identity.meansub_layer !=
+                    output.upward_target_identity.meansub_layer ||
+                meansub_ref.model_id !=
+                    output.upward_target_identity.meansub_model_id ||
+                meansub_ref.layer !=
+                    output.upward_target_identity.meansub_layer ||
+                output.upward_source_identity.meansub_digest !=
+                    output.upward_target_identity.meansub_digest ||
+                ggml_turbo_meansub_table(
+                    output.upward_source_identity.meansub_model_id,
+                    is_v ? 1 : 0, &max_l, &max_c, &live) == nullptr ||
+                live <= 0 || output.upward_source_identity.meansub_layer >= max_l) {
+                return false;
+            }
+            for (size_t i = 0; i < units.size(); ++i) {
+                const uint64_t columns = uint64_t(units[i].second->t->ne[0]);
+                if (output.shards[i].logical_offset > uint64_t(max_c) ||
+                    columns > uint64_t(max_c)-output.shards[i].logical_offset) {
+                    return false;
+                }
+            }
+        }
         output.upward_row_bytes = output.shards.front().row_bytes;
         output.upward_mapped_bytes = mapped;
         output.upward_transfer_bytes = transfer;
         output.upward_codec_workspace_bytes = workspace;
         output.upward_build_identity_digest = vbr_upward_build_identity(
-            upward_recipe, output.upward_meansub_model_id,
-            output.meansub_digest,
+            upward_recipe, output.upward_source_identity,
+            output.upward_target_identity,
             projection.child_type_digests[projection_child],
             projection.tree_digest);
         return vbr_digest_nonzero(output.upward_build_identity_digest);
@@ -5852,8 +5949,10 @@ vbr_downward_transform_status llama_kv_cache::vbr_downward_transform_import(
 bool llama_kv_cache::vbr_upward_transform_import(
         const vbr_validated_child_plan & plan) noexcept {
     try {
-        if (plan.transform_kind !=
-                vbr_import_transform_kind::upward_same_domain ||
+        const bool cross_domain = plan.transform_kind ==
+            vbr_import_transform_kind::upward_cross_domain;
+        if ((!cross_domain && plan.transform_kind !=
+                vbr_import_transform_kind::upward_same_domain) ||
             plan.logical_unit_id/2 >= layers.size() ||
             plan.upward_recipe.n_edges != 1 ||
             plan.descriptor.current_type !=
@@ -5876,7 +5975,14 @@ bool llama_kv_cache::vbr_upward_transform_import(
             plan.upward_recipe.target_type);
         if (plan.source_domain != source_domain ||
             plan.selected_target_domain != target_domain ||
-            source_domain != target_domain) {
+            (cross_domain ?
+                 (source_domain != vbr_repr_domain::tapped ||
+                  target_domain != vbr_repr_domain::full ||
+                  plan.upward_recipe.edges[0].mean_action !=
+                      vbr_upward_mean_action::add_baked_source_mean) :
+                 (source_domain != target_domain ||
+                  plan.upward_recipe.edges[0].mean_action !=
+                      vbr_upward_mean_action::none))) {
             return false;
         }
         if (source_domain == vbr_repr_domain::tapped) {
@@ -5895,13 +6001,41 @@ bool llama_kv_cache::vbr_upward_transform_import(
         }
         const size_t ikv = plan.logical_unit_id/2;
         const bool is_v = (plan.logical_unit_id & 1u) != 0;
+        int mean_max_l = 0;
+        int mean_max_c = 0;
+        int mean_live = 0;
+        if (cross_domain) {
+            const auto meansub_ref = layers[ikv].turbo_meansub_ref;
+            if (!plan.transcode_source_identity.meansub_baked ||
+                !plan.transcode_target_identity.meansub_baked ||
+                plan.transcode_source_identity.meansub_model_id <= 0 ||
+                plan.transcode_source_identity.meansub_model_id !=
+                    plan.transcode_target_identity.meansub_model_id ||
+                plan.transcode_source_identity.meansub_layer < 0 ||
+                plan.transcode_source_identity.meansub_layer !=
+                    plan.transcode_target_identity.meansub_layer ||
+                plan.transcode_source_identity.meansub_digest !=
+                    plan.transcode_target_identity.meansub_digest ||
+                meansub_ref.model_id !=
+                    plan.transcode_source_identity.meansub_model_id ||
+                meansub_ref.layer !=
+                    plan.transcode_source_identity.meansub_layer ||
+                ggml_turbo_meansub_table(
+                    meansub_ref.model_id, is_v ? 1 : 0,
+                    &mean_max_l, &mean_max_c, &mean_live) == nullptr ||
+                mean_live <= 0 || meansub_ref.layer >= mean_max_l) {
+                return false;
+            }
+        }
         const auto & units = vbr_units_of(ikv, is_v);
         if (units.size() != plan.shards.size()) {
             return false;
         }
         const bool restore_stash =
             source_domain == vbr_repr_domain::tapped &&
-            plan.stash_action == vbr_validated_stash_action::restore_exact;
+            (plan.stash_action == vbr_validated_stash_action::restore_exact ||
+             plan.stash_action ==
+                 vbr_validated_stash_action::consume_exact_then_drop);
         const uint64_t stash_rows = restore_stash
             ? plan.descriptor.clean_stash.valid_rows : 0;
         if (restore_stash &&
@@ -5925,7 +6059,10 @@ bool llama_kv_cache::vbr_upward_transform_import(
                 units[shard.shard_index].second->t->type !=
                     plan.upward_recipe.target_type ||
                 !pool->be || !pool->backend ||
-                pool->be->kv_transcode == nullptr) {
+                (cross_domain
+                    ? pool->cross_be == nullptr ||
+                      pool->cross_be->kv_cross_domain_reconstruct == nullptr
+                    : pool->be->kv_transcode == nullptr)) {
                 return false;
             }
             ggml_tensor source;
@@ -5957,6 +6094,13 @@ bool llama_kv_cache::vbr_upward_transform_import(
                     return false;
                 }
             }
+            const uint64_t columns = uint64_t(
+                units[shard.shard_index].second->t->ne[0]);
+            if (cross_domain &&
+                (shard.logical_offset > uint64_t(mean_max_c) ||
+                 columns > uint64_t(mean_max_c)-shard.logical_offset)) {
+                return false;
+            }
         }
         // Validate the complete shard set before the first asynchronous
         // submission. After this point the loop is deliberately no-fail;
@@ -5981,7 +6125,20 @@ bool llama_kv_cache::vbr_upward_transform_import(
                 int64_t(plan.descriptor.wm_cells), is_v,
                 stash, int64_t(stash_rows), 0,
             };
-            pool->be->kv_transcode(pool->backend, &params);
+            if (cross_domain) {
+                const ggml_vbr_cross_domain_reconstruct_params reconstruct = {
+                    params,
+                    plan.transcode_source_identity.meansub_model_id,
+                    plan.transcode_source_identity.meansub_layer,
+                    shard.logical_offset,
+                };
+                if (!pool->cross_be->kv_cross_domain_reconstruct(
+                        pool->backend, &reconstruct)) {
+                    return false;
+                }
+            } else {
+                pool->be->kv_transcode(pool->backend, &params);
+            }
         }
         return true;
     } catch (...) {
@@ -6357,6 +6514,7 @@ bool llama_kv_cache::vbr_capture_size_pass(
             plan.child_id = request.child_id;
             plan.logical_unit = unit;
             plan.is_v = is_v;
+            plan.meansub_ref = layers[ikv].turbo_meansub_ref;
             plan.generation = tracker->unit_generation(unit);
             plan.n_stream = n_stream;
             plan.unified = n_stream == 1;
@@ -6695,6 +6853,10 @@ bool llama_kv_cache::vbr_capture_projected_sources_impl(
             plan.logical_unit >= tracker->unit_count() ||
             plan.logical_unit/2 >= layers.size() ||
             plan.is_v != ((plan.logical_unit & 1u) != 0) ||
+            plan.meansub_ref.model_id !=
+                layers[plan.logical_unit/2].turbo_meansub_ref.model_id ||
+            plan.meansub_ref.layer !=
+                layers[plan.logical_unit/2].turbo_meansub_ref.layer ||
             plan.n_stream != n_stream || plan.unified != (n_stream == 1) ||
             plan.shards.empty() || plan.wm_cells == 0 ||
             (expected != nullptr && expected->size() != plan.shards.size()) ||
@@ -8500,18 +8662,26 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
         return;
     }
     // run once per distinct pool device (multi-GPU: exercise every device's transcode path)
-    std::vector<std::pair<int, const ggml_vbr_backend_iface *>> devices;
+    struct anchor_device {
+        int device = -1;
+        const ggml_vbr_backend_iface * be = nullptr;
+        const ggml_vbr_cross_domain_iface_v1 * cross_be = nullptr;
+    };
+    std::vector<anchor_device> devices;
     for (const auto & p : vbr_pools_) {
         if (p.be == nullptr) {
             continue; // bookkeeping-only pool (static allocation), no backend vtable
         }
         const int dev = p.device >= 0 ? p.device : 0;
         if (std::find_if(devices.begin(), devices.end(),
-                [dev](const auto & d) { return d.first == dev; }) == devices.end()) {
-            devices.push_back({ dev, p.be });
+                [dev](const auto & d) { return d.device == dev; }) == devices.end()) {
+            devices.push_back({ dev, p.be, p.cross_be });
         }
     }
-    for (const auto & [dev, be] : devices) {
+    for (const auto & device : devices) {
+    const int dev = device.device;
+    const auto * be = device.be;
+    const auto * cross_be = device.cross_be;
     fprintf(stderr, "VBR anchor: device %d\n", dev);
     ggml_backend_t bk = be->backend_init(dev);
     if (!bk) {
@@ -8521,7 +8691,12 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
     {
         const ggml_type t8 = GGML_TYPE_TURBO8_0;
         int64_t ne0 = 1024;
-        for (size_t i = 0; i < layers.size(); ++i) if (layers[i].k && layers[i].k->type == t8) { ne0 = layers[i].k->ne[0]; break; }
+        llama_turbo_meansub_ref oracle_mean_ref;
+        for (size_t i = 0; i < layers.size(); ++i) if (layers[i].k && layers[i].k->type == t8) {
+            ne0 = layers[i].k->ne[0];
+            oracle_mean_ref = layers[i].turbo_meansub_ref;
+            break;
+        }
         const char *  nenv = getenv("VBR_TRANSCODE_TEST_N");
         const int64_t N  = nenv ? atoll(nenv) : 256;
         const size_t  r8 = ggml_row_size(t8, ne0);
@@ -8608,10 +8783,29 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
         //    dequant carries the decode-alpha epilogue. Each hop's in-place result feeds the next,
         //    so later hops double as the multi-hop chain from the live promote-burst repro.
         for (int ivar = 0; ivar < 2; ++ivar) {
-            const char * nm = ivar ? "cache_v_l3" : "cache_k_l3";
+            char nm_storage[64];
+            snprintf(
+                nm_storage, sizeof(nm_storage), "cache_%c_l%d_ms%d",
+                ivar ? 'v' : 'k', oracle_mean_ref.layer,
+                oracle_mean_ref.model_id);
+            const char * nm = nm_storage;
             const ggml_type ladder[4] = { GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ,
                                           GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0 };
             const size_t r_max = ggml_row_size(ladder[3], ne0);
+            const size_t r_full_max = ggml_row_size(GGML_TYPE_F16, ne0);
+            int mean_max_l = 0;
+            int mean_max_c = 0;
+            int mean_live = 0;
+            const bool cross_ready =
+                cross_be != nullptr &&
+                cross_be->kv_cross_domain_reconstruct != nullptr &&
+                cross_be->kv_transcode_workspace_reserve_v2 != nullptr &&
+                oracle_mean_ref.model_id > 0 && oracle_mean_ref.layer >= 0 &&
+                ggml_turbo_meansub_table(
+                    oracle_mean_ref.model_id, ivar, &mean_max_l,
+                    &mean_max_c, &mean_live) != nullptr &&
+                oracle_mean_ref.layer < mean_max_l && mean_live > 0 &&
+                ne0 <= mean_max_c;
 
             // t8 source re-encoded under this variant's codebook name
             ggml_init_params ips = { 8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -8631,7 +8825,8 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
 
             // slab plays the VMM slot: sized for the largest tier so in-place grows stay in bounds
             ggml_backend_buffer_t slabbuf = ggml_backend_buft_alloc_buffer(
-                    ggml_backend_get_default_buffer_type(bk), r_max * (size_t) N);
+                    ggml_backend_get_default_buffer_type(bk),
+                    std::max(r_max, r_full_max) * (size_t) N);
             void * slab = ggml_backend_buffer_get_base(slabbuf);
             // header contexts: transcode reads type/ne[0]/nb[1]/data/name of src only
             ggml_init_params iph = { 128*ggml_tensor_overhead(), nullptr, true };
@@ -8751,6 +8946,61 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
                         ggml_backend_buffer_free(f2);
                     }
                     ggml_backend_buffer_free(hsep);
+                }
+                if (cross_ready) {
+                    const ggml_vbr_transcode_workspace_params_v2 workspace_request = {
+                        N, ne0, 0, true,
+                    };
+                    GGML_ASSERT(cross_be->kv_transcode_workspace_reserve_v2(
+                        bk, &workspace_request));
+                    for (const ggml_type full_target : {
+                            GGML_TYPE_TURBO8_0, GGML_TYPE_F16 }) {
+                        const size_t bytes_to =
+                            ggml_row_size(full_target, ne0)*(size_t) N;
+                        ggml_backend_buffer_t hsep =
+                            ggml_backend_buft_alloc_buffer(
+                                ggml_backend_get_default_buffer_type(bk),
+                                bytes_to);
+                        const ggml_vbr_cross_domain_reconstruct_params separate = {
+                            { alias(tfrom, source, sourcebuf), full_target,
+                              ggml_backend_buffer_get_base(hsep), hsep, N,
+                              ivar != 0, nullptr, 0, 0 },
+                            oracle_mean_ref.model_id,
+                            oracle_mean_ref.layer,
+                            0,
+                        };
+                        GGML_ASSERT(cross_be->kv_cross_domain_reconstruct(
+                            bk, &separate));
+                        ggml_backend_tensor_set(
+                            alias(tfrom, slab, slabbuf),
+                            source_host.data(), 0, bytesFrom);
+                        const ggml_vbr_cross_domain_reconstruct_params inplace = {
+                            { alias(tfrom, slab, slabbuf), full_target,
+                              slab, slabbuf, N, ivar != 0,
+                              nullptr, 0, 0 },
+                            oracle_mean_ref.model_id,
+                            oracle_mean_ref.layer,
+                            0,
+                        };
+                        GGML_ASSERT(cross_be->kv_cross_domain_reconstruct(
+                            bk, &inplace));
+                        ggml_backend_synchronize(bk);
+                        std::vector<uint8_t> separate_host(bytes_to);
+                        std::vector<uint8_t> inplace_host(bytes_to);
+                        download(
+                            ggml_backend_buffer_get_base(hsep), hsep,
+                            separate_host.data(), bytes_to);
+                        download(
+                            slab, slabbuf, inplace_host.data(), bytes_to);
+                        const bool identical = separate_host == inplace_host;
+                        fprintf(stderr,
+                            "VBR SELFTEST CROSS %s %s->%s in-place==separate: %s (%zu bytes)\n",
+                            nm, ggml_type_name(tfrom),
+                            ggml_type_name(full_target),
+                            identical ? "IDENTICAL" : "MISMATCH", bytes_to);
+                        GGML_ASSERT(identical);
+                        ggml_backend_buffer_free(hsep);
+                    }
                 }
                 ggml_backend_buffer_free(sourcebuf);
             }

@@ -9,6 +9,7 @@
 #include "llama-vbr-artifact-catalog.h"
 #include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-identity-digest.h"
+#include "llama-vbr-upward.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -313,6 +314,10 @@ struct f42a_harness_target {
     std::array<uint8_t, 32> downward_tree_digest = {};
     const vbr_artifact_package_view * package = nullptr;
     const std::vector<llama_vbr_artifact_domain_binding> * bindings = nullptr;
+    const vbr_import_schedule_quote * schedule_quote = nullptr;
+    const void * representation_context = nullptr;
+    vbr_explicit_capture_request::representation_identity_fn
+        representation_identity = nullptr;
     llama_seq_id destination = 0;
 
     static uint64_t accounting_serial(const void * context) noexcept {
@@ -324,25 +329,19 @@ struct f42a_harness_target {
         return self && self->memory
             ? vbr_explicit_import_policy_epoch(*self->memory) : 0;
     }
-    static bool downward_tree(
+    static bool transform_tree(
             const void * context,
             std::array<uint8_t, 32> & output) noexcept {
         const auto * self = static_cast<const f42a_harness_target *>(context);
         if (!self || !self->memory || !self->package ||
-            !self->bindings) {
+            !self->bindings || !self->schedule_quote) {
             return false;
         }
-        vbr_target_validation_snapshot snapshot;
-        vbr_downward_policy_projection projection;
-        bool downward = false;
-        if (!vbr_explicit_import_target_snapshot(
+        return vbr_explicit_import_transform_projection_recheck(
                 *self->memory, self->destination, *self->package,
-                *self->bindings, false, 1, snapshot, &projection,
-                &downward) || !downward) {
-            return false;
-        }
-        output = projection.tree_digest;
-        return output == self->downward_tree_digest;
+                *self->bindings, *self->schedule_quote,
+                self->representation_context, self->representation_identity,
+                output) && output == self->downward_tree_digest;
     }
     static bool recheck(
             const void * context,
@@ -354,6 +353,46 @@ struct f42a_harness_target {
                 *self->memory, self->destination, expected);
     }
 };
+
+struct f42a_representation_drift_context {
+    enum class kind : uint8_t {
+        codec_version = 0,
+        codebook_digest,
+        rotation_digest,
+    } drift = kind::codec_version;
+    const vbr_explicit_representation_policy * policy = nullptr;
+    int32_t source_type = GGML_TYPE_COUNT;
+};
+
+static bool f42a_representation_identity_with_source_drift(
+        const void * context,
+        int32_t current_type,
+        bool value_side,
+        int32_t meansub_model_id,
+        vbr_explicit_representation_identity & output) noexcept {
+    const auto * drift =
+        static_cast<const f42a_representation_drift_context *>(context);
+    if (!drift || !drift->policy ||
+        !vbr_explicit_capture_representation_identity(
+            drift->policy, current_type, value_side,
+            meansub_model_id, output)) {
+        return false;
+    }
+    if (current_type == drift->source_type) {
+        switch (drift->drift) {
+            case f42a_representation_drift_context::kind::codec_version:
+                ++output.codec_version;
+                break;
+            case f42a_representation_drift_context::kind::codebook_digest:
+                output.codebook_digest[0] ^= 0x5a;
+                break;
+            case f42a_representation_drift_context::kind::rotation_digest:
+                output.rotation_digest[0] ^= 0xa5;
+                break;
+        }
+    }
+    return true;
+}
 
 static bool f42a_reserve_transform(
         void * context,
@@ -917,6 +956,9 @@ static vbr_artifact_package package(
         descriptor.codebook_digest = marker(0x60+child_id);
         descriptor.rotation_digest = marker(0x62+child_id);
         descriptor.meansub_digest = marker(0x64+child_id);
+        descriptor.meansub_model_id = 7;
+        descriptor.meansub_layer = int32_t(child_id);
+        descriptor.meansub_baked = true;
         descriptor.shards = {
             shard(0, bytes.payload[child_id*2]),
             shard(1, bytes.payload[child_id*2+1]),
@@ -1417,8 +1459,10 @@ struct seam final : vbr_adopt_test_seam {
             uint32_t child_id,
             const vbr_validated_child_plan & plan) noexcept override {
         if (child_id >= children.size() || !children[child_id].armed ||
-            plan.transform_kind !=
-                vbr_import_transform_kind::upward_same_domain ||
+            (plan.transform_kind !=
+                 vbr_import_transform_kind::upward_same_domain &&
+             plan.transform_kind !=
+                 vbr_import_transform_kind::upward_cross_domain) ||
             plan.descriptor.wm_cells == 0) {
             return false;
         }
@@ -1431,14 +1475,18 @@ struct seam final : vbr_adopt_test_seam {
             const vbr_validated_child_plan & plan,
             uint32_t stash_rows) noexcept override {
         if (child_id >= children.size() || !children[child_id].armed ||
-            plan.transform_kind !=
-                vbr_import_transform_kind::upward_same_domain ||
+            (plan.transform_kind !=
+                 vbr_import_transform_kind::upward_same_domain &&
+             plan.transform_kind !=
+                 vbr_import_transform_kind::upward_cross_domain) ||
             plan.upward_recipe.n_edges != 1) {
             return false;
         }
         const bool expected_stash =
             plan.source_domain == vbr_repr_domain::tapped &&
-            plan.stash_action == vbr_validated_stash_action::restore_exact;
+            (plan.stash_action == vbr_validated_stash_action::restore_exact ||
+             plan.stash_action ==
+                 vbr_validated_stash_action::consume_exact_then_drop);
         if ((expected_stash &&
              stash_rows != plan.descriptor.clean_stash.valid_rows) ||
             (!expected_stash && stash_rows != 0)) {
@@ -1472,8 +1520,11 @@ struct seam final : vbr_adopt_test_seam {
             noexcept override {
         if (child_id >= children.size() || plans.empty() ||
             std::none_of(plans.begin(), plans.end(), [](const auto * plan) {
-                return plan && plan->transform_kind ==
-                    vbr_import_transform_kind::upward_same_domain;
+                return plan &&
+                    (plan->transform_kind ==
+                         vbr_import_transform_kind::upward_same_domain ||
+                     plan->transform_kind ==
+                         vbr_import_transform_kind::upward_cross_domain);
             })) {
             return false;
         }
@@ -2022,6 +2073,9 @@ struct fixture {
             unit.codebook_digest = descriptor.codebook_digest;
             unit.rotation_digest = descriptor.rotation_digest;
             unit.meansub_digest = descriptor.meansub_digest;
+            unit.meansub_model_id = descriptor.meansub_model_id;
+            unit.meansub_layer = descriptor.meansub_layer;
+            unit.meansub_baked = descriptor.meansub_baked;
             unit.n_stream = descriptor.n_stream;
             unit.unified = descriptor.unified;
             unit.wm_cells = descriptor.wm_cells;
@@ -2135,6 +2189,22 @@ struct fixture {
                     unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
                     unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
                     unit.upward_meansub_model_id = 7;
+                    const auto & source_descriptor =
+                        view.units()[child.child_id].descriptor;
+                    unit.upward_source_identity = {
+                        source_descriptor.codebook_digest,
+                        source_descriptor.rotation_digest,
+                        source_descriptor.meansub_digest,
+                        source_descriptor.meansub_model_id,
+                        source_descriptor.meansub_layer,
+                        source_descriptor.meansub_baked,
+                        source_descriptor.representation.codec_id,
+                        source_descriptor.representation.codec_version,
+                        source_descriptor.representation.reference_digest,
+                    };
+                    unit.upward_target_identity = unit.upward_source_identity;
+                    unit.upward_meansub_model_id =
+                        unit.upward_source_identity.meansub_model_id;
                     CHECK(vbr_upward_resolve_recipe(
                         source_type, target_type, unit.upward_recipe) ==
                         vbr_upward_recipe_status::resolved);
@@ -2189,19 +2259,25 @@ struct fixture {
                 if (!(mixed_exact_upward && child.child_id != 0)) {
                     unit.upward_build_identity_digest =
                         vbr_upward_build_identity(
-                            unit.upward_recipe, unit.upward_meansub_model_id,
-                            unit.meansub_digest,
+                            unit.upward_recipe,
+                            unit.upward_source_identity,
+                            unit.upward_target_identity,
                             upward_destination.child_type_digests[child.child_id],
                             upward_destination.tree_digest);
                 }
             }
             CHECK(vbr_quote_import_schedule(snapshot, view, schedule_quote));
+            const auto expected_schedule =
+                vbr_downward_tier_domain(upward_source_type) ==
+                        vbr_downward_tier_domain(upward_target_type)
+                    ? vbr_import_schedule_status::upward_same_domain
+                    : vbr_import_schedule_status::upward_cross_domain;
             CHECK(schedule_quote.status() ==
-                  vbr_import_schedule_status::upward_same_domain);
+                  expected_schedule);
             CHECK(vbr_rebind_import_schedule_quote(
                 snapshot, view, upward_destination, schedule_quote));
             CHECK(schedule_quote.status() ==
-                  vbr_import_schedule_status::upward_same_domain);
+                  expected_schedule);
             validation.downward_tree_digest = upward_destination.tree_digest;
         }
         if (with_companion) {
@@ -2300,7 +2376,10 @@ struct fixture {
                 auto & self = *static_cast<fixture *>(context);
                 const auto expected = self.downward
                     ? vbr_import_transform_kind::downward
-                    : vbr_import_transform_kind::upward_same_domain;
+                    : vbr_downward_tier_domain(self.upward_source_type) ==
+                              vbr_downward_tier_domain(self.upward_target_type)
+                        ? vbr_import_transform_kind::upward_same_domain
+                        : vbr_import_transform_kind::upward_cross_domain;
                 if (plans.empty() || std::any_of(
                         plans.begin(), plans.end(),
                         [&](const vbr_validated_child_plan & plan) {
@@ -2794,6 +2873,44 @@ static void test_g2_upward_reconstruction() {
                 f.target.upward_events.end());
         }
     }
+    // Cross-domain reconstruction consumes the authenticated centered stash,
+    // adds the baked source mean, and publishes full-domain bytes without
+    // retaining the now-inapplicable tapped stash.
+    for (const ggml_type target : {
+            GGML_TYPE_TURBO8_0, GGML_TYPE_F16 }) {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, target, 0,
+            vbr_artifact_clean_stash_state::present);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validation.proof);
+        for (const auto & plan : validation.proof->children()) {
+            CHECK(plan.transform_kind ==
+                  vbr_import_transform_kind::upward_cross_domain);
+            CHECK(plan.upward_recipe.edges[0].mean_action ==
+                  vbr_upward_mean_action::add_baked_source_mean);
+            CHECK(plan.transcode_source_identity.meansub_baked);
+            CHECK(plan.transcode_source_identity.meansub_model_id ==
+                  plan.transcode_target_identity.meansub_model_id);
+            CHECK(plan.transcode_source_identity.meansub_layer ==
+                  plan.transcode_target_identity.meansub_layer);
+            CHECK(plan.target_last_source_type == GGML_TYPE_TURBO2_TCQ);
+            CHECK(plan.target_promote_hops == 1);
+            CHECK(plan.stash_action ==
+                  vbr_validated_stash_action::consume_exact_then_drop);
+        }
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.h2d_bytes == 60);
+        CHECK(f.target.upward_transforms == 2);
+        CHECK(f.target.upward_stash_transforms == 2);
+        CHECK(f.target.upward_stash_rows == 10);
+        CHECK(f.target.upward_syncs == 2);
+    }
     // A tapped exact-stash import cannot use downward's stashless fallback.
     // Its mandatory physical endpoint is rejected while staging, before any
     // source or stash byte reaches the target.
@@ -3152,6 +3269,21 @@ static bool f42a_model_backed_adoption(
     const bool live_matrix = live_token_count != 0;
     const bool require_destination_degraded =
         expected_destination_type != GGML_TYPE_COUNT;
+    vbr_upward_recipe destination_upward_recipe;
+    const bool destination_upward = require_destination_degraded &&
+        vbr_upward_resolve_recipe(
+            source_type, expected_destination_type,
+            destination_upward_recipe) ==
+                vbr_upward_recipe_status::resolved;
+    const bool needs_transform = downward_mode || destination_upward;
+    const auto expected_schedule_status = downward_mode
+        ? vbr_import_schedule_status::downward
+        : destination_upward
+            ? (vbr_downward_tier_domain(source_type) ==
+                       vbr_downward_tier_domain(expected_destination_type)
+                   ? vbr_import_schedule_status::upward_same_domain
+                   : vbr_import_schedule_status::upward_cross_domain)
+            : vbr_import_schedule_status::exact;
     ggml_backend_load_all();
     if (live_matrix) {
         // F5 validates the shipped, model-matched order. The older homogeneous
@@ -3641,15 +3773,44 @@ static bool f42a_model_backed_adoption(
         vbr_downward_policy_projection downward_projection;
         bool detected_downward = false;
         vbr_import_schedule_quote schedule_quote;
+        if (destination_upward) {
+            for (auto drift_kind : {
+                    f42a_representation_drift_context::kind::codec_version,
+                    f42a_representation_drift_context::kind::codebook_digest,
+                    f42a_representation_drift_context::kind::rotation_digest,
+                 }) {
+                f42a_representation_drift_context drift_context {
+                    drift_kind, &representation_policy,
+                    int32_t(source_type),
+                };
+                vbr_target_validation_snapshot drifted_target;
+                vbr_downward_policy_projection drifted_projection;
+                bool drifted_downward = false;
+                vbr_import_schedule_quote drifted_quote;
+                CHECK(vbr_explicit_import_target_schedule_snapshot(
+                    *target_memory, 0, package, bindings,
+                    previously_observed, accounting_snapshot.serial,
+                    &drift_context,
+                    f42a_representation_identity_with_source_drift,
+                    drifted_target, drifted_projection,
+                    drifted_downward, drifted_quote) ==
+                    vbr_import_target_snapshot_status::unavailable);
+                CHECK(drifted_target.children.empty());
+                CHECK(drifted_projection.final_types.empty());
+                CHECK(drifted_quote.status() ==
+                      vbr_import_schedule_status::_count);
+            }
+        }
         CHECK(vbr_explicit_import_target_schedule_snapshot(
             *target_memory, 0, package, bindings, previously_observed,
-            accounting_snapshot.serial, target_snapshot,
+            accounting_snapshot.serial,
+            &representation_policy,
+            vbr_explicit_capture_representation_identity,
+            target_snapshot,
             downward_projection, detected_downward, schedule_quote) ==
             vbr_import_target_snapshot_status::actionable);
         CHECK(detected_downward == downward_mode);
-        CHECK(schedule_quote.status() == (downward_mode
-            ? vbr_import_schedule_status::downward
-            : vbr_import_schedule_status::exact));
+        CHECK(schedule_quote.status() == expected_schedule_status);
         if (require_destination_degraded) {
             CHECK(schedule_quote.destination().status ==
                 vbr_import_destination_status::feasible_degraded);
@@ -3682,9 +3843,15 @@ static bool f42a_model_backed_adoption(
         target_owner.ledger = &ledger;
         target_owner.package = &package;
         target_owner.bindings = &bindings;
-        if (downward_mode) {
+        target_owner.schedule_quote = &schedule_quote;
+        target_owner.representation_context = &representation_policy;
+        target_owner.representation_identity =
+            vbr_explicit_capture_representation_identity;
+        if (needs_transform) {
             target_owner.downward_tree_digest =
-                downward_projection.tree_digest;
+                downward_mode
+                    ? downward_projection.tree_digest
+                    : schedule_quote.destination().tree_digest;
         }
         vbr_adopt_policy policy;
         policy.authorized = true;
@@ -3710,14 +3877,15 @@ static bool f42a_model_backed_adoption(
             f42a_harness_target::accounting_serial;
         policy.read_policy_epoch = f42a_harness_target::policy_serial;
         policy.parse_companion = vbr_parse_recurrent_companion;
-        llama_cache_budget_plan downward_budget_plan;
-        if (downward_mode) {
-            downward_budget_plan.accounting_serial =
+        llama_cache_budget_plan transform_budget_plan;
+        if (needs_transform) {
+            transform_budget_plan.accounting_serial =
                 accounting_snapshot.serial;
-            policy.transform_budget_plan = &downward_budget_plan;
-            policy.downward_projection = &downward_projection;
+            policy.transform_budget_plan = &transform_budget_plan;
+            policy.downward_projection = downward_mode
+                ? &downward_projection : nullptr;
             policy.read_transform_tree_digest =
-                f42a_harness_target::downward_tree;
+                f42a_harness_target::transform_tree;
         }
 
         auto validated = vbr_validate_unit_manifest_snapshot(
@@ -3792,7 +3960,7 @@ static bool f42a_model_backed_adoption(
             target_pools.front().backend,
             false,
         });
-        if (downward_mode) {
+        if (needs_transform) {
             stage_policy.transform_context = target_memory;
             stage_policy.reserve_transform = f42a_reserve_transform;
         }
@@ -3831,7 +3999,10 @@ static bool f42a_model_backed_adoption(
             bool rolled_back_downward = false;
             CHECK(vbr_explicit_import_target_snapshot(
                 *target_memory, 0, package, bindings, previously_observed,
-                ledger.snapshot().serial, rolled_back,
+                ledger.snapshot().serial,
+                &representation_policy,
+                vbr_explicit_capture_representation_identity,
+                rolled_back,
                 &rolled_back_projection, &rolled_back_downward));
             CHECK(std::all_of(
                 rolled_back.children.begin(), rolled_back.children.end(),
@@ -3950,7 +4121,7 @@ static bool f42a_model_backed_adoption(
         CHECK(run_import(false, require_straddled
             ? vbr_import_decision::live_rebased
             : vbr_import_decision::native_import));
-    } else if (!downward_mode) {
+    } else if (!needs_transform) {
         for (uint8_t phase = uint8_t(vbr_adopt_phase::operation_open);
              phase <= uint8_t(vbr_adopt_phase::composite_publish); ++phase) {
             CHECK(run_import(false, vbr_import_decision::native_import,
@@ -3958,16 +4129,16 @@ static bool f42a_model_backed_adoption(
         }
         CHECK(run_import(false, vbr_import_decision::native_import));
         CHECK(run_import(true, vbr_import_decision::live_rebased));
-    } else if (!require_destination_degraded) {
+    } else if (downward_mode && !require_destination_degraded) {
         CHECK(run_import(false, vbr_import_decision::downward_rebase));
     } else {
+        const auto transform_decision = destination_upward
+            ? vbr_import_decision::upward_reconstruct
+            : vbr_import_decision::downward_rebase;
         CHECK(run_import(false,
-            downward_mode ? vbr_import_decision::downward_rebase
-                          : vbr_import_decision::native_import,
+            transform_decision,
             vbr_adopt_phase::composite_publish));
-        CHECK(run_import(false,
-            downward_mode ? vbr_import_decision::downward_rebase
-                          : vbr_import_decision::native_import));
+        CHECK(run_import(false, transform_decision));
     }
     package.reset();
     CHECK(catalog.retire(reference) == vbr_artifact_retire_status::retired);
@@ -4095,11 +4266,18 @@ int main(int argc, char ** argv) {
                 GGML_TYPE_TURBO1_TCQ, true, destination_recipe);
             destination_downward =
                 relation == vbr_downward_recipe_status::resolved;
+            vbr_upward_recipe destination_upward_recipe;
+            const bool destination_upward =
+                vbr_upward_resolve_recipe(
+                    source_type, expected_destination_type,
+                    destination_upward_recipe) ==
+                    vbr_upward_recipe_status::resolved;
             if (!destination_budget_mib ||
                 destination_budget_mib > UINT64_MAX/(1024*1024) ||
                 *budget_end ||
                 (relation != vbr_downward_recipe_status::resolved &&
-                 relation != vbr_downward_recipe_status::equal_tier)) {
+                 relation != vbr_downward_recipe_status::equal_tier &&
+                 !destination_upward)) {
                 std::fprintf(stderr, "invalid H2 destination schedule\n");
                 return 2;
             }

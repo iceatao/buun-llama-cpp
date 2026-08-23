@@ -17,7 +17,15 @@ struct vbr_downward_stage_reservation;
 struct vbr_validated_child_plan;
 struct vbr_import_schedule_quote;
 struct vbr_import_schedule_unit;
+struct vbr_explicit_representation_identity;
 enum class vbr_import_schedule_status : uint8_t;
+
+using vbr_explicit_representation_identity_fn = bool (*)(
+    const void * context,
+    int32_t current_type,
+    bool value_side,
+    int32_t meansub_model_id,
+    vbr_explicit_representation_identity & output) noexcept;
 
 enum class vbr_explicit_capture_status : uint8_t {
     ok = 0,
@@ -181,6 +189,8 @@ bool vbr_explicit_import_target_snapshot(
     const std::vector<llama_vbr_artifact_domain_binding> & bindings,
     bool previously_observed,
     uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
     vbr_target_validation_snapshot & output,
     vbr_downward_policy_projection * downward_projection = nullptr,
     bool * downward_required = nullptr) noexcept;
@@ -203,9 +213,9 @@ vbr_explicit_import_schedule_actionability(
     const std::vector<vbr_import_schedule_unit> & units) noexcept;
 
 // Typed reporting seam. Upward actionability is limited to resolver-certified
-// full-domain T8->F16 or tapped-domain reconstruction; cross-domain and mixed
-// schedules return their immutable quote without implying that validation,
-// staging, or adoption may proceed.
+// same- or cross-domain reconstruction. Mixed and unsupported schedules return
+// their immutable quote without implying that validation, staging, or adoption
+// may proceed.
 vbr_import_target_snapshot_status
 vbr_explicit_import_target_schedule_snapshot(
     llama_memory_i & memory,
@@ -214,20 +224,24 @@ vbr_explicit_import_target_schedule_snapshot(
     const std::vector<llama_vbr_artifact_domain_binding> & bindings,
     bool previously_observed,
     uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
     vbr_target_validation_snapshot & output,
     vbr_downward_policy_projection & downward_projection,
     bool & downward_required,
     vbr_import_schedule_quote & schedule_quote) noexcept;
 
 // Final transform-currency barrier shared by downward and the supported
-// same-domain upward reconstruction path. The authenticated schedule remains
-// the sole representation/destination authority.
+// same- and cross-domain upward reconstruction paths. The authenticated
+// schedule remains the sole representation/destination authority.
 bool vbr_explicit_import_transform_projection_recheck(
     llama_memory_i & memory,
     llama_seq_id destination,
     const vbr_artifact_package_view & package,
     const std::vector<llama_vbr_artifact_domain_binding> & bindings,
     const vbr_import_schedule_quote & authenticated_schedule,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
     std::array<uint8_t, 32> & tree_digest) noexcept;
 bool vbr_explicit_import_target_recheck(
     llama_memory_i & memory,
@@ -246,6 +260,7 @@ struct vbr_explicit_representation_identity {
     std::array<uint8_t, 32> codebook_digest = {};
     std::array<uint8_t, 32> rotation_digest = {};
     std::array<uint8_t, 32> meansub_digest = {};
+    bool meansub_baked = false;
 };
 
 // Server policy input to the library-owned codec identity recipe. The build
@@ -254,15 +269,20 @@ struct vbr_explicit_representation_identity {
 struct vbr_explicit_representation_policy {
     const char * build_identity = nullptr;
     size_t build_identity_len = 0;
-    // Baked-mean registry ID of the capturing model (hparams.turbo_meansub_id) since the
-    // per-model mean-table isolation; 0 = no baked table (digest records "inactive").
-    int turbo_meansub_id = 0;
 };
+
+struct vbr_explicit_representation_identity_diagnostics {
+    uint64_t baked_table_hashes = 0;
+};
+
+vbr_explicit_representation_identity_diagnostics
+vbr_explicit_representation_identity_diagnostics_snapshot() noexcept;
 
 bool vbr_explicit_capture_representation_identity(
     const void * context,
     int32_t current_type,
     bool value_side,
+    int32_t meansub_model_id,
     vbr_explicit_representation_identity & output) noexcept;
 
 struct vbr_explicit_companion_provider {
@@ -287,11 +307,8 @@ struct vbr_explicit_companion_provider {
 };
 
 struct vbr_explicit_capture_request {
-    using representation_identity_fn = bool (*)(
-        const void * context,
-        int32_t current_type,
-        bool value_side,
-        vbr_explicit_representation_identity & output) noexcept;
+    using representation_identity_fn =
+        vbr_explicit_representation_identity_fn;
 
     llama_seq_id sequence = -1;
     vbr_checkpoint_frontier_fields frontier;

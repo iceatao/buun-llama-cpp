@@ -21,12 +21,25 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
 namespace {
+
+struct baked_representation_identity_cache_entry {
+    int32_t type = -1;
+    bool value_side = false;
+    int32_t meansub_model_id = -1;
+    std::array<uint8_t, 32> digest = {};
+};
+
+std::mutex g_baked_representation_identity_mutex;
+std::vector<baked_representation_identity_cache_entry>
+    g_baked_representation_identity_cache;
+std::atomic<uint64_t> g_baked_representation_identity_hashes { 0 };
 
 std::array<uint8_t, 32> representation_hash_file_or_marker(
         const char * tag,
@@ -117,8 +130,11 @@ std::array<uint8_t, 32> representation_rotation_identity(
 std::array<uint8_t, 32> representation_meansub_identity(
         int32_t type,
         bool value_side,
+        int32_t meansub_model_id,
         const vbr_explicit_representation_policy & policy,
-        bool & ok) {
+        bool & ok,
+        bool & baked) {
+    baked = false;
     llama_sha256_writer writer;
     static constexpr char domain_label[] =
         "buun.vbr.codec-meansub/v1";
@@ -140,11 +156,30 @@ std::array<uint8_t, 32> representation_meansub_identity(
             path, uint32_t(type), value_side, policy, ok);
     }
 
+    // Built-in mean tables are immutable for the life of the process. Cache
+    // their exact representation digest after checking the mutable environment
+    // overrides above, so request-path import validation never re-hashes the
+    // full dense table. Keeping the final digest preserves the wire identity.
+    std::lock_guard<std::mutex> lock(
+        g_baked_representation_identity_mutex);
+    const auto cached = std::find_if(
+        g_baked_representation_identity_cache.begin(),
+        g_baked_representation_identity_cache.end(),
+        [&](const baked_representation_identity_cache_entry & entry) {
+            return entry.type == type &&
+                   entry.value_side == value_side &&
+                   entry.meansub_model_id == meansub_model_id;
+        });
+    if (cached != g_baked_representation_identity_cache.end()) {
+        baked = true;
+        return cached->digest;
+    }
+
     int max_layers = 0;
     int max_channels = 0;
     int live_layers = 0;
     const float * active = ggml_turbo_meansub_table(
-        policy.turbo_meansub_id, value_side ? 1 : 0,
+        meansub_model_id, value_side ? 1 : 0,
         &max_layers, &max_channels, &live_layers);
     if (active == nullptr || max_layers <= 0 ||
         max_channels <= 0 || live_layers <= 0) {
@@ -166,12 +201,39 @@ std::array<uint8_t, 32> representation_meansub_identity(
     writer.bytes(
         active,
         size_t(max_layers)*size_t(max_channels)*sizeof(float));
-    return writer.finish();
+    const auto digest = writer.finish();
+    g_baked_representation_identity_cache.push_back({
+        type, value_side, meansub_model_id, digest,
+    });
+    g_baked_representation_identity_hashes.fetch_add(
+        1, std::memory_order_relaxed);
+    baked = true;
+    return digest;
 }
 
 bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
     return std::any_of(digest.begin(), digest.end(),
         [](uint8_t value) { return value != 0; });
+}
+
+std::array<uint8_t, 32> representation_reference_digest(
+        int32_t current_type,
+        int32_t last_source_type,
+        const vbr_explicit_representation_identity & identity) {
+    llama_sha256_writer writer;
+    static constexpr char domain[] = "buun.vbr.capture/representation";
+    writer.string(domain, sizeof(domain) - 1);
+    writer.u32(uint32_t(current_type));
+    writer.u32(uint32_t(last_source_type));
+    writer.u32(identity.codec_id);
+    writer.u32(identity.codec_version);
+    writer.bytes(identity.codebook_digest.data(),
+                 identity.codebook_digest.size());
+    writer.bytes(identity.rotation_digest.data(),
+                 identity.rotation_digest.size());
+    writer.bytes(identity.meansub_digest.data(),
+                 identity.meansub_digest.size());
+    return writer.finish();
 }
 
 // Shared by the capture stamp and the import target check so the recurrent
@@ -574,15 +636,18 @@ bool vbr_explicit_capture_representation_identity(
         const void * context,
         int32_t current_type,
         bool value_side,
+        int32_t meansub_model_id,
         vbr_explicit_representation_identity & output) noexcept {
     try {
         if (context == nullptr ||
-            current_type < 0 || current_type >= GGML_TYPE_COUNT) {
+            current_type < 0 || current_type >= GGML_TYPE_COUNT ||
+            meansub_model_id < 0) {
             return false;
         }
         const auto & policy =
             *static_cast<const vbr_explicit_representation_policy *>(
                 context);
+        output = {};
         output.codec_id = uint32_t(current_type) + 1;
         output.codec_version = 1;
         bool ok = true;
@@ -596,11 +661,20 @@ bool vbr_explicit_capture_representation_identity(
                 current_type, value_side);
         output.meansub_digest =
             representation_meansub_identity(
-                current_type, value_side, policy, ok);
+                current_type, value_side, meansub_model_id,
+                policy, ok, output.meansub_baked);
         return ok;
     } catch (...) {
         return false;
     }
+}
+
+vbr_explicit_representation_identity_diagnostics
+vbr_explicit_representation_identity_diagnostics_snapshot() noexcept {
+    return {
+        g_baked_representation_identity_hashes.load(
+            std::memory_order_relaxed),
+    };
 }
 
 class vbr_live_capture_adapter {
@@ -614,6 +688,13 @@ public:
         llama_kv_cache::vbr_capture_stability_token stability;
         vbr_checkpoint_generation_controller generation;
         std::vector<vbr_artifact_stream_placement> placements;
+    };
+
+    struct representation_cache_entry {
+        int32_t current_type = -1;
+        bool value_side = false;
+        int32_t meansub_model_id = -1;
+        vbr_explicit_representation_identity identity;
     };
 
     static bool settle(llama_kv_cache & cache) {
@@ -704,6 +785,10 @@ public:
             const std::vector<llama_vbr_artifact_domain_binding> & bindings,
             bool previously_observed,
             uint64_t policy_epoch,
+            const void * representation_context,
+            vbr_explicit_capture_request::representation_identity_fn
+                representation_identity,
+            std::vector<representation_cache_entry> & representation_cache,
             vbr_target_child_snapshot & output) noexcept {
         auto * cache = tree_child.attention;
         if (!cache || !cache->vbr_operation_armed()) {
@@ -729,6 +814,9 @@ public:
             return false;
         }
 
+        if (!representation_context || !representation_identity) {
+            return false;
+        }
         output = {};
         output.child_id = tree_child.child_id;
         output.dependency_mode = tree_child.dependency_mode;
@@ -764,6 +852,36 @@ public:
             }
             const auto live_generation = tracker->unit_generation(
                 descriptor.logical_unit_id);
+            const auto meansub_ref =
+                cache->layers[layer].turbo_meansub_ref;
+            auto representation = std::find_if(
+                representation_cache.begin(), representation_cache.end(),
+                [&](const representation_cache_entry & cached) {
+                    return cached.current_type == descriptor.current_type &&
+                           cached.value_side == value_side &&
+                           cached.meansub_model_id == meansub_ref.model_id;
+                });
+            if (representation == representation_cache.end()) {
+                vbr_explicit_representation_identity identity;
+                if (!representation_identity(
+                        representation_context, descriptor.current_type,
+                        value_side, meansub_ref.model_id, identity)) {
+                    return false;
+                }
+                representation_cache.push_back({
+                    descriptor.current_type, value_side,
+                    meansub_ref.model_id, std::move(identity),
+                });
+                representation = std::prev(representation_cache.end());
+            }
+            const auto & live_identity = representation->identity;
+            if (live_identity.codec_id == 0 ||
+                live_identity.codec_version == 0 ||
+                !digest_nonzero(live_identity.codebook_digest) ||
+                !digest_nonzero(live_identity.rotation_digest) ||
+                !digest_nonzero(live_identity.meansub_digest)) {
+                return false;
+            }
             vbr_target_unit_snapshot target;
             target.child_id = descriptor.child_id;
             target.logical_unit_id = descriptor.logical_unit_id;
@@ -772,10 +890,12 @@ public:
             target.promote_hops = live_generation.promote_hops;
             target.last_transition = live_generation.last_transition;
             target.representation_kind = descriptor.representation.kind;
-            target.codec_id = descriptor.representation.codec_id;
-            target.codec_version = descriptor.representation.codec_version;
+            target.codec_id = live_identity.codec_id;
+            target.codec_version = live_identity.codec_version;
             target.representation_reference_digest =
-                descriptor.representation.reference_digest;
+                representation_reference_digest(
+                    descriptor.current_type, descriptor.last_source_type,
+                    live_identity);
             target.source_loss_history =
                 descriptor.representation.source_loss_history;
             target.checkpoint_codec_hops =
@@ -785,9 +905,12 @@ public:
             target.layout = descriptor.layout;
             target.row_codec_version = descriptor.row_codec_version;
             target.current_domain = live_generation.domain;
-            target.codebook_digest = descriptor.codebook_digest;
-            target.rotation_digest = descriptor.rotation_digest;
-            target.meansub_digest = descriptor.meansub_digest;
+            target.codebook_digest = live_identity.codebook_digest;
+            target.rotation_digest = live_identity.rotation_digest;
+            target.meansub_digest = live_identity.meansub_digest;
+            target.meansub_model_id = meansub_ref.model_id;
+            target.meansub_layer = meansub_ref.layer;
+            target.meansub_baked = live_identity.meansub_baked;
             target.n_stream = descriptor.n_stream;
             target.unified = descriptor.unified;
             target.v_trans = false;
@@ -850,6 +973,10 @@ public:
             const std::vector<llama_memory_tree_child> & tree,
             const vbr_artifact_package_view & package,
             const vbr_import_destination_projection & destination,
+            const void * representation_context,
+            vbr_explicit_capture_request::representation_identity_fn
+                representation_identity,
+            std::vector<representation_cache_entry> & representation_cache,
             vbr_target_validation_snapshot & output,
             vbr_downward_policy_projection & projection) noexcept {
         struct indexed_child {
@@ -943,11 +1070,75 @@ public:
                     [unit.logical_unit_id];
                 const auto live_type = static_cast<ggml_type>(
                     unit.current_type);
-                if ((source_type != target_type || target_type != live_type) &&
-                    !child.cache->vbr_import_bind_target_unit(
-                        source_type, target_type, projection,
-                        uint32_t(child_index), unit)) {
-                    return false;
+                if (source_type != target_type || target_type != live_type) {
+                    const bool value_side =
+                        (unit.logical_unit_id & 1u) != 0;
+                    const auto meansub_ref = child.cache->layers[
+                        unit.logical_unit_id/2].turbo_meansub_ref;
+                    auto target_representation = std::find_if(
+                        representation_cache.begin(),
+                        representation_cache.end(),
+                        [&](const representation_cache_entry & cached) {
+                            return cached.current_type == int32_t(target_type) &&
+                                   cached.value_side == value_side &&
+                                   cached.meansub_model_id == meansub_ref.model_id;
+                        });
+                    if (target_representation == representation_cache.end()) {
+                        vbr_explicit_representation_identity identity;
+                        if (!representation_identity ||
+                            !representation_context ||
+                            !representation_identity(
+                                representation_context, int32_t(target_type),
+                                value_side, meansub_ref.model_id, identity)) {
+                            return false;
+                        }
+                        representation_cache.push_back({
+                            int32_t(target_type), value_side,
+                            meansub_ref.model_id, std::move(identity),
+                        });
+                        target_representation =
+                            std::prev(representation_cache.end());
+                    }
+                    const auto & selected_identity =
+                        target_representation->identity;
+                    if (selected_identity.codec_id == 0 ||
+                        selected_identity.codec_version == 0 ||
+                        !digest_nonzero(selected_identity.codebook_digest) ||
+                        !digest_nonzero(selected_identity.rotation_digest) ||
+                        !digest_nonzero(selected_identity.meansub_digest)) {
+                        return false;
+                    }
+                    const vbr_upward_representation_identity
+                        selected_source_identity {
+                            unit.codebook_digest,
+                            unit.rotation_digest,
+                            unit.meansub_digest,
+                            unit.meansub_model_id,
+                            unit.meansub_layer,
+                            unit.meansub_baked,
+                            unit.codec_id,
+                            unit.codec_version,
+                            unit.representation_reference_digest,
+                        };
+                    const vbr_upward_representation_identity
+                        selected_target_identity {
+                            selected_identity.codebook_digest,
+                            selected_identity.rotation_digest,
+                            selected_identity.meansub_digest,
+                            meansub_ref.model_id, meansub_ref.layer,
+                            selected_identity.meansub_baked,
+                            selected_identity.codec_id,
+                            selected_identity.codec_version,
+                            representation_reference_digest(
+                                int32_t(target_type), int32_t(source_type),
+                                selected_identity),
+                        };
+                    if (!child.cache->vbr_import_bind_target_unit(
+                            descriptor, target_type, selected_source_identity,
+                            selected_target_identity, projection,
+                            uint32_t(child_index), unit)) {
+                        return false;
+                    }
                 }
                 if (source_type == target_type) {
                     // This copied snapshot is the post-adoption image. Exact
@@ -1278,12 +1469,6 @@ public:
             operation);
     }
 
-    struct representation_cache_entry {
-        int32_t current_type = -1;
-        bool value_side = false;
-        vbr_explicit_representation_identity identity;
-    };
-
     static bool capture_schema(
             const child & value,
             const void * representation_context,
@@ -1329,6 +1514,8 @@ public:
                 plan.n_stream != policy.n_stream ||
                 plan.unified != policy.unified ||
                 plan.wm_cells != policy.wm_cells ||
+                plan.meansub_ref.model_id < 0 ||
+                plan.meansub_ref.layer < 0 ||
                 plan.shards.empty()) {
                 status = vbr_explicit_capture_status::unsupported_layout;
                 return false;
@@ -1352,20 +1539,24 @@ public:
                 [&](const auto & cached) {
                     return cached.current_type ==
                             plan.generation.current_type &&
-                        cached.value_side == plan.is_v;
+                        cached.value_side == plan.is_v &&
+                        cached.meansub_model_id ==
+                            plan.meansub_ref.model_id;
                 });
             if (representation == representation_cache.end()) {
                 vbr_explicit_representation_identity identity;
                 if (!representation_identity(
                         representation_context,
                         plan.generation.current_type,
-                        plan.is_v, identity)) {
+                        plan.is_v, plan.meansub_ref.model_id,
+                        identity)) {
                     status =
                         vbr_explicit_capture_status::identity_unavailable;
                     return false;
                 }
                 representation_cache.push_back({
                     plan.generation.current_type, plan.is_v,
+                    plan.meansub_ref.model_id,
                     std::move(identity),
                 });
                 representation = std::prev(representation_cache.end());
@@ -1383,29 +1574,10 @@ public:
             descriptor.representation.codec_id = identity.codec_id;
             descriptor.representation.codec_version =
                 identity.codec_version;
-            llama_sha256_writer representation_hash;
-            static constexpr char REPRESENTATION_DOMAIN[] =
-                "buun.vbr.capture/representation";
-            representation_hash.string(
-                REPRESENTATION_DOMAIN,
-                sizeof(REPRESENTATION_DOMAIN) - 1);
-            representation_hash.u32(
-                uint32_t(plan.generation.current_type));
-            representation_hash.u32(
-                uint32_t(plan.generation.last_source_type));
-            representation_hash.u32(identity.codec_id);
-            representation_hash.u32(identity.codec_version);
-            representation_hash.bytes(
-                identity.codebook_digest.data(),
-                identity.codebook_digest.size());
-            representation_hash.bytes(
-                identity.rotation_digest.data(),
-                identity.rotation_digest.size());
-            representation_hash.bytes(
-                identity.meansub_digest.data(),
-                identity.meansub_digest.size());
             descriptor.representation.reference_digest =
-                representation_hash.finish();
+                representation_reference_digest(
+                    plan.generation.current_type,
+                    plan.generation.last_source_type, identity);
             descriptor.representation.source_loss_history =
                 plan.generation.promote_hops;
             descriptor.side = plan.is_v
@@ -1468,6 +1640,9 @@ public:
             descriptor.codebook_digest = identity.codebook_digest;
             descriptor.rotation_digest = identity.rotation_digest;
             descriptor.meansub_digest = identity.meansub_digest;
+            descriptor.meansub_model_id = plan.meansub_ref.model_id;
+            descriptor.meansub_layer = plan.meansub_ref.layer;
+            descriptor.meansub_baked = identity.meansub_baked;
             descriptor.clean_stash_state = has_stash
                 ? vbr_artifact_clean_stash_state::present
                 : vbr_artifact_clean_stash_state::absent_at_source;
@@ -3008,8 +3183,8 @@ import_classified_schedule_actionability(
         case vbr_import_schedule_status::downward:
             return vbr_import_target_snapshot_status::actionable;
         case vbr_import_schedule_status::upward_same_domain:
-            break;
         case vbr_import_schedule_status::upward_cross_domain:
+            break;
         case vbr_import_schedule_status::mixed_direction_unsupported:
             return vbr_import_target_snapshot_status::report_only;
         case vbr_import_schedule_status::unavailable:
@@ -3046,8 +3221,10 @@ vbr_explicit_import_schedule_actionability(
 
 static bool import_upward_schedule_supported(
         const vbr_import_schedule_quote & schedule) noexcept {
-    return schedule.status() ==
-               vbr_import_schedule_status::upward_same_domain &&
+    return (schedule.status() ==
+                vbr_import_schedule_status::upward_same_domain ||
+            schedule.status() ==
+                vbr_import_schedule_status::upward_cross_domain) &&
            import_classified_schedule_actionability(
                schedule.status(), schedule.units()) ==
                vbr_import_target_snapshot_status::actionable;
@@ -3060,6 +3237,9 @@ static bool import_target_snapshot_core(
         const std::vector<llama_vbr_artifact_domain_binding> & bindings,
         bool previously_observed,
         uint64_t accounting_serial,
+        const void * representation_context,
+        vbr_explicit_capture_request::representation_identity_fn
+            representation_identity,
         vbr_target_validation_snapshot & output,
         vbr_downward_policy_projection * transform_projection,
         bool * downward_required,
@@ -3101,6 +3281,8 @@ static bool import_target_snapshot_core(
             memory.seq_pos_max(destination) < 0;
         output.tree_shape_digest = import_tree_digest(memory, tree);
         output.target_state_serial = 1;
+        std::vector<vbr_live_capture_adapter::representation_cache_entry>
+            representation_cache;
         size_t n_attention = 0;
         size_t n_recurrent = 0;
         for (const auto & child : tree) {
@@ -3125,7 +3307,9 @@ static bool import_target_snapshot_core(
             vbr_target_child_snapshot snapshot;
             if (!vbr_live_capture_adapter::fill_import_child(
                     child, package, bindings, previously_observed,
-                    policy_epoch, snapshot)) {
+                    policy_epoch, representation_context,
+                    representation_identity, representation_cache,
+                    snapshot)) {
                 output = {};
                 return false;
             }
@@ -3161,7 +3345,8 @@ static bool import_target_snapshot_core(
                     authenticated_schedule->destination()) ||
                 !vbr_live_capture_adapter::apply_import_destination(
                     tree, package, authenticated_schedule->destination(),
-                    output, selected_projection) ||
+                    representation_context, representation_identity,
+                    representation_cache, output, selected_projection) ||
                 !vbr_import_schedule_quote_matches(
                     *authenticated_schedule, output, package)) {
                 output = {};
@@ -3188,7 +3373,9 @@ static bool import_target_snapshot_core(
             }
             const auto & selected = destination->destination();
             if (!vbr_live_capture_adapter::apply_import_destination(
-                    tree, package, selected, output,
+                    tree, package, selected,
+                    representation_context, representation_identity,
+                    representation_cache, output,
                     selected_projection)) {
                 output = {};
                 *destination = {};
@@ -3254,12 +3441,16 @@ bool vbr_explicit_import_target_snapshot(
         const std::vector<llama_vbr_artifact_domain_binding> & bindings,
         bool previously_observed,
         uint64_t accounting_serial,
+        const void * representation_context,
+        vbr_explicit_capture_request::representation_identity_fn
+            representation_identity,
         vbr_target_validation_snapshot & output,
         vbr_downward_policy_projection * downward_projection,
         bool * downward_required) noexcept {
     return import_target_snapshot_core(
         memory, destination, package, bindings, previously_observed,
-        accounting_serial, output, downward_projection, downward_required,
+        accounting_serial, representation_context, representation_identity,
+        output, downward_projection, downward_required,
         nullptr, nullptr);
 }
 
@@ -3271,6 +3462,9 @@ vbr_explicit_import_target_schedule_snapshot(
         const std::vector<llama_vbr_artifact_domain_binding> & bindings,
         bool previously_observed,
         uint64_t accounting_serial,
+        const void * representation_context,
+        vbr_explicit_capture_request::representation_identity_fn
+            representation_identity,
         vbr_target_validation_snapshot & output,
         vbr_downward_policy_projection & downward_projection,
         bool & downward_required,
@@ -3278,8 +3472,9 @@ vbr_explicit_import_target_schedule_snapshot(
     downward_projection = {};
     vbr_downward_policy_projection transform_projection;
     if (!import_target_snapshot_core(
-            memory, destination, package, bindings, previously_observed,
-            accounting_serial, output, &transform_projection,
+        memory, destination, package, bindings, previously_observed,
+        accounting_serial, representation_context, representation_identity,
+        output, &transform_projection,
             &downward_required, &schedule_quote, nullptr)) {
         return vbr_import_target_snapshot_status::unavailable;
     }
@@ -3303,6 +3498,9 @@ bool vbr_explicit_import_transform_projection_recheck(
         const vbr_artifact_package_view & package,
         const std::vector<llama_vbr_artifact_domain_binding> & bindings,
         const vbr_import_schedule_quote & authenticated_schedule,
+        const void * representation_context,
+        vbr_explicit_capture_request::representation_identity_fn
+            representation_identity,
         std::array<uint8_t, 32> & tree_digest) noexcept {
     tree_digest = {};
     if (authenticated_schedule.status() !=
@@ -3315,7 +3513,8 @@ bool vbr_explicit_import_transform_projection_recheck(
     bool downward = false;
     if (!import_target_snapshot_core(
             memory, destination, package, bindings, false,
-            authenticated_schedule.accounting_serial(), snapshot,
+            authenticated_schedule.accounting_serial(),
+            representation_context, representation_identity, snapshot,
             &projection, &downward,
             nullptr, &authenticated_schedule, &tree_digest) ||
         (authenticated_schedule.status() ==

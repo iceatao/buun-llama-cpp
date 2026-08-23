@@ -664,7 +664,9 @@ bool stage_child(
     }
 
     if (child.stash_action !=
-            vbr_validated_stash_action::restore_exact) {
+            vbr_validated_stash_action::restore_exact &&
+        child.stash_action !=
+            vbr_validated_stash_action::consume_exact_then_drop) {
         return true;
     }
     const auto unit = std::find_if(

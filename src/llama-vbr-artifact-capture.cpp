@@ -123,6 +123,9 @@ bool capture_descriptor_schema_equal(
         lhs.codebook_digest != rhs.codebook_digest ||
         lhs.rotation_digest != rhs.rotation_digest ||
         lhs.meansub_digest != rhs.meansub_digest ||
+        lhs.meansub_model_id != rhs.meansub_model_id ||
+        lhs.meansub_layer != rhs.meansub_layer ||
+        lhs.meansub_baked != rhs.meansub_baked ||
         lhs.clean_stash_state != rhs.clean_stash_state ||
         lhs.clean_stash.valid_rows != rhs.clean_stash.valid_rows ||
         lhs.clean_stash.domain != rhs.clean_stash.domain ||

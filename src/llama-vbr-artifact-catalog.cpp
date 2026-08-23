@@ -375,6 +375,9 @@ Digest projected_digest(
     hash.string(
         descriptor.meansub_digest.data(),
         descriptor.meansub_digest.size());
+    hash.u32(uint32_t(descriptor.meansub_model_id));
+    hash.u32(uint32_t(descriptor.meansub_layer));
+    hash.u32(descriptor.meansub_baked ? 1 : 0);
     hash.u32(uint32_t(unit.shards().size()));
     for (uint32_t i = 0; i < unit.shards().size(); ++i) {
         const auto & shard = unit.shards()[i];

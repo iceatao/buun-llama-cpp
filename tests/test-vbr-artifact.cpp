@@ -288,6 +288,9 @@ static vbr_artifact_package make_package(fixture_storage & storage) {
     descriptor.codebook_digest = marker(0x61);
     descriptor.rotation_digest = marker(0x62);
     descriptor.meansub_digest = marker(0x63);
+    descriptor.meansub_model_id = 1;
+    descriptor.meansub_layer = 0;
+    descriptor.meansub_baked = true;
     descriptor.shards = {
         make_shard(0, storage.payload0.source()),
         make_shard(1, storage.payload1.source()),
@@ -450,7 +453,7 @@ static void test_golden_and_native_lineage() {
     CHECK(package.topologies[0].digest ==
           llama_cache_acct_compute_topology_digest(package.topologies[0]));
     CHECK(hex(package.unit_blobs[0].unit_version_id.bytes()) ==
-          "492279d0d4a8cbbba1cf997c706d077d1209fb720d52e4820788bbc9fccaccce");
+          "61f278bd75cbae9e94a892ffd73ac8811aab0b13543cfe5223668e87fe483b96");
     CHECK(hex(package.unit_blobs[0].payload_digest.bytes()) ==
           "8325d422f361b83e19f57dd0e6e566f330961cae4889c2f934bf94619316705f");
     CHECK(hex(package.unit_blobs[0].descriptor.clean_stash.payload_id.bytes()) ==
@@ -460,13 +463,13 @@ static void test_golden_and_native_lineage() {
     CHECK(hex(package.manifest.token_block.digest.bytes()) ==
           "9635811050104e380f761c837ec49756986867248fab5e94877adbb7be90ad68");
     CHECK(hex(package.manifest.manifest_digest.bytes()) ==
-          "6e7ac611f37686aa527bae124a115e58ca278a2122c76a336717b4f3b7637d4b");
+          "e19f919b9369b41afad3c6506c7c6a3159c02dd4961b9f883ba79eff41c989c8");
     CHECK(hex(digest_of(encoded)) ==
-          "085b609eb67c847f5086ccd8ae44c9a8cc0243d0ce279bee5c617c63298f03dd");
-    CHECK(encoded.size() == 2358);
+          "098e00421a46ec5e2a8680db85814bd960deb61f6db53597d762124cb21cfc5d");
+    CHECK(encoded.size() == 2370);
     CHECK(encoded[0] == 0x56 && encoded[1] == 0x42 &&
           encoded[2] == 0x52 && encoded[3] == 0x32);
-    CHECK(encoded[4] == 2 && encoded[5] == 0 &&
+    CHECK(encoded[4] == 3 && encoded[5] == 0 &&
           encoded[6] == 0 && encoded[7] == 0);
 
     vbr_artifact_package decoded;
@@ -475,6 +478,9 @@ static void test_golden_and_native_lineage() {
           vbr_artifact_status::ok);
     CHECK(decoded.version == VBR_UNIT_ARTIFACT_FORMAT_VERSION);
     CHECK(decoded.unit_blobs.size() == 1);
+    CHECK(decoded.unit_blobs[0].descriptor.meansub_model_id == 1);
+    CHECK(decoded.unit_blobs[0].descriptor.meansub_layer == 0);
+    CHECK(decoded.unit_blobs[0].descriptor.meansub_baked);
     CHECK(decoded.manifest.generation.controllers.size() == 1);
     CHECK(decoded.manifest.generation.controllers[0].lineage_uuid ==
           package.manifest.generation.controllers[0].lineage_uuid);
@@ -498,12 +504,18 @@ static void test_v1_decode_and_v2_restore_metadata() {
     auto legacy = make_package(storage);
     legacy.version = 1;
     legacy.manifest.version = 1;
+    legacy.unit_blobs[0].descriptor.meansub_model_id = -1;
+    legacy.unit_blobs[0].descriptor.meansub_layer = -1;
+    legacy.unit_blobs[0].descriptor.meansub_baked = false;
     legacy.manifest.token_block = {};
     legacy.manifest.stream_placements.clear();
     std::vector<uint8_t> bytes;
     CHECK(vbr_artifact_encode_vector(legacy, bytes, 1024*1024) ==
           vbr_artifact_status::ok);
     CHECK(bytes[4] == 1);
+    CHECK(bytes.size() == 2254);
+    CHECK(hex(digest_of(bytes)) ==
+          "b8ba3cb1191ca5be00720d5ab77a2b8c49406b9c5957b39f52c932e2c6c68e8d");
     vbr_artifact_package decoded;
     CHECK(vbr_artifact_decode_vector(bytes, limits(1024*1024), decoded) ==
           vbr_artifact_status::ok);
@@ -511,6 +523,26 @@ static void test_v1_decode_and_v2_restore_metadata() {
     CHECK(decoded.manifest.stream_placements.empty());
     CHECK(decoded.manifest.token_block.tokens.empty());
     CHECK(!decoded.manifest.token_block.digest.valid());
+
+    auto v2 = make_package(storage);
+    v2.version = 2;
+    v2.unit_blobs[0].descriptor.meansub_model_id = -1;
+    v2.unit_blobs[0].descriptor.meansub_layer = -1;
+    v2.unit_blobs[0].descriptor.meansub_baked = false;
+    bytes.clear();
+    CHECK(vbr_artifact_encode_vector(v2, bytes, 1024*1024) ==
+          vbr_artifact_status::ok);
+    CHECK(bytes[4] == 2);
+    CHECK(bytes.size() == 2358);
+    CHECK(hex(digest_of(bytes)) ==
+          "085b609eb67c847f5086ccd8ae44c9a8cc0243d0ce279bee5c617c63298f03dd");
+    decoded = {};
+    CHECK(vbr_artifact_decode_vector(bytes, limits(1024*1024), decoded) ==
+          vbr_artifact_status::ok);
+    CHECK(decoded.version == 2);
+    CHECK(decoded.unit_blobs[0].descriptor.meansub_model_id == -1);
+    CHECK(decoded.unit_blobs[0].descriptor.meansub_layer == -1);
+    CHECK(!decoded.unit_blobs[0].descriptor.meansub_baked);
 }
 
 static void test_identity_and_reference_separation() {
@@ -545,6 +577,20 @@ static void test_identity_and_reference_separation() {
           first.unit_blobs[0].unit_version_id);
     CHECK(token_changed.manifest.token_block.digest !=
           first.manifest.token_block.digest);
+
+    auto mean_row_changed = make_package(storage);
+    ++mean_row_changed.unit_blobs[0].descriptor.meansub_layer;
+    CHECK(vbr_artifact_encode_vector(
+              mean_row_changed, bytes, 1024*1024) ==
+          vbr_artifact_status::ok);
+    CHECK(mean_row_changed.unit_blobs[0].unit_version_id !=
+          first.unit_blobs[0].unit_version_id);
+
+    auto invalid_mean_ref = make_package(storage);
+    invalid_mean_ref.unit_blobs[0].descriptor.meansub_layer = -1;
+    CHECK(vbr_artifact_encode_vector(
+              invalid_mean_ref, bytes, 1024*1024) !=
+          vbr_artifact_status::ok);
 
     storage.payload0.bytes[0] ^= 1;
     auto payload_changed = make_package(storage);
@@ -741,7 +787,7 @@ static void test_fail_closed_decode() {
           package.manifest.unit_references[0].repr_gen);
 
     auto bad_version = encoded;
-    bad_version[4] = 3;
+    bad_version[4] = uint8_t(VBR_UNIT_ARTIFACT_FORMAT_VERSION + 1);
     CHECK(vbr_artifact_decode_vector(
               bad_version, limits(1024*1024), decoded) ==
           vbr_artifact_status::unsupported_version);
@@ -3266,7 +3312,8 @@ struct validator_fixture {
             bool include_pinned = false,
             ggml_type source_type = GGML_TYPE_COUNT,
             uint8_t source_promote_hops = 1,
-            bool include_exact_sibling = false)
+            bool include_exact_sibling = false,
+            bool meansub_baked = true)
         : base(true, include_pinned) {
         // Keep the historical artifact golden intact while making this
         // validator fixture's physical authorization fit its one-row unit.
@@ -3274,6 +3321,12 @@ struct validator_fixture {
         auto & stream = manifest.generation.controllers[0].streams[0];
         auto & placement = manifest.stream_placements[0];
         auto & stash = manifest.unit_references[0].stash_reference;
+        for (auto & blob : base.package.unit_blobs) {
+            blob.descriptor.meansub_model_id = 7;
+            blob.descriptor.meansub_layer =
+                int32_t(blob.descriptor.logical_unit_id/2);
+            blob.descriptor.meansub_baked = meansub_baked;
+        }
         if (stash_case == 1) {
             auto & descriptor = base.package.unit_blobs[0].descriptor;
             descriptor.wm_cells = 2;
@@ -3374,6 +3427,11 @@ struct validator_fixture {
         if (legacy_v1) {
             base.package.version = 1;
             manifest.version = 1;
+            for (auto & unit : base.package.unit_blobs) {
+                unit.descriptor.meansub_model_id = -1;
+                unit.descriptor.meansub_layer = -1;
+                unit.descriptor.meansub_baked = false;
+            }
             manifest.stream_placements.clear();
             manifest.token_block = {};
             const auto published = publish_fixture(*base.catalog,
@@ -3497,6 +3555,9 @@ struct validator_fixture {
             unit.codebook_digest = descriptor.codebook_digest;
             unit.rotation_digest = descriptor.rotation_digest;
             unit.meansub_digest = descriptor.meansub_digest;
+            unit.meansub_model_id = descriptor.meansub_model_id;
+            unit.meansub_layer = descriptor.meansub_layer;
+            unit.meansub_baked = descriptor.meansub_baked;
             unit.n_stream = descriptor.n_stream;
             unit.unified = descriptor.unified;
             unit.wm_cells = descriptor.wm_cells;
@@ -3568,6 +3629,31 @@ static vbr_manifest_validation_result validate(
         const vbr_adopt_policy & policy) {
     return vbr_validate_unit_manifest_snapshot(
         target, fixture.view, policy);
+}
+
+static vbr_upward_representation_identity live_upward_identity(
+        const vbr_target_unit_snapshot & unit) {
+    return {
+        unit.codebook_digest,
+        unit.rotation_digest,
+        unit.meansub_digest,
+        unit.meansub_model_id,
+        unit.meansub_layer,
+        unit.meansub_baked,
+        unit.codec_id,
+        unit.codec_version,
+        unit.representation_reference_digest,
+    };
+}
+
+static void bind_test_upward_identities(
+        vbr_target_unit_snapshot & unit,
+        const vbr_artifact_unit_descriptor & descriptor) {
+    (void) descriptor;
+    unit.upward_source_identity = live_upward_identity(unit);
+    unit.upward_target_identity = unit.upward_source_identity;
+    unit.upward_meansub_model_id =
+        unit.upward_source_identity.meansub_model_id;
 }
 
 static void test_manifest_validator_matrix() {
@@ -3835,6 +3921,30 @@ static void test_manifest_validator_matrix() {
     CHECK(vbr_upward_resolve_recipe(
               GGML_TYPE_TURBO4_0, GGML_TYPE_F16,
               unsupported_recipe) ==
+          vbr_upward_recipe_status::resolved);
+    CHECK(unsupported_recipe.edges[0].mean_action ==
+          vbr_upward_mean_action::add_baked_source_mean);
+    size_t cross_domain_pairs = 0;
+    for (const auto source : tapped_types) {
+        for (const auto target :
+             { GGML_TYPE_TURBO8_0, GGML_TYPE_F16 }) {
+            vbr_upward_recipe cross_recipe;
+            CHECK(vbr_upward_resolve_recipe(
+                      source, target, cross_recipe) ==
+                  vbr_upward_recipe_status::resolved);
+            CHECK(cross_recipe.n_edges == 1);
+            CHECK(cross_recipe.edges[0].source_domain ==
+                  vbr_repr_domain::tapped);
+            CHECK(cross_recipe.edges[0].target_domain ==
+                  vbr_repr_domain::full);
+            CHECK(cross_recipe.edges[0].mean_action ==
+                  vbr_upward_mean_action::add_baked_source_mean);
+            ++cross_domain_pairs;
+        }
+    }
+    CHECK(cross_domain_pairs == 8);
+    CHECK(vbr_upward_resolve_recipe(
+              GGML_TYPE_Q4_0, GGML_TYPE_F16, unsupported_recipe) ==
           vbr_upward_recipe_status::cross_domain_unsupported);
     CHECK(vbr_upward_resolve_recipe(
               GGML_TYPE_F16, GGML_TYPE_TURBO8_0,
@@ -3864,7 +3974,8 @@ static void test_manifest_validator_matrix() {
     upward_unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
     upward_unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
     upward_unit.upward_recipe = upward_recipe;
-    upward_unit.upward_meansub_model_id = 7;
+    bind_test_upward_identities(
+        upward_unit, same_domain_source.view.units()[0].descriptor);
     upward_unit.upward_row_bytes = 4;
     upward_unit.upward_mapped_bytes = 4;
     upward_unit.upward_transfer_bytes =
@@ -3895,8 +4006,8 @@ static void test_manifest_validator_matrix() {
     CHECK(same_domain_upward.status() ==
           vbr_import_schedule_status::upward_same_domain);
     upward_unit.upward_build_identity_digest = vbr_upward_build_identity(
-        upward_recipe, upward_unit.upward_meansub_model_id,
-        upward_unit.meansub_digest,
+        upward_recipe, upward_unit.upward_source_identity,
+        upward_unit.upward_target_identity,
         upward_destination.child_type_digests[0],
         upward_destination.tree_digest);
     CHECK(std::any_of(
@@ -3989,17 +4100,49 @@ static void test_manifest_validator_matrix() {
               same_domain_source, bad_upward_identity, upward_policy).status ==
           vbr_manifest_validation_status::codebook_mismatch);
     auto bad_upward_codebook = same_domain_target;
-    bad_upward_codebook.children[0].units[0].codebook_digest[0] ^= 1;
+    bad_upward_codebook.children[0].units[0]
+        .upward_source_identity.codebook_digest[0] ^= 1;
     CHECK(validate(
               same_domain_source, bad_upward_codebook, upward_policy).status ==
-          vbr_manifest_validation_status::codebook_mismatch);
+          vbr_manifest_validation_status::representation_mismatch);
+    const auto check_live_source_drift = [&](
+            auto mutate_live_identity) {
+        auto drifted = same_domain_target;
+        auto & unit = drifted.children[0].units[0];
+        mutate_live_identity(unit.upward_source_identity);
+        unit.upward_build_identity_digest = vbr_upward_build_identity(
+            unit.upward_recipe, unit.upward_source_identity,
+            unit.upward_target_identity,
+            upward_destination.child_type_digests[0],
+            upward_destination.tree_digest);
+        CHECK(vbr_digest_nonzero(unit.upward_build_identity_digest));
+        const auto refused = validate(
+            same_domain_source, drifted, upward_policy);
+        CHECK(refused.status ==
+              vbr_manifest_validation_status::representation_mismatch);
+        CHECK(!refused.proof);
+    };
+    check_live_source_drift([](auto & identity) {
+        identity.codebook_digest[0] ^= 1;
+    });
+    check_live_source_drift([](auto & identity) {
+        identity.rotation_digest[0] ^= 1;
+    });
+    check_live_source_drift([](auto & identity) {
+        ++identity.codec_version;
+    });
+    check_live_source_drift([](auto & identity) {
+        identity.representation_reference_digest[0] ^= 1;
+    });
     auto bad_upward_rotation = same_domain_target;
-    bad_upward_rotation.children[0].units[0].rotation_digest[0] ^= 1;
+    bad_upward_rotation.children[0].units[0]
+        .upward_target_identity.rotation_digest[0] ^= 1;
     CHECK(validate(
               same_domain_source, bad_upward_rotation, upward_policy).status ==
           vbr_manifest_validation_status::codebook_mismatch);
     auto bad_upward_meansub = same_domain_target;
-    bad_upward_meansub.children[0].units[0].meansub_digest[0] ^= 1;
+    bad_upward_meansub.children[0].units[0]
+        .upward_target_identity.meansub_digest[0] ^= 1;
     CHECK(validate(
               same_domain_source, bad_upward_meansub, upward_policy).status ==
           vbr_manifest_validation_status::codebook_mismatch);
@@ -4033,7 +4176,8 @@ static void test_manifest_validator_matrix() {
         unit.upward_domain = vbr_repr_domain::tapped;
         unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
         unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
-        unit.upward_meansub_model_id = 7;
+        bind_test_upward_identities(
+            unit, source.view.units()[0].descriptor);
         CHECK(vbr_upward_resolve_recipe(
                   source_type, target_type, unit.upward_recipe) ==
               vbr_upward_recipe_status::resolved);
@@ -4080,8 +4224,9 @@ static void test_manifest_validator_matrix() {
         CHECK(vbr_rebind_import_schedule_quote(
             target, source.view, destination, quote));
         unit.upward_build_identity_digest = vbr_upward_build_identity(
-            unit.upward_recipe, unit.upward_meansub_model_id,
-            unit.meansub_digest, destination.child_type_digests[0],
+            unit.upward_recipe, unit.upward_source_identity,
+            unit.upward_target_identity,
+            destination.child_type_digests[0],
             destination.tree_digest);
         CHECK(vbr_digest_nonzero(unit.upward_build_identity_digest));
 
@@ -4161,7 +4306,8 @@ static void test_manifest_validator_matrix() {
     promoted_unit.upward_domain = vbr_repr_domain::tapped;
     promoted_unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
     promoted_unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
-    promoted_unit.upward_meansub_model_id = 7;
+    bind_test_upward_identities(
+        promoted_unit, mixed_tapped.view.units()[0].descriptor);
     CHECK(vbr_upward_resolve_recipe(
               GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0,
               promoted_unit.upward_recipe) ==
@@ -4217,8 +4363,8 @@ static void test_manifest_validator_matrix() {
         mixed_destination, mixed_quote));
     promoted_unit.upward_build_identity_digest = vbr_upward_build_identity(
         promoted_unit.upward_recipe,
-        promoted_unit.upward_meansub_model_id,
-        promoted_unit.meansub_digest,
+        promoted_unit.upward_source_identity,
+        promoted_unit.upward_target_identity,
         mixed_destination.child_type_digests[0],
         mixed_destination.tree_digest);
     llama_cache_budget_plan mixed_transform_plan;
@@ -4265,17 +4411,165 @@ static void test_manifest_validator_matrix() {
         }
     }
 
-    validator_fixture cross_domain_source(false, 4);
-    auto cross_domain_target = cross_domain_source.target;
-    cross_domain_target.children[0].units[0].current_type = GGML_TYPE_F16;
-    cross_domain_target.children[0].units[0].current_domain =
-        vbr_repr_domain::full;
-    vbr_import_schedule_quote cross_domain_upward;
-    CHECK(vbr_quote_import_schedule(
-        cross_domain_target, cross_domain_source.view,
-        cross_domain_upward));
-    CHECK(cross_domain_upward.status() ==
-          vbr_import_schedule_status::upward_cross_domain);
+    const auto check_cross_domain_upward = [](
+            ggml_type source_type, ggml_type target_type,
+            uint8_t source_hops, int stash_case, bool baked,
+            bool mutate_source_identity, bool mutate_target_mean,
+            bool expected_valid) {
+        validator_fixture source(
+            false, stash_case, false, source_type, source_hops,
+            true, baked);
+        auto target = source.target;
+        auto & child = target.children[0];
+        auto & unit = child.units[0];
+        const auto & descriptor = source.view.units()[0].descriptor;
+        unit.current_type = target_type;
+        unit.current_domain = vbr_repr_domain::full;
+        unit.upward_supported = true;
+        unit.upward_type = target_type;
+        unit.upward_domain = vbr_repr_domain::full;
+        unit.upward_recipe_id = VBR_UPWARD_RECIPE_ID;
+        unit.upward_recipe_version = VBR_UPWARD_RECIPE_VERSION;
+        CHECK(vbr_upward_resolve_recipe(
+                  source_type, target_type, unit.upward_recipe) ==
+              vbr_upward_recipe_status::resolved);
+        bind_test_upward_identities(unit, descriptor);
+        // The destination codec is independently authenticated even though
+        // both endpoints must name the same immutable baked mean row.
+        unit.upward_target_identity.codebook_digest = marker(0xb1);
+        unit.upward_target_identity.rotation_digest = marker(0xb2);
+        if (mutate_source_identity) {
+            unit.upward_source_identity.codebook_digest[0] ^= 1;
+        }
+        if (mutate_target_mean) {
+            unit.upward_target_identity.meansub_layer++;
+        }
+        uint64_t mapped = 0;
+        uint64_t transfer = 0;
+        for (auto & shard : unit.shards) {
+            shard.row_bytes = target_type == GGML_TYPE_F16 ? 4 : 2;
+            CHECK(unit.wm_cells <= UINT64_MAX/shard.row_bytes);
+            shard.mapped_bytes = unit.wm_cells*shard.row_bytes;
+            CHECK(mapped <= UINT64_MAX-shard.mapped_bytes);
+            mapped += shard.mapped_bytes;
+        }
+        for (const auto & shard : descriptor.shards) {
+            CHECK(transfer <= UINT64_MAX-shard.payload_bytes);
+            transfer += shard.payload_bytes;
+        }
+        unit.upward_row_bytes = unit.shards.front().row_bytes;
+        unit.upward_mapped_bytes = mapped;
+        unit.upward_transfer_bytes = transfer;
+        unit.upward_codec_workspace_bytes = 64;
+
+        const ggml_type target_types[] = {
+            target_type, source_type,
+        };
+        child.controller_policy.current_type_vector_digest =
+            vbr_type_vector_digest(target_types, 2);
+        vbr_import_destination_projection destination;
+        destination.status =
+            vbr_import_destination_status::feasible_current;
+        destination.initial_types = { { target_type, source_type } };
+        destination.final_types = destination.initial_types;
+        destination.initial_cursors = { child.controller_policy.cursor };
+        destination.final_cursors = destination.initial_cursors;
+        destination.child_type_digests = {
+            child.controller_policy.current_type_vector_digest,
+        };
+        destination.tree_digest = vbr_type_tree_digest(
+            destination.child_type_digests,
+            VBR_DOWNWARD_RECIPE_VERSION);
+        vbr_import_schedule_quote quote;
+        CHECK(vbr_quote_import_schedule(target, source.view, quote));
+        CHECK(quote.status() ==
+              vbr_import_schedule_status::upward_cross_domain);
+        CHECK(vbr_rebind_import_schedule_quote(
+            target, source.view, destination, quote));
+        unit.upward_build_identity_digest = vbr_upward_build_identity(
+            unit.upward_recipe, unit.upward_source_identity,
+            unit.upward_target_identity,
+            destination.child_type_digests[0],
+            destination.tree_digest);
+
+        llama_cache_budget_plan transform_plan;
+        transform_plan.accounting_serial = source.accounting.serial;
+        auto policy = source.policy;
+        policy.schedule_quote = &quote;
+        policy.transform_budget_plan = &transform_plan;
+        source.serials.transform_tree_digest = destination.tree_digest;
+        policy.read_transform_tree_digest =
+            validator_serials::read_transform_tree;
+        const auto validated = validate(source, target, policy);
+        if (!expected_valid) {
+            CHECK(validated.status ==
+                  vbr_manifest_validation_status::representation_mismatch ||
+                  validated.status ==
+                  vbr_manifest_validation_status::codebook_mismatch);
+            CHECK(!validated.proof);
+            return;
+        }
+        CHECK(vbr_digest_nonzero(unit.upward_build_identity_digest));
+        CHECK(validated.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validated.decision ==
+              vbr_import_decision::upward_reconstruct);
+        CHECK(validated.proof &&
+              validated.proof->children().size() == 2);
+        CHECK(validated.proof &&
+              validated.proof->tracker_install().children.size() == 1);
+        if (!validated.proof ||
+            validated.proof->children().size() != 2 ||
+            validated.proof->tracker_install().children.size() != 1) {
+            return;
+        }
+        const auto & plans = validated.proof->children();
+        CHECK(plans[0].transform_kind ==
+              vbr_import_transform_kind::upward_cross_domain);
+        CHECK(plans[0].upward_recipe.edges[0].mean_action ==
+              vbr_upward_mean_action::add_baked_source_mean);
+        CHECK(plans[0].transcode_source_identity ==
+              unit.upward_source_identity);
+        CHECK(plans[0].transcode_target_identity ==
+              unit.upward_target_identity);
+        CHECK(plans[0].target_last_source_type == source_type);
+        CHECK(plans[0].target_promote_hops == source_hops + 1);
+        CHECK(plans[0].stash_action ==
+              (stash_case == 0
+                  ? vbr_validated_stash_action::consume_exact_then_drop
+                  : vbr_validated_stash_action::omit_live_rebased));
+        CHECK(plans[1].transform_kind ==
+              vbr_import_transform_kind::none);
+        const auto & generation =
+            validated.proof->tracker_install().children[0].units;
+        CHECK(generation.size() == 2);
+        if (generation.size() == 2) {
+            CHECK(generation[0].current_type == target_type);
+            CHECK(generation[0].domain == vbr_repr_domain::full);
+            CHECK(generation[0].last_source_type == source_type);
+            CHECK(generation[0].promote_hops == source_hops + 1);
+            CHECK(generation[1].current_type == source_type);
+            CHECK(generation[1].promote_hops == source_hops);
+        }
+    };
+    check_cross_domain_upward(
+        GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO8_0,
+        0, 0, true, false, false, true);
+    check_cross_domain_upward(
+        GGML_TYPE_TURBO1_TCQ, GGML_TYPE_F16,
+        1, 1, true, false, false, true);
+    check_cross_domain_upward(
+        GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16,
+        2, 0, true, false, false, false);
+    check_cross_domain_upward(
+        GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16,
+        0, 0, false, false, false, false);
+    check_cross_domain_upward(
+        GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16,
+        0, 0, true, true, false, false);
+    check_cross_domain_upward(
+        GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16,
+        0, 0, true, false, true, false);
     CHECK(vbr_classify_import_schedule_units({
         { 0, 0, GGML_TYPE_F16, GGML_TYPE_TURBO4_0,
           vbr_repr_domain::full, vbr_repr_domain::tapped },

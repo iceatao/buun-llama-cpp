@@ -979,10 +979,12 @@ struct h2_representation_identity_counts {
 
 static bool h2_test_representation_identity(
         const void * opaque, int32_t current_type, bool value_side,
+        int32_t meansub_model_id,
         vbr_explicit_representation_identity & output) noexcept {
     auto * counts = const_cast<h2_representation_identity_counts *>(
         static_cast<const h2_representation_identity_counts *>(opaque));
-    if (!counts || current_type < 0 || current_type >= GGML_TYPE_COUNT) {
+    if (!counts || current_type < 0 || current_type >= GGML_TYPE_COUNT ||
+        meansub_model_id < 0) {
         return false;
     }
     ++counts->calls[size_t(current_type)][value_side ? 1 : 0];
@@ -992,6 +994,7 @@ static bool h2_test_representation_identity(
     output.codebook_digest.fill(value_side ? 0x31 : 0x32);
     output.rotation_digest.fill(value_side ? 0x41 : 0x42);
     output.meansub_digest.fill(value_side ? 0x51 : 0x52);
+    output.meansub_baked = true;
     return true;
 }
 
@@ -1234,6 +1237,15 @@ static bool h2_projected_capture_batch_exact(
     for (const auto & manifest : captured.assembly.manifests()) {
         if (manifest.state != vbr_capture_manifest_state::ready) {
             return false;
+        }
+    }
+    for (const auto & target : captured.assembly.controller_targets()) {
+        for (const auto & descriptor : target.unit_descriptors) {
+            if (descriptor.meansub_model_id < 0 ||
+                descriptor.meansub_layer < 0 ||
+                !descriptor.meansub_baked) {
+                return false;
+            }
         }
     }
     for (const auto & publication : captured.publications) {

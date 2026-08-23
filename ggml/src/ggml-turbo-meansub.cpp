@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <mutex>
+#include <atomic>
 
 // Registry entry shape consumed by the generated data table. Compact storage: only live layers
 // are stored ([n_live][max_c]) plus their layer indices; the accessor expands to a dense
@@ -36,8 +37,8 @@ static_assert(
         "GGML_TURBO_MEANSUB_MAX_MODELS must include the unsupported-model slot");
 
 static std::mutex g_dense_mutex;
-static float * g_dense_k[sizeof(g_meansub_table)/sizeof(g_meansub_table[0])] = {};
-static float * g_dense_v[sizeof(g_meansub_table)/sizeof(g_meansub_table[0])] = {};
+static std::atomic<float *> g_dense_k[sizeof(g_meansub_table)/sizeof(g_meansub_table[0])] = {};
+static std::atomic<float *> g_dense_v[sizeof(g_meansub_table)/sizeof(g_meansub_table[0])] = {};
 
 GGML_API int ggml_turbo_meansub_model_id(const char * arch, int n_layer, int n_embd) {
     if (!arch || !arch[0]) {
@@ -84,10 +85,15 @@ GGML_API const float * ggml_turbo_meansub_table(
     if (out_max_c) *out_max_c = e->max_c;
     if (out_live)  *out_live  = kvsel ? e->v_live : e->k_live;
 
-    std::lock_guard<std::mutex> lock(g_dense_mutex);
-    float ** slot = kvsel ? &g_dense_v[index] : &g_dense_k[index];
-    if (!*slot) {
-        *slot = expand_dense(e, kvsel);
+    std::atomic<float *> & slot = kvsel ? g_dense_v[index] : g_dense_k[index];
+    float * dense = slot.load(std::memory_order_acquire);
+    if (!dense) {
+        std::lock_guard<std::mutex> lock(g_dense_mutex);
+        dense = slot.load(std::memory_order_relaxed);
+        if (!dense) {
+            dense = expand_dense(e, kvsel);
+            slot.store(dense, std::memory_order_release);
+        }
     }
-    return *slot;
+    return dense;
 }

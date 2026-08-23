@@ -743,6 +743,41 @@ static bool workspace_reserve(
     return true;
 }
 
+static bool workspace_memory_v2(
+        ggml_backend_t backend, int device,
+        const ggml_vbr_transcode_workspace_params_v2 * request,
+        size_t * now, size_t * endpoint) {
+    if (!request || !request->mean_addback) {
+        return false;
+    }
+    if (!workspace_memory(
+            backend, device, request->n_cells, request->ne0,
+            request->stash_rows, now, endpoint)) {
+        return false;
+    }
+    *endpoint += size_t(request->ne0)*sizeof(float);
+    return true;
+}
+
+static bool workspace_reserve_v2(
+        ggml_backend_t backend,
+        const ggml_vbr_transcode_workspace_params_v2 * request) {
+    if (!request || !request->mean_addback) {
+        return false;
+    }
+    auto * state = reinterpret_cast<fake_workspace *>(backend);
+    state->reserves++;
+    state->current = size_t(request->n_cells)*4096 +
+        size_t(request->ne0)*sizeof(float);
+    return true;
+}
+
+static bool cross_domain_reconstruct(
+        ggml_backend_t,
+        const ggml_vbr_cross_domain_reconstruct_params *) {
+    return true;
+}
+
 struct fake_stash {
     uint64_t current = 0;
     uint64_t endpoint = 8192;
@@ -980,6 +1015,81 @@ static void test_workspace_prices_max_shape_but_reserves_once() {
     }
 }
 
+static void test_cross_domain_workspace_prices_mean_plane_once() {
+    constexpr size_t request_count = 16384;
+    llama_cache_acct_ledger ledger;
+    configure_resource_ledger(ledger);
+    fake_workspace workspace;
+    workspace.request_scaled_endpoint = true;
+    ggml_vbr_backend_iface iface = {};
+    iface.kv_transcode_workspace_memory = workspace_memory;
+    iface.kv_transcode_workspace_reserve = workspace_reserve;
+    const ggml_vbr_cross_domain_iface_v1 cross_iface = {
+        GGML_VBR_CROSS_DOMAIN_IFACE_V1_VERSION,
+        sizeof(ggml_vbr_cross_domain_iface_v1),
+        cross_domain_reconstruct,
+        workspace_memory_v2,
+        workspace_reserve_v2,
+    };
+    const int workspace_owner = 2;
+    vbr_downward_workspace_endpoint endpoint;
+    endpoint.owner = &workspace_owner;
+    endpoint.iface = &iface;
+    endpoint.cross_iface = &cross_iface;
+    endpoint.backend = reinterpret_cast<ggml_backend_t>(&workspace);
+    endpoint.device = 0;
+    endpoint.domain = HOST;
+    endpoint.requests.reserve(request_count);
+    for (size_t i = 0; i < request_count; ++i) {
+        const int64_t n_cells = int64_t((i*8191) % request_count + 1);
+        endpoint.requests.push_back({ n_cells, 256, 0, true });
+    }
+    {
+        vbr_downward_resource_receipts receipts(ledger);
+        const auto result = receipts.reserve_resources({}, { endpoint }, {});
+        assert(result.status == vbr_downward_reserve_status::reserved);
+        assert(result.workspace_growth == request_count*4096 + 1024);
+        assert(workspace.prices == request_count);
+        assert(workspace.reserves == 1);
+        assert(workspace.current == request_count*4096 + 1024);
+    }
+}
+
+static void test_cross_domain_workspace_refuses_legacy_only_backend() {
+    llama_cache_acct_ledger ledger;
+    configure_resource_ledger(ledger);
+    fake_workspace workspace;
+    ggml_vbr_backend_iface legacy = {};
+    legacy.kv_transcode_workspace_memory = workspace_memory;
+    legacy.kv_transcode_workspace_reserve = workspace_reserve;
+    const int workspace_owner = 3;
+    vbr_downward_workspace_endpoint endpoint;
+    endpoint.owner = &workspace_owner;
+    endpoint.iface = &legacy;
+    endpoint.backend = reinterpret_cast<ggml_backend_t>(&workspace);
+    endpoint.device = 0;
+    endpoint.domain = HOST;
+    endpoint.requests.push_back({ 128, 256, 0, true });
+
+    vbr_downward_resource_receipts receipts(ledger);
+    const auto result = receipts.reserve_resources({}, { endpoint }, {});
+    assert(result.status == vbr_downward_reserve_status::projection_unavailable);
+    assert(workspace.prices == 0);
+    assert(workspace.reserves == 0);
+}
+
+static void test_mean_addback_launch_shape_is_row_bounded() {
+    ggml_vbr_mean_addback_launch_shape shape = {};
+    assert(ggml_vbr_mean_addback_launch_shape_for(256, 6144, &shape));
+    assert(shape.blocks == 256);
+    assert(shape.threads == 256);
+    assert(shape.blocks < (256u*6144u + shape.threads - 1)/shape.threads);
+    assert(ggml_vbr_mean_addback_launch_shape_for(1048576, 6144, &shape));
+    assert(shape.blocks == 1048576);
+    assert(!ggml_vbr_mean_addback_launch_shape_for(0, 6144, &shape));
+    assert(!ggml_vbr_mean_addback_launch_shape_for(1, 0, &shape));
+}
+
 int main() {
     test_iswa_physical_preflight_preserves_device_skew();
     test_iswa_physical_preflight_shared_scratch_and_overflow();
@@ -996,6 +1106,9 @@ int main() {
     test_mixed_transform_and_stash_only_receipts();
     test_trusted_stash_batch_validation_is_linear();
     test_workspace_prices_max_shape_but_reserves_once();
+    test_cross_domain_workspace_prices_mean_plane_once();
+    test_cross_domain_workspace_refuses_legacy_only_backend();
+    test_mean_addback_launch_shape_is_row_bounded();
     std::puts("test-vbr-downward: OK");
     return 0;
 }

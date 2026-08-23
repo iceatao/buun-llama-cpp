@@ -60,6 +60,7 @@ struct workspace_request {
     int64_t n_cells   = 0;
     int64_t ne0       = 0;
     int64_t stash_rows = 0;
+    bool mean_addback = false;
 };
 
 // Price only tuples that will really execute.  In particular, never synthesize a tuple from

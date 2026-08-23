@@ -387,8 +387,10 @@ class vbr_kv_import_session {
                             vbr_validated_stash_action::restore_exact
                         ? uint32_t(plan->descriptor.clean_stash.valid_rows)
                         : 0,
-                    uint8_t(plan->transform_kind ==
-                            vbr_import_transform_kind::upward_same_domain
+                    uint8_t((plan->transform_kind ==
+                            vbr_import_transform_kind::upward_same_domain ||
+                             plan->transform_kind ==
+                            vbr_import_transform_kind::upward_cross_domain)
                         ? plan->target_promote_hops
                         : plan->transform_kind ==
                                 vbr_import_transform_kind::downward
@@ -678,8 +680,10 @@ class vbr_kv_import_session {
                     vbr_import_transform_kind::downward
                 ? test_seam_->session_initialize_downward_backing(
                     child_id_, plan)
-                : plan.transform_kind ==
-                        vbr_import_transform_kind::upward_same_domain &&
+                : (plan.transform_kind ==
+                        vbr_import_transform_kind::upward_same_domain ||
+                   plan.transform_kind ==
+                        vbr_import_transform_kind::upward_cross_domain) &&
                     test_seam_->session_initialize_upward_backing(
                         child_id_, plan);
         }
@@ -750,16 +754,21 @@ class vbr_kv_import_session {
         if (test_seam_) {
             const uint32_t stash_rows =
                 plan.source_domain == vbr_repr_domain::tapped &&
-                plan.stash_action ==
-                    vbr_validated_stash_action::restore_exact
+                (plan.stash_action ==
+                     vbr_validated_stash_action::restore_exact ||
+                 plan.stash_action ==
+                     vbr_validated_stash_action::consume_exact_then_drop)
                     ? uint32_t(plan.descriptor.clean_stash.valid_rows)
                     : 0;
             return test_seam_->session_transform_upward(
                 child_id_, plan, stash_rows);
         }
         const auto metadata = final_unit_indices_.find(plan.logical_unit_id);
-        if (!armed_ || plan.transform_kind !=
-                vbr_import_transform_kind::upward_same_domain ||
+        if (!armed_ ||
+            (plan.transform_kind !=
+                 vbr_import_transform_kind::upward_same_domain &&
+             plan.transform_kind !=
+                 vbr_import_transform_kind::upward_cross_domain) ||
             metadata == final_unit_indices_.end() ||
             !cache_->vbr_upward_transform_import(plan)) {
             return false;
@@ -785,7 +794,8 @@ class vbr_kv_import_session {
                 return test_seam_->session_synchronize_downward(
                     child_id_, plans);
             }
-            return kind == vbr_import_transform_kind::upward_same_domain &&
+            return (kind == vbr_import_transform_kind::upward_same_domain ||
+                    kind == vbr_import_transform_kind::upward_cross_domain) &&
                 test_seam_->session_synchronize_upward(child_id_, plans);
         }
         if (!armed_ || plans.empty() ||
@@ -1531,7 +1541,9 @@ vbr_adopt_status transform_all(
                 : vbr_adopt_status::upward_recipe_invalid;
         }
         if (plan.transform_kind ==
-                vbr_import_transform_kind::upward_same_domain) {
+                vbr_import_transform_kind::upward_same_domain ||
+            plan.transform_kind ==
+                vbr_import_transform_kind::upward_cross_domain) {
             if (!child->second.session->transform_upward(plan)) {
                 return vbr_adopt_status::upward_transform_failed;
             }

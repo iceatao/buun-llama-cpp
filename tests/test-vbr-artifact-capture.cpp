@@ -8,6 +8,7 @@
 #include "server-vbr-artifact-store.h"
 
 #include "ggml.h"
+#include "ggml-turbo-meansub.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1276,6 +1277,9 @@ static vbr_capture_controller_target projected_target(
     descriptor.dimensions = { target.policy.wm_cells, 1, 0, 0 };
     descriptor.row_alignment = 1;
     descriptor.row_codec_version = 1;
+    descriptor.meansub_model_id = 1;
+    descriptor.meansub_layer = int32_t(child_id);
+    descriptor.meansub_baked = true;
     vbr_artifact_shard_descriptor shard;
     shard.shard_index = 0;
     shard.topology_index = 0;
@@ -2658,6 +2662,14 @@ static void test_manifest_coherent_assembly() {
         target_first, schema_mutant));
     schema_mutant = target_shared_a;
     schema_mutant.unit_descriptors[0].shards[0].section_checksum[0] ^= 1;
+    CHECK(!vbr_capture_controller_representation_equal(
+        target_first, schema_mutant));
+    schema_mutant = target_shared_a;
+    schema_mutant.unit_descriptors[0].meansub_layer++;
+    CHECK(!vbr_capture_controller_representation_equal(
+        target_first, schema_mutant));
+    schema_mutant = target_shared_a;
+    schema_mutant.unit_descriptors[0].meansub_baked = false;
     CHECK(!vbr_capture_controller_representation_equal(
         target_first, schema_mutant));
 
@@ -4444,7 +4456,7 @@ static void test_server_import_schedule_actionability() {
           schedule::upward_cross_domain);
     CHECK(vbr_explicit_import_schedule_actionability(
               schedule::upward_cross_domain, cross_domain) ==
-          snapshot::report_only);
+          snapshot::actionable);
 
     // A caller cannot relabel identical evidence into an actionable route.
     CHECK(vbr_explicit_import_schedule_actionability(
@@ -4504,17 +4516,39 @@ static void test_library_representation_identity() {
     vbr_explicit_representation_identity a;
     vbr_explicit_representation_identity b;
     CHECK(vbr_explicit_capture_representation_identity(
-        &policy_a, GGML_TYPE_F16, false, a));
+        &policy_a, GGML_TYPE_F16, false, 0, a));
     CHECK(vbr_explicit_capture_representation_identity(
-        &policy_b, GGML_TYPE_F16, false, b));
+        &policy_b, GGML_TYPE_F16, false, 0, b));
     CHECK(a.codec_id == uint32_t(GGML_TYPE_F16) + 1);
     CHECK(a.codec_version == 1);
     CHECK(a.codebook_digest != b.codebook_digest);
     CHECK(a.rotation_digest == b.rotation_digest);
     CHECK(a.meansub_digest == b.meansub_digest);
+    CHECK(!a.meansub_baked);
+
+    const int baked_model = ggml_turbo_meansub_model_id(
+        "qwen35", 64, 5120);
+    CHECK(baked_model > 0);
+    const auto before =
+        vbr_explicit_representation_identity_diagnostics_snapshot();
+    vbr_explicit_representation_identity baked_first;
+    CHECK(vbr_explicit_capture_representation_identity(
+        &policy_a, GGML_TYPE_F16, false, baked_model, baked_first));
+    const auto after_first =
+        vbr_explicit_representation_identity_diagnostics_snapshot();
+    vbr_explicit_representation_identity baked_second;
+    CHECK(vbr_explicit_capture_representation_identity(
+        &policy_a, GGML_TYPE_F16, false, baked_model, baked_second));
+    const auto after_second =
+        vbr_explicit_representation_identity_diagnostics_snapshot();
+    CHECK(baked_first.meansub_baked);
+    CHECK(baked_second.meansub_baked);
+    CHECK(baked_first.meansub_digest == baked_second.meansub_digest);
+    CHECK(after_first.baked_table_hashes == before.baked_table_hashes + 1);
+    CHECK(after_second.baked_table_hashes == after_first.baked_table_hashes);
     vbr_explicit_representation_identity missing;
     CHECK(!vbr_explicit_capture_representation_identity(
-        nullptr, GGML_TYPE_F16, false, missing));
+        nullptr, GGML_TYPE_F16, false, 0, missing));
 }
 
 static void test_cuda_ring() {
