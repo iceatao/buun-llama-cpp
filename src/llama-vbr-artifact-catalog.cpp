@@ -1771,7 +1771,7 @@ vbr_artifact_resolve_status vbr_artifact_package_view::retain(
         output.reset();
         return vbr_artifact_resolve_status::not_found;
     }
-    return owner_->resolve_reference(storage_->reference, output);
+    return owner_->retain_package_view(*this, output);
 }
 
 llama_vbr_artifact_catalog::~llama_vbr_artifact_catalog() {
@@ -4388,6 +4388,38 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
         out.owner_ = this;
         return vbr_artifact_resolve_status::ok;
     } catch (...) {
+        return vbr_artifact_resolve_status::internal_error;
+    }
+}
+
+vbr_artifact_resolve_status llama_vbr_artifact_catalog::retain_package_view(
+        const vbr_artifact_package_view & source,
+        vbr_artifact_package_view & output) noexcept {
+    output.reset();
+    if (source.owner_ != this || !source.storage_) {
+        return vbr_artifact_resolve_status::not_found;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto reference = source.storage_->reference;
+        const auto found = impl_->references.find(reference.v);
+        if (reference.v == 0 || found == impl_->references.end()) {
+            return vbr_artifact_resolve_status::not_found;
+        }
+        if (found->second.retire_pending ||
+            found->second.prepared_retire_token != 0 ||
+            found->second.borrow_count == UINT64_MAX ||
+            found->second.manifest.manifest_digest !=
+                source.storage_->manifest.manifest_digest) {
+            return vbr_artifact_resolve_status::busy;
+        }
+        ++found->second.borrow_count;
+        output.owner_ = this;
+        output.storage_ = source.storage_;
+        output.host_owned_ = false;
+        return vbr_artifact_resolve_status::ok;
+    } catch (...) {
+        output.reset();
         return vbr_artifact_resolve_status::internal_error;
     }
 }

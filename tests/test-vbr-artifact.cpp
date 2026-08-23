@@ -1943,6 +1943,25 @@ static void test_catalog_owned_union_retirement() {
           vbr_artifact_resolve_status::ok);
     CHECK(first_view.claim_host_ownership());
     CHECK(second_view.claim_host_ownership());
+    vbr_artifact_package_view external_view;
+    CHECK(f.catalog->resolve_reference(
+              first.reference_artifact, external_view) ==
+          vbr_artifact_resolve_status::busy);
+    CHECK(!external_view);
+    vbr_artifact_package_view retained_alias;
+    CHECK(first_view.retain(retained_alias) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(retained_alias);
+    CHECK(!retained_alias.host_owned());
+    CHECK(retained_alias.reference_artifact() ==
+          first_view.reference_artifact());
+    CHECK(retained_alias.manifest().manifest_digest ==
+          first_view.manifest().manifest_digest);
+    vbr_artifact_prepared_retire pinned_retire;
+    CHECK(!first_view.prepare_owned_retire(
+        { &first_view, &second_view },
+        f.ledger.serial(), pinned_retire));
+    retained_alias.reset();
     CHECK(f.catalog->retire(first.reference_artifact) ==
           vbr_artifact_retire_status::busy);
 

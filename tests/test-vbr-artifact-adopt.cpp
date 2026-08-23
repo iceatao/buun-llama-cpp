@@ -2,6 +2,7 @@
 #include "llama-bit-ops.h"
 
 #include "common.h"
+#include "llama-context.h"
 #include "llama-kv-cache.h"
 #include "llama-vbr-generation.h"
 #include "llama-vbr-operation.h"
@@ -4686,6 +4687,10 @@ static bool h2_model_backed_occupied_store(
     context_params.vbr_dynamic = true;
     context_params.vbr_budget_explicit = true;
     context_params.vbr_vram_budget_bytes = 4ull*1024*1024*1024;
+    // Imported KV receipts retain their accounting owner until the context
+    // releases the adopted cache image. Keep the ledger alive across context
+    // destruction, just as the server's cache-accounting owner does.
+    llama_cache_acct_ledger ledger;
     auto context = llama_context_ptr(
         llama_init_from_model(model.get(), context_params));
     CHECK(context != nullptr);
@@ -4740,8 +4745,16 @@ static bool h2_model_backed_occupied_store(
     }
 
     const auto & first_pool = pools.front();
-    CHECK(first_pool.backend_device != nullptr && first_pool.backend != nullptr);
-    if (!first_pool.backend_device || !first_pool.backend) {
+    CHECK(first_pool.backend_device != nullptr);
+    if (!first_pool.backend_device) {
+        return false;
+    }
+    ggml_backend_t ring_backend = first_pool.backend;
+    if (ring_backend == nullptr) {
+        ring_backend = context->backend_for_device(first_pool.backend_device);
+    }
+    CHECK(ring_backend != nullptr);
+    if (!ring_backend) {
         return false;
     }
     vbr_artifact_portable_topology topology;
@@ -4753,7 +4766,6 @@ static bool h2_model_backed_occupied_store(
     CHECK(llama_cache_acct_build_shard_topology(
         identities, LLAMA_SPLIT_MODE_LAYER, 0, split, topology));
 
-    llama_cache_acct_ledger ledger;
     llama_cache_acct_resource_domain device_domain;
     CHECK(ledger.make_device_domain(
         topology, llama_cache_acct_device_ordinal { 0 }, device_domain));
@@ -4776,7 +4788,7 @@ static bool h2_model_backed_occupied_store(
         });
     }
     store_config.lanes = {
-        { first_pool.backend_device, first_pool.backend, false },
+        { first_pool.backend_device, ring_backend, false },
     };
     store_config.attention_children = attention_children;
     store_config.ring_bytes = 64ull*1024*1024;
@@ -4830,10 +4842,24 @@ static bool h2_model_backed_occupied_store(
         request.frontier.next_position = request.identity.next_position;
         request.idle_decode_thread = true;
         const auto captured = store->capture(*memory, std::move(request), tenant);
-        return captured.status == server_vbr_artifact_capture_status::ok &&
+        const bool ok =
+            captured.status == server_vbr_artifact_capture_status::ok &&
             !captured.reference.empty() &&
             store->retain_host_payload(captured.reference, tenant, owner) &&
             owner && owner->package();
+        if (!ok) {
+            std::fprintf(stderr,
+                "H2 occupied capture failed: store=%s library=%s phase=%s "
+                "generation=%s size=%s reference=%zu owner=%d package=%d\n",
+                server_vbr_artifact_capture_status_name(captured.status),
+                vbr_explicit_capture_status_name(captured.library_status),
+                vbr_explicit_capture_phase_name(captured.phase),
+                vbr_explicit_generation_failure_name(captured.generation_failure),
+                vbr_explicit_size_failure_name(captured.size_failure),
+                captured.reference.size(), bool(owner),
+                bool(owner && owner->package()));
+        }
+        return ok;
     };
 
     std::shared_ptr<const server_prompt_cache_vbr_payload> incoming_owner;
@@ -5036,6 +5062,25 @@ static bool h2_model_backed_occupied_store(
     const auto imported = store->import_host_occupied_replacement(
         import_request(state), ticket.incoming_payload(),
         ticket.recovery_payload());
+    if (imported.status != server_vbr_artifact_import_status::ok ||
+        imported.adopt_status != vbr_adopt_status::adopted ||
+        !state.published) {
+        std::fprintf(stderr,
+            "H2 occupied import failed: store=%s validation=%s stage=%s "
+            "reserve=%s adopt=%s recovery=%s phase=%s schedule=%s "
+            "destination=%s decision=%s attempted=%d published=%d\n",
+            server_vbr_artifact_import_status_name(imported.status),
+            vbr_manifest_validation_status_name(imported.validation_status),
+            vbr_adopt_stage_status_name(imported.stage_status),
+            vbr_downward_reserve_status_name(imported.downward_reserve_status),
+            vbr_adopt_status_name(imported.adopt_status),
+            vbr_adopt_recovery_outcome_name(imported.recovery),
+            vbr_adopt_phase_name(imported.phase),
+            vbr_import_schedule_status_name(imported.schedule_status),
+            vbr_import_destination_status_name(imported.destination_status),
+            vbr_import_decision_name(imported.decision),
+            imported.adopt_attempted, state.published);
+    }
     CHECK(imported.status == server_vbr_artifact_import_status::ok);
     CHECK(imported.adopt_status == vbr_adopt_status::adopted);
     CHECK(state.published);
@@ -5046,6 +5091,11 @@ static bool h2_model_backed_occupied_store(
     CHECK(llama_kv_cache_vbr_epoch_test::adopted_matches(
         occupied_cache, incoming_owner->package(),
         incoming_owner->package().manifest(), destination_slot));
+    if (imported.status != server_vbr_artifact_import_status::ok ||
+        imported.adopt_status != vbr_adopt_status::adopted ||
+        !state.published) {
+        return false;
+    }
     cache.commit_vbr_occupied_replacement(
         ticket, incumbent_prompt, incumbent_family, destination_slot);
     CHECK(!ticket.ready());

@@ -660,6 +660,9 @@ private:
     vbr_artifact_resolve_status materialize_reference_locked(
         llama_cache_acct_artifact_id reference,
         std::shared_ptr<const vbr_artifact_package_view::storage> & output);
+    vbr_artifact_resolve_status retain_package_view(
+        const vbr_artifact_package_view & source,
+        vbr_artifact_package_view & output) noexcept;
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
     bool claim_host_ownership(
         llama_cache_acct_artifact_id reference) noexcept;

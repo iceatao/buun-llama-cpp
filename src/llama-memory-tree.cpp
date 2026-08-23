@@ -37,8 +37,12 @@ bool collect_impl(
         return true;
     }
     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
+        // A prompt artifact must bind the selected sequence's logical rows to
+        // their physical cells.  Even though a plain KV cache has no sibling
+        // state dependency, treating it as payload-complete discards that
+        // placement and leaves the resulting artifact unusable for restore.
         output.push_back({ uint32_t(output.size()), kv, nullptr,
-            checkpoint_child_dependency_mode::payload_complete });
+            checkpoint_child_dependency_mode::live_guarded });
         return true;
     }
     if (auto * recurrent = dynamic_cast<llama_memory_recurrent *>(memory)) {
