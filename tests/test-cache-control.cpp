@@ -742,6 +742,8 @@ static void test_http_codec_and_golden() {
     result.status = server_cache_control_status::ok;
     result.lease = token;
     result.granted_class = server_cache_lease_class::hard;
+    result.subject_kind =
+        server_cache_control_subject_kind::host_snapshot;
     result.protection = server_cache_control_protection_state::current;
     result.lease_frontier = { 71, 12, 12 };
     result.proven_frontier = { 71, 12, 12 };
@@ -760,6 +762,39 @@ static void test_http_codec_and_golden() {
     CHECK(wire["status"] == "ok");
     CHECK(wire["result"]["granted_class"] == "hard");
     CHECK(wire["result"]["fallback"]["kind"] == "retained_host");
+    CHECK(wire["result"]["payload_kind"] == "fixed_state");
+    CHECK(wire["result"]["fallback"]["payload_kind"] == "fixed_state");
+    server_cache_control_result vbr = result;
+    vbr.subject_kind = server_cache_control_subject_kind::vbr_reference;
+    vbr.fallback_kind = server_cache_control_subject_kind::vbr_reference;
+    const auto vbr_wire = server_cache_control_json(
+        server_cache_control_operation::lease_inspect, vbr);
+    CHECK(vbr_wire["result"]["payload_kind"] == "vbr_artifact");
+    CHECK(vbr_wire["result"]["fallback"]["payload_kind"] == "vbr_artifact");
+    server_cache_control_result family;
+    family.status = server_cache_control_status::ok;
+    family.family = token;
+    family.families.push_back({ token, "shared-agent" });
+    const auto family_wire = server_cache_control_json(
+        server_cache_control_operation::family_register, family);
+    CHECK(family_wire["result"]["payload_scope"] ==
+          nlohmann::ordered_json::array({ "fixed_state", "vbr_artifact" }));
+    server_cache_control_result event_result;
+    event_result.status = server_cache_control_status::ok;
+    server_cache_control_event_view event;
+    event.subject_kind = server_cache_control_subject_kind::vbr_reference;
+    event_result.events.push_back(event);
+    const auto events_wire = server_cache_control_json(
+        server_cache_control_operation::events, event_result);
+    CHECK(events_wire["result"]["events"][0]["payload_kind"] ==
+          "vbr_artifact");
+    common_cache_plan_destruction_receipt receipt;
+    CHECK(server_cache_destruction_receipt_json(
+              receipt, 0)["payload_kind"].is_null());
+    receipt.payload_kind = common_cache_plan_payload_kind::vbr_artifact;
+    const auto receipt_wire = server_cache_destruction_receipt_json(
+        receipt, 0);
+    CHECK(receipt_wire["payload_kind"] == "vbr_artifact");
     result.cache_family = { { 7 }, common_cache_family_role::main };
     result.family_label = "main-agent";
     const auto inspect_wire = server_cache_control_json(

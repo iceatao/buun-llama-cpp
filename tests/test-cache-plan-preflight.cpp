@@ -361,7 +361,7 @@ static void test_wire_serializer_and_golden() {
     const auto wire = server_cache_plan_preflight_json(view);
     CHECK(wire["object"] == "cache_plan_preflight");
     CHECK(wire["schema_version"] == 1);
-    CHECK(wire["cache_plan_schema_version"] == 6);
+    CHECK(wire["cache_plan_schema_version"] == 7);
     CHECK(wire["authoritative"] == false);
     CHECK(wire["reservation"] == "none");
     CHECK(wire["valid_until"].is_null());

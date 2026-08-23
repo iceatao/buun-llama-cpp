@@ -192,8 +192,8 @@ static void test_revoke_and_planner_clear() {
 // kinds with canonical raw units — a default array would collapse to five "restore" slots
 static void test_record_defaults() {
     common_cache_plan_record rec;
-    CHECK(rec.schema_version == 6);
-    CHECK(common_cache_plan_accounting_schema(6) == 2);
+    CHECK(rec.schema_version == 7);
+    CHECK(common_cache_plan_accounting_schema(7) == 2);
     CHECK(rec.outcome == common_cache_plan_outcome::unknown);
     CHECK(rec.n_reused_tokens.state == llama_cache_acct_known::unknown);
     CHECK(rec.ttft_us.state == llama_cache_acct_known::unknown);
@@ -248,6 +248,10 @@ static void test_name_tables() {
     }
     for (uint8_t i = 0; i < uint8_t(common_cache_plan_provider::_count); i++) {
         CHECK(strcmp(common_cache_plan_provider_name(common_cache_plan_provider(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_payload_kind::_count); i++) {
+        CHECK(strcmp(common_cache_plan_payload_kind_name(
+                         common_cache_plan_payload_kind(i)), "invalid") != 0);
     }
     for (uint8_t i = 0; i < uint8_t(common_cache_plan_outcome::_count); i++) {
         CHECK(strcmp(common_cache_plan_outcome_name(common_cache_plan_outcome(i)), "invalid") != 0);
@@ -342,6 +346,7 @@ static void test_json_serialization() {
                                   COMMON_CACHE_PLAN_PHASE_HOST_SCAN, 1,
                                   common_cache_plan_selection::similarity);
     host->accept();
+    host->payload_kind = common_cache_plan_payload_kind::vbr_artifact;
     host->delivered     = true;
     host->lcp_tokens    = llama_cache_acct_value::measured(500);
     host->payload_bytes = llama_cache_acct_value::measured(1000);
@@ -368,7 +373,7 @@ static void test_json_serialization() {
     host->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimator_version = 1;
     host->predicted_total_us = llama_cache_acct_value::measured(50000);
 
-    // Record schema-v6 / accounting-v2 bridge: interned topology table plus per-domain
+    // Record schema-v7 / accounting-v2 bridge: interned topology table plus per-domain
     // producer completeness, with explicit not_applicable rather than fabricated zeroes.
     llama_cache_acct_ledger ledger;
     const auto domain = llama_cache_acct_resource_domain::non_device(
@@ -413,7 +418,7 @@ static void test_json_serialization() {
     });
     // Synthetic serializer-coupled schema vector: production does not emit a
     // refused receipt with a resolved concrete citation. Combining them here
-    // exercises both independent wire fields in the one schema-6 golden.
+    // exercises both independent wire fields in the one schema-7 golden.
     rec.destruction.state = common_cache_plan_destruction_state::refused;
     rec.destruction.reason = common_cache_plan_destruction_reason::effect_drift;
     rec.destruction.effects = common_cache_plan_destruction_effect_bit(
@@ -439,18 +444,23 @@ static void test_json_serialization() {
     rec.destruction.recovery_source_manifest_digest =
         common_cache_plan_destruction_recovery_digest::from_sha256(
             std::array<uint8_t, 32>{ 3 });
+    rec.destruction.payload_kind =
+        common_cache_plan_payload_kind::vbr_artifact;
     common_cache_plan_finalize_shadow_authority(rec);
 
     const auto j = common_cache_plan_record_json(rec);
     // Golden regeneration door: this deliberately exercises the production
-    // serializer instead of maintaining a hand-authored schema-6 facsimile.
-    if (std::getenv("CACHE_PLAN_PRINT_SCHEMA6_GOLDEN")) {
+    // serializer instead of maintaining a hand-authored schema-7 facsimile.
+    if (std::getenv("CACHE_PLAN_PRINT_SCHEMA7_GOLDEN")) {
         std::puts(j.dump().c_str());
     }
-    CHECK(j["schema_version"] == 6);
+    CHECK(j["schema_version"] == 7);
     CHECK(j["candidates"].size() == 3);
     CHECK(j["candidates"][0]["id"] == 0);
     CHECK(j["candidates"][0]["provider"] == "host_cache_entry");
+    CHECK(j["candidates"][0]["payload_kind"] == "vbr_artifact");
+    CHECK(j["candidates"][1]["payload_kind"].is_null());
+    CHECK(j["candidates"][2]["payload_kind"] == "vbr_artifact");
     CHECK(j["candidates"][0]["target_slot_id"] == 1);
     CHECK(j["candidates"][0]["origin_tier"] == "similarity");
     CHECK(j["candidates"][0]["cost_terms"].contains("replay"));
@@ -461,6 +471,7 @@ static void test_json_serialization() {
     CHECK(j["chosen"] == "live_context_checkpoint");
     CHECK(j["chosen_candidate"] == 1);
     CHECK(j["shipped_plan_candidate"] == 2); // the chain, not the terminal provider row
+    CHECK(j["destruction"]["payload_kind"] == "vbr_artifact");
     CHECK(j["planner_status"] == "profile_unfitted");
     CHECK(j["shadow"] == "unavailable"); // string sentinel per the acct-value convention
     CHECK(j["authority"]["policy_version"] == 1);

@@ -10,11 +10,13 @@
       "expires_at_ms": 123456789,
       "fallback": {
         "state": "resolved",
-        "kind": "retained_host"
+        "kind": "retained_host",
+        "payload_kind": "fixed_state"
       },
       "protected_bytes": 64,
       "fallback_pinned_bytes": 96,
-      "shared_fallback": true
+      "shared_fallback": true,
+      "payload_kind": "fixed_state"
     }
   },
   "inspect": {
@@ -37,11 +39,13 @@
       "family_label": "main-agent",
       "fallback": {
         "state": "resolved",
-        "kind": "retained_host"
+        "kind": "retained_host",
+        "payload_kind": "fixed_state"
       },
       "protected_bytes": 64,
       "fallback_pinned_bytes": 96,
-      "shared_fallback": true
+      "shared_fallback": true,
+      "payload_kind": "fixed_state"
     }
   }
 }

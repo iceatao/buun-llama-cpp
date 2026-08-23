@@ -7813,6 +7813,8 @@ private:
                 if (!host) {
                     return false;
                 }
+                host->payload_kind =
+                    server_cache_plan_payload_kind(state.payload.kind());
                 server_cache_plan_apply_host(host, host_eval);
 
                 int32_t checkpoint_ordinal = 0;
@@ -9321,6 +9323,33 @@ private:
                     construction_empty)) {
                 return false;
             }
+            const int32_t plan_source_id = candidate.source_id();
+            const uint64_t plan_prefix_tokens = candidate.prefix_tokens();
+            const auto observe_vbr_delivery = [&] (
+                    uint64_t delivered_payload_bytes) noexcept {
+                if (!slot.cache_plan || plan_source_id < 0) {
+                    return;
+                }
+                auto & rec = *slot.cache_plan;
+                auto * row = rec.find_or_add(
+                    common_cache_plan_provider::host_cache_entry,
+                    plan_source_id, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
+                    slot.id, rec.selection);
+                if (!row) {
+                    return;
+                }
+                row->payload_kind =
+                    common_cache_plan_payload_kind::vbr_artifact;
+                row->lcp_tokens = llama_cache_acct_value::measured(
+                    plan_prefix_tokens);
+                row->payload_bytes = llama_cache_acct_value::measured(
+                    delivered_payload_bytes);
+                row->accept();
+                row->delivered = true;
+                rec.select(common_cache_plan_provider::host_cache_entry, row);
+                rec.note_inventory_complete(
+                    common_cache_plan_provider::host_cache_entry);
+            };
             llama_memory_i * memory = nullptr;
             if (occupied_candidate) {
                 if (candidate.requires_prefix_projection()) {
@@ -9420,6 +9449,12 @@ private:
                     ticket, slot.prompt, slot.cache_family, slot.id);
                 vbr_automatic_restore_succeeded++;
                 vbr_automatic_restore_occupied_succeeded++;
+                const uint64_t delivered_payload_bytes =
+                    imported.payload_bytes <=
+                            UINT64_MAX - imported.companion_bytes
+                        ? imported.payload_bytes + imported.companion_bytes
+                        : 0;
+                observe_vbr_delivery(delivered_payload_bytes);
                 if (restored_prefix) {
                     *restored_prefix = size_t(prefix_tokens);
                 }
@@ -9554,6 +9589,11 @@ private:
                 vbr_automatic_restore_quality_fallbacks++;
             }
             vbr_automatic_restore_succeeded++;
+            const uint64_t delivered_payload_bytes =
+                imported.payload_bytes <= UINT64_MAX - imported.companion_bytes
+                    ? imported.payload_bytes + imported.companion_bytes
+                    : 0;
+            observe_vbr_delivery(delivered_payload_bytes);
             if (restored_prefix) {
                 *restored_prefix = size_t(prefix_tokens);
             }

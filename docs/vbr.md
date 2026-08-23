@@ -81,15 +81,16 @@ The default-on server route is intentionally narrower than the explicit artifact
 It currently supports text-only, non-aLoRA, non-speculative slots on a dynamic-VBR
 target whose artifact store can bind every attention child, device lane, and accounting
 domain. Ordinary LoRA identity, attention-only targets, ordinary hybrid/recurrent
-targets, SWA/iSWA full frontiers, single-GPU placement, and bound multi-GPU placement
-use that route. Shortened stem publication remains attention-only; unsupported stem
-shapes retain the complete live frontier.
+targets with an exact companion frontier, single-GPU placement, and bound multi-GPU
+placement use that route. Shortened stem publication remains attention-only;
+unsupported stem shapes retain the complete live frontier.
 
 The following automatic cases are typed live-only fallbacks today:
 
 | Case | Typed reason | Behavior |
 | --- | --- | --- |
 | active draft/MTP context | `draft_context_unsupported` | automatic host caching is disabled before its cache/ring allocation |
+| SWA/iSWA attention tree | capture `unsupported_layout` at `memory_tree` | the live source remains resident; `payload_complete` SWA-child capture is not yet enabled |
 | per-slot speculative state | `speculative_slot_unsupported` | that live slot is neither captured nor displaced |
 | media prompt/projector state | `media_prompt_unsupported` | that live slot is neither captured nor displaced |
 | aLoRA invocation boundary | `alora_invocation_unsupported` | that live slot is neither captured nor displaced |
@@ -102,6 +103,18 @@ request is strict instead: an unsupported global topology or unavailable store f
 startup with the same typed reason. Transient capture/admission failures retain the live
 source and retry; permanent per-artifact incompatibilities are terminal only for that
 unchanged frontier.
+
+### Host-cache control-plane payloads
+
+The cache control plane uses one payload vocabulary everywhere: `fixed_state` is the
+historical serialized target/draft state image and `vbr_artifact` is an authenticated,
+immutable projected artifact. `/cache/plan` reports `payload_kind` on every host candidate;
+cache lifecycle and destruction receipts use the same field. Lease inspection and event
+records derive it from their typed `host_snapshot` or `vbr_reference` subject. Families
+apply to both representations and therefore report
+`payload_scope: ["fixed_state", "vbr_artifact"]`; they are lineage policy, not a second
+payload owner. Live prefixes and checkpoints report a null payload kind because their state
+has not entered the host tier.
 
 ## Degrade orders
 

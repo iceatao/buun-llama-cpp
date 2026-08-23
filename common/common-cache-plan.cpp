@@ -100,6 +100,17 @@ const char * common_cache_plan_provider_name(common_cache_plan_provider p) {
     return "invalid";
 }
 
+const char * common_cache_plan_payload_kind_name(
+        common_cache_plan_payload_kind kind) noexcept {
+    switch (kind) {
+        case common_cache_plan_payload_kind::unavailable:  return "unavailable";
+        case common_cache_plan_payload_kind::fixed_state:  return "fixed_state";
+        case common_cache_plan_payload_kind::vbr_artifact: return "vbr_artifact";
+        case common_cache_plan_payload_kind::_count:       break;
+    }
+    return "invalid";
+}
+
 const char * common_cache_plan_outcome_name(common_cache_plan_outcome o) {
     switch (o) {
         case common_cache_plan_outcome::unknown:                       return "unknown";
@@ -824,6 +835,10 @@ static json cache_plan_destruction_json(
         { "policy_version", receipt.policy_version },
         { "state", common_cache_plan_destruction_state_name(receipt.state) },
         { "reason", common_cache_plan_destruction_reason_name(receipt.reason) },
+        { "payload_kind", receipt.payload_kind ==
+                common_cache_plan_payload_kind::unavailable
+            ? json(nullptr)
+            : json(common_cache_plan_payload_kind_name(receipt.payload_kind)) },
         { "effects", std::move(effects) },
         { "lease_verdict", common_cache_plan_destruction_lease_verdict_name(receipt.lease_verdict) },
         { "displaced_fate", common_cache_plan_displaced_fate_name(receipt.displaced_fate) },
@@ -872,6 +887,14 @@ static json cache_plan_ordinal_json(int32_t ordinal) {
         ? json(ordinal)
         : json(common_cache_acct_known_name(llama_cache_acct_known::unavailable));
 }
+
+static json cache_plan_payload_kind_json(
+        common_cache_plan_payload_kind kind) {
+    return kind == common_cache_plan_payload_kind::unavailable
+        ? json(nullptr)
+        : json(common_cache_plan_payload_kind_name(kind));
+}
+
 json common_cache_plan_record_json(const common_cache_plan_record & rec) {
     const bool finalized = rec.outcome != common_cache_plan_outcome::unknown;
 
@@ -883,6 +906,7 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
             { "target_slot_id", cache_plan_ordinal_json(c.target_slot_id) },
             { "origin_tier",   common_cache_plan_selection_name(c.origin_tier) },
             { "provider",      common_cache_plan_provider_name(c.provider) },
+            { "payload_kind",  cache_plan_payload_kind_json(c.payload_kind) },
             { "phases",        cache_plan_phases_json(c.phases_seen) },
             { "disposition",   common_cache_plan_disposition_name(c.disposition) },
             { "reason",        common_cache_plan_reason_name(c.reason) },

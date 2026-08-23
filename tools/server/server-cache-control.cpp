@@ -1176,6 +1176,7 @@ server_cache_control_result server_cache_control_authority::execute(
             }
             out.lease = handle;
             out.granted_class = granted_class;
+            out.subject_kind = request.subject.kind;
             out.cache_family = cache_family;
             if (cache_family.declared()) {
                 if (const auto * label = state_->family_label(
@@ -1219,6 +1220,7 @@ server_cache_control_result server_cache_control_authority::execute(
         }
 
         out.lease = request.lease;
+        out.subject_kind = lease->subject.kind;
         out.fallback_kind = lease->fallback.kind;
         out.cache_family = lease->cache_family;
         if (lease->cache_family.declared()) {

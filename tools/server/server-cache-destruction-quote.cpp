@@ -244,6 +244,10 @@ nlohmann::ordered_json server_cache_destruction_receipt_json(
     json out = {
         { "state", common_cache_plan_destruction_state_name(receipt.state) },
         { "reason", common_cache_plan_destruction_reason_name(receipt.reason) },
+        { "payload_kind", receipt.payload_kind ==
+                common_cache_plan_payload_kind::unavailable
+            ? json(nullptr)
+            : json(common_cache_plan_payload_kind_name(receipt.payload_kind)) },
     };
     if (action_class) {
         out["action_class"] = action_class;
@@ -721,6 +725,7 @@ bool server_cache_destruction_quote_all(
             common_cache_plan_destruction_quote staged;
             auto & quote = staged.receipt;
             quote.plan_candidate = int32_t(i);
+            quote.payload_kind = candidate.payload_kind;
             quote.admission_sequence = options.admission_sequence;
             quote.effects = effects;
             quote.quote_accounting_serial = accounting_serial;
@@ -736,10 +741,12 @@ bool server_cache_destruction_quote_all(
             if (cached != memo.end()) {
                 const int32_t plan_candidate = quote.plan_candidate;
                 const auto candidate_effects = quote.effects;
+                const auto candidate_payload_kind = quote.payload_kind;
                 staged = cached->second;
                 auto & cached_receipt = staged.receipt;
                 cached_receipt.plan_candidate = plan_candidate;
                 cached_receipt.effects = candidate_effects;
+                cached_receipt.payload_kind = candidate_payload_kind;
                 if (cached_receipt.reason ==
                         common_cache_plan_destruction_reason::none ||
                     cached_receipt.reason ==

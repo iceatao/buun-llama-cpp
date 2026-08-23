@@ -3017,7 +3017,9 @@ bool server_prompt_cache::prepare_vbr_restore(
         candidate.source_tokens_ = selected.source_tokens;
         candidate.selected_next_position_ = selected.selected_next_position;
         candidate.requires_prefix_projection_ = selected.projected;
-        candidate.source_id_ = selected.best->cache_plan_source_id;
+        int32_t selected_source_id = -1;
+        (void) cache_plan_get_source_id(*selected.best, selected_source_id);
+        candidate.source_id_ = selected_source_id;
         return true;
     } catch (...) {
         candidate = {};
@@ -4936,6 +4938,8 @@ struct host_trade_ranking {
     bool zero_destruction = false;
     bool zero_destruction_tie_break = false;
     common_cache_family_role family_role = common_cache_family_role::_count;
+    common_cache_plan_payload_kind payload_kind =
+        common_cache_plan_payload_kind::unavailable;
 };
 
 struct host_destruction_certification {
@@ -5017,6 +5021,8 @@ void emit_recovery_pin_excluded(
     try {
         const auto artifact = host_entry_artifact_id(cache, state);
         common_cache_plan_destruction_receipt receipt;
+        receipt.payload_kind =
+            server_cache_plan_payload_kind(state.payload.kind());
         receipt.effects = common_cache_plan_destruction_effect_bit(
             common_cache_plan_destruction_effect::
                 different_host_source_consumption);
@@ -5198,6 +5204,9 @@ host_destruction_certification certify_host_destruction(
             admission_sequence,
             preview,
             project);
+        out.quote.receipt.payload_kind = ranking
+            ? ranking->payload_kind
+            : common_cache_plan_payload_kind::unavailable;
         server_prompt_cache_observe_host_destruction(
             cache,
             out.quote.receipt,
@@ -5369,6 +5378,8 @@ bool host_trade_price(
         server_cache_destruction_artifact local_artifact;
         out.vbr = victim->payload.kind() ==
             server_prompt_cache_payload_kind::vbr_artifact;
+        out.ranking.payload_kind =
+            server_cache_plan_payload_kind(victim->payload.kind());
         if (!prepared_artifact && !(out.vbr
                 ? build_host_retention_artifact(cache, *victim, local_artifact)
                 : build_host_destruction_artifact(cache, *victim, local_artifact))) {
@@ -5865,6 +5876,9 @@ void observe_host_trade_refusal(
     receipt.state = common_cache_plan_destruction_state::refused;
     receipt.reason = reason;
     receipt.admission_sequence = admission_sequence;
+    receipt.payload_kind = ranking
+        ? ranking->payload_kind
+        : common_cache_plan_payload_kind::unavailable;
     server_prompt_cache_observe_host_destruction(
         cache, receipt, true, 0, ranking);
 }
@@ -8789,6 +8803,7 @@ bool server_prompt_cache::commit_vbr_restore(
             debug_lifecycle_emissions++;
             SRV_INF(
                 "CACHE_HOST_LIFECYCLE {\"mode\":\"vbr_non_consuming\","
+                "\"payload_kind\":\"vbr_artifact\","
                 "\"source_id\":%d,\"host_entries\":%zu,"
                 "\"host_bytes\":%zu,\"prefix_tokens\":%" PRIu64 "}\n",
                 candidate.source_id_, states.size(), size(),
@@ -8827,6 +8842,7 @@ void server_prompt_cache::commit_restore_delivery(
             debug_lifecycle_emissions++;
             SRV_INF(
                 "CACHE_HOST_LIFECYCLE {\"mode\":\"non_consuming\","
+                "\"payload_kind\":\"fixed_state\","
                 "\"source_id\":%d,\"host_entries\":%zu,"
                 "\"host_bytes\":%zu,\"retained_restores\":%" PRIu64 "}\n",
                 debug_source_id, states.size(), size(),
@@ -8906,6 +8922,10 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
                     common_cache_plan_provider::host_cache_entry,
                     obs_source, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
                     rec->id_slot, rec->selection);
+                if (row) {
+                    row->payload_kind =
+                        common_cache_plan_payload_kind::fixed_state;
+                }
             } else {
                 rec->inventory_states[size_t(
                     common_cache_plan_provider::host_cache_entry)] =
@@ -8986,6 +9006,8 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
                                           obs_source_best, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
                                           rec->id_slot, rec->selection);
             if (win) {
+                win->payload_kind =
+                    common_cache_plan_payload_kind::fixed_state;
                 win->accept(); // shipped winner: promote over the scan-time cost-loser default
                 win->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) obs_lcp_sel);
                 // bytes the restore actually installs (main+draft state) — NOT entry

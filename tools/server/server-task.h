@@ -26,6 +26,13 @@
 
 using json = nlohmann::ordered_json;
 
+constexpr common_cache_plan_payload_kind server_cache_plan_payload_kind(
+        server_prompt_cache_payload_kind kind) noexcept {
+    return kind == server_prompt_cache_payload_kind::vbr_artifact
+        ? common_cache_plan_payload_kind::vbr_artifact
+        : common_cache_plan_payload_kind::fixed_state;
+}
+
 bool server_cache_lease_build_identity(
     const std::string & execution_identity,
     const std::string & adapter_identity,

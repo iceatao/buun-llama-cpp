@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-// common-cache-plan.h — P2 B0/B/D-S/B-A/D-A decision record, schema version 6.
+// common-cache-plan.h — P2 B0/B/D-S/B-A/D-A decision record, schema version 7.
 //
 // §7.7 decision records + §7.5 shadow-planner inventory: the ONE closed plan-reason enum
 // shared by server and tests, the orthogonal candidate disposition, the closed provider
@@ -34,15 +34,17 @@
 // not_observed actual-yield slot reserved for later D-A authority. v5 adds the
 // B-A authority receipt and target-qualified candidate identity without changing
 // the established meaning of `shadow_choice` (the planner counterfactual). v6 adds
-// D-A's shadow destruction quote/receipt; accounting remains schema 2.
+// D-A's shadow destruction quote/receipt; accounting remains schema 2. v7 names the
+// host payload representation independently of the provider so fixed state and sealed
+// VBR artifacts remain distinguishable throughout the control plane.
 
-constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 6;
+constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 7;
 
 // Explicit record→embedded-accounting compatibility table. A C schema bump cannot compile
 // under the current record version until this table and the record version move together.
 constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
     return (record_schema == 3 || record_schema == 4 || record_schema == 5 ||
-            record_schema == 6) ? 2 :
+            record_schema == 6 || record_schema == 7) ? 2 :
            (record_schema == 1 || record_schema == 2 ? 1 : 0);
 }
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
@@ -178,6 +180,18 @@ enum class common_cache_plan_provider : uint8_t {
     cold_replay,
     _count,
 };
+
+// Orthogonal to provider. A host_cache_entry can be either the historical fixed state
+// image or an immutable VBR artifact; live/checkpoint/cold rows carry `unavailable`.
+enum class common_cache_plan_payload_kind : uint8_t {
+    unavailable = 0,
+    fixed_state,
+    vbr_artifact,
+    _count,
+};
+
+const char * common_cache_plan_payload_kind_name(
+    common_cache_plan_payload_kind kind) noexcept;
 
 constexpr bool common_cache_plan_provider_is_live(
         common_cache_plan_provider provider) noexcept {
@@ -503,7 +517,7 @@ struct common_cache_plan_destruction_receipt {
     common_cache_plan_destruction_effect_digest union_effect_digest;
     std::vector<llama_cache_acct_artifact_id> selected_attention;
     std::vector<llama_cache_acct_artifact_id> selected_recurrent;
-    // Schema-v6 recovery-source detail. A resolved citation is legal without
+    // Schema-v6 recovery-source detail retained by schema v7. A resolved citation is legal without
     // these fields: B-path recovery can resolve a logical/durable source that
     // has no D-A artifact pin. When D-A resolves a concrete protected source,
     // the artifact plus a tagged digest over its canonical op set identifies
@@ -511,10 +525,14 @@ struct common_cache_plan_destruction_receipt {
     // Prospective and unavailable citations also leave both fields unavailable.
     llama_cache_acct_artifact_id recovery_source_artifact_id;
     common_cache_plan_destruction_recovery_digest recovery_source_manifest_digest;
+    // Representation owned by the selected host candidate. Live/checkpoint-only
+    // receipts retain `unavailable`, which serializes as JSON null.
+    common_cache_plan_payload_kind payload_kind =
+        common_cache_plan_payload_kind::unavailable;
 };
 
 // Process-local quote pre-image. Domain bytes are projected into the existing
-// schema-v4 yield table only for the selected destructive plan, so schema 6
+// schema-v4 yield table only for the selected destructive plan, so schema 7
 // does not grow a second predicted/actual byte vocabulary.
 struct common_cache_plan_destruction_quote {
     common_cache_plan_destruction_receipt receipt;
@@ -695,6 +713,8 @@ common_cache_plan_default_cost_terms() {
 // Trivially copyable and written only through noexcept record methods (A2 transport).
 struct common_cache_plan_candidate {
     common_cache_plan_provider provider = common_cache_plan_provider::cold_replay;
+    common_cache_plan_payload_kind payload_kind =
+        common_cache_plan_payload_kind::unavailable;
     // Schema-v5 executable-plan identity. The target is part of the merge key: the same
     // provider/source offered to two physical slots is two distinct plans. origin_tier is
     // the legacy/planner tier that introduced the plan, independent of the record's
@@ -1001,6 +1021,7 @@ struct common_cache_plan_record {
         if (comp0 >= 0 && uint32_t(comp0) < n_inventory - 1) {
             c.target_slot_id = inventory[size_t(comp0)].target_slot_id;
             c.origin_tier = inventory[size_t(comp0)].origin_tier;
+            c.payload_kind = inventory[size_t(comp0)].payload_kind;
         }
         if (comp1 >= 0 && uint32_t(comp1) < n_inventory - 1) {
             const auto & rhs = inventory[size_t(comp1)];

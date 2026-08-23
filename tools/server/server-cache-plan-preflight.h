@@ -101,7 +101,7 @@ struct server_cache_plan_preflight_view {
     std::vector<server_cache_plan_preflight_miss_reason> miss_reasons;
 };
 
-// E0 v1 public projection. This is deliberately independent of the schema-6
+// E0 v1 public projection. This is deliberately independent of the schema-7
 // debug serializer: identities, digests, accounting rows, ordinals, serials,
 // leases, and recovery-source handles have no representation here.
 nlohmann::ordered_json server_cache_plan_preflight_json(

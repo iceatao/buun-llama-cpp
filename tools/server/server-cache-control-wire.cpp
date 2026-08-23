@@ -196,6 +196,24 @@ json frontier_json(const server_cache_lease_frontier & frontier) {
     };
 }
 
+json payload_kind_json(server_cache_control_subject_kind kind) {
+    switch (kind) {
+        case server_cache_control_subject_kind::host_snapshot:
+            return "fixed_state";
+        case server_cache_control_subject_kind::vbr_reference:
+            return "vbr_artifact";
+        case server_cache_control_subject_kind::live_prefix:
+        case server_cache_control_subject_kind::live_checkpoint:
+        case server_cache_control_subject_kind::_count:
+            return nullptr;
+    }
+    return nullptr;
+}
+
+json host_payload_scope_json() {
+    return json::array({ "fixed_state", "vbr_artifact" });
+}
+
 json fallback_json(const server_cache_control_result & result) {
     if (result.fallback_kind >= server_cache_control_subject_kind::_count) {
         return nullptr;
@@ -203,6 +221,7 @@ json fallback_json(const server_cache_control_result & result) {
     return {
         { "state", "resolved" },
         { "kind", fallback_kind_name(result.fallback_kind) },
+        { "payload_kind", payload_kind_json(result.fallback_kind) },
     };
 }
 
@@ -508,6 +527,7 @@ json server_cache_control_json(
                         server_cache_control_handle_kind::lease, lease.lease) },
                     { "subject_kind", server_cache_control_subject_kind_name(
                         lease.subject_kind) },
+                    { "payload_kind", payload_kind_json(lease.subject_kind) },
                     { "proven_frontier", frontier_json(lease.proven_frontier) },
                 });
             }
@@ -517,6 +537,7 @@ json server_cache_control_json(
                     { "family", server_cache_control_encode_handle(
                         server_cache_control_handle_kind::family, family.family) },
                     { "label", family.label },
+                    { "payload_scope", host_payload_scope_json() },
                 });
             }
             body = {
@@ -536,12 +557,16 @@ json server_cache_control_json(
                     server_cache_control_handle_kind::family, result.family) },
                 { "label", result.families.empty()
                     ? json(nullptr) : json(result.families.front().label) },
+                { "payload_scope", host_payload_scope_json() },
             };
             break;
         case server_cache_control_operation::family_bind:
-            body = { { "family_binding", server_cache_control_encode_handle(
-                server_cache_control_handle_kind::family_binding,
-                result.family_binding) } };
+            body = {
+                { "family_binding", server_cache_control_encode_handle(
+                    server_cache_control_handle_kind::family_binding,
+                    result.family_binding) },
+                { "payload_scope", host_payload_scope_json() },
+            };
             break;
         case server_cache_control_operation::lease_acquire:
             body = {
@@ -558,6 +583,7 @@ json server_cache_control_json(
                 { "fallback_pinned_bytes", result.fallback_pinned_bytes_known
                     ? json(result.fallback_pinned_bytes) : json(nullptr) },
                 { "shared_fallback", result.shared_fallback },
+                { "payload_kind", payload_kind_json(result.subject_kind) },
             };
             break;
         case server_cache_control_operation::lease_inspect:
@@ -580,6 +606,7 @@ json server_cache_control_json(
                 { "fallback_pinned_bytes", result.fallback_pinned_bytes_known
                     ? json(result.fallback_pinned_bytes) : json(nullptr) },
                 { "shared_fallback", result.shared_fallback },
+                { "payload_kind", payload_kind_json(result.subject_kind) },
             };
             break;
         case server_cache_control_operation::lease_release:
@@ -599,6 +626,7 @@ json server_cache_control_json(
                         server_cache_control_subject_kind::_count
                             ? json(server_cache_control_subject_kind_name(
                                   event.subject_kind)) : json(nullptr) },
+                    { "payload_kind", payload_kind_json(event.subject_kind) },
                     { "family_role", event.family_role < common_cache_family_role::_count
                         ? json(server_cache_control_family_role_name(event.family_role))
                         : json("automatic") },

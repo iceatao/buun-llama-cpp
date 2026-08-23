@@ -1,7 +1,7 @@
 {
   "object": "cache_plan_preflight",
   "schema_version": 1,
-  "cache_plan_schema_version": 6,
+  "cache_plan_schema_version": 7,
   "authoritative": false,
   "reservation": "none",
   "valid_until": null,

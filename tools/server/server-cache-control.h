@@ -210,6 +210,8 @@ struct server_cache_control_result {
     common_cache_family_binding cache_family;
     std::string family_label;
     server_cache_lease_class granted_class = server_cache_lease_class::none;
+    server_cache_control_subject_kind subject_kind =
+        server_cache_control_subject_kind::_count;
     server_cache_control_protection_state protection =
         server_cache_control_protection_state::released;
     server_cache_lease_frontier lease_frontier;

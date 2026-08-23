@@ -5909,6 +5909,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         fixture.package.manifest.identity.adapter_config_identity,
         projected));
     CHECK(projected.ready());
+    CHECK(projected.source_id() >= 0);
     CHECK(projected.requires_prefix_projection());
     CHECK(projected.prefix_tokens() == 1);
     CHECK(projected.source_tokens() == 2);
