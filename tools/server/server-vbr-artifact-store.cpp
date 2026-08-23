@@ -1,6 +1,7 @@
 #include "server-vbr-artifact-store.h"
 
 #include "server-prompt-cache-payload.h"
+#include "../../common/speculative.h"
 
 #include "build-info.h"
 
@@ -16,6 +17,180 @@ namespace {
 
 // One prefix keeps the reference builder and the authorizer in lock-step.
 constexpr char VBR_REFERENCE_PREFIX[] = "vbrref_";
+
+std::array<uint8_t, 32> companion_build_digest(const char * domain) {
+    llama_sha256_writer writer;
+    writer.string(domain, strlen(domain));
+    const char * commit = llama_commit();
+    writer.string(commit, strlen(commit));
+    return writer.finish();
+}
+
+class server_vbr_parsed_bytes final : public vbr_parsed_companion_image {
+public:
+    vbr_artifact_companion_kind companion_kind =
+        vbr_artifact_companion_kind::_count;
+    uint32_t version = 0;
+    std::vector<uint8_t> bytes;
+
+    vbr_artifact_companion_kind kind() const noexcept override {
+        return companion_kind;
+    }
+    uint32_t format_version() const noexcept override { return version; }
+};
+
+struct server_vbr_draft_target {
+    llama_context * ctx = nullptr;
+    llama_seq_id destination = -1;
+};
+
+class server_vbr_draft_image final : public vbr_prepared_companion_image {
+public:
+    server_vbr_draft_target target;
+    std::vector<uint8_t> expected;
+    std::vector<uint8_t> scratch;
+
+    static bool empty(const void * opaque) noexcept {
+        const auto * target = static_cast<const server_vbr_draft_target *>(opaque);
+        if (!target || !target->ctx || target->destination < 0) return false;
+        auto * memory = llama_get_memory(target->ctx);
+        return memory &&
+            llama_memory_seq_pos_min(memory, target->destination) < 0 &&
+            llama_memory_seq_pos_max(memory, target->destination) < 0;
+    }
+    static bool prepare(
+            const void * opaque,
+            std::unique_ptr<vbr_parsed_companion_image> parsed_base,
+            llama_seq_id destination,
+            std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+        try {
+            output.reset();
+            const auto * target = static_cast<const server_vbr_draft_target *>(opaque);
+            auto * parsed = dynamic_cast<server_vbr_parsed_bytes *>(parsed_base.get());
+            if (!target || !target->ctx || target->destination != destination ||
+                !parsed || parsed->companion_kind !=
+                    vbr_artifact_companion_kind::required_spec_payload ||
+                parsed->bytes.empty() || !empty(opaque)) {
+                return false;
+            }
+            auto image = std::make_unique<server_vbr_draft_image>();
+            image->target = *target;
+            image->expected = std::move(parsed->bytes);
+            image->scratch.resize(image->expected.size());
+            const size_t written = llama_state_seq_set_data_ext(
+                target->ctx, image->expected.data(), image->expected.size(),
+                destination, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (written != image->expected.size()) {
+                llama_memory_seq_rm(
+                    llama_get_memory(target->ctx), destination, -1, -1);
+                return false;
+            }
+            output = std::move(image);
+            return true;
+        } catch (...) {
+            output.reset();
+            return false;
+        }
+    }
+    static bool recheck(
+            const void * opaque,
+            const vbr_prepared_companion_image & base) noexcept {
+        auto & image = const_cast<server_vbr_draft_image &>(
+            static_cast<const server_vbr_draft_image &>(base));
+        const auto * target = static_cast<const server_vbr_draft_target *>(opaque);
+        return target && target->ctx == image.target.ctx &&
+            target->destination == image.target.destination &&
+            llama_state_seq_get_size_ext(
+                target->ctx, target->destination,
+                LLAMA_STATE_SEQ_FLAGS_NONE) == image.expected.size() &&
+            llama_state_seq_get_data_ext(
+                target->ctx, image.scratch.data(), image.scratch.size(),
+                target->destination, LLAMA_STATE_SEQ_FLAGS_NONE) ==
+                    image.expected.size() &&
+            image.scratch == image.expected;
+    }
+    static void publish(const void *, vbr_prepared_companion_image &) noexcept {}
+    static bool rollback(
+            const void *, vbr_prepared_companion_image & base) noexcept {
+        auto & image = static_cast<server_vbr_draft_image &>(base);
+        return image.target.ctx && llama_memory_seq_rm(
+            llama_get_memory(image.target.ctx), image.target.destination, -1, -1);
+    }
+};
+
+struct server_vbr_accelerator_target {
+    common_speculative * spec = nullptr;
+};
+
+class server_vbr_accelerator_image final : public vbr_prepared_companion_image {
+public:
+    common_speculative * spec = nullptr;
+    std::vector<uint8_t> expected;
+    mutable std::vector<uint8_t> scratch;
+
+    static bool empty(const void * opaque) noexcept {
+        const auto * target =
+            static_cast<const server_vbr_accelerator_target *>(opaque);
+        return target && target->spec &&
+            common_speculative_ring_state_empty(target->spec);
+    }
+    static bool prepare(
+            const void * opaque,
+            std::unique_ptr<vbr_parsed_companion_image> parsed_base,
+            llama_seq_id,
+            std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+        try {
+            output.reset();
+            const auto * target =
+                static_cast<const server_vbr_accelerator_target *>(opaque);
+            auto * parsed = dynamic_cast<server_vbr_parsed_bytes *>(parsed_base.get());
+            if (!target || !target->spec || !parsed ||
+                parsed->companion_kind !=
+                    vbr_artifact_companion_kind::typed_accelerator ||
+                parsed->bytes.empty() || !empty(opaque)) {
+                return false;
+            }
+            auto image = std::make_unique<server_vbr_accelerator_image>();
+            image->spec = target->spec;
+            image->expected = std::move(parsed->bytes);
+            image->scratch.resize(image->expected.size());
+            if (!common_speculative_ring_state_load(
+                    image->spec, image->expected.data(),
+                    image->expected.size())) {
+                common_speculative_ring_state_reset(image->spec);
+                return false;
+            }
+            output = std::move(image);
+            return true;
+        } catch (...) {
+            output.reset();
+            return false;
+        }
+    }
+    static bool recheck(
+            const void * opaque,
+            const vbr_prepared_companion_image & base) noexcept {
+        const auto * target =
+            static_cast<const server_vbr_accelerator_target *>(opaque);
+        const auto & image =
+            static_cast<const server_vbr_accelerator_image &>(base);
+        if (!target || target->spec != image.spec ||
+            common_speculative_ring_state_size(image.spec) !=
+                image.expected.size()) {
+            return false;
+        }
+        common_speculative_ring_state_save(
+            image.spec, image.scratch.data(), image.scratch.size());
+        return image.scratch == image.expected;
+    }
+    static void publish(const void *, vbr_prepared_companion_image &) noexcept {}
+    static bool rollback(
+            const void *, vbr_prepared_companion_image & base) noexcept {
+        auto & image = static_cast<server_vbr_accelerator_image &>(base);
+        common_speculative_ring_state_reset(image.spec);
+        return common_speculative_ring_state_empty(image.spec);
+    }
+};
 
 bool capture_capacity_category_applies(
         llama_cache_acct_category category,
@@ -193,12 +368,36 @@ bool import_parse_companion(
         const artifact_segment_chain & source,
         const vbr_target_companion_snapshot & target,
         std::unique_ptr<vbr_parsed_companion_image> & output) noexcept {
-    if (descriptor.kind != vbr_artifact_companion_kind::recurrent) {
+    if (descriptor.kind == vbr_artifact_companion_kind::recurrent) {
+        return vbr_parse_recurrent_companion(
+            opaque, descriptor, source, target, output);
+    }
+    try {
+        output.reset();
+        if (!target.available || target.target_cookie == nullptr ||
+            descriptor.format_version != 1 ||
+            descriptor.payload_bytes != source.size() ||
+            source.size() == 0 ||
+            source.size() > std::numeric_limits<size_t>::max() ||
+            (descriptor.kind !=
+                 vbr_artifact_companion_kind::required_spec_payload &&
+             descriptor.kind !=
+                 vbr_artifact_companion_kind::typed_accelerator)) {
+            return false;
+        }
+        auto parsed = std::make_unique<server_vbr_parsed_bytes>();
+        parsed->companion_kind = descriptor.kind;
+        parsed->version = descriptor.format_version;
+        parsed->bytes.resize(size_t(source.size()));
+        if (!source.read(0, parsed->bytes.data(), parsed->bytes.size())) {
+            return false;
+        }
+        output = std::move(parsed);
+        return true;
+    } catch (...) {
         output.reset();
         return false;
     }
-    return vbr_parse_recurrent_companion(
-        opaque, descriptor, source, target, output);
 }
 
 bool import_reserve_transform(
@@ -2203,6 +2402,38 @@ server_vbr_artifact_store::complete_validated_import(
                         *child.recurrent));
             }
         }
+        server_vbr_draft_target draft_target {
+            request.draft_context, request.destination,
+        };
+        if (request.draft_context) {
+            vbr_companion_adoption_provider provider;
+            provider.kind =
+                vbr_artifact_companion_kind::required_spec_payload;
+            provider.target_cookie = request.draft_context;
+            provider.context = &draft_target;
+            provider.prepare = server_vbr_draft_image::prepare;
+            provider.target_empty = server_vbr_draft_image::empty;
+            provider.recheck = server_vbr_draft_image::recheck;
+            provider.publish_swap = server_vbr_draft_image::publish;
+            provider.rollback = server_vbr_draft_image::rollback;
+            hooks.companions.push_back(provider);
+        }
+        server_vbr_accelerator_target accelerator_target {
+            request.accelerator,
+        };
+        if (request.accelerator) {
+            vbr_companion_adoption_provider provider;
+            provider.kind =
+                vbr_artifact_companion_kind::typed_accelerator;
+            provider.target_cookie = request.accelerator;
+            provider.context = &accelerator_target;
+            provider.prepare = server_vbr_accelerator_image::prepare;
+            provider.target_empty = server_vbr_accelerator_image::empty;
+            provider.recheck = server_vbr_accelerator_image::recheck;
+            provider.publish_swap = server_vbr_accelerator_image::publish;
+            provider.rollback = server_vbr_accelerator_image::rollback;
+            hooks.companions.push_back(provider);
+        }
         const auto adopted = vbr_adopt_empty_manifest(
             *request.memory, request.destination,
             std::move(*staged.manifest), std::move(*staged.staged),
@@ -2432,6 +2663,28 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
                 vbr_explicit_capture_representation_identity,
                 context.snapshot,
                 downward_projection, downward, schedule_quote);
+        if (request.draft_context) {
+            auto * draft_memory = llama_get_memory(request.draft_context);
+            context.snapshot.companions.push_back({
+                vbr_artifact_companion_kind::required_spec_payload, 1,
+                companion_build_digest("buun.vbr.draft-state-codec/v1"),
+                draft_memory &&
+                    llama_memory_seq_pos_min(
+                        draft_memory, request.destination) < 0 &&
+                    llama_memory_seq_pos_max(
+                        draft_memory, request.destination) < 0,
+                request.draft_context,
+            });
+        }
+        if (request.accelerator) {
+            context.snapshot.companions.push_back({
+                vbr_artifact_companion_kind::typed_accelerator, 1,
+                companion_build_digest(
+                    "buun.vbr.accelerator-ring-codec/v1"),
+                common_speculative_ring_state_empty(request.accelerator),
+                request.accelerator,
+            });
+        }
         if (snapshot_status ==
                 vbr_import_target_snapshot_status::unavailable) {
             output.validation_status =

@@ -68,11 +68,9 @@ static void test_vbr_prompt_cache_support_contract() {
     CHECK(server_vbr_prompt_cache_support_for(
               false, false, false, false) == status::supported);
     CHECK(server_vbr_prompt_cache_support_for(
-              true, false, false, false) ==
-          status::draft_context_unsupported);
+              true, false, false, false) == status::supported);
     CHECK(server_vbr_prompt_cache_support_for(
-              false, true, false, false) ==
-          status::speculative_slot_unsupported);
+              false, true, false, false) == status::supported);
     CHECK(server_vbr_prompt_cache_support_for(
               false, false, true, false) ==
           status::media_prompt_unsupported);
@@ -84,10 +82,10 @@ static void test_vbr_prompt_cache_support_contract() {
     // reports one deterministic reason rather than depending on call order.
     CHECK(server_vbr_prompt_cache_support_for(
               true, true, true, true) ==
-          status::draft_context_unsupported);
+          status::media_prompt_unsupported);
     CHECK(server_vbr_prompt_cache_support_for(
               false, true, true, true) ==
-          status::speculative_slot_unsupported);
+          status::media_prompt_unsupported);
     CHECK(server_vbr_prompt_cache_support_for(
               false, false, true, true) ==
           status::media_prompt_unsupported);
@@ -6911,6 +6909,62 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     }
     CHECK(retention.prefix_tracking_available());
     retention.retire(maximum_source_key);
+
+    // Speculative generation can leave the live slot's indexed coverage one
+    // sampled token behind the sealed capture frontier. The prepared host
+    // must receive the authenticated full prompt while preserving lineage;
+    // blindly cloning the shorter source prefix makes the artifact invisible
+    // to an exact request at its own frontier.
+    {
+        server_retention_sidecar_store lag_retention;
+        lag_retention.configure(
+            &fixture.ledger, fixture.host, &authority.leases);
+        CHECK(lag_retention.enable_prefix_tracking());
+        constexpr int32_t lag_source_slot = 47;
+        const auto lag_source_key =
+            server_retention_instance_key::for_slot(lag_source_slot);
+        server_prompt lag_prefix = prompt.clone();
+        lag_prefix.tokens.set_token(
+            size_t(lag_prefix.n_tokens() - 1),
+            lag_prefix.tokens[size_t(lag_prefix.n_tokens() - 1)] + 1);
+        common_chat_msg_spans lag_spans;
+        lag_spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+        CHECK(lag_retention.publish(
+            lag_source_key, common_retention_pool::recurrent,
+            lag_spans, true, prompt.n_tokens(), prompt.n_tokens(), true));
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            lag_retention, lag_source_key, lag_prefix,
+            fixture.package.manifest.identity.adapter_config_identity,
+            lag_prefix.n_tokens()));
+
+        server_prompt_cache lag_cache(0, 0);
+        lag_cache.acct = &fixture.ledger;
+        lag_cache.retention_obs = &lag_retention;
+        lag_cache.lease_obs = &authority.leases;
+        lag_cache.lease_execution_identity =
+            &fixture.package.manifest.identity.execution_identity;
+        server_prompt_cache_vbr_publication_metadata lag_metadata;
+        CHECK(lag_cache.prepare_vbr_publication_metadata(
+            prompt,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            lag_source_slot, lag_metadata));
+        server_prompt_cache::iterator lag_host;
+        CHECK(lag_cache.publish_vbr(
+            lag_metadata, payload, {}, false, &lag_host));
+        CHECK(lag_host != lag_cache.states.end());
+        server_prompt_cache_vbr_restore_candidate lag_restore;
+        CHECK(lag_cache.prepare_vbr_restore(
+            prompt.tokens,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            lag_restore, false));
+        CHECK(lag_restore.prefix_tokens() == uint64_t(prompt.n_tokens()));
+        lag_restore = {};
+        lag_cache.clear_accounting();
+        lag_cache.states.clear();
+        lag_retention.retire(lag_source_key);
+    }
 }
 
 static vbr_artifact_package prompt_cache_quality_anchor_package(

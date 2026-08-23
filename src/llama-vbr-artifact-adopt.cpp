@@ -1877,7 +1877,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             }
             for (auto it = companions.rbegin(); it != companions.rend(); ++it) {
                 if (it->second && it->first->rollback) {
-                    it->first->rollback(it->first->context, *it->second);
+                    rollback_ok = it->first->rollback(
+                                      it->first->context, *it->second) &&
+                                  rollback_ok;
                 }
             }
             if (claims_committed && staged) {
@@ -2260,9 +2262,10 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                            value.target_cookie == plan.target_cookie;
                 });
             if (provider == server_hooks.companions.end() ||
-                provider->prepare == nullptr || provider->publish_swap == nullptr ||
+                provider->prepare == nullptr || provider->recheck == nullptr ||
+                provider->publish_swap == nullptr ||
                 provider->target_empty == nullptr ||
-                !plan.parsed) {
+                !plan.parsed || !provider->target_empty(provider->context)) {
                 return fail(vbr_adopt_status::companion_failed);
             }
             std::unique_ptr<vbr_prepared_companion_image> image;
@@ -2382,6 +2385,15 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             expected_attention, barrier_tree, prepared_providers);
         if (tree_status != vbr_adopt_status::adopted) {
             return fail(tree_status);
+        }
+        if (!std::all_of(
+                companions.begin(), companions.end(),
+                [](const auto & value) {
+                    return value.first && value.second &&
+                        value.first->recheck && value.first->recheck(
+                            value.first->context, *value.second);
+                })) {
+            return fail(vbr_adopt_status::barrier_failed);
         }
         for (const auto & entry : children) {
             const auto expected = std::find_if(

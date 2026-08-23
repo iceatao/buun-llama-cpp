@@ -731,6 +731,10 @@ struct server_slot {
     bool retention_branch_pending = false;
     bool retention_request_succeeded = false;
     bool retention_geometry_failed = false;
+    // VBR captures its own authenticated physical/draft payload. A refused
+    // legacy checkpoint may suppress checkpoint lineage, but must not also
+    // erase the final live token/lineage source needed by exact VBR capture.
+    bool vbr_prompt_cache_enabled = false;
     server_cache_checkpoint_attempt_latch checkpoint_attempts;
     const common_prompt_checkpoint * checkpoint_seam_heuristic = nullptr;
     common_cache_plan_destruction_reason checkpoint_floor_refusal =
@@ -1057,6 +1061,7 @@ struct server_slot {
         if (mem.ctx_tgt) {
             mem.seq_rm(id, -1, -1);
         }
+        common_speculative_ring_state_reset(get_spec());
 
         if (lifecycle_authority && !prompt.checkpoints.empty()) {
             checkpoint_ring_changed();
@@ -1202,6 +1207,14 @@ struct server_slot {
                 server_cache_destruction_verdict::would_refuse_hard_leased ||
             admission.verdict ==
                 server_cache_destruction_verdict::unavailable) {
+            return false;
+        }
+        // The VBR artifact owns every required companion at this frontier,
+        // including the draft-context sequence when speculation is active.
+        // Leaving that sequence live would make the otherwise-empty import
+        // target fail its required-companion admission on the next request.
+        if (ctx_dft && !llama_memory_seq_rm(
+                llama_get_memory(ctx_dft), id, -1, -1)) {
             return false;
         }
         server_cache_slot_drop_impl();
@@ -1844,7 +1857,8 @@ struct server_slot {
             }
 
             if (retention_obs) {
-                if (retention_geometry_failed ||
+                if ((retention_geometry_failed &&
+                     !vbr_prompt_cache_enabled) ||
                     (retention_branch_pending &&
                      !retention_request_succeeded)) {
                     retention_obs->retire(
@@ -4385,6 +4399,7 @@ private:
 
         for (server_slot & slot : slots) {
             slot.ctx_dft = ctx_dft.get();
+            slot.vbr_prompt_cache_enabled = params_base.vbr_prompt_cache;
             slot.spec_shared = spec.get();
             common_speculative_set_seq_id(slot.get_spec(), slot.id);
         }
@@ -6510,6 +6525,7 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft.get();
+            slot.vbr_prompt_cache_enabled = params_base.vbr_prompt_cache;
             slot.n_ctx   = n_ctx_slot;
             slot.frontier_ratchet_min_agreements =
                 frontier_ratchet_threshold;
@@ -9299,7 +9315,7 @@ private:
         }
         try {
             if (!params_base.vbr_prompt_cache || !prompt_cache ||
-                !vbr_artifact_store || ctx_dft ||
+                !vbr_artifact_store ||
                 task.type != SERVER_TASK_TYPE_COMPLETION || task.is_child() ||
                 task.is_parent() || task.tokens.empty() ||
                 !task.params.cache_prompt ||
@@ -9326,7 +9342,8 @@ private:
             if (!prompt_cache->prepare_vbr_restore(
                     task.tokens, frontier_execution_identity,
                     adapter_identity, candidate,
-                    construction_empty)) {
+                    construction_empty && !ctx_dft &&
+                        !slot.can_speculate())) {
                 return false;
             }
             const int32_t plan_source_id = candidate.source_id();
@@ -9358,6 +9375,10 @@ private:
             };
             llama_memory_i * memory = nullptr;
             if (occupied_candidate) {
+                if (ctx_dft || slot.can_speculate()) {
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    return false;
+                }
                 if (candidate.requires_prefix_projection()) {
                     vbr_automatic_restore_occupied_fallbacks++;
                     return false;
@@ -9521,6 +9542,8 @@ private:
                 request.execution_identity = frontier_execution_identity;
                 request.adapter_config_identity = adapter_identity;
                 request.previously_observed = false;
+                request.draft_context = ctx_dft.get();
+                request.accelerator = slot.get_spec();
                 request.publish_context = &state;
                 request.prepare_publish = [](
                     void * opaque,
@@ -10733,11 +10756,9 @@ private:
             const server_tokens & tokens,
             const std::vector<common_adapter_lora_info> & lora,
             bool speculative_slot) noexcept {
-        // H2 currently has no frontier-media lookup authority and cannot
-        // resume through an aLoRA invocation boundary. Such artifacts remain
-        // useful to explicit control paths. Speculative slot state likewise
-        // has no automatic publish/restore transaction yet. All three remain
-        // live-only until their matching restore routes exist.
+        // Media and aLoRA still need their own frontier authority. Draft-model
+        // and DFlash state are exact companion payloads in the same adoption
+        // transaction as target KV, so speculative slots are supported.
         return server_vbr_prompt_cache_support_for(
             false, speculative_slot, tokens.has_media(),
             lora_all_alora(lora));
@@ -10880,7 +10901,7 @@ private:
     size_t publish_idle_vbr_batch(
             server_queue::idle_capture_session & capture_session) noexcept {
         if (!params_base.vbr_prompt_cache || !prompt_cache ||
-            !vbr_artifact_store || ctx_dft ||
+            !vbr_artifact_store ||
             !capture_session.continue_capture()) {
             return 0;
         }
@@ -10913,6 +10934,9 @@ private:
         if (!memory) {
             return 0;
         }
+        const bool requires_coordinated_tree_clear = n_swa > 0 ||
+            llama_model_is_recurrent(model_tgt) ||
+            llama_model_is_hybrid(model_tgt);
         const auto representation =
             memory->vbr_representation_identity();
         const auto slot_by_id = [&](int32_t id) -> server_slot * {
@@ -11182,7 +11206,7 @@ private:
                     representation.tier_epoch_swa);
 
             bool stem_retry = false;
-            if (!durable && n_swa == 0 &&
+            if (!durable && !requires_coordinated_tree_clear &&
                 !idle.prompt.tokens.has_media()) {
                 if (idle.vbr_idle_stem_source_valid &&
                     idle.vbr_idle_stem_source_identity == attempt_identity) {
@@ -11251,7 +11275,8 @@ private:
                 // dependency. It cannot be partitioned across the projected
                 // <=8-manifest union, so capture one ranked source per idle
                 // wave through the exact host handoff below.
-                if (stem_retry || n_swa > 0) {
+                if (stem_retry || requires_coordinated_tree_clear || ctx_dft ||
+                    idle.can_speculate()) {
                     break;
                 }
             } catch (...) {
@@ -11263,7 +11288,7 @@ private:
             // sequence cannot empty that child, so its live aliases are
             // reclaimed atomically below only after every resident slot has
             // a durable host frontier.
-            if (n_swa > 0) {
+            if (requires_coordinated_tree_clear) {
                 return;
             }
             for (size_t order = 0;
@@ -11343,7 +11368,11 @@ private:
         }
         const int64_t started = ggml_time_us();
 
-        if (n_swa > 0) {
+        const bool exact_companion_capture =
+            requires_coordinated_tree_clear || ctx_dft ||
+            (!candidates.empty() && candidates.front().slot &&
+             candidates.front().slot->can_speculate());
+        if (exact_companion_capture) {
             if (candidates.size() != 1 || manifests.size() != 1 ||
                 !capture_session.continue_capture()) {
                 return 0;
@@ -11681,7 +11710,7 @@ private:
                 const bool begin_stem_retry = !candidate.refresh &&
                     !candidate.stem_requested && candidates.size() == 1 &&
                     (aggregate_over_cap || incoming_over_host_cap) &&
-                    n_swa == 0 &&
+                    !requires_coordinated_tree_clear &&
                     !candidate.slot->prompt.tokens.has_media();
                 if (begin_stem_retry || candidate.stem_requested) {
                     candidate.slot->vbr_idle_stem_source_identity =
@@ -11919,7 +11948,7 @@ private:
                     adapter_key)) {
                 continue;
             }
-            if (n_swa == 0) {
+            if (!requires_coordinated_tree_clear) {
                 if (!source.prompt_clear_after_vbr_publication()) {
                     continue;
                 }
@@ -11934,7 +11963,7 @@ private:
         // throughout projection and D2H.
         displace_existing_sources();
 
-        if (n_swa > 0) {
+        if (requires_coordinated_tree_clear) {
             std::vector<server_slot *> reclaim;
             bool all_durable = true;
             try {

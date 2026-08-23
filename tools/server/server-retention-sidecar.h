@@ -133,6 +133,9 @@ public:
         llama_cache_acct_artifact_id source,
         llama_cache_acct_artifact_id destination,
         uint64_t lineage_id) noexcept;
+    bool exact_matches(
+        llama_cache_acct_artifact_id artifact,
+        const std::vector<llama_token> & tokens) const noexcept;
     void retire(llama_cache_acct_artifact_id artifact) noexcept;
     bool external_shared_coverage(
         llama_cache_acct_artifact_id artifact,
@@ -242,6 +245,15 @@ public:
     bool clone_prefix(
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept;
+    // Clone an exact host frontier while preserving the cheap shared-prefix
+    // path when source coverage already matches. If the semantic prompt has
+    // advanced beyond the live sidecar coverage, mint a same-lineage record
+    // at the authenticated token frontier and index that exact block.
+    bool clone_exact_prefix(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens) noexcept;
     bool visit_prefix_instances(
         common_retention_pool pool,
         const std::string & exact_scope,

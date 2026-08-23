@@ -2965,10 +2965,13 @@ bool server_prompt_cache::prepare_vbr_restore(
                 current.artifact = artifact_id;
                 return true;
             };
-        const bool indexed = retention_obs->visit_prefix_instances(
+        const bool indexed_attention = retention_obs->visit_prefix_instances(
             common_retention_pool::attention, scope,
             request_tokens.retention_token_ids(), &exact, select);
-        if (!indexed) {
+        const bool indexed_recurrent = retention_obs->visit_prefix_instances(
+            common_retention_pool::recurrent, scope,
+            request_tokens.retention_token_ids(), &exact, select);
+        if (!indexed_attention || !indexed_recurrent) {
             return false;
         }
         selection projected {
@@ -3748,6 +3751,7 @@ static bool server_prompt_cache_mirror_artifact_clone(
 
     common_chat_msg_spans no_spans;
     bool cloned = false;
+    bool prefix_prepared = false;
     switch (prefix_mode) {
         case server_prompt_cache_prefix_clone_mode::publish_stem:
             cloned = source_turn_tokens > 0 && coverage_tokens > 0 &&
@@ -3765,19 +3769,29 @@ static bool server_prompt_cache_mirror_artifact_clone(
                     uint64_t(coverage_tokens), true);
             break;
         case server_prompt_cache_prefix_clone_mode::publish_from_prompt:
+            if (source_turn_tokens > 0 && coverage_tokens > 0) {
+                std::string scope;
+                cloned = server_prompt_retention_exact_scope(
+                        prompt, adapter_identity, coverage_tokens, scope) &&
+                    cache.retention_obs->clone_exact_prefix(
+                        source_key, destination_key, scope,
+                        prompt.tokens.retention_token_ids());
+                prefix_prepared = cloned;
+            }
+            break;
         case server_prompt_cache_prefix_clone_mode::share_source:
             cloned = cache.retention_obs->clone(
                 source_key, destination_key);
             break;
     }
-    const bool indexed = cloned &&
+    const bool indexed = cloned && (prefix_prepared ||
         (destination_kind == common_retention_artifact_kind::checkpoint ||
          (prefix_mode == server_prompt_cache_prefix_clone_mode::share_source
               ? cache.retention_obs->clone_prefix(
                     source_key, destination_key)
               : server_prompt_retention_publish_exact_prefix(
                     *cache.retention_obs, destination_key, prompt,
-                    adapter_identity, coverage_tokens)));
+                    adapter_identity, coverage_tokens))));
     const server_cache_lease_subject source {
         cache.retention_obs->artifact_id(source_key),
         source_kind,
@@ -3880,7 +3894,7 @@ bool server_prompt_cache::prepare_vbr_publication_metadata_impl(
             state.prompt, state.adapter_config_key,
             state.prompt.n_tokens(),
             stem ? server_prompt_cache_prefix_clone_mode::publish_stem
-                 : server_prompt_cache_prefix_clone_mode::share_source,
+                 : server_prompt_cache_prefix_clone_mode::publish_from_prompt,
             source_prompt.n_tokens());
     if (!mirrored) {
         retention_obs->retire(destination_key);

@@ -1916,6 +1916,13 @@ static bool companion_empty(const void * context) noexcept {
            !state->report_nonempty;
 }
 
+static bool companion_recheck(
+        const void * context,
+        const vbr_prepared_companion_image &) noexcept {
+    const auto * state = static_cast<const recurrent_state *>(context);
+    return state && state->prepared && companion_empty(context);
+}
+
 static void companion_publish(
         const void * context, vbr_prepared_companion_image &) noexcept {
     auto * state = const_cast<recurrent_state *>(
@@ -1925,13 +1932,14 @@ static void companion_publish(
     state->empty = false;
 }
 
-static void companion_rollback(
+static bool companion_rollback(
         const void * context, vbr_prepared_companion_image &) noexcept {
     auto * state = const_cast<recurrent_state *>(
         static_cast<const recurrent_state *>(context));
     state->prepared = false;
     state->report_nonempty = false;
     ++state->rollbacks;
+    return true;
 }
 
 static vbr_verified_segment segment(
@@ -2698,6 +2706,7 @@ struct fixture {
         out.context = &target.recurrent;
         out.prepare = companion_prepare;
         out.target_empty = companion_empty;
+        out.recheck = companion_recheck;
         out.publish_swap = companion_publish;
         out.rollback = companion_rollback;
         return out;

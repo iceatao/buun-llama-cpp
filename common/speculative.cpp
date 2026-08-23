@@ -4088,6 +4088,18 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         return true;
     }
 
+    bool ring_state_empty() const {
+        return ring_filled == 0 && committed_len == 0;
+    }
+
+    void ring_state_reset() {
+        ring_write_pos = 0;
+        ring_filled = 0;
+        committed_len = 0;
+        crosskv_projected_len = 0;
+        prefill_flushed = false;
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         for (llama_seq_id sid = 0; sid < (llama_seq_id) n_seq; ++sid) {
             auto & dp = dparams[sid];
@@ -5821,6 +5833,28 @@ bool common_speculative_ring_state_load(common_speculative * spec, const uint8_t
         }
     }
     return false;
+}
+
+bool common_speculative_ring_state_empty(const common_speculative * spec) {
+    if (spec == nullptr) return true;
+    for (const auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH &&
+            !static_cast<const common_speculative_impl_dflash *>(impl.get())->
+                ring_state_empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void common_speculative_ring_state_reset(common_speculative * spec) {
+    if (spec == nullptr) return;
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            static_cast<common_speculative_impl_dflash *>(impl.get())->
+                ring_state_reset();
+        }
+    }
 }
 
 int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params) {

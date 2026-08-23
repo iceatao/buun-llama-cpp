@@ -96,10 +96,12 @@ class vbr_prepared_companion_image {
     vbr_prepared_companion_image() = default;
 };
 
-// Provider callbacks are closed over one target-memory child. `prepare` may
-// allocate but cannot mutate the target. `publish_swap` is the phase-12,
-// statically-noexcept holder swap. `rollback` is used only for provider-owned
-// prepublication resources.
+// Provider callbacks are closed over one companion target. `prepare` runs
+// after unit H2D and may either build an off-side image or install reversible
+// state in an otherwise-empty target. `recheck` is the allocation-free late
+// barrier for that prepared image. `publish_swap` is the phase-12 no-fail
+// terminal. `rollback` must restore the pre-prepare target and reports whether
+// recovery was complete.
 struct vbr_companion_adoption_provider {
     vbr_artifact_companion_kind kind =
         vbr_artifact_companion_kind::_count;
@@ -113,10 +115,13 @@ struct vbr_companion_adoption_provider {
     // Phase-10 drift gate. It must be allocation-free and must describe the
     // same target object as target_cookie/prepare/publish_swap.
     bool (*target_empty)(const void * context) noexcept = nullptr;
+    bool (*recheck)(
+        const void * context,
+        const vbr_prepared_companion_image & image) noexcept = nullptr;
     void (*publish_swap)(
         const void * context,
         vbr_prepared_companion_image & image) noexcept = nullptr;
-    void (*rollback)(
+    bool (*rollback)(
         const void * context,
         vbr_prepared_companion_image & image) noexcept = nullptr;
 };

@@ -243,9 +243,18 @@ class vbr_recurrent_prepared_image final :
         // END VBR_IMPORT_RECURRENT_METADATA_SWAP
     }
 
-    static void rollback(
+    static bool recheck(
+            const void * context,
+            const vbr_prepared_companion_image & base) noexcept {
+        const auto * image =
+            static_cast<const vbr_recurrent_prepared_image *>(&base);
+        return image && image->target == context && target_empty(context);
+    }
+
+    static bool rollback(
             const void *, vbr_prepared_companion_image &) noexcept {
         // All resources remain owned by the off-side image until publish.
+        return true;
     }
 
     static bool target_empty(const void * context) noexcept {
@@ -340,6 +349,7 @@ vbr_companion_adoption_provider vbr_recurrent_companion_adoption_provider(
     provider.context = &target;
     provider.prepare = &vbr_recurrent_prepared_image::prepare;
     provider.target_empty = &vbr_recurrent_prepared_image::target_empty;
+    provider.recheck = &vbr_recurrent_prepared_image::recheck;
     provider.publish_swap = &vbr_recurrent_prepared_image::publish;
     provider.rollback = &vbr_recurrent_prepared_image::rollback;
     return provider;

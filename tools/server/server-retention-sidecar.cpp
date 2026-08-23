@@ -503,6 +503,17 @@ bool server_retention_prefix_index::clone(
     }
 }
 
+bool server_retention_prefix_index::exact_matches(
+        llama_cache_acct_artifact_id artifact,
+        const std::vector<llama_token> & tokens) const noexcept {
+    if (!pimpl || !pimpl->healthy || artifact.v == 0 || tokens.empty()) {
+        return false;
+    }
+    const auto found = pimpl->artifacts.find(artifact.v);
+    return found != pimpl->artifacts.end() && found->second.tokens &&
+        found->second.tokens->values == tokens;
+}
+
 bool server_retention_prefix_index::visit_prefixes(
         const std::vector<llama_token> & tokens,
         void * context,
@@ -1163,6 +1174,17 @@ struct server_retention_sidecar_store::prefix_tracking {
         }
     }
 
+    bool exact_matches(
+            llama_cache_acct_artifact_id artifact,
+            const std::vector<llama_token> & tokens) const noexcept {
+        if (!healthy || artifact.v == 0 || tokens.empty()) {
+            return false;
+        }
+        const auto found = artifacts.find(artifact.v);
+        return found != artifacts.end() && found->second.scope &&
+            found->second.scope->index.exact_matches(artifact, tokens);
+    }
+
     void retire(llama_cache_acct_artifact_id artifact) noexcept {
         if (!healthy || artifact.v == 0) {
             return;
@@ -1498,6 +1520,67 @@ bool server_retention_sidecar_store::clone_prefix(
     }
     destination_artifact->second.prefix_indexed = true;
     return true;
+}
+
+bool server_retention_sidecar_store::clone_exact_prefix(
+        const server_retention_instance_key & source,
+        const server_retention_instance_key & destination,
+        const std::string & exact_scope,
+        const std::vector<llama_token> & tokens) noexcept {
+    if (!prefixes) {
+        return !prefix_tracking_requested && clone(source, destination);
+    }
+    try {
+        const auto source_association = associations.find(source);
+        const auto * item = find_clone_source(source);
+        if (source_association == associations.end() || !item ||
+            tokens.empty() || !item->record.turns ||
+            tokens.size() > item->record.turns->token_count) {
+            retire(destination);
+            return false;
+        }
+        if (item->record.stamp.coverage_tokens == tokens.size() &&
+            item->prefix_indexed && prefixes->exact_matches(
+                source_association->second, tokens)) {
+            if (!clone(source, destination) ||
+                !clone_prefix(source, destination)) {
+                retire(destination);
+                return false;
+            }
+            return true;
+        }
+
+        auto record = item->record;
+        record.kind = destination.kind;
+        record.stamp.coverage_tokens = tokens.size();
+        if (!common_retention_score(
+                *record.turns, record.stamp.coverage_tokens,
+                record.stamp)) {
+            record.stamp.state = common_retention_score_state::unavailable;
+            record.stamp.mandatory_anchor = false;
+            record.stamp.mapped_turn_ordinal = 0;
+            record.stamp.anchor_rank = 0;
+        }
+        server_cache_lease_identity checkpoint_identity;
+        const server_cache_lease_identity * checkpoint_identity_ptr = nullptr;
+        if (item->checkpoint_identity_known) {
+            checkpoint_identity = item->checkpoint_identity;
+            checkpoint_identity_ptr = &checkpoint_identity;
+        }
+        if (!allocator.issue(record.stamp.pool, record.stamp) ||
+            !install(
+                destination, std::move(record), checkpoint_identity_ptr,
+                nullptr) ||
+            !publish_prefix(destination, exact_scope, tokens)) {
+            retire(destination);
+            return false;
+        }
+        return true;
+    } catch (...) {
+        retire(destination);
+        mark_unavailable();
+        return false;
+    }
 }
 
 bool server_retention_sidecar_store::visit_prefix_instances(

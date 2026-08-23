@@ -13,6 +13,8 @@
 #include <vector>
 
 class server_prompt_cache_vbr_payload;
+struct common_speculative;
+struct llama_context;
 struct server_vbr_artifact_store_test_door;
 
 enum class server_vbr_artifact_capture_status : uint8_t {
@@ -312,6 +314,11 @@ struct server_vbr_artifact_import_target {
     std::string execution_identity;
     std::string adapter_config_identity;
     bool previously_observed = false;
+    // Optional server-owned companion targets. They are authenticated against
+    // the artifact descriptors and participate in the same adoption journal
+    // as target KV state.
+    llama_context * draft_context = nullptr;
+    common_speculative * accelerator = nullptr;
     void * publish_context = nullptr;
     prepare_publish_fn prepare_publish = nullptr;
     publish_fn publish = nullptr;

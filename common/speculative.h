@@ -170,6 +170,8 @@ void   common_speculative_rollback_dft(common_speculative * spec, llama_seq_id s
 size_t common_speculative_ring_state_size(const common_speculative * spec);
 void   common_speculative_ring_state_save(const common_speculative * spec, uint8_t * buf, size_t size);
 bool   common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size);
+bool   common_speculative_ring_state_empty(const common_speculative * spec);
+void   common_speculative_ring_state_reset(common_speculative * spec);
 
 // fork: draft length params
 int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);

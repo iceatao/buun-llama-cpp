@@ -31,14 +31,8 @@ server_vbr_prompt_cache_support_for(
         bool speculative_slot,
         bool media_prompt,
         bool alora_invocation) noexcept {
-    if (has_draft_context) {
-        return server_vbr_prompt_cache_support_status::
-            draft_context_unsupported;
-    }
-    if (speculative_slot) {
-        return server_vbr_prompt_cache_support_status::
-            speculative_slot_unsupported;
-    }
+    (void) has_draft_context;
+    (void) speculative_slot;
     if (media_prompt) {
         return server_vbr_prompt_cache_support_status::
             media_prompt_unsupported;
