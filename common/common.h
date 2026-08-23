@@ -775,7 +775,8 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
-    bool    vbr_prompt_cache    = false; // opt in to projected VBR host-cache publication
+    bool    vbr_prompt_cache    = false; // resolved projected VBR host-cache publication request
+    bool    vbr_prompt_cache_explicit = false; // whether --[no-]vbr-prompt-cache was provided
     int32_t vbr_anchor_cache_mib = 0;    // optional extra quality-anchor pool for VBR artifacts
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
@@ -942,6 +943,20 @@ enum class common_vbr_cpu_fallback_result {
     applied,
     explicit_vbr,
 };
+
+enum class common_vbr_prompt_cache_mode {
+    disabled_cache_ram,
+    disabled_static,
+    disabled_explicit,
+    enabled_explicit,
+    enabled_automatic,
+};
+
+// H3 default policy. Dynamic VBR follows the ordinary nonzero --cache-ram
+// default unless the legacy VBR-specific switch was explicitly set. A zero
+// cache budget is authoritative and prevents all host-cache activation.
+common_vbr_prompt_cache_mode common_vbr_prompt_cache_mode_for(
+    const common_params & params);
 
 // Common-layer policy seam for the implicit dynamic-VBR default. `has_gpu`
 // describes the resolved placement inventory; explicit VBR is never rewritten.

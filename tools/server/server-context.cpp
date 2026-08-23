@@ -5155,6 +5155,15 @@ private:
 
         params_base = params_load;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+        const auto vbr_prompt_cache_mode =
+            common_vbr_prompt_cache_mode_for(params_base);
+        const bool vbr_prompt_cache_automatic =
+            vbr_prompt_cache_mode ==
+                common_vbr_prompt_cache_mode::enabled_automatic;
+        params_base.vbr_prompt_cache =
+            vbr_prompt_cache_automatic ||
+            vbr_prompt_cache_mode ==
+                common_vbr_prompt_cache_mode::enabled_explicit;
 
         // Qwen-27B external MTP sidecars can derive and reuse a frequency-prior
         // vocabulary-trimmed copy. This runs before fit/placement so the first
@@ -6624,7 +6633,7 @@ private:
             if (params_base.cache_ram_mib != 0 &&
                 !params_base.vbr_prompt_cache) {
                 params_base.cache_ram_mib = 0;
-                SRV_WRN("%s\n", "prompt cache state storage is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+                SRV_WRN("%s\n", "dynamic VBR prompt-cache artifacts were explicitly disabled; fixed KV state images are unsafe and cache-ram will be disabled");
             } else if (params_base.cache_ram_mib != 0) {
                 SRV_INF("%s\n", "dynamic VBR idle caching will store projected artifacts; fixed KV state images remain disabled");
             }
@@ -7220,6 +7229,20 @@ private:
                         diagnostics.constructed_ring_bytes,
                         diagnostics.chunk_bytes);
                 }
+            }
+
+            if (vbr_prompt_cache_automatic && !vbr_artifact_store) {
+                // Automatic H3 rollout must not turn a topology-specific typed
+                // miss into a server startup failure. Explicit requests retain
+                // the strict validation below. The live VBR cache remains the
+                // source of truth and ordinary processing continues uncached.
+                params_base.vbr_prompt_cache = false;
+                params_base.cache_idle_slots = false;
+                params_base.cache_ram_mib = 0;
+                prompt_cache.reset();
+                SRV_WRN("%s\n",
+                    "automatic dynamic VBR host caching is unavailable for "
+                    "this topology; continuing live-only (cache-ram disabled)");
             }
 
             if (prompt_cache) {

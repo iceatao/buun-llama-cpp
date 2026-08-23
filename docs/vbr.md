@@ -38,6 +38,7 @@ runs stay coherent — the price orders were measured on KLD panels per model.
 | `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the ladder range [1.25, 16]. Implicit VBR defaults to t4 (4.125); explicit `-ct vbr` without this flag uses t1 (1.25). |
 | `--vbr-vram <SIZE>` | explicit KV VRAM budget (e.g. `8G`). Default `auto` = derived by the fit pass. |
 | `--vbr-policy <json>` | fixed mode only: a measured policy ladder; the best rung ≤ the fixed budget (and ≥ the floor) is selected and its per-layer schedule applied. |
+| `--cache-ram <MiB>` | on the server, a nonzero value enables automatic projected-artifact host caching for supported dynamic-VBR topologies (default: 8192). `--cache-ram 0` is the zero-cost opt-out. |
 
 Notes:
 
@@ -62,11 +63,12 @@ Notes:
   automatically, with a warning.
 - **Context shift / self-extend** is disabled under dynamic VBR (the shift graph would
   touch unmapped pool pages); generation stops cleanly when the context fills.
-- **State save/load** (session files, server slot save, prompt-cache-ram, cache reuse) is
-  not supported in dynamic mode: snapshots carry tier-typed KV, and a degraded-tier save
-  could never restore. Saves are refused loudly; the server disables these features on
-  startup with warnings. Context checkpoints stay enabled on hybrid models (recurrent
-  state only) but are disabled on SWA models.
+- **Host prompt cache**: supported server topologies use authenticated projected VBR
+  artifacts under the ordinary `--cache-ram` budget. The fixed-layout state serializer,
+  manual slot files, and KV shifting/cache reuse remain disabled because their snapshots
+  carry tier-typed KV. If artifact construction is unavailable for a topology, startup
+  reports the typed refusal and continues live-only. Context checkpoints stay enabled on
+  hybrid models (recurrent state only) but are disabled on SWA models.
 - Degrade progress lines are `INFO`-level: visible with `-v`. Greedy-identical output does
   NOT mean no degrades happened.
 - `--vbr-policy` exports its per-layer schedule through a process-global env: with a

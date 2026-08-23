@@ -435,6 +435,21 @@ common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
     return common_vbr_cpu_fallback_result::applied;
 }
 
+common_vbr_prompt_cache_mode common_vbr_prompt_cache_mode_for(
+        const common_params & params) {
+    if (params.cache_ram_mib == 0) {
+        return common_vbr_prompt_cache_mode::disabled_cache_ram;
+    }
+    if (params.vbr_prompt_cache_explicit) {
+        return params.vbr_prompt_cache
+            ? common_vbr_prompt_cache_mode::enabled_explicit
+            : common_vbr_prompt_cache_mode::disabled_explicit;
+    }
+    return params.vbr_dynamic()
+        ? common_vbr_prompt_cache_mode::enabled_automatic
+        : common_vbr_prompt_cache_mode::disabled_static;
+}
+
 void common_params_print_info(const common_params & params, bool print_devices) {
 #ifdef NDEBUG
     const char * build_type = "";

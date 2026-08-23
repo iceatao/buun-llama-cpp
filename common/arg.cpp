@@ -2422,9 +2422,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--vbr-prompt-cache"},
         {"--no-vbr-prompt-cache"},
-        "publish idle dynamic-VBR slots as projected prompt-cache artifacts (default: disabled; requires cache-idle-slots and cache-ram)",
+        "publish idle dynamic-VBR slots as projected prompt-cache artifacts (default: automatic for supported dynamic VBR when cache-ram is nonzero)",
         [](common_params & params, bool value) {
             params.vbr_prompt_cache = value;
+            params.vbr_prompt_cache_explicit = true;
         }
     ).set_env("LLAMA_ARG_VBR_PROMPT_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

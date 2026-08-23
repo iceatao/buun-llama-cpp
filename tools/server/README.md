@@ -27,9 +27,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 tier and degrades tensors down a measured price order as the context fills, within an
 auto-derived (or `--vbr-vram`) VRAM budget. See [docs/vbr.md](../../docs/vbr.md) for
 flags, the floor semantics and limitations. Server specifics: `/props` and `/models`
-expose a `vbr` object; prompt-cache-ram, cache reuse, slot save/restore and (on SWA
-models) context checkpoints are disabled with warnings in dynamic mode, and unified KV
-is forced when `-np > 1`.
+expose a `vbr` object; the ordinary nonzero `--cache-ram` budget automatically enables
+projected-artifact host caching on supported dynamic-VBR topologies (`--cache-ram 0`
+disables it). Fixed-layout cache reuse, slot save/restore and (on SWA models) context
+checkpoints remain disabled with warnings, and unified KV is forced when `-np > 1`.
 
 ## Usage
 
@@ -177,7 +178,7 @@ is forced when `-np > 1`.
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
-| `--vbr-prompt-cache, --no-vbr-prompt-cache` | publish idle dynamic-VBR slots as projected prompt-cache artifacts (default: disabled; requires cache-idle-slots and cache-ram)<br/>(env: LLAMA_ARG_VBR_PROMPT_CACHE) |
+| `--vbr-prompt-cache, --no-vbr-prompt-cache` | publish idle dynamic-VBR slots as projected prompt-cache artifacts (default: automatic for supported dynamic VBR when cache-ram is nonzero)<br/>(env: LLAMA_ARG_VBR_PROMPT_CACHE) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |

@@ -277,6 +277,31 @@ static void test(void) {
         assert(vbr_default.vbr_dynamic());
         assert(vbr_default.vbr_min_bits_value == 4.125);
         assert(vbr_default.vbr_capacity_bits == 4.125);
+        assert(!vbr_default.vbr_prompt_cache_explicit);
+        assert(common_vbr_prompt_cache_mode_for(vbr_default) ==
+               common_vbr_prompt_cache_mode::enabled_automatic);
+
+        common_params vbr_cache_disabled;
+        argv = {"binary_name", "-m", "model.gguf", "--cache-ram", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_cache_disabled, LLAMA_EXAMPLE_SERVER));
+        assert(common_vbr_prompt_cache_mode_for(vbr_cache_disabled) ==
+               common_vbr_prompt_cache_mode::disabled_cache_ram);
+
+        common_params vbr_cache_explicit_off;
+        argv = {"binary_name", "-m", "model.gguf", "--no-vbr-prompt-cache"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_cache_explicit_off, LLAMA_EXAMPLE_SERVER));
+        assert(vbr_cache_explicit_off.vbr_prompt_cache_explicit);
+        assert(!vbr_cache_explicit_off.vbr_prompt_cache);
+        assert(common_vbr_prompt_cache_mode_for(vbr_cache_explicit_off) ==
+               common_vbr_prompt_cache_mode::disabled_explicit);
+
+        common_params vbr_cache_explicit_on;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-prompt-cache"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_cache_explicit_on, LLAMA_EXAMPLE_SERVER));
+        assert(vbr_cache_explicit_on.vbr_prompt_cache_explicit);
+        assert(vbr_cache_explicit_on.vbr_prompt_cache);
+        assert(common_vbr_prompt_cache_mode_for(vbr_cache_explicit_on) ==
+               common_vbr_prompt_cache_mode::enabled_explicit);
 
         common_params implicit_cpu = vbr_default;
         assert(common_params_apply_vbr_cpu_fallback(implicit_cpu, false) ==
@@ -323,6 +348,8 @@ static void test(void) {
         assert(vbr_opt_out.cache_type_k_explicit);
         assert(vbr_opt_out.cache_type_v_explicit);
         assert(!vbr_opt_out.vbr_enabled());
+        assert(common_vbr_prompt_cache_mode_for(vbr_opt_out) ==
+               common_vbr_prompt_cache_mode::disabled_static);
 
         // Explicit VBR preserves the historical full ladder: the cache STARTS at F16 (full quality
         // until budget pressure; the measured fp16->t8 band degrades first) and the runtime
