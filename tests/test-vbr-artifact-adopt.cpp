@@ -907,7 +907,8 @@ static vbr_artifact_package package(
         uint8_t promote_hops = 0,
         vbr_artifact_clean_stash_state stash_state =
             vbr_artifact_clean_stash_state::absent_at_source,
-        bool partial_stash = false) {
+        bool partial_stash = false,
+        uint32_t child_count = 2) {
     vbr_artifact_package out;
     out.topologies.push_back(topology());
     auto & manifest = out.manifest;
@@ -926,7 +927,7 @@ static vbr_artifact_package package(
     manifest.consistency.kind =
         vbr_artifact_consistency_kind::capture_exact;
 
-    for (uint32_t child_id = 0; child_id < 2; ++child_id) {
+    for (uint32_t child_id = 0; child_id < child_count; ++child_id) {
         vbr_artifact_unit_blob blob;
         auto & descriptor = blob.descriptor;
         descriptor.child_id = child_id;
@@ -1066,9 +1067,11 @@ static vbr_artifact_package package(
     };
     manifest.accounting = {
         { vbr_artifact_accounting_role::unit_payload,
-          device0, 10, 10, llama_cache_acct_attr_kind::artifact },
+          device0, 5*child_count, 5*child_count,
+          llama_cache_acct_attr_kind::artifact },
         { vbr_artifact_accounting_role::unit_payload,
-          device1, 10, 10, llama_cache_acct_attr_kind::artifact },
+          device1, 5*child_count, 5*child_count,
+          llama_cache_acct_attr_kind::artifact },
         { vbr_artifact_accounting_role::descriptor_metadata,
           host, 512, 512, llama_cache_acct_attr_kind::artifact },
         { vbr_artifact_accounting_role::reference_metadata,
@@ -1077,11 +1080,13 @@ static vbr_artifact_package package(
     if (stash_state == vbr_artifact_clean_stash_state::present) {
         manifest.accounting.push_back({
             vbr_artifact_accounting_role::clean_stash_payload,
-            device0, 20, 20, llama_cache_acct_attr_kind::artifact,
+            device0, 10*child_count, 10*child_count,
+            llama_cache_acct_attr_kind::artifact,
         });
         manifest.accounting.push_back({
             vbr_artifact_accounting_role::clean_stash_payload,
-            device1, 20, 20, llama_cache_acct_attr_kind::artifact,
+            device1, 10*child_count, 10*child_count,
+            llama_cache_acct_attr_kind::artifact,
         });
     }
     if (companion) {
@@ -1207,6 +1212,12 @@ struct seam final : vbr_adopt_test_seam {
     uint32_t upward_null_stash_transforms = 0;
     uint64_t upward_stash_rows = 0;
     uint32_t upward_syncs = 0;
+    bool occupied_mode = false;
+    uint32_t occupied_rechecks = 0;
+    uint32_t relocated_prepares = 0;
+    uint32_t relocated_images = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> relocated_offsets;
+    uint64_t incumbent_sentinel = UINT64_C(0xabcddcba11223344);
     std::vector<upward_event> upward_events;
 
     seam() {
@@ -1303,6 +1314,18 @@ struct seam final : vbr_adopt_test_seam {
                 (child.mapped == 0 && child.h2d_bytes == 0));
     }
 
+    bool session_recheck_occupied(
+            uint32_t child_id,
+            const vbr_occupied_replacement_guard & guard,
+            bool) const noexcept override {
+        if (!occupied_mode || child_id != 0 || !guard.ready() ||
+            guard.destination() != 0) {
+            return false;
+        }
+        ++const_cast<seam *>(this)->occupied_rechecks;
+        return true;
+    }
+
     bool session_arm(uint32_t child_id, vbr_operation_id) noexcept override {
         if (child_id >= children.size() || children[child_id].armed) {
             return false;
@@ -1327,6 +1350,20 @@ struct seam final : vbr_adopt_test_seam {
                 return false;
             }
         }
+        return true;
+    }
+
+    bool session_prepare_relocated_backing(
+            uint32_t child_id,
+            const std::vector<const vbr_validated_child_plan *> & plans,
+            const std::vector<vbr_occupied_replacement_relocation_run> & runs) noexcept override {
+        if (!occupied_mode || child_id != 0 || plans.empty() || runs.empty() ||
+            !children[child_id].armed) {
+            return false;
+        }
+        auto & child = children[child_id];
+        child.mapped = uint32_t(runs.size());
+        ++relocated_prepares;
         return true;
     }
 
@@ -1362,6 +1399,15 @@ struct seam final : vbr_adopt_test_seam {
             }
         }
         auto & child = children[child_id];
+        if (occupied_mode && read.kind == vbr_staged_read_kind::unit_payload) {
+            if (!child.image_ready || read.projection_ranges.size() != 1) {
+                return false;
+            }
+            relocated_offsets.push_back({
+                read.projection_ranges.front().source_offset,
+                read.destination_offset,
+            });
+        }
         for (size_t i = 0; i < bytes.size(); ++i) {
             child.destination[i % child.destination.size()] ^= bytes[i];
         }
@@ -1552,6 +1598,21 @@ struct seam final : vbr_adopt_test_seam {
         return true;
     }
 
+    bool session_build_relocated_live_image(
+            uint32_t child_id,
+            const std::vector<const vbr_validated_child_plan *> & plans,
+            const vbr_tracker_install_child &,
+            const vbr_checkpoint_generation_controller &,
+            const vbr_occupied_replacement_guard & guard) noexcept override {
+        if (!occupied_mode || child_id != 0 || plans.empty() || !guard.ready() ||
+            !children[child_id].completed_units.empty()) {
+            return false;
+        }
+        children[child_id].image_ready = true;
+        ++relocated_images;
+        return true;
+    }
+
     bool session_prepare_receipts(
             uint32_t child_id,
             std::shared_ptr<void> receipt_owner) noexcept override {
@@ -1568,7 +1629,8 @@ struct seam final : vbr_adopt_test_seam {
 
     bool session_mapped_prefixes_complete(
             uint32_t child_id) const noexcept override {
-        return child_id < children.size() && children[child_id].mapped == 5;
+        return child_id < children.size() &&
+            children[child_id].mapped == (occupied_mode ? 1u : 5u);
     }
 
     bool session_barrier(uint32_t child_id, uint64_t serial,
@@ -1829,6 +1891,8 @@ struct fixture {
             llama_cache_acct_residency::pinned_host);
     llama_cache_acct_artifact_id reference;
     vbr_artifact_package_view view;
+    llama_cache_acct_artifact_id recovery_reference;
+    vbr_artifact_package_view recovery_view;
     seam target;
     validation_context validation;
     vbr_target_validation_snapshot snapshot;
@@ -1840,6 +1904,8 @@ struct fixture {
     ggml_type upward_source_type = GGML_TYPE_TURBO8_0;
     ggml_type upward_target_type = GGML_TYPE_F16;
     bool mixed_exact_upward = false;
+    bool occupied = false;
+    vbr_occupied_replacement_guard occupied_guard;
     vbr_downward_policy_projection downward_projection;
     vbr_import_destination_projection upward_destination;
     vbr_import_schedule_quote schedule_quote;
@@ -1857,20 +1923,26 @@ struct fixture {
                      vbr_artifact_clean_stash_state stash_state =
                          vbr_artifact_clean_stash_state::absent_at_source,
                      bool mixed_exact = false,
-                     bool partial_stash = false)
+                     bool partial_stash = false,
+                     bool occupied_import = false)
         : source(package(
               bytes, companion,
               upward_import ? upward_source : GGML_TYPE_TURBO8_0,
               upward_import ? source_promote_hops : 0,
               upward_import ? stash_state :
                   vbr_artifact_clean_stash_state::absent_at_source,
-              upward_import && partial_stash)),
+              upward_import && partial_stash,
+              occupied_import ? 1 : 2)),
           catalog(ledger),
           with_companion(companion), downward(downward_import),
           upward(upward_import), upward_source_type(upward_source),
           upward_target_type(upward_target),
-          mixed_exact_upward(mixed_exact) {
+          mixed_exact_upward(mixed_exact), occupied(occupied_import) {
         CHECK(!(downward && upward));
+        if (occupied) {
+            target.live.resize(1);
+            target.occupied_mode = true;
+        }
         if (downward) {
             for (auto & controller : source.manifest.controller_policy) {
                 controller.floor_type = GGML_TYPE_TURBO1_TCQ;
@@ -2001,6 +2073,42 @@ struct fixture {
         CHECK(catalog.resolve_reference(reference, view) ==
               vbr_artifact_resolve_status::ok);
         CHECK(view.validate() == vbr_artifact_status::ok);
+        if (occupied) {
+            auto recovery_build = catalog.begin_capture(
+                source, budget, {}, stream_status);
+            CHECK(recovery_build &&
+                  stream_status == vbr_capture_stream_status::ok);
+            if (!recovery_build) {
+                return;
+            }
+            for (uint32_t unit_index = 0;
+                 unit_index < source.unit_blobs.size(); ++unit_index) {
+                auto unit = recovery_build->begin_unit(unit_index, stream_status);
+                CHECK(unit && stream_status == vbr_capture_stream_status::ok);
+                if (!unit) {
+                    return;
+                }
+                for (uint32_t shard_index = 0; shard_index < 2; ++shard_index) {
+                    CHECK(unit->accept_verified_segment(segment(
+                              unit_index, shard_index,
+                              bytes.payload[unit_index*2+shard_index])) ==
+                          vbr_capture_stream_status::ok);
+                }
+                CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+            }
+            const auto recovery_published =
+                recovery_build->publish_reference();
+            CHECK(recovery_published.status ==
+                  vbr_capture_stream_status::ok);
+            recovery_reference = recovery_published.reference_artifact;
+            CHECK(recovery_reference.v != 0);
+            CHECK(recovery_reference != reference);
+            recovery_build.reset();
+            CHECK(catalog.resolve_reference(
+                      recovery_reference, recovery_view) ==
+                  vbr_artifact_resolve_status::ok);
+            CHECK(recovery_view.validate() == vbr_artifact_status::ok);
+        }
         catalog_live_ops = ledger.snapshot().live_ops;
 
         validation.target = &target;
@@ -2011,11 +2119,53 @@ struct fixture {
             &validation.downward_tree_digest;
         fill_snapshot();
         fill_policy();
+        if (occupied) {
+            refresh();
+            std::array<vbr_occupied_replacement_cell, 5> cells;
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                cells[i] = { 0, i, llama_pos(i), llama_pos(10+i),
+                    llama_pos(20+i), 0, 1 };
+            }
+            const auto & descriptor = view.units().front().descriptor;
+            const auto & captured =
+                view.manifest().generation.controllers.front().units.front();
+            const vbr_occupied_replacement_unit_currency unit {
+                0, descriptor.logical_unit_id,
+                { captured.repr_gen, 0, captured.current_type,
+                  captured.last_source_type, captured.domain,
+                  captured.promote_hops, captured.last_transition },
+            };
+            const vbr_occupied_replacement_observation observation {
+                0, view.manifest().identity.sequence_epoch,
+                view.manifest().generation.controllers.front().global_generation,
+                snapshot.children.front().state_serial, 10,
+                cells.data(), cells.size(), &unit, 1,
+            };
+            CHECK(vbr_prepare_occupied_replacement_guard(
+                snapshot, view, recovery_view, observation, occupied_guard) ==
+                vbr_occupied_replacement_guard_status::ready);
+            CHECK(occupied_guard.incoming_artifact() == reference);
+            CHECK(occupied_guard.recovery_artifact() == recovery_reference);
+            CHECK(occupied_guard.incoming_artifact() !=
+                  occupied_guard.recovery_artifact());
+            policy.occupied_replacement = &occupied_guard;
+            policy.occupied_representation_context = this;
+            policy.occupied_representation_identity = [](
+                    const void *, int32_t, bool, int32_t,
+                    vbr_explicit_representation_identity &) noexcept {
+                return false;
+            };
+        }
     }
 
     ~fixture() {
         target.erase_imported();
+        recovery_view.reset();
         view.reset();
+        if (recovery_reference.v != 0) {
+            CHECK(catalog.retire(recovery_reference) ==
+                  vbr_artifact_retire_status::retired);
+        }
         if (reference.v != 0) {
             CHECK(catalog.retire(reference) ==
                   vbr_artifact_retire_status::retired);
@@ -2032,19 +2182,22 @@ struct fixture {
         snapshot.policy_epoch = validation.policy_epoch;
         snapshot.scheduler_idle = true;
         snapshot.destination_sequence_absent = true;
-        for (uint32_t child_id = 0; child_id < 2; ++child_id) {
+        for (uint32_t child_id = 0; child_id < view.units().size(); ++child_id) {
             const auto & descriptor = view.units()[child_id].descriptor;
             vbr_target_child_snapshot child;
             child.child_id = child_id;
             child.dependency_mode =
                 checkpoint_child_dependency_mode::live_guarded;
             child.memory_cookie = &target.children[child_id];
-            child.empty = true;
+            child.empty = !occupied;
             child.dedicated = true;
             child.armed = true;
-            child.lineage_uuid = { 0x7000+child_id, 0x8000+child_id };
+            child.lineage_uuid = occupied
+                ? view.manifest().generation.controllers[child_id].lineage_uuid
+                : vbr_lineage_uuid { 0x7000+child_id, 0x8000+child_id };
             child.instance_id = target.children[child_id].instance;
             child.state_serial = snapshot.target_state_serial;
+            child.previously_observed = occupied;
             child.policy_epoch = snapshot.policy_epoch;
             child.controller_policy =
                 view.manifest().controller_policy[child_id];
@@ -2098,10 +2251,14 @@ struct fixture {
                     source_shard.row_bytes,
                     source_shard.payload_bytes,
                 });
+                if (occupied) {
+                    unit.shards.back().mapped_bytes *= 2;
+                }
             }
             child.units.push_back(std::move(unit));
             snapshot.children.push_back(std::move(child));
         }
+        snapshot.destination_sequence_absent = !occupied;
         if (downward) {
             std::vector<vbr_downward_policy_child> projected;
             projected.reserve(snapshot.children.size());
@@ -2485,6 +2642,125 @@ static void test_g2_real_driver_smoke() {
     CHECK(f.ledger.snapshot().live_ops > f.catalog_live_ops);
     f.target.erase_imported();
     CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+}
+
+static vbr_adopt_result adopt_occupied(
+        fixture & f, vbr_adopt_phase fail_phase = vbr_adopt_phase::_count,
+        bool fail_after = false) {
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.staged);
+    if (!staged.manifest || !staged.staged) {
+        return {};
+    }
+    CHECK(staged.staged->read_count() == 2);
+    vbr_composite_publish_hooks hooks;
+    hooks.context = &f.target.target;
+    hooks.owner_token = &f.target.target;
+    hooks.validate_owner_token = owner_token_valid;
+    vbr_adopt_test_control test;
+    test.target = &f.target;
+    if (fail_after) {
+        test.fault.fail_after = fail_phase;
+    } else {
+        test.fault.fail_before = fail_phase;
+    }
+    hooks.test = &test;
+    return vbr_adopt_empty_manifest(
+        f.target.target, 0, std::move(*staged.manifest),
+        std::move(*staged.staged), f.ledger, hooks);
+}
+
+static void test_occupied_replacement_free_cell_adoption() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true);
+    const auto result = adopt_occupied(f);
+    CHECK(result.status == vbr_adopt_status::adopted);
+    CHECK(result.h2d_bytes == 10);
+    CHECK(f.target.occupied_rechecks == 2);
+    CHECK(f.target.relocated_prepares == 1);
+    CHECK(f.target.relocated_images == 1);
+    CHECK(f.target.children[0].published);
+    CHECK(f.target.children[0].receipts);
+    CHECK(f.target.relocated_offsets.size() == 2);
+    for (const auto & offset : f.target.relocated_offsets) {
+        CHECK(offset.first == 0);
+        CHECK(offset.second == 5);
+    }
+}
+
+static void test_occupied_replacement_fault_preserves_incumbent() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true);
+    const auto sentinel = f.target.incumbent_sentinel;
+    const auto result = adopt_occupied(
+        f, vbr_adopt_phase::unit_h2d, true);
+    CHECK(result.status == vbr_adopt_status::transfer_failed);
+    CHECK(f.target.publish_calls == 0);
+    CHECK(f.target.transfer_calls == 2);
+    CHECK(f.target.children[0].mapped == 0);
+    CHECK(!f.target.children[0].published);
+    CHECK(!f.target.children[0].image_ready);
+    CHECK(f.target.incumbent_sentinel == sentinel);
+    CHECK(std::all_of(
+        f.target.children[0].destination.begin(),
+        f.target.children[0].destination.end(),
+        [](uint8_t value) { return value == 0; }));
+}
+
+static void test_occupied_replacement_tracker_consumes_canonical_map() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true);
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.manifest->is_occupied_replacement());
+    if (!staged.manifest || !staged.manifest->is_occupied_replacement()) {
+        return;
+    }
+    const auto * guard = staged.manifest->occupied_replacement();
+    const auto * source = staged.manifest->source_controller(0);
+    CHECK(guard && source);
+    CHECK(staged.manifest->tracker_install().children.size() == 1);
+    if (!guard || !source ||
+        staged.manifest->tracker_install().children.size() != 1) {
+        return;
+    }
+
+    auto plan = staged.manifest->tracker_install().children.front();
+    vbr_generation_tracker tracker(
+        1, 10, uint32_t(plan.units.size()),
+        vbr_lineage_uuid { 0x81, 0x82 });
+    CHECK(tracker.active());
+    plan.target_instance = tracker.runtime_instance();
+    plan.lineage_uuid = tracker.lineage_identity();
+    plan.transition = vbr_tracker_install_transition::whole_import;
+    plan.global_generation = 1;
+    for (auto & unit : plan.units) {
+        unit.repr_gen = 1;
+        unit.last_transition = vbr_repr_transition::whole_import;
+    }
+    vbr_tracker_import_image image;
+    CHECK(tracker.prepare_relocated_import_image(
+        plan, *source, 0, *guard, image));
+    CHECK(image.ready());
+    CHECK(image.stable());
+    auto binding = import_binding(tracker.runtime_instance());
+    vbr_scoped_operation operation(binding);
+    CHECK(bool(operation));
+    CHECK(tracker.import_image_installable(image, operation.id()));
+    tracker.install_import_image_swap(image);
+    for (const auto & mapping : guard->cell_mapping()) {
+        CHECK(tracker.dependency_generation(
+                  0, mapping.destination_physical_cell) == 1);
+        CHECK(tracker.membership_generation(
+                  0, mapping.destination_physical_cell) == 1);
+        CHECK(tracker.last_membership_seq(
+                  0, mapping.destination_physical_cell) == 0);
+    }
+    CHECK(operation.close(vbr_operation_outcome::committed));
 }
 
 static void test_g2_erase_releases_receipt_for_second_adopt() {
@@ -4196,6 +4472,9 @@ static bool f42b_parse_type(const std::string & name, ggml_type & output) {
 }
 
 int main(int argc, char ** argv) {
+    g2::test_occupied_replacement_free_cell_adoption();
+    g2::test_occupied_replacement_fault_preserves_incumbent();
+    g2::test_occupied_replacement_tracker_consumes_canonical_map();
     test_epoch_capacity_preflight();
     test_closed_vocabularies();
     test_complete_tree_barrier_fail_closed();

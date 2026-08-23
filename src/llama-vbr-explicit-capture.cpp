@@ -1786,6 +1786,179 @@ public:
                value.cache->vbr_capture_stability_matches(value.stability);
     }
 
+    static bool occupied_observation(
+            llama_kv_cache & cache,
+            llama_seq_id destination,
+            uint64_t sequence_epoch,
+            std::vector<vbr_occupied_replacement_cell> & cells_out,
+            std::vector<vbr_occupied_replacement_unit_currency> & units_out,
+            vbr_occupied_replacement_observation & output) {
+        cells_out.clear();
+        units_out.clear();
+        output = {};
+        const auto * tracker = cache.vbr_generation_tracker_get();
+        if (destination < 0 || cache.other != nullptr ||
+            cache.n_stream != 1 || cache.v_cells.size() != 1 ||
+            cache.v_cells[0].size() == 0 ||
+            cache.v_cells[0].size() > VBR_OCCUPIED_REPLACEMENT_MAX_CELLS ||
+            !cache.vbr_operation_armed() || cache.vbr_import_in_progress_ ||
+            !tracker || !tracker->active() || !tracker->stable()) {
+            return false;
+        }
+        const auto & cells = cache.v_cells[0];
+        cells_out.reserve(cells.get_used());
+        for (uint32_t physical = 0; physical < cells.size(); ++physical) {
+            if (cells.is_empty(physical)) {
+                continue;
+            }
+            const auto & ext = cells.ext_get(physical);
+            cells_out.push_back({
+                0, physical, cells.pos_get(physical), ext.x, ext.y,
+                cells.seq_count(physical) == 1
+                    ? cells.seq_get(physical) : -1,
+                uint32_t(cells.seq_count(physical)),
+            });
+        }
+        units_out.reserve(tracker->unit_count());
+        for (uint32_t unit = 0; unit < tracker->unit_count(); ++unit) {
+            units_out.push_back({ 0, unit, tracker->unit_generation(unit) });
+        }
+        output.destination = destination;
+        output.sequence_epoch = sequence_epoch;
+        output.controller_generation = tracker->controller_generation();
+        output.representation_epoch = cache.vbr_representation_epoch_;
+        output.cell_capacity = cells.size();
+        output.cells = cells_out.data();
+        output.cell_count = cells_out.size();
+        output.units = units_out.data();
+        output.unit_count = units_out.size();
+        return true;
+    }
+
+    static bool occupied_direct_currency_digest(
+            llama_kv_cache & cache,
+            llama_seq_id destination,
+            uint64_t accounting_serial,
+            const void * representation_context,
+            vbr_explicit_representation_identity_fn representation_identity,
+            vbr_operation_id active_import_operation,
+            std::array<uint8_t, 32> & output) noexcept {
+        output = {};
+        try {
+            const auto * tracker = cache.vbr_generation_tracker_get();
+            llama_kv_cache::vbr_capture_stability_token policy;
+            if (destination < 0 || accounting_serial == 0 ||
+                !representation_context || !representation_identity ||
+                cache.other != nullptr || cache.n_stream != 1 ||
+                cache.v_cells.size() != 1 ||
+                cache.v_cells[0].size() == 0 ||
+                cache.v_cells[0].size() >
+                    VBR_OCCUPIED_REPLACEMENT_MAX_CELLS ||
+                (cache.vbr_import_in_progress_
+                    ? (!active_import_operation ||
+                       cache.vbr_import_operation_ != active_import_operation)
+                    : bool(active_import_operation)) ||
+                !cache.vbr_operation_armed() ||
+                cache.vbr_stash_dirty_ ||
+                !tracker || !tracker->active() || !tracker->stable() ||
+                !cache.vbr_capture_policy_snapshot(policy)) {
+                return false;
+            }
+            for (const auto & pool : cache.vbr_pools_) {
+                for (const auto * extents : { &pool.k, &pool.v }) {
+                    for (const auto & extent : *extents) {
+                        if (extent.t != nullptr && extent.stash_valid != 0) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            llama_sha256_writer writer;
+            static constexpr char domain[] =
+                "buun.vbr.occupied-replacement/direct-currency/v1";
+            writer.string(domain, sizeof(domain)-1);
+            writer.u64(uint64_t(reinterpret_cast<uintptr_t>(&cache)));
+            writer.u64(uint64_t(destination));
+            writer.u64(accounting_serial);
+            writer.u64(cache.vbr_representation_epoch_);
+            writer.u64(tracker->lineage_identity().hi);
+            writer.u64(tracker->lineage_identity().lo);
+            writer.u64(tracker->runtime_instance().hi);
+            writer.u64(tracker->runtime_instance().lo);
+            writer.u64(tracker->controller_generation());
+            writer.bytes(policy.degrade_order_digest.data(),
+                         policy.degrade_order_digest.size());
+            writer.bytes(policy.policy_digest.data(),
+                         policy.policy_digest.size());
+            writer.u64(uint64_t(policy.floor_type));
+            writer.u64(policy.pressure_independent_settings);
+            writer.u64(cache.n_stream);
+            writer.u64(cache.n_stream == 1 ? 1 : 0);
+            writer.u64(policy.degrade_cursor);
+            writer.u64(policy.completed_wave ? 1 : 0);
+            const auto & cells = cache.v_cells[0];
+            writer.u64(cells.size());
+            writer.u64(cells.get_used());
+            for (uint32_t physical = 0; physical < cells.size(); ++physical) {
+                if (cells.is_empty(physical)) {
+                    continue;
+                }
+                if (cells.seq_count(physical) != 1 ||
+                    !cells.seq_has(physical, destination)) {
+                    return false;
+                }
+                const auto & ext = cells.ext_get(physical);
+                writer.u64(physical);
+                writer.u64(uint64_t(cells.pos_get(physical)));
+                writer.u64(uint64_t(ext.x));
+                writer.u64(uint64_t(ext.y));
+            }
+            writer.u64(tracker->unit_count());
+            for (uint32_t unit = 0; unit < tracker->unit_count(); ++unit) {
+                const auto generation = tracker->unit_generation(unit);
+                writer.u64(unit);
+                writer.u64(generation.repr_gen);
+                writer.u64(generation.publish_seq);
+                writer.u64(uint64_t(generation.current_type));
+                writer.u64(uint64_t(generation.last_source_type));
+                writer.u64(uint64_t(generation.domain));
+                writer.u64(generation.promote_hops);
+                writer.u64(uint64_t(generation.last_transition));
+                const size_t layer = unit/2;
+                const bool value_side = (unit & 1u) != 0;
+                if (layer >= cache.layers.size()) {
+                    return false;
+                }
+                const auto * tensor = value_side
+                    ? cache.layers[layer].v : cache.layers[layer].k;
+                const auto meansub = cache.layers[layer].turbo_meansub_ref;
+                vbr_explicit_representation_identity identity;
+                if (!tensor || tensor->type != generation.current_type ||
+                    !representation_identity(
+                        representation_context, generation.current_type,
+                        value_side, meansub.model_id, identity)) {
+                    return false;
+                }
+                writer.u64(identity.codec_id);
+                writer.u64(identity.codec_version);
+                writer.bytes(identity.codebook_digest.data(),
+                             identity.codebook_digest.size());
+                writer.bytes(identity.rotation_digest.data(),
+                             identity.rotation_digest.size());
+                writer.bytes(identity.meansub_digest.data(),
+                             identity.meansub_digest.size());
+                writer.u64(identity.meansub_baked ? 1 : 0);
+                writer.u64(uint64_t(meansub.model_id));
+                writer.u64(uint64_t(meansub.layer));
+            }
+            output = writer.finish();
+            return vbr_digest_nonzero(output);
+        } catch (...) {
+            output = {};
+            return false;
+        }
+    }
+
     static bool stream(
             const child & value,
             const llama_kv_cache::vbr_capture_unit_plan & unit,
@@ -1797,6 +1970,127 @@ public:
                    unit, sink, ring, stats);
     }
 };
+
+
+static bool import_target_snapshot_core(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & package,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    bool previously_observed,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_capture_request::representation_identity_fn
+        representation_identity,
+    vbr_target_validation_snapshot & output,
+    vbr_downward_policy_projection * transform_projection,
+    bool * downward_required,
+    vbr_import_schedule_quote * schedule_quote,
+    const vbr_import_schedule_quote * authenticated_schedule,
+    std::array<uint8_t, 32> * transform_tree_digest = nullptr,
+    const std::vector<llama_memory_tree_child> * canonical_tree = nullptr)
+    noexcept;
+
+
+vbr_occupied_replacement_guard_status
+vbr_explicit_prepare_occupied_replacement_guard(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_artifact_package_view & incoming,
+        const vbr_artifact_package_view & recovery,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        uint64_t accounting_serial,
+        const void * representation_context,
+        vbr_explicit_representation_identity_fn representation_identity,
+        vbr_occupied_replacement_guard & output) noexcept {
+    output.reset();
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree) || tree.size() != 1 ||
+            !tree.front().attention || tree.front().recurrent) {
+            return vbr_occupied_replacement_guard_status::unsupported_tree;
+        }
+        vbr_target_validation_snapshot target;
+        if (!import_target_snapshot_core(
+                memory, destination, recovery, bindings, false,
+                accounting_serial, representation_context,
+                representation_identity, target,
+                nullptr, nullptr, nullptr, nullptr, nullptr, &tree) ||
+            target.destination_sequence_absent) {
+            return vbr_occupied_replacement_guard_status::unsupported_tree;
+        }
+        std::vector<vbr_occupied_replacement_cell> cells;
+        std::vector<vbr_occupied_replacement_unit_currency> units;
+        vbr_occupied_replacement_observation observation;
+        if (!vbr_live_capture_adapter::occupied_observation(
+                *tree.front().attention, destination,
+                recovery.manifest().identity.sequence_epoch,
+                cells, units, observation)) {
+            return vbr_occupied_replacement_guard_status::unsupported_layout;
+        }
+        const auto status = vbr_prepare_occupied_replacement_guard(
+            target, incoming, recovery, observation, output);
+        if (status != vbr_occupied_replacement_guard_status::ready) {
+            return status;
+        }
+        std::array<uint8_t, 32> direct;
+        if (!vbr_live_capture_adapter::occupied_direct_currency_digest(
+                *tree.front().attention, destination, accounting_serial,
+                representation_context, representation_identity, {}, direct)) {
+            output.reset();
+            return vbr_occupied_replacement_guard_status::currency_changed;
+        }
+        output.memory_ = &memory;
+        output.cache_ = tree.front().attention;
+        output.direct_currency_digest_ = direct;
+        return status;
+    } catch (...) {
+        output.reset();
+        return vbr_occupied_replacement_guard_status::internal_error;
+    }
+}
+
+vbr_occupied_replacement_guard_status
+vbr_explicit_recheck_occupied_replacement_guard(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        uint64_t accounting_serial,
+        const void * representation_context,
+        vbr_explicit_representation_identity_fn representation_identity,
+        vbr_occupied_replacement_guard & guard) noexcept {
+    return vbr_explicit_recheck_occupied_replacement_guard(
+        memory, destination, accounting_serial, representation_context,
+        representation_identity, {}, guard);
+}
+
+vbr_occupied_replacement_guard_status
+vbr_explicit_recheck_occupied_replacement_guard(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        uint64_t accounting_serial,
+        const void * representation_context,
+        vbr_explicit_representation_identity_fn representation_identity,
+        vbr_operation_id active_import_operation,
+        vbr_occupied_replacement_guard & guard) noexcept {
+    if (!guard.ready() || guard.memory_ != &memory || !guard.cache_ ||
+        guard.destination_ != destination ||
+        guard.accounting_serial_ != accounting_serial ||
+        !vbr_digest_nonzero(guard.direct_currency_digest_)) {
+        guard.reset();
+        return vbr_occupied_replacement_guard_status::currency_changed;
+    }
+    std::array<uint8_t, 32> current;
+    if (!vbr_live_capture_adapter::occupied_direct_currency_digest(
+            *guard.cache_, destination, accounting_serial,
+            representation_context, representation_identity,
+            active_import_operation, current) ||
+        current != guard.direct_currency_digest_) {
+        guard.reset();
+        return vbr_occupied_replacement_guard_status::currency_changed;
+    }
+    return vbr_occupied_replacement_guard_status::ready;
+}
+
 
 namespace {
 
@@ -3245,7 +3539,8 @@ static bool import_target_snapshot_core(
         bool * downward_required,
         vbr_import_schedule_quote * schedule_quote,
         const vbr_import_schedule_quote * authenticated_schedule,
-        std::array<uint8_t, 32> * transform_tree_digest = nullptr) noexcept {
+        std::array<uint8_t, 32> * transform_tree_digest,
+        const std::vector<llama_memory_tree_child> * canonical_tree) noexcept {
     output = {};
     if (transform_projection) {
         *transform_projection = {};
@@ -3260,9 +3555,14 @@ static bool import_target_snapshot_core(
         *transform_tree_digest = {};
     }
     try {
-        std::vector<llama_memory_tree_child> tree;
+        std::vector<llama_memory_tree_child> collected_tree;
         if (destination < 0 || !package ||
-            !llama_memory_tree_collect(&memory, tree)) {
+            (!canonical_tree &&
+             !llama_memory_tree_collect(&memory, collected_tree))) {
+            return false;
+        }
+        const auto & tree = canonical_tree ? *canonical_tree : collected_tree;
+        if (tree.empty()) {
             return false;
         }
         const uint64_t policy_epoch = import_policy_epoch(tree);

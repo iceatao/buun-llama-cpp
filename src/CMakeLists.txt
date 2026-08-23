@@ -48,6 +48,7 @@ add_library(llama
             llama-vbr-pinned-ring.cpp
             llama-vbr-artifact-capture.cpp
             llama-vbr-artifact-catalog.cpp
+            llama-vbr-occupied-replacement.cpp
             llama-vbr-artifact-validate.cpp
             llama-vbr-artifact-stage.cpp
             llama-vbr-artifact-adopt.cpp

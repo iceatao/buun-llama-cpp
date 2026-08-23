@@ -1014,6 +1014,81 @@ private:
     server_prompt * adopted_destination_ = nullptr;
     std::unique_ptr<server_prompt> prepared_prompt_;
     friend struct server_prompt_cache;
+    friend class server_prompt_cache_vbr_replacement_ticket;
+};
+
+class server_cache_recovery_pin;
+
+// Move-only preparation for replacing an occupied live prompt after an
+// incoming VBR import is already complete. The capability owns both durable
+// host pins and a provisional launch association, but deliberately owns no
+// live-slot mutation: destruction or move-overwrite leaves the incumbent
+// prompt and its canonical sidecar association untouched.
+class server_prompt_cache_vbr_replacement_ticket {
+public:
+    server_prompt_cache_vbr_replacement_ticket() = default;
+    ~server_prompt_cache_vbr_replacement_ticket();
+    server_prompt_cache_vbr_replacement_ticket(
+        const server_prompt_cache_vbr_replacement_ticket &) = delete;
+    server_prompt_cache_vbr_replacement_ticket & operator=(
+        const server_prompt_cache_vbr_replacement_ticket &) = delete;
+    server_prompt_cache_vbr_replacement_ticket(
+        server_prompt_cache_vbr_replacement_ticket && other) noexcept;
+    server_prompt_cache_vbr_replacement_ticket & operator=(
+        server_prompt_cache_vbr_replacement_ticket && other) noexcept;
+
+    // Strong recheck of the prompt, family, retention lineage, host owners,
+    // recovery pin, and current lease classification bound by preparation.
+    bool ready() const noexcept;
+    const server_prompt & replacement_prompt() const noexcept;
+    int32_t destination_slot() const noexcept;
+    uint64_t incoming_prefix_tokens() const noexcept;
+    uint64_t incumbent_tokens() const noexcept;
+    uint64_t incumbent_live_lcp() const noexcept;
+    llama_cache_acct_artifact_id incumbent_artifact() const noexcept;
+    llama_cache_acct_artifact_id incoming_owner_artifact() const noexcept;
+    llama_cache_acct_artifact_id recovery_owner_artifact() const noexcept;
+    llama_cache_acct_artifact_id recovery_host_artifact() const noexcept;
+    llama_cache_acct_artifact_id provisional_artifact() const noexcept;
+
+private:
+    void clear() noexcept;
+    server_prompt_cache * cache_ = nullptr;
+    server_prompt_cache_vbr_restore_candidate incoming_;
+    server_prompt_cache_state * recovery_source_ = nullptr;
+    server_prompt_cache_vbr_owner recovery_owner_;
+    std::unique_ptr<server_cache_recovery_pin> recovery_pin_;
+    std::vector<llama_cache_acct_op_id> recovery_ops_;
+    server_prompt * incumbent_ = nullptr;
+    const common_cache_family_binding * incumbent_family_current_ = nullptr;
+    common_cache_family_binding incumbent_family_;
+    common_cache_family_binding incoming_family_;
+    std::string execution_identity_;
+    std::string adapter_config_key_;
+    std::unique_ptr<server_prompt> replacement_prompt_;
+    server_retention_instance_key provisional_key_;
+    int32_t destination_slot_ = -1;
+    uint64_t incoming_prefix_tokens_ = 0;
+    uint64_t incumbent_tokens_ = 0;
+    uint64_t incumbent_live_lcp_ = 0;
+    uint64_t incumbent_sequence_epoch_ = 0;
+    std::array<uint8_t, 32> incoming_token_digest_ = {};
+    std::array<uint8_t, 32> incumbent_token_digest_ = {};
+    llama_cache_acct_artifact_id incumbent_artifact_;
+    uint64_t incumbent_lineage_ = 0;
+    llama_cache_acct_artifact_id incoming_owner_artifact_;
+    llama_cache_acct_artifact_id recovery_owner_artifact_;
+    llama_cache_acct_artifact_id recovery_host_artifact_;
+    friend struct server_prompt_cache;
+};
+
+// Bounded recovery-selection evidence for occupied replacement. Published
+// host prompts carry a mutation-invalidated token digest, so a state-list scan
+// performs raw token comparison only for the one unambiguous digest match.
+struct server_prompt_cache_vbr_replacement_diagnostics {
+    uint64_t recovery_states_visited = 0;
+    uint64_t recovery_digest_matches = 0;
+    uint64_t recovery_raw_token_comparisons = 0;
 };
 
 inline void server_prompt_cache_apply_family(
@@ -1026,7 +1101,6 @@ inline void server_prompt_cache_apply_family(
 }
 
 struct server_cache_authority;
-class server_cache_recovery_pin;
 
 struct server_prompt_cache_payload_leaf {
     llama_cache_acct_category category =
@@ -1388,6 +1462,23 @@ struct server_prompt_cache {
         common_cache_family_binding & destination_family,
         int32_t id_slot) noexcept;
 
+    // CPU-only preparation for an occupied destination. The incoming
+    // candidate must be exact (not a parent projection) and must improve the
+    // live common prefix. Preparation clones all replacement metadata into a
+    // private provisional launch association; it never mutates or retires the
+    // incumbent slot. A later slice will consume this ticket inside one
+    // allocation-free live/KV replacement terminal.
+    bool prepare_vbr_occupied_replacement(
+        server_prompt_cache_vbr_restore_candidate && incoming,
+        server_prompt & incumbent,
+        const common_cache_family_binding & incumbent_family,
+        int32_t id_slot,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        server_prompt_cache_vbr_replacement_ticket & ticket,
+        server_prompt_cache_vbr_replacement_diagnostics * diagnostics =
+            nullptr) noexcept;
+
     // Resolve the exact durable host state used by prompt_save's durability
     // predicate and pin its three-payload accounting source. D-A5 calls this
     // after the same-flow save and before preparing live-slot destruction.
@@ -1500,8 +1591,11 @@ private:
         int64_t source_vbr_coverage_tokens = -1);
     void release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
+    void release_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept;
     friend class server_prompt_cache_vbr_publication_metadata;
     friend class server_prompt_cache_vbr_restore_candidate;
+    friend class server_prompt_cache_vbr_replacement_ticket;
 
 public:
 

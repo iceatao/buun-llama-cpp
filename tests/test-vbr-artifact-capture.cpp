@@ -794,6 +794,23 @@ static vbr_artifact_stream_placement projected_placement(
     return placement;
 }
 
+static vbr_artifact_stream_placement projected_placement(
+        uint64_t manifest,
+        llama_seq_id sequence,
+        const std::vector<uint32_t> & cells) {
+    GGML_UNUSED(manifest);
+    vbr_artifact_stream_placement placement;
+    placement.child_id = 0;
+    placement.stream_index = 0;
+    placement.source_sequence = sequence;
+    placement.computation_frontier = llama_pos(cells.size());
+    llama_pos position = 0;
+    for (uint32_t cell : cells) {
+        placement.cells.push_back({ cell, position++, 0, 0 });
+    }
+    return placement;
+}
+
 static std::vector<uint8_t> projected_rows(
         const std::vector<uint8_t> & source,
         uint64_t row_bytes,
@@ -1377,16 +1394,30 @@ static vbr_capture_projected_unit capture_projected_unit_for_target(
         const vbr_capture_controller_target & target,
         uint32_t stream_index = 0,
         uint64_t row_bytes = 1,
-        uint32_t logical_unit_id = 0) {
+        uint32_t logical_unit_id = 0,
+        uint32_t max_source_operations = 4096) {
+    uint64_t source_rows = target.policy.wm_cells;
+    for (const auto & stream : projection->streams) {
+        if (stream.child_id != target.child_id ||
+            stream.stream_index != stream_index) {
+            continue;
+        }
+        for (const auto & segment : stream.segments) {
+            source_rows = std::max<uint64_t>(
+                source_rows,
+                uint64_t(segment.first_physical_cell) + segment.cell_count);
+        }
+    }
+    CHECK(source_rows <= UINT32_MAX);
     synthetic_source source;
-    source.bytes.resize(size_t(8*row_bytes));
-    for (uint32_t i = 0; i < source.bytes.size(); ++i) {
+    source.bytes.resize(size_t(source_rows*row_bytes));
+    for (size_t i = 0; i < source.bytes.size(); ++i) {
         source.bytes[i] = uint8_t(
             i + target.child_id + target.controller_generation);
     }
     vbr_capture_projected_shard_source shard;
     shard.shard_index = 0;
-    shard.row_count = 8;
+    shard.row_count = uint32_t(source_rows);
     shard.row_bytes = row_bytes;
     shard.source_identity =
         target.controller_generation*10 + target.child_id + 1;
@@ -1414,9 +1445,11 @@ static vbr_capture_projected_unit capture_projected_unit_for_target(
     CHECK(ring);
     vbr_capture_projected_unit unit;
     if (ring) {
+        vbr_capture_projected_transfer_limits limits;
+        limits.max_source_operations = max_source_operations;
         CHECK(vbr_capture_projected_unit_transfer(
                   projection, target.child_id, stream_index, logical_unit_id,
-                  sources, {}, snapshot.provider(), *ring, unit) ==
+                  sources, limits, snapshot.provider(), *ring, unit) ==
               vbr_capture_stream_status::ok);
     }
     return unit;
@@ -1566,6 +1599,254 @@ static vbr_projected_manifest_publication projected_publication(
         host, 256, 256, llama_cache_acct_attr_kind::artifact,
     });
     return out;
+}
+
+struct occupied_guard_fixture {
+    vbr_target_validation_snapshot target;
+    std::vector<vbr_occupied_replacement_cell> cells;
+    std::vector<vbr_occupied_replacement_unit_currency> units;
+    vbr_occupied_replacement_observation observation;
+
+    void bind() noexcept {
+        observation.cells = cells.data();
+        observation.cell_count = cells.size();
+        observation.units = units.data();
+        observation.unit_count = units.size();
+    }
+};
+
+static bool make_occupied_guard_fixture(
+        const vbr_artifact_package_view & recovery,
+        llama_seq_id destination,
+        uint32_t capacity,
+        occupied_guard_fixture & out) {
+    out = {};
+    if (!recovery || recovery.units().empty() ||
+        recovery.manifest().generation.controllers.size() != 1 ||
+        recovery.manifest().controller_policy.size() != 1 ||
+        recovery.manifest().stream_placements.size() != 1) {
+        return false;
+    }
+    static const uint8_t memory_cookie = 0;
+    static const uint8_t pool_cookie = 0;
+    const auto & controller =
+        recovery.manifest().generation.controllers.front();
+    const auto & placement =
+        recovery.manifest().stream_placements.front();
+    out.target.memory_instance_cookie = 0x4101;
+    out.target.target_state_serial = 0x4102;
+    out.target.accounting_serial = 0x4103;
+    out.target.tree_shape_digest = 0x4104;
+    out.target.policy_epoch = 0x4105;
+    out.target.scheduler_idle = true;
+    out.target.destination_sequence_absent = false;
+    vbr_target_child_snapshot child;
+    child.child_id = 0;
+    child.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+    child.memory_cookie = &memory_cookie;
+    child.empty = false;
+    child.dedicated = true;
+    child.armed = true;
+    child.lineage_uuid = controller.lineage_uuid;
+    child.instance_id = { 0x4111, 0x4112 };
+    child.state_serial = out.target.target_state_serial;
+    child.policy_epoch = out.target.policy_epoch;
+    child.controller_policy =
+        recovery.manifest().controller_policy.front();
+    for (size_t i = 0; i < recovery.units().size(); ++i) {
+        const auto & descriptor = recovery.units()[i].descriptor;
+        if (descriptor.logical_unit_id != i ||
+            descriptor.child_id != 0 || i >= controller.units.size()) {
+            return false;
+        }
+        const auto & generation = controller.units[i];
+        vbr_target_unit_snapshot unit;
+        unit.child_id = descriptor.child_id;
+        unit.logical_unit_id = descriptor.logical_unit_id;
+        unit.current_type = descriptor.current_type;
+        unit.last_source_type = descriptor.last_source_type;
+        unit.promote_hops = descriptor.promote_hops;
+        unit.last_transition = descriptor.last_transition;
+        unit.representation_kind = descriptor.representation.kind;
+        unit.codec_id = descriptor.representation.codec_id;
+        unit.codec_version = descriptor.representation.codec_version;
+        unit.representation_reference_digest =
+            descriptor.representation.reference_digest;
+        unit.source_loss_history =
+            descriptor.representation.source_loss_history;
+        unit.checkpoint_codec_hops =
+            descriptor.representation.checkpoint_codec_hops;
+        unit.recoverability = descriptor.recoverability;
+        unit.side = descriptor.side;
+        unit.layout = descriptor.layout;
+        unit.row_codec_version = descriptor.row_codec_version;
+        unit.current_domain = generation.domain;
+        unit.codebook_digest = descriptor.codebook_digest;
+        unit.rotation_digest = descriptor.rotation_digest;
+        unit.meansub_digest = descriptor.meansub_digest;
+        unit.meansub_model_id = descriptor.meansub_model_id;
+        unit.meansub_layer = descriptor.meansub_layer;
+        unit.meansub_baked = descriptor.meansub_baked;
+        unit.n_stream = descriptor.n_stream;
+        unit.unified = descriptor.unified;
+        unit.wm_cells = descriptor.wm_cells;
+        unit.rank = descriptor.rank;
+        unit.dimensions = descriptor.dimensions;
+        unit.row_alignment = descriptor.row_alignment;
+        for (const auto & shard : descriptor.shards) {
+            if (shard.topology_index >= recovery.topologies().size()) {
+                return false;
+            }
+            unit.shards.push_back({
+                shard.shard_index, &pool_cookie, {},
+                shard.topology_index, shard.device_ordinal,
+                recovery.topologies()[shard.topology_index].digest,
+                shard.logical_offset, shard.row_count, shard.row_bytes,
+                shard.payload_bytes,
+            });
+        }
+        child.units.push_back(std::move(unit));
+        vbr_unit_generation live;
+        live.repr_gen = generation.repr_gen;
+        live.publish_seq = 0x4200 + i;
+        live.current_type = generation.current_type;
+        live.last_source_type = generation.last_source_type;
+        live.domain = generation.domain;
+        live.promote_hops = generation.promote_hops;
+        live.last_transition = generation.last_transition;
+        out.units.push_back({ 0, uint32_t(i), live });
+    }
+    out.target.children.push_back(std::move(child));
+    out.cells.reserve(placement.cells.size());
+    for (const auto & cell : placement.cells) {
+        out.cells.push_back({
+            0, cell.physical_cell, cell.logical_position,
+            cell.ext_x, cell.ext_y, destination, 1,
+        });
+    }
+    std::sort(out.cells.begin(), out.cells.end(),
+        [](const auto & a, const auto & b) {
+            return a.physical_cell < b.physical_cell;
+        });
+    out.observation.destination = destination;
+    out.observation.sequence_epoch =
+        recovery.manifest().identity.sequence_epoch;
+    out.observation.controller_generation = controller.global_generation;
+    out.observation.representation_epoch =
+        out.target.children.front().state_serial;
+    out.observation.cell_capacity = capacity;
+    out.bind();
+    return true;
+}
+
+static bool publish_occupied_guard_package(
+        llama_vbr_artifact_catalog & catalog,
+        const vbr_artifact_portable_topology & topology,
+        const llama_cache_budget_config & budget,
+        uint64_t manifest_id,
+        uint32_t token_count,
+        bool alternating_physical_cells,
+        llama_cache_acct_artifact_id & reference,
+        vbr_artifact_package_view & view,
+        uint64_t schedule_seed = 0,
+        uint64_t source_capacity_override = 0,
+        uint32_t proof_count = 1) {
+    reference = {};
+    view.reset();
+    if (token_count == 0 || proof_count == 0 || proof_count > 4096) {
+        return false;
+    }
+    std::vector<uint32_t> physical(token_count);
+    for (uint32_t i = 0; i < token_count; ++i) {
+        physical[i] = alternating_physical_cells ? 2*i + 1 : i;
+    }
+    const uint64_t seed = schedule_seed == 0 ? manifest_id : schedule_seed;
+    auto target = projected_target(
+        manifest_id, 0, 5000 + seed,
+        projected_generation(6000 + seed));
+    const uint64_t source_capacity = source_capacity_override != 0
+        ? source_capacity_override
+        : alternating_physical_cells ? uint64_t(token_count)*2 : token_count;
+    target.policy.wm_cells = source_capacity;
+    target.policy.current_type_vector_digest =
+        vbr_type_vector_digest(std::vector<ggml_type> { GGML_TYPE_F16 });
+    auto & descriptor = target.unit_descriptors.front();
+    descriptor.wm_cells = source_capacity;
+    descriptor.dimensions[0] = source_capacity;
+    descriptor.shards.front().row_count = source_capacity;
+    descriptor.shards.front().payload_bytes = source_capacity;
+    const auto generation = target.units.front();
+    const auto descriptor_template = descriptor;
+    target.units.resize(proof_count, generation);
+    target.unit_descriptors.resize(proof_count, descriptor_template);
+    std::vector<ggml_type> types(proof_count, GGML_TYPE_F16);
+    target.policy.current_type_vector_digest = vbr_type_vector_digest(types);
+    for (uint32_t i = 0; i < proof_count; ++i) {
+        target.unit_descriptors[i].logical_unit_id = i;
+    }
+
+    vbr_capture_projection_manifest manifest;
+    manifest.manifest_id = manifest_id;
+    manifest.placements.push_back(projected_placement(
+        manifest_id, llama_seq_id(manifest_id), physical));
+    bind_projected_manifest_metadata(manifest, target);
+    manifest.identity.token_count = token_count;
+    manifest.identity.next_position = token_count;
+    manifest.token_block.tokens.resize(token_count);
+    for (uint32_t i = 0; i < token_count; ++i) {
+        manifest.token_block.tokens[i] = llama_token(i + 1);
+    }
+    vbr_capture_projection projection;
+    if (!vbr_artifact_project_capture_union(
+            { 707, { manifest } }, {}, projection)) {
+        fprintf(stderr, "occupied package projection failed: %" PRIu64 "\n",
+                manifest_id);
+        return false;
+    }
+    std::vector<vbr_capture_projected_unit> units;
+    units.reserve(proof_count);
+    for (uint32_t i = 0; i < proof_count; ++i) {
+        units.push_back(capture_projected_unit_for_target(
+            projection, target, 0, 1, i,
+            std::max<uint32_t>(4096, token_count)));
+    }
+    vbr_capture_manifest_assembly assembly;
+    projected_controller_fixture controller;
+    if (!assemble_projected_test_batch(
+            projection, { target }, units, controller.provider(), {},
+            assembly)) {
+        fprintf(stderr, "occupied package assembly failed: %" PRIu64 "\n",
+                manifest_id);
+        return false;
+    }
+    if (assembly.manifests().empty() ||
+        assembly.manifests().front().state !=
+            vbr_capture_manifest_state::ready) {
+        fprintf(stderr,
+                "occupied package not ready: %" PRIu64 " state=%u\n",
+                manifest_id, assembly.manifests().empty() ? UINT32_MAX :
+                    uint32_t(assembly.manifests().front().state));
+    }
+    std::vector<vbr_projected_manifest_publication> publications;
+    publications.push_back(projected_publication(
+        manifest_id, assembly, topology));
+    std::vector<vbr_projected_manifest_publish_result> results;
+    if (!catalog.publish_projected_batch(
+            assembly, std::move(publications), budget, results) ||
+        results.size() != 1 ||
+        results.front().status !=
+            vbr_projected_manifest_publish_status::published) {
+        fprintf(stderr,
+                "occupied package publication failed: %" PRIu64
+                " size=%zu status=%u\n",
+                manifest_id, results.size(),
+                results.empty() ? UINT32_MAX :
+                    uint32_t(results.front().status));
+        return false;
+    }
+    reference = results.front().publication.reference_artifact;
+    return catalog.resolve_reference(reference, view) ==
+        vbr_artifact_resolve_status::ok;
 }
 
 static void test_projected_publication_claim_preparation() {
@@ -2048,6 +2329,328 @@ static void test_dependency_scoped_projected_catalog_publication() {
     }
     CHECK(catalog.snapshot().references == 0);
     CHECK(catalog.snapshot().blobs == 0);
+    CHECK(ledger.snapshot().live_ops == 0);
+
+    // Occupied replacement is a two-artifact capability: the recovery image
+    // authenticates the incumbent bytes while the incoming image supplies the
+    // provisional source rows.  This model-free publication reaches the same
+    // immutable catalog view used by production rather than constructing a
+    // mutable package facade in the test.
+    llama_cache_acct_artifact_id occupied_reference;
+    vbr_artifact_package_view occupied_view;
+    CHECK(publish_occupied_guard_package(
+        catalog, topology, budget, 92, 8, false,
+        occupied_reference, occupied_view));
+    occupied_guard_fixture occupied;
+    CHECK(make_occupied_guard_fixture(
+        occupied_view, 92, 16, occupied));
+    vbr_occupied_replacement_guard occupied_guard;
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              occupied.target, occupied_view, occupied_view,
+              occupied.observation, occupied_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(occupied_guard.ready());
+    CHECK(occupied_guard.destination() == 92);
+    CHECK(occupied_guard.accounting_serial() ==
+          occupied.target.accounting_serial);
+    CHECK(occupied_guard.incoming_artifact() == occupied_reference);
+    CHECK(occupied_guard.recovery_artifact() == occupied_reference);
+    CHECK(occupied_guard.cell_mapping().size() == 8);
+    CHECK(occupied_guard.cell_mapping().front()
+              .source_physical_cell == 0);
+    CHECK(occupied_guard.cell_mapping().front().source_packed_row == 0);
+    CHECK(occupied_guard.cell_mapping().front()
+              .destination_physical_cell == 8);
+    CHECK(occupied_guard.cell_mapping().back()
+              .destination_physical_cell == 15);
+    CHECK(occupied_guard.relocation_runs().size() == 1);
+    CHECK(occupied_guard.relocation_runs().front()
+              .first_source_packed_row == 0);
+    CHECK(occupied_guard.relocation_runs().front()
+              .first_destination_physical_cell == 8);
+    CHECK(occupied_guard.relocation_runs().front().cell_count == 8);
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              occupied_guard, occupied.target, occupied.observation) ==
+          vbr_occupied_replacement_guard_status::ready);
+
+    vbr_occupied_replacement_guard moved_guard(std::move(occupied_guard));
+    CHECK(!occupied_guard.ready());
+    CHECK(moved_guard.ready());
+    vbr_occupied_replacement_guard overwritten_guard;
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              occupied.target, occupied_view, occupied_view,
+              occupied.observation, overwritten_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    overwritten_guard = std::move(moved_guard);
+    CHECK(!moved_guard.ready());
+    CHECK(overwritten_guard.ready());
+    overwritten_guard.reset();
+    CHECK(!overwritten_guard.ready());
+    CHECK(overwritten_guard.cell_mapping().empty());
+
+    const auto expect_recheck_refusal = [&] (
+            occupied_guard_fixture mutant) {
+        mutant.bind();
+        vbr_occupied_replacement_guard guard;
+        CHECK(vbr_prepare_occupied_replacement_guard(
+                  occupied.target, occupied_view, occupied_view,
+                  occupied.observation, guard) ==
+              vbr_occupied_replacement_guard_status::ready);
+        CHECK(vbr_recheck_occupied_replacement_guard(
+                  guard, mutant.target, mutant.observation) !=
+              vbr_occupied_replacement_guard_status::ready);
+        CHECK(!guard.ready());
+    };
+    auto mutant = occupied;
+    mutant.target.accounting_serial++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.target.tree_shape_digest++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.target.policy_epoch++;
+    mutant.target.children[0].policy_epoch++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.target.children[0].lineage_uuid.lo++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.target.children[0].state_serial++;
+    mutant.observation.representation_epoch++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.target.children[0].units[0].codec_version++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.units[0].generation.repr_gen++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.observation.controller_generation++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.observation.sequence_epoch++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.cells[0].owner_sequence = 93;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.cells[0].reference_count = 2;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.cells[0].logical_position++;
+    expect_recheck_refusal(std::move(mutant));
+    mutant = occupied;
+    mutant.target.companions.push_back({});
+    expect_recheck_refusal(std::move(mutant));
+
+    occupied_guard_fixture cell_cap;
+    CHECK(make_occupied_guard_fixture(
+        occupied_view, 92, VBR_OCCUPIED_REPLACEMENT_MAX_CELLS, cell_cap));
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              cell_cap.target, occupied_view, occupied_view,
+              cell_cap.observation, occupied_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    occupied_guard.reset();
+    cell_cap.observation.cell_capacity =
+        VBR_OCCUPIED_REPLACEMENT_MAX_CELLS + 1;
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              cell_cap.target, occupied_view, occupied_view,
+              cell_cap.observation, occupied_guard) ==
+          vbr_occupied_replacement_guard_status::cell_limit_exceeded);
+    CHECK(!occupied_guard.ready());
+    occupied_view.reset();
+    CHECK(catalog.retire(occupied_reference) ==
+          vbr_artifact_retire_status::retired);
+
+    // Incoming and recovery are separate authorities.  Three projected unit
+    // proofs select the same sparse rows, but packed-row expansion is paid once
+    // while the recovery placement independently authenticates the incumbent.
+    llama_cache_acct_artifact_id distinct_recovery_reference;
+    llama_cache_acct_artifact_id distinct_incoming_reference;
+    llama_cache_acct_artifact_id wrong_role_reference;
+    vbr_artifact_package_view distinct_recovery;
+    vbr_artifact_package_view distinct_incoming;
+    vbr_artifact_package_view wrong_role;
+    CHECK(publish_occupied_guard_package(
+        catalog, topology, budget, 192, 8, false,
+        distinct_recovery_reference, distinct_recovery, 777, 16, 3));
+    CHECK(publish_occupied_guard_package(
+        catalog, topology, budget, 193, 8, true,
+        distinct_incoming_reference, distinct_incoming, 777, 16, 3));
+    CHECK(distinct_recovery_reference.v != 0);
+    CHECK(distinct_incoming_reference.v != 0);
+    CHECK(distinct_recovery_reference != distinct_incoming_reference);
+    occupied_guard_fixture distinct_fixture;
+    CHECK(make_occupied_guard_fixture(
+        distinct_recovery, 192, 16, distinct_fixture));
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              distinct_fixture.target, distinct_incoming, distinct_recovery,
+              distinct_fixture.observation, occupied_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(occupied_guard.incoming_artifact() == distinct_incoming_reference);
+    CHECK(occupied_guard.recovery_artifact() == distinct_recovery_reference);
+    CHECK(occupied_guard.packed_rows_expanded() == 8);
+    CHECK(occupied_guard.cell_mapping().front().source_physical_cell == 1);
+    CHECK(occupied_guard.cell_mapping().front().source_packed_row == 0);
+    CHECK(distinct_fixture.cells.front().physical_cell == 0);
+    occupied_guard.reset();
+
+    CHECK(publish_occupied_guard_package(
+        catalog, topology, budget, 194, 8, true,
+        wrong_role_reference, wrong_role, 778, 16, 3));
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              distinct_fixture.target, wrong_role, distinct_recovery,
+              distinct_fixture.observation, occupied_guard) !=
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(!occupied_guard.ready());
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              distinct_fixture.target, distinct_incoming, wrong_role,
+              distinct_fixture.observation, occupied_guard) !=
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(!occupied_guard.ready());
+    wrong_role.reset();
+    distinct_incoming.reset();
+    distinct_recovery.reset();
+    CHECK(catalog.retire(wrong_role_reference) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(catalog.retire(distinct_incoming_reference) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(catalog.retire(distinct_recovery_reference) ==
+          vbr_artifact_retire_status::retired);
+
+    llama_cache_acct_artifact_id run_reference;
+    vbr_artifact_package_view run_view;
+    CHECK(publish_occupied_guard_package(
+        catalog, topology, budget, 93,
+        VBR_OCCUPIED_REPLACEMENT_MAX_RUNS, true,
+        run_reference, run_view));
+    occupied_guard_fixture run_fixture;
+    CHECK(make_occupied_guard_fixture(
+        run_view, 93, 2*VBR_OCCUPIED_REPLACEMENT_MAX_RUNS,
+        run_fixture));
+    const auto occupied_accounting = ledger.snapshot();
+    run_fixture.target.accounting_serial = occupied_accounting.serial;
+    for (auto & unit : run_fixture.target.children.front().units) {
+        for (auto & shard : unit.shards) {
+            shard.domain = device;
+            shard.mapped_bytes = unit.wm_cells*shard.row_bytes;
+        }
+    }
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              run_fixture.target, run_view, run_view,
+              run_fixture.observation, occupied_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(occupied_guard.relocation_runs().size() ==
+          VBR_OCCUPIED_REPLACEMENT_MAX_RUNS);
+    CHECK(occupied_guard.cell_mapping().front().source_physical_cell == 1);
+    CHECK(occupied_guard.cell_mapping().front().source_packed_row == 0);
+    CHECK(occupied_guard.cell_mapping().back().source_physical_cell ==
+          2*VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-1);
+    CHECK(occupied_guard.cell_mapping().back().source_packed_row ==
+          VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-1);
+
+    prefix_validator_serials occupied_serials;
+    occupied_serials.accounting = occupied_accounting.serial;
+    occupied_serials.policy = run_fixture.target.policy_epoch;
+    occupied_serials.memory = run_fixture.target.memory_instance_cookie;
+    occupied_serials.state = run_fixture.target.target_state_serial;
+    occupied_serials.tree = run_fixture.target.tree_shape_digest;
+    vbr_adopt_policy occupied_policy;
+    occupied_policy.authorized = true;
+    occupied_policy.identity.execution_identity =
+        run_view.manifest().identity.execution_identity;
+    occupied_policy.identity.adapter_config_identity =
+        run_view.manifest().identity.adapter_config_identity;
+    occupied_policy.identity.media_content_identity =
+        run_view.manifest().identity.media_content_identity;
+    occupied_policy.identity.sequence_epoch =
+        run_view.manifest().identity.sequence_epoch;
+    occupied_policy.identity.requested_frontier =
+        run_view.manifest().identity.next_position;
+    occupied_policy.identity.tokens = &run_view.manifest().token_block.tokens;
+    occupied_policy.destination_sequence = 93;
+    occupied_policy.adoption_nonce = 0x4106;
+    occupied_policy.domain_bindings = bindings;
+    occupied_policy.domain_bindings.push_back({ UINT32_MAX, UINT16_MAX, host });
+    occupied_policy.accounting_snapshot = &occupied_accounting;
+    occupied_policy.budget_config = &budget;
+    occupied_policy.context = &occupied_serials;
+    occupied_policy.read_accounting_serial =
+        prefix_validator_serials::read_accounting;
+    occupied_policy.read_policy_epoch = prefix_validator_serials::read_policy;
+    occupied_policy.occupied_replacement = &occupied_guard;
+    occupied_policy.occupied_representation_identity = [](
+            const void *, int32_t, bool, int32_t,
+            vbr_explicit_representation_identity &) noexcept {
+        return false;
+    };
+    auto occupied_validated = vbr_validate_unit_manifest_snapshot(
+        run_fixture.target, run_view, occupied_policy);
+    if (occupied_validated.status !=
+            vbr_manifest_validation_status::validated) {
+        fprintf(stderr, "sparse occupied validation status: %s\n",
+            vbr_manifest_validation_status_name(occupied_validated.status));
+    }
+    CHECK(occupied_validated.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(occupied_validated.proof);
+    CHECK(!occupied_guard.ready());
+    CHECK(occupied_validated.proof &&
+          occupied_validated.proof->relocation_runs().size() ==
+          VBR_OCCUPIED_REPLACEMENT_MAX_RUNS);
+    CHECK(occupied_validated.proof &&
+          occupied_validated.proof->relocation_runs().front()
+              .first_source_packed_row == 0);
+    CHECK(occupied_validated.proof &&
+          occupied_validated.proof->relocation_runs().back()
+              .first_source_packed_row ==
+          VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-1);
+
+    vbr_adopt_stage_policy occupied_stage_policy;
+    occupied_stage_policy.ledger = &ledger;
+    occupied_stage_policy.budget = &budget;
+    occupied_stage_policy.pinned_domain = pinned;
+    occupied_stage_policy.pinned_ring_bytes = 8192;
+    occupied_stage_policy.chunk_bytes = 4096;
+    occupied_stage_policy.lanes.push_back({ device, nullptr, nullptr, false });
+    auto occupied_staged = occupied_validated.proof
+        ? vbr_stage_validated_manifest(
+            std::move(occupied_validated.proof), occupied_stage_policy)
+        : vbr_adopt_stage_result {};
+    if (occupied_staged.status != vbr_adopt_stage_status::staged) {
+        fprintf(stderr, "sparse occupied stage status: %s\n",
+            vbr_adopt_stage_status_name(occupied_staged.status));
+    }
+    CHECK(occupied_staged.status == vbr_adopt_stage_status::staged);
+    CHECK(occupied_staged.staged);
+    CHECK(occupied_staged.staged->reads().size() ==
+          VBR_OCCUPIED_REPLACEMENT_MAX_RUNS);
+    CHECK(occupied_staged.staged->reads().front()
+              .projection_ranges.front().source_offset == 0);
+    CHECK(occupied_staged.staged->reads().back()
+              .projection_ranges.front().source_offset ==
+          VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-1);
+    occupied_staged.staged.reset();
+    occupied_staged.manifest.reset();
+    run_view.reset();
+    CHECK(catalog.retire(run_reference) ==
+          vbr_artifact_retire_status::retired);
+
+    CHECK(publish_occupied_guard_package(
+        catalog, topology, budget, 94,
+        VBR_OCCUPIED_REPLACEMENT_MAX_RUNS + 1, true,
+        run_reference, run_view));
+    CHECK(make_occupied_guard_fixture(
+        run_view, 94, 2*(VBR_OCCUPIED_REPLACEMENT_MAX_RUNS + 1),
+        run_fixture));
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              run_fixture.target, run_view, run_view,
+              run_fixture.observation, occupied_guard) ==
+          vbr_occupied_replacement_guard_status::run_limit_exceeded);
+    CHECK(!occupied_guard.ready());
+    run_view.reset();
+    CHECK(catalog.retire(run_reference) ==
+          vbr_artifact_retire_status::retired);
     CHECK(ledger.snapshot().live_ops == 0);
 
     // Keep the shared batch fence intact until catalog validation chooses a

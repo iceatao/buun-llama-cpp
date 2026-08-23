@@ -3,6 +3,7 @@
 #include "llama-kv-cache.h"
 #include "llama-memory-tree.h"
 #include "llama-vbr-controller-id.h"
+#include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-operation.h"
 
 #include "ggml.h"
@@ -14,6 +15,7 @@
 #include <new>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 class vbr_import_receipt_group {
@@ -258,11 +260,13 @@ class vbr_kv_import_session {
     struct extent_prefix {
         llama_kv_cache::vbr_pool * pool = nullptr;
         llama_kv_cache::vbr_extent * extent = nullptr;
+        size_t pool_index = SIZE_MAX;
         // A transform maps the larger of source and target before H2D.  The
         // phase-12 invariant is the target-tier prefix left after the
         // fallible transform (and downward-only tail trim).
         uint64_t mapped_row_bytes = 0;
         uint64_t final_row_bytes = 0;
+        uint32_t initial_watermark = 0;
     };
     struct final_unit_metadata {
         uint32_t logical_unit = UINT32_MAX;
@@ -274,9 +278,11 @@ class vbr_kv_import_session {
     vbr_kv_import_session(llama_kv_cache & cache, uint32_t child_id,
                           llama_seq_id destination,
                           vbr_operation_id operation,
+                          bool occupied_replacement,
                           vbr_adopt_test_seam * test_seam = nullptr) noexcept
         : cache_(&cache), child_id_(child_id), destination_(destination),
-          operation_(operation), test_seam_(test_seam) {}
+          operation_(operation), occupied_replacement_(occupied_replacement),
+          test_seam_(test_seam) {}
 
     ~vbr_kv_import_session() {
         if (!published_) {
@@ -327,14 +333,16 @@ class vbr_kv_import_session {
             !vbr_controller_instance_owned_by(expected.instance_id, tracker)) {
             return false;
         }
-        for (const auto & cells : cache_->v_cells) {
-            if (cells.get_used() != 0) {
-                return false;
+        if (!occupied_replacement_) {
+            for (const auto & cells : cache_->v_cells) {
+                if (cells.get_used() != 0) {
+                    return false;
+                }
             }
-        }
-        for (const auto & pool : cache_->vbr_pools_) {
-            if (pool.wm_cells != 0) {
-                return false;
+            for (const auto & pool : cache_->vbr_pools_) {
+                if (pool.wm_cells != 0) {
+                    return false;
+                }
             }
         }
         return !vbr_recovery_pending_for_except(
@@ -356,18 +364,32 @@ class vbr_kv_import_session {
     }
 
     bool prepare_backing(
-            const std::vector<const vbr_validated_child_plan *> & plans) noexcept {
+            const std::vector<const vbr_validated_child_plan *> & plans,
+            const std::vector<vbr_occupied_replacement_relocation_run> * relocation = nullptr) noexcept {
         if (test_seam_) {
-            return armed_ && test_seam_->session_prepare_backing(
-                child_id_, plans);
+            return armed_ && (relocation
+                ? test_seam_->session_prepare_relocated_backing(
+                    child_id_, plans, *relocation)
+                : test_seam_->session_prepare_backing(child_id_, plans));
         }
         if (!armed_ || plans.empty()) {
             return false;
         }
         try {
+            size_t shard_count = 0;
+            for (const auto * plan : plans) {
+                if (!plan || plan->shards.size() > SIZE_MAX-shard_count) {
+                    return false;
+                }
+                shard_count += plan->shards.size();
+            }
             unit_complete_.assign(cache_->vbr_generation_tracker_get()->unit_count(), false);
             final_watermarks_.assign(cache_->vbr_pools_.size(), 0);
             pool_indices_.clear();
+            extent_prefixes_.clear();
+            extent_prefixes_.reserve(shard_count);
+            extent_prefix_indices_.clear();
+            extent_prefix_indices_.reserve(shard_count);
             unit_by_pool_.clear();
             final_unit_indices_.clear();
             transform_backends_.clear();
@@ -460,17 +482,15 @@ class vbr_kv_import_session {
                                 transform_backends_.end()) {
                         transform_backends_.push_back(pool->backend);
                     }
-                    if (std::none_of(extent_prefixes_.begin(), extent_prefixes_.end(),
-                            [&](const extent_prefix & value) {
-                                return value.pool == pool &&
-                                       value.extent == unit.second;
-                            })) {
+                    const auto prefix = extent_prefix_indices_.emplace(
+                        unit.second, extent_prefixes_.size());
+                    if (prefix.second) {
                         extent_prefixes_.push_back({
-                            pool, unit.second,
+                            pool, unit.second, pool_index->second,
                             std::max(
                                 shard.row_bytes,
                                 shard.target_row_bytes),
-                            shard.target_row_bytes,
+                            shard.target_row_bytes, pool->wm_cells,
                         });
                     }
                     if (plan->descriptor.wm_cells > UINT32_MAX) {
@@ -485,13 +505,51 @@ class vbr_kv_import_session {
                     // a falsely-short published watermark.
                     const uint32_t descriptor_watermark =
                         uint32_t(plan->descriptor.wm_cells);
-                    backing_watermarks[pool_index->second] = std::max(
-                        backing_watermarks[pool_index->second],
-                        descriptor_watermark);
-                    final_watermarks_[pool_index->second] = std::max(
-                        final_watermarks_[pool_index->second],
-                        descriptor_watermark);
-                    for (const auto & run : plan->authorized_runs) {
+                    if (!relocation) {
+                        backing_watermarks[pool_index->second] = std::max(
+                            backing_watermarks[pool_index->second],
+                            descriptor_watermark);
+                        final_watermarks_[pool_index->second] = std::max(
+                            final_watermarks_[pool_index->second],
+                            descriptor_watermark);
+                    }
+                    const auto validate_run = [&](uint64_t source_first,
+                                                  uint32_t destination_first,
+                                                  uint32_t cell_count) {
+                        if (cell_count == 0 ||
+                            destination_first > UINT32_MAX-cell_count ||
+                            source_first > UINT64_MAX/shard.row_bytes ||
+                            uint64_t(cell_count) > UINT64_MAX/shard.row_bytes) {
+                            return false;
+                        }
+                        const uint64_t relative =
+                            uint64_t(source_first)*shard.row_bytes;
+                        const uint64_t bytes = uint64_t(cell_count)*shard.row_bytes;
+                        if (relative > shard.payload_bytes ||
+                            bytes > shard.payload_bytes-relative ||
+                            unit.second->byte_off > pool->size ||
+                            uint64_t(destination_first)*shard.target_row_bytes >
+                                pool->size-unit.second->byte_off ||
+                            uint64_t(cell_count)*shard.target_row_bytes >
+                                pool->size-unit.second->byte_off-
+                                uint64_t(destination_first)*shard.target_row_bytes) {
+                            return false;
+                        }
+                        final_watermarks_[pool_index->second] = std::max(
+                            final_watermarks_[pool_index->second],
+                            destination_first+cell_count);
+                        return true;
+                    };
+                    if (relocation) {
+                        for (const auto & run : *relocation) {
+                            if (!validate_run(
+                                    run.first_source_packed_row,
+                                    run.first_destination_physical_cell,
+                                    run.cell_count)) {
+                                return false;
+                            }
+                        }
+                    } else for (const auto & run : plan->authorized_runs) {
                         if (run.cell_count == 0 ||
                             run.first_physical_cell >
                                 UINT32_MAX-run.cell_count ||
@@ -518,6 +576,10 @@ class vbr_kv_import_session {
                 }
             }
             for (size_t i = 0; i < final_watermarks_.size(); ++i) {
+                if (relocation) {
+                    final_watermarks_[i] = std::max(
+                        final_watermarks_[i], cache_->vbr_pools_[i].wm_cells);
+                }
                 backing_watermarks[i] = std::max(
                     backing_watermarks[i], final_watermarks_[i]);
             }
@@ -525,19 +587,15 @@ class vbr_kv_import_session {
             // of authorized copy runs.  Foreign rows remain untouched, but
             // every extent is backed over [0, final_watermark) before publish.
             for (const auto & prefix : extent_prefixes_) {
-                const auto pool_it = std::find_if(
-                    cache_->vbr_pools_.begin(), cache_->vbr_pools_.end(),
-                    [&](llama_kv_cache::vbr_pool & value) {
-                        return &value == prefix.pool;
-                    });
-                if (pool_it == cache_->vbr_pools_.end() ||
+                if (prefix.pool_index >= cache_->vbr_pools_.size() ||
+                    &cache_->vbr_pools_[prefix.pool_index] != prefix.pool ||
                     !prefix.extent || prefix.mapped_row_bytes == 0 ||
                     prefix.final_row_bytes == 0 ||
                     prefix.pool->gran == 0) {
                     return false;
                 }
-                const uint64_t watermark = backing_watermarks[
-                    size_t(pool_it-cache_->vbr_pools_.begin())];
+                const uint64_t watermark =
+                    backing_watermarks[prefix.pool_index];
                 if (watermark == 0 ||
                     watermark > UINT64_MAX/prefix.mapped_row_bytes) {
                     return false;
@@ -560,10 +618,32 @@ class vbr_kv_import_session {
                 if (last > prefix.pool->size) {
                     return false;
                 }
-                mapped_.push_back({ prefix.pool, first, last-first });
-                if (!prefix.pool->be->vmm_pool_map(
-                        prefix.pool->vmm, absolute, bytes)) {
-                    return false;
+                if (relocation) {
+                    if (prefix.initial_watermark >
+                            SIZE_MAX/prefix.mapped_row_bytes) {
+                        return false;
+                    }
+                    const size_t old_bytes = size_t(
+                        prefix.initial_watermark*prefix.mapped_row_bytes);
+                    if (absolute > SIZE_MAX-old_bytes ||
+                        absolute+old_bytes > SIZE_MAX-(gran-1)) {
+                        return false;
+                    }
+                    const size_t old_last =
+                        ((absolute+old_bytes+gran-1)/gran)*gran;
+                    if (last > old_last) {
+                        mapped_.push_back({ prefix.pool, old_last, last-old_last });
+                        if (!prefix.pool->be->vmm_pool_map(
+                                prefix.pool->vmm, old_last, last-old_last)) {
+                            return false;
+                        }
+                    }
+                } else {
+                    mapped_.push_back({ prefix.pool, first, last-first });
+                    if (!prefix.pool->be->vmm_pool_map(
+                            prefix.pool->vmm, absolute, bytes)) {
+                        return false;
+                    }
                 }
             }
             return true;
@@ -884,15 +964,19 @@ class vbr_kv_import_session {
     bool build_live_image(
             const std::vector<const vbr_validated_child_plan *> & plans,
             const vbr_tracker_install_child & tracker_plan,
-            const vbr_checkpoint_generation_controller & source) noexcept {
+            const vbr_checkpoint_generation_controller & source,
+            const vbr_occupied_replacement_guard * replacement = nullptr) noexcept {
         if (test_seam_) {
-            return test_seam_->session_build_live_image(
-                child_id_, plans, tracker_plan, source);
+            return replacement
+                ? test_seam_->session_build_relocated_live_image(
+                    child_id_, plans, tracker_plan, source, *replacement)
+                : test_seam_->session_build_live_image(
+                    child_id_, plans, tracker_plan, source);
         }
         try {
             for (const auto * plan : plans) {
                 if (!plan || plan->logical_unit_id >= unit_complete_.size() ||
-                    !unit_complete_[plan->logical_unit_id]) {
+                    (!replacement && !unit_complete_[plan->logical_unit_id])) {
                     return false;
                 }
             }
@@ -903,45 +987,67 @@ class vbr_kv_import_session {
             }
             final_ownership_ = std::make_unique<vbr_ownership_index>(
                 cache_->n_stream, cache_->n_seq_max, cache_->get_size());
-            std::set<std::tuple<uint32_t, uint32_t, llama_pos>> installed;
             std::vector<vbr_artifact_stream_placement> placements;
-            for (const auto * plan : plans) {
-                for (const auto & placement : plan->placements) {
-                    if (placement.child_id != child_id_ ||
-                        placement.stream_index >= final_cells_.size()) {
+            if (replacement) {
+                auto & cells = final_cells_.front();
+                for (const auto & mapping : replacement->cell_mapping()) {
+                    if (mapping.source_stream != 0 ||
+                        mapping.destination_physical_cell >= cells.size() ||
+                        mapping.logical_position < 0 ||
+                        !cells.is_empty(mapping.destination_physical_cell)) {
                         return false;
                     }
-                    placements.push_back(placement);
-                    auto & cells = final_cells_[placement.stream_index];
-                    for (const auto & cell : placement.cells) {
-                        if (cell.physical_cell >= cells.size() ||
-                            cell.logical_position < 0) {
+                    cells.pos_set(mapping.destination_physical_cell,
+                                  mapping.logical_position);
+                    cells.ext_set(mapping.destination_physical_cell,
+                                  { mapping.ext_x, mapping.ext_y });
+                    cells.seq_add(mapping.destination_physical_cell, destination_);
+                    if (!final_ownership_->add_cell(
+                            0, destination_, mapping.destination_physical_cell,
+                            mapping.logical_position)) {
+                        return false;
+                    }
+                }
+            } else {
+                std::set<std::tuple<uint32_t, uint32_t, llama_pos>> installed;
+                for (const auto * plan : plans) {
+                    for (const auto & placement : plan->placements) {
+                        if (placement.child_id != child_id_ ||
+                            placement.stream_index >= final_cells_.size()) {
                             return false;
                         }
-                        const auto key = std::make_tuple(
-                            placement.stream_index, cell.physical_cell,
-                            cell.logical_position);
-                        if (installed.insert(key).second) {
-                            if (!cells.is_empty(cell.physical_cell)) {
+                        placements.push_back(placement);
+                        auto & cells = final_cells_[placement.stream_index];
+                        for (const auto & cell : placement.cells) {
+                            if (cell.physical_cell >= cells.size() ||
+                                cell.logical_position < 0) {
                                 return false;
                             }
-                            cells.pos_set(cell.physical_cell,
-                                          cell.logical_position);
-                            cells.ext_set(cell.physical_cell,
-                                { cell.ext_x, cell.ext_y });
-                            cells.seq_add(cell.physical_cell, destination_);
-                            if (!final_ownership_->add_cell(
-                                    placement.stream_index, destination_,
-                                    cell.physical_cell,
-                                    cell.logical_position)) {
+                            const auto key = std::make_tuple(
+                                placement.stream_index, cell.physical_cell,
+                                cell.logical_position);
+                            if (installed.insert(key).second) {
+                                if (!cells.is_empty(cell.physical_cell)) {
+                                    return false;
+                                }
+                                cells.pos_set(cell.physical_cell,
+                                              cell.logical_position);
+                                cells.ext_set(cell.physical_cell,
+                                    { cell.ext_x, cell.ext_y });
+                                cells.seq_add(cell.physical_cell, destination_);
+                                if (!final_ownership_->add_cell(
+                                        placement.stream_index, destination_,
+                                        cell.physical_cell,
+                                        cell.logical_position)) {
+                                    return false;
+                                }
+                            } else if (cells.is_empty(cell.physical_cell) ||
+                                       cells.pos_get(cell.physical_cell) !=
+                                           cell.logical_position ||
+                                       !cells.seq_has(cell.physical_cell,
+                                                      destination_)) {
                                 return false;
                             }
-                        } else if (cells.is_empty(cell.physical_cell) ||
-                                   cells.pos_get(cell.physical_cell) !=
-                                       cell.logical_position ||
-                                   !cells.seq_has(cell.physical_cell,
-                                                  destination_)) {
-                            return false;
                         }
                     }
                 }
@@ -957,9 +1063,13 @@ class vbr_kv_import_session {
                     ? next : 0;
             }
             auto * tracker = cache_->vbr_generation_tracker_mut();
-            if (!tracker || !tracker->prepare_import_image(
-                    tracker_plan, source, destination_, placements,
-                    tracker_image_)) {
+            if (!tracker || (replacement
+                    ? !tracker->prepare_relocated_import_image(
+                        tracker_plan, source, destination_, *replacement,
+                        tracker_image_)
+                    : !tracker->prepare_import_image(
+                        tracker_plan, source, destination_, placements,
+                        tracker_image_))) {
                 return false;
             }
             // Validation writes the target cursor on every unit plan, even
@@ -1030,11 +1140,30 @@ class vbr_kv_import_session {
             }
             const size_t start = prefix.extent->byte_off;
             const size_t bytes = size_t(bytes64);
+            if (occupied_replacement_ &&
+                final_watermarks_[size_t(pool_it-cache_->vbr_pools_.begin())] <=
+                    prefix.initial_watermark) {
+                continue;
+            }
+            if (occupied_replacement_ &&
+                prefix.initial_watermark > SIZE_MAX/prefix.final_row_bytes) {
+                return false;
+            }
+            const size_t initial_bytes = occupied_replacement_
+                ? size_t(prefix.initial_watermark*prefix.final_row_bytes) : 0;
+            if (start > SIZE_MAX-initial_bytes ||
+                start+initial_bytes > SIZE_MAX-(prefix.pool->gran-1)) {
+                return false;
+            }
+            const size_t required_start = occupied_replacement_
+                ? ((start+initial_bytes+prefix.pool->gran-1)/prefix.pool->gran)*
+                    prefix.pool->gran
+                : start;
             const auto covered = std::find_if(
                 mapped_.begin(), mapped_.end(),
                 [&](const mapped_range & range) {
                     return range.pool == prefix.pool &&
-                           range.offset <= start &&
+                           range.offset <= required_start &&
                            range.size <= std::numeric_limits<size_t>::max()-range.offset &&
                            start <= std::numeric_limits<size_t>::max()-bytes &&
                            range.offset+range.size >= start+bytes;
@@ -1113,7 +1242,8 @@ class vbr_kv_import_session {
             return receipt && test_seam_->session_prepare_receipts(
                 child_id_, receipt);
         }
-        if (!receipt || cache_->vbr_import_receipt_ || receipt_) {
+        if (!receipt || receipt_ ||
+            (!occupied_replacement_ && cache_->vbr_import_receipt_)) {
             return false;
         }
         receipt_ = receipt;
@@ -1125,10 +1255,14 @@ class vbr_kv_import_session {
             test_seam_->session_publish_receipts(child_id_);
             return;
         }
-        GGML_ASSERT(published_ && receipt_ &&
-                    !cache_->vbr_import_receipt_);
-        cache_->vbr_import_receipt_ = receipt_;
-        receipt_.reset();
+        GGML_ASSERT(published_ && receipt_);
+        if (occupied_replacement_) {
+            cache_->vbr_import_receipt_.swap(receipt_);
+        } else {
+            GGML_ASSERT(!cache_->vbr_import_receipt_);
+            cache_->vbr_import_receipt_ = receipt_;
+            receipt_.reset();
+        }
     }
 
     bool rollback(bool inject_failure) noexcept {
@@ -1247,8 +1381,11 @@ class vbr_kv_import_session {
     bool armed_ = false;
     bool image_ready_ = false;
     bool published_ = false;
+    bool occupied_replacement_ = false;
     std::vector<mapped_range> mapped_;
     std::vector<extent_prefix> extent_prefixes_;
+    std::unordered_map<llama_kv_cache::vbr_extent *, size_t>
+        extent_prefix_indices_;
     std::vector<ggml_context_ptr> stash_contexts_;
     std::vector<bool> unit_complete_;
     std::vector<final_unit_metadata> final_units_;
@@ -1699,6 +1836,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             return fail(vbr_adopt_status::invalid_capability_pair);
         }
         out.decision = manifest->decision();
+        const bool occupied_replacement =
+            manifest->is_occupied_replacement();
         if (out.decision == vbr_import_decision::downward_rebase ||
             out.decision == vbr_import_decision::upward_reconstruct) {
             transform_stash_valid.assign(manifest->children().size(), 0);
@@ -1748,13 +1887,26 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         auto staged_fingerprint = manifest->target();
         staged_fingerprint.accounting_serial =
             staged->accounting_serial_after_prepare();
+        const bool replacement_current = !occupied_replacement ||
+            (test_target(server_hooks)
+                ? test_target(server_hooks)->session_recheck_occupied(
+                    0, *manifest->occupied_replacement(), false)
+                : vbr_explicit_recheck_occupied_replacement_guard(
+                    target, destination,
+                    manifest->occupied_replacement()->accounting_serial(),
+                    manifest->occupied_representation_context_,
+                    manifest->occupied_representation_identity_,
+                    *manifest->occupied_replacement_) ==
+                        vbr_occupied_replacement_guard_status::ready);
         if (fault_before(server_hooks, out.phase) ||
             accounting.snapshot().serial != staged->accounting_serial_after_prepare() ||
-            manifest->recheck_target_empty_ == nullptr ||
             manifest->read_accounting_serial_ == nullptr ||
             manifest->read_policy_epoch_ == nullptr ||
-            !manifest->recheck_target_empty_(
-                manifest->recheck_context_, staged_fingerprint) ||
+            !replacement_current ||
+            (!occupied_replacement &&
+             (manifest->recheck_target_empty_ == nullptr ||
+              !manifest->recheck_target_empty_(
+                  manifest->recheck_context_, staged_fingerprint))) ||
             manifest->read_accounting_serial_(manifest->recheck_context_) !=
                 staged->accounting_serial_after_prepare() ||
             manifest->read_policy_epoch_(manifest->recheck_context_) !=
@@ -1789,6 +1941,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             entry.second.cache = live->attention;
             entry.second.session = std::make_unique<vbr_kv_import_session>(
                 *live->attention, entry.first, destination, operation.id(),
+                occupied_replacement,
                 test_target(server_hooks));
             if (!entry.second.session->recheck(*expected)) {
                 return fail(vbr_adopt_status::target_drift);
@@ -1835,8 +1988,23 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             return fail(vbr_adopt_status::accounting_unavailable);
         }
         for (auto & entry : children) {
-            if (!entry.second.session->prepare_backing(entry.second.plans)) {
+            if (!entry.second.session->prepare_backing(
+                    entry.second.plans,
+                    occupied_replacement
+                        ? &manifest->relocation_runs() : nullptr)) {
                 return fail(vbr_adopt_status::private_backing_failed);
+            }
+        }
+        if (occupied_replacement) {
+            for (auto & entry : children) {
+                const auto * install = tracker_plan(*manifest, entry.first);
+                const auto * source = source_controller(*manifest, entry.first);
+                if (!install || !source ||
+                    !entry.second.session->build_live_image(
+                        entry.second.plans, *install, *source,
+                        manifest->occupied_replacement())) {
+                    return fail(vbr_adopt_status::tracker_failed);
+                }
             }
         }
         if (fault_after(server_hooks, out.phase)) {
@@ -1853,11 +2021,13 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             return fail(vbr_adopt_status::transfer_failed);
         }
         const bool prefix_projection = manifest->is_prefix_projection();
+        const bool packed_transfer =
+            prefix_projection || occupied_replacement;
         if (prefix_projection && !manifest->projection_transfer_ready()) {
             return fail(vbr_adopt_status::source_changed);
         }
         vbr_h2d_ring_operation projection_operation;
-        if (prefix_projection && !test_target(server_hooks)) {
+        if (packed_transfer && !test_target(server_hooks)) {
             projection_operation =
                 staged->adoption_ring()->try_begin_operation();
             if (!projection_operation) {
@@ -1889,7 +2059,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             auto * ring = staged->adoption_ring();
             if (!child->second.session->transfer(
                     read, ring,
-                    prefix_projection && !test_target(server_hooks)
+                    packed_transfer && !test_target(server_hooks)
                         ? &projection_operation : nullptr,
                     server_hooks.test != nullptr &&
                             completion == server_hooks.test->fault.fail_h2d_completion
@@ -1944,8 +2114,10 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             return fail(vbr_adopt_status::transfer_failed);
         }
         for (const auto & plan : manifest->children()) {
-            const uint64_t expected = prefix_projection
-                ? plan.shards.size()
+            const uint64_t expected = packed_transfer
+                ? uint64_t(plan.shards.size())*
+                    (occupied_replacement
+                        ? manifest->relocation_runs().size() : 1)
                 : uint64_t(plan.shards.size())*plan.authorized_runs.size();
             if (expected == 0 || expected > UINT32_MAX ||
                 transferred_units[{ plan.child_id, plan.logical_unit_id }] !=
@@ -2017,13 +2189,15 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         if (fault_before(server_hooks, out.phase)) {
             return fail(vbr_adopt_status::tracker_failed);
         }
-        for (auto & entry : children) {
-            const auto * install = tracker_plan(*manifest, entry.first);
-            const auto * source = source_controller(*manifest, entry.first);
-            if (!install || !source ||
-                !entry.second.session->build_live_image(
-                    entry.second.plans, *install, *source)) {
-                return fail(vbr_adopt_status::tracker_failed);
+        if (!occupied_replacement) {
+            for (auto & entry : children) {
+                const auto * install = tracker_plan(*manifest, entry.first);
+                const auto * source = source_controller(*manifest, entry.first);
+                if (!install || !source ||
+                    !entry.second.session->build_live_image(
+                        entry.second.plans, *install, *source)) {
+                    return fail(vbr_adopt_status::tracker_failed);
+                }
             }
         }
         if (staged->adoption_committed_ops().empty()) {
@@ -2064,9 +2238,23 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                            plan.transcode_tree_digest ==
                                transform_tree_digest;
                 }));
+        const bool replacement_barrier_current = !occupied_replacement ||
+            (test_target(server_hooks)
+                ? test_target(server_hooks)->session_recheck_occupied(
+                    0, *manifest->occupied_replacement(), true)
+                : vbr_explicit_recheck_occupied_replacement_guard(
+                    target, destination,
+                    manifest->occupied_replacement()->accounting_serial(),
+                    manifest->occupied_representation_context_,
+                    manifest->occupied_representation_identity_,
+                    operation.id(),
+                    *manifest->occupied_replacement_) ==
+                        vbr_occupied_replacement_guard_status::ready);
         if (accounting.snapshot().serial != post_commit_serial ||
-            !manifest->recheck_target_empty_(
-                manifest->recheck_context_, barrier_fingerprint) ||
+            !replacement_barrier_current ||
+            (!occupied_replacement &&
+             !manifest->recheck_target_empty_(
+                manifest->recheck_context_, barrier_fingerprint)) ||
             manifest->read_accounting_serial_(manifest->recheck_context_) !=
                 post_commit_serial ||
             manifest->read_policy_epoch_(manifest->recheck_context_) !=

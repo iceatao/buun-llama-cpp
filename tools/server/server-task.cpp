@@ -2391,7 +2391,11 @@ static bool server_prompt_cache_vbr_frontier_matches(
         const server_prompt & prompt,
         const server_prompt_cache_payload & payload,
         const std::string & execution_identity,
-        const std::string & adapter_config_key) noexcept {
+        const std::string & adapter_config_key,
+        bool * raw_token_comparison = nullptr) noexcept {
+    if (raw_token_comparison) {
+        *raw_token_comparison = false;
+    }
     try {
         const auto * artifact = payload.vbr_artifact();
         if (!artifact || execution_identity.empty()) {
@@ -2407,8 +2411,13 @@ static bool server_prompt_cache_vbr_frontier_matches(
             identity.adapter_config_identity != adapter_config_key ||
             identity.sequence_epoch != prompt.sequence_epoch ||
             identity.token_count != prompt.n_tokens() ||
-            identity.next_position != prompt.tokens.pos_next() ||
-            manifest.token_block.tokens !=
+            identity.next_position != prompt.tokens.pos_next()) {
+            return false;
+        }
+        if (raw_token_comparison) {
+            *raw_token_comparison = true;
+        }
+        if (manifest.token_block.tokens !=
                 prompt.tokens.retention_token_ids()) {
             return false;
         }
@@ -3143,6 +3152,245 @@ void server_prompt_cache_vbr_restore_candidate::clear() noexcept {
     prepared_destination_ = nullptr;
     adopted_destination_ = nullptr;
     prepared_prompt_.reset();
+}
+
+static bool server_prompt_cache_vbr_owner_is_current(
+        const server_prompt_cache_state * state,
+        const server_prompt_cache_vbr_owner & owner) noexcept {
+    const auto * variants = state ? state->payload.vbr_variants() : nullptr;
+    return variants && owner &&
+        (variants->compact_current() == owner ||
+         variants->quality_anchor() == owner);
+}
+
+server_prompt_cache_vbr_replacement_ticket::
+~server_prompt_cache_vbr_replacement_ticket() {
+    if (cache_) {
+        cache_->release_vbr_occupied_replacement(*this);
+    }
+}
+
+server_prompt_cache_vbr_replacement_ticket::
+server_prompt_cache_vbr_replacement_ticket(
+        server_prompt_cache_vbr_replacement_ticket && other) noexcept {
+    *this = std::move(other);
+}
+
+server_prompt_cache_vbr_replacement_ticket &
+server_prompt_cache_vbr_replacement_ticket::operator=(
+        server_prompt_cache_vbr_replacement_ticket && other) noexcept {
+    if (this != &other) {
+        if (cache_) {
+            cache_->release_vbr_occupied_replacement(*this);
+        }
+        cache_ = other.cache_;
+        incoming_ = std::move(other.incoming_);
+        recovery_source_ = other.recovery_source_;
+        recovery_owner_ = std::move(other.recovery_owner_);
+        recovery_pin_ = std::move(other.recovery_pin_);
+        recovery_ops_ = std::move(other.recovery_ops_);
+        incumbent_ = other.incumbent_;
+        incumbent_family_current_ = other.incumbent_family_current_;
+        incumbent_family_ = other.incumbent_family_;
+        incoming_family_ = other.incoming_family_;
+        execution_identity_ = std::move(other.execution_identity_);
+        adapter_config_key_ = std::move(other.adapter_config_key_);
+        replacement_prompt_ = std::move(other.replacement_prompt_);
+        provisional_key_ = other.provisional_key_;
+        destination_slot_ = other.destination_slot_;
+        incoming_prefix_tokens_ = other.incoming_prefix_tokens_;
+        incumbent_tokens_ = other.incumbent_tokens_;
+        incumbent_live_lcp_ = other.incumbent_live_lcp_;
+        incumbent_sequence_epoch_ = other.incumbent_sequence_epoch_;
+        incoming_token_digest_ = other.incoming_token_digest_;
+        incumbent_token_digest_ = other.incumbent_token_digest_;
+        incumbent_artifact_ = other.incumbent_artifact_;
+        incumbent_lineage_ = other.incumbent_lineage_;
+        incoming_owner_artifact_ = other.incoming_owner_artifact_;
+        recovery_owner_artifact_ = other.recovery_owner_artifact_;
+        recovery_host_artifact_ = other.recovery_host_artifact_;
+        other.clear();
+    }
+    return *this;
+}
+
+bool server_prompt_cache_vbr_replacement_ticket::ready() const noexcept {
+    if (!cache_ || !incoming_.ready() || incoming_.cache_ != cache_ ||
+        incoming_.requires_prefix_projection_ || !recovery_source_ ||
+        !recovery_owner_ || !recovery_pin_ || !recovery_pin_->valid() ||
+        !incumbent_ || !incumbent_family_current_ ||
+        *incumbent_family_current_ != incumbent_family_ ||
+        incoming_.cache_family_ != incoming_family_ ||
+        !replacement_prompt_ || destination_slot_ < 0 ||
+        incoming_prefix_tokens_ <= incumbent_live_lcp_ ||
+        incumbent_tokens_ == 0 || incumbent_sequence_epoch_ == 0 ||
+        incumbent_artifact_.v == 0 || incumbent_lineage_ == 0 ||
+        incoming_owner_artifact_.v == 0 ||
+        recovery_owner_artifact_.v == 0 ||
+        recovery_host_artifact_.v == 0 ||
+        !recovery_pin_->binds_exact(
+            recovery_host_artifact_, recovery_ops_) ||
+        incumbent_->sequence_epoch != incumbent_sequence_epoch_ ||
+        incumbent_->n_tokens() <= 0 ||
+        uint64_t(incumbent_->n_tokens()) != incumbent_tokens_ ||
+        incumbent_->tokens.has_media() ||
+        !incumbent_->checkpoints.empty() ||
+        replacement_prompt_->tokens.has_media() ||
+        !replacement_prompt_->checkpoints.empty() ||
+        replacement_prompt_->sequence_epoch !=
+            incoming_.source_->prompt.sequence_epoch ||
+        uint64_t(replacement_prompt_->n_tokens()) !=
+            incoming_prefix_tokens_ ||
+        !server_prompt_cache_vbr_owner_is_current(
+            incoming_.source_, incoming_.payload_) ||
+        recovery_source_->payload.vbr_compact_owner() != recovery_owner_ ||
+        recovery_source_->adapter_config_key != adapter_config_key_ ||
+        recovery_source_->vbr_execution_identity != execution_identity_ ||
+        recovery_source_->cache_family != incumbent_family_ ||
+        recovery_source_->prompt.sequence_epoch !=
+            incumbent_sequence_epoch_ ||
+        recovery_source_->prompt.n_tokens() != incumbent_->n_tokens() ||
+        recovery_source_->recovery_pins == 0 ||
+        recovery_owner_->reference_artifact() !=
+            recovery_owner_artifact_ ||
+        incoming_.payload_->reference_artifact() !=
+            incoming_owner_artifact_ ||
+        !cache_->retention_obs ||
+        cache_->retention_obs->artifact_id(
+            server_retention_instance_key::for_slot(destination_slot_)) !=
+                incumbent_artifact_ ||
+        cache_->retention_obs->artifact_id(provisional_key_).v == 0 ||
+        !cache_->retention_obs->prepared_for_launch(provisional_key_)) {
+        return false;
+    }
+    std::array<uint8_t, 32> digest = {};
+    std::array<uint8_t, 32> incoming_digest = {};
+    std::array<uint8_t, 32> recovery_digest = {};
+    common_retention_lineage_record lineage;
+    server_retention_candidate recovery;
+    server_cache_lease_identity lease_identity;
+    const auto recovery_key =
+        server_retention_instance_key::for_host_entry(recovery_source_);
+    if (!incumbent_->tokens.retention_token_digest(digest) ||
+        !incoming_.source_->prompt.tokens.retention_token_digest(
+            incoming_digest) ||
+        !recovery_source_->prompt.tokens.retention_token_digest(
+            recovery_digest) ||
+        !server_cache_lease_build_identity(
+            execution_identity_, adapter_config_key_, incumbent_->tokens,
+            int64_t(incumbent_tokens_), lease_identity)) {
+        return false;
+    }
+    const auto lease = cache_->lease_obs
+        ? cache_->lease_obs->inspect_range(
+            incumbent_artifact_, lease_identity,
+            incumbent_sequence_epoch_, 0, incumbent_tokens_)
+        : server_cache_lease_evaluation {};
+    return digest == incumbent_token_digest_ &&
+        incoming_digest == incoming_token_digest_ &&
+        recovery_digest == incumbent_token_digest_ &&
+        cache_->retention_obs->lineage_for_instance(
+            server_retention_instance_key::for_slot(destination_slot_),
+            lineage) &&
+        lineage.lineage_id == incumbent_lineage_ &&
+        cache_->retention_obs->candidate_for_instance(
+            recovery_key, recovery) &&
+        recovery.avail ==
+            server_retention_candidate_availability::available &&
+        recovery.artifact_id == recovery_host_artifact_ &&
+        recovery.provenance_op && recovery_ops_.size() == 1 &&
+        recovery_ops_.front() == recovery.provenance_op &&
+        lease.state == server_cache_lease_eval_state::known &&
+        !server_cache_lease_is_hard(lease);
+}
+
+const server_prompt &
+server_prompt_cache_vbr_replacement_ticket::replacement_prompt()
+        const noexcept {
+    static const server_prompt empty;
+    return replacement_prompt_ ? *replacement_prompt_ : empty;
+}
+
+int32_t server_prompt_cache_vbr_replacement_ticket::destination_slot()
+        const noexcept {
+    return destination_slot_;
+}
+
+uint64_t
+server_prompt_cache_vbr_replacement_ticket::incoming_prefix_tokens()
+        const noexcept {
+    return incoming_prefix_tokens_;
+}
+
+uint64_t server_prompt_cache_vbr_replacement_ticket::incumbent_tokens()
+        const noexcept {
+    return incumbent_tokens_;
+}
+
+uint64_t server_prompt_cache_vbr_replacement_ticket::incumbent_live_lcp()
+        const noexcept {
+    return incumbent_live_lcp_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::incumbent_artifact()
+        const noexcept {
+    return incumbent_artifact_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::incoming_owner_artifact()
+        const noexcept {
+    return incoming_owner_artifact_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::recovery_owner_artifact()
+        const noexcept {
+    return recovery_owner_artifact_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::recovery_host_artifact()
+        const noexcept {
+    return recovery_host_artifact_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::provisional_artifact()
+        const noexcept {
+    return cache_ && cache_->retention_obs
+        ? cache_->retention_obs->artifact_id(provisional_key_)
+        : llama_cache_acct_artifact_id {};
+}
+
+void server_prompt_cache_vbr_replacement_ticket::clear() noexcept {
+    incoming_ = {};
+    cache_ = nullptr;
+    recovery_source_ = nullptr;
+    recovery_owner_.reset();
+    recovery_pin_.reset();
+    recovery_ops_.clear();
+    incumbent_ = nullptr;
+    incumbent_family_current_ = nullptr;
+    incumbent_family_ = {};
+    incoming_family_ = {};
+    execution_identity_.clear();
+    adapter_config_key_.clear();
+    replacement_prompt_.reset();
+    provisional_key_ = {};
+    destination_slot_ = -1;
+    incoming_prefix_tokens_ = 0;
+    incumbent_tokens_ = 0;
+    incumbent_live_lcp_ = 0;
+    incumbent_sequence_epoch_ = 0;
+    incoming_token_digest_ = {};
+    incumbent_token_digest_ = {};
+    incumbent_artifact_ = {};
+    incumbent_lineage_ = 0;
+    incoming_owner_artifact_ = {};
+    recovery_owner_artifact_ = {};
+    recovery_host_artifact_ = {};
 }
 
 std::list<server_prompt_cache_state> server_prompt_cache::stage_vbr(
@@ -8053,6 +8301,247 @@ static void server_prompt_cache_mirror_restore_retention(
     if (!admit_restored_checkpoints()) {
         discard_unowned_checkpoints();
     }
+}
+
+void server_prompt_cache::release_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept {
+    if (ticket.cache_ != this) {
+        return;
+    }
+    if (retention_obs && ticket.provisional_key_.instance != 0) {
+        retention_obs->abandon_prepared_launch(ticket.provisional_key_);
+        retention_obs->retire(ticket.provisional_key_);
+    }
+    ticket.recovery_pin_.reset();
+    ticket.incoming_ = {};
+    ticket.clear();
+}
+
+bool server_prompt_cache::prepare_vbr_occupied_replacement(
+        server_prompt_cache_vbr_restore_candidate && incoming,
+        server_prompt & incumbent,
+        const common_cache_family_binding & incumbent_family,
+        int32_t id_slot,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        server_prompt_cache_vbr_replacement_ticket & ticket,
+        server_prompt_cache_vbr_replacement_diagnostics * diagnostics) noexcept {
+    ticket = {};
+    if (diagnostics) {
+        *diagnostics = {};
+    }
+    if (!incoming.ready() || incoming.cache_ != this || id_slot < 0 ||
+        incoming.requires_prefix_projection_ ||
+        incoming.prepared_slot_ >= 0 || incoming.prepared_destination_ ||
+        incoming.adopted_destination_ || incoming.prepared_prompt_ ||
+        !incoming.source_ || !retention_obs || !lease_obs ||
+        execution_identity.empty() || adapter_config_key.empty() ||
+        !lease_execution_identity ||
+        *lease_execution_identity != execution_identity ||
+        incumbent.tokens.empty() || incumbent.tokens.has_media() ||
+        !incumbent.checkpoints.empty() || incumbent.sequence_epoch == 0 ||
+        incoming.source_->prompt.tokens.has_media() ||
+        !incoming.source_->prompt.checkpoints.empty() ||
+        incoming.prefix_tokens_ != incoming.source_tokens_ ||
+        uint64_t(incoming.source_->prompt.n_tokens()) !=
+            incoming.prefix_tokens_) {
+        return false;
+    }
+    const uint64_t incumbent_tokens = uint64_t(incumbent.n_tokens());
+    const uint64_t live_lcp = incumbent.tokens.get_common_prefix(
+        incoming.source_->prompt.tokens);
+    if (incoming.prefix_tokens_ <= live_lcp) {
+        return false;
+    }
+
+    const auto incumbent_key =
+        server_retention_instance_key::for_slot(id_slot);
+    server_retention_candidate incumbent_retention;
+    if (!retention_obs->candidate_for_instance(
+            incumbent_key, incumbent_retention) ||
+        incumbent_retention.avail !=
+            server_retention_candidate_availability::available ||
+        incumbent_retention.record.kind !=
+            common_retention_artifact_kind::live_slot ||
+        incumbent_retention.artifact_id.v == 0 ||
+        incumbent_retention.lineage.lineage_id == 0) {
+        return false;
+    }
+    const auto incumbent_artifact = incumbent_retention.artifact_id;
+
+    std::array<uint8_t, 32> incumbent_digest = {};
+    std::array<uint8_t, 32> incoming_digest = {};
+    server_cache_lease_identity incumbent_lease_identity;
+    if (!incumbent.tokens.retention_token_digest(incumbent_digest) ||
+        !incoming.source_->prompt.tokens.retention_token_digest(
+            incoming_digest) ||
+        !server_cache_lease_build_identity(
+            execution_identity, adapter_config_key, incumbent.tokens,
+            int64_t(incumbent_tokens), incumbent_lease_identity)) {
+        return false;
+    }
+    const auto incumbent_lease = lease_obs->inspect_range(
+        incumbent_artifact, incumbent_lease_identity,
+        incumbent.sequence_epoch, 0, incumbent_tokens);
+    if (incumbent_lease.state != server_cache_lease_eval_state::known ||
+        server_cache_lease_is_hard(incumbent_lease)) {
+        return false;
+    }
+
+    iterator recovery = states.end();
+    for (auto current = states.begin(); current != states.end(); ++current) {
+        if (diagnostics) {
+            ++diagnostics->recovery_states_visited;
+        }
+        const auto compact = current->payload.vbr_compact_owner();
+        if (!compact || current->adapter_config_key != adapter_config_key ||
+            current->vbr_execution_identity != execution_identity ||
+            current->cache_family != incumbent_family ||
+            current->prompt.sequence_epoch != incumbent.sequence_epoch ||
+            current->prompt.n_tokens() != incumbent.n_tokens() ||
+            current->prompt.tokens.has_media() ||
+            !current->prompt.checkpoints.empty()) {
+            continue;
+        }
+        std::array<uint8_t, 32> current_digest = {};
+        if (!current->prompt.tokens.retention_token_digest(current_digest) ||
+            current_digest != incumbent_digest) {
+            continue;
+        }
+        if (diagnostics) {
+            ++diagnostics->recovery_digest_matches;
+        }
+        if (recovery != states.end()) {
+            return false;
+        }
+        recovery = current;
+    }
+    if (recovery == states.end() ||
+        recovery->recovery_pins == std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const auto recovery_owner = recovery->payload.vbr_compact_owner();
+    const auto incoming_owner_artifact =
+        incoming.payload_->reference_artifact();
+    const auto recovery_owner_artifact =
+        recovery_owner ? recovery_owner->reference_artifact()
+                       : llama_cache_acct_artifact_id {};
+    if (!recovery_owner || incoming_owner_artifact.v == 0 ||
+        recovery_owner_artifact.v == 0) {
+        return false;
+    }
+    bool raw_token_comparison = false;
+    const bool frontier_matches = server_prompt_cache_vbr_frontier_matches(
+            recovery->prompt, recovery->payload,
+            execution_identity, adapter_config_key,
+            &raw_token_comparison);
+    if (diagnostics) {
+        diagnostics->recovery_raw_token_comparisons +=
+            raw_token_comparison ? 1 : 0;
+    }
+    if (!frontier_matches) {
+        return false;
+    }
+
+    server_retention_candidate recovery_retention;
+    const auto recovery_key =
+        server_retention_instance_key::for_host_entry(&*recovery);
+    if (!retention_obs->candidate_for_instance(
+            recovery_key, recovery_retention) ||
+        recovery_retention.avail !=
+            server_retention_candidate_availability::available ||
+        recovery_retention.artifact_id.v == 0 ||
+        !recovery_retention.provenance_op) {
+        return false;
+    }
+    std::vector<llama_cache_acct_op_id> recovery_ops;
+    std::unique_ptr<server_cache_recovery_pin> recovery_pin;
+    std::unique_ptr<server_prompt> replacement;
+    try {
+        recovery_ops.push_back(recovery_retention.provenance_op);
+        auto pin = acquire_host_recovery_pin(
+            *recovery, { recovery_retention.artifact_id }, recovery_ops);
+        if (!pin.valid() || !pin.binds_exact(
+                recovery_retention.artifact_id, recovery_ops)) {
+            return false;
+        }
+        recovery_pin = std::make_unique<server_cache_recovery_pin>(
+            std::move(pin));
+        replacement = std::make_unique<server_prompt>(
+            incoming.source_->prompt.clone());
+    } catch (...) {
+        return false;
+    }
+    if (!replacement || replacement->tokens.has_media() ||
+        !replacement->checkpoints.empty() ||
+        uint64_t(replacement->n_tokens()) != incoming.prefix_tokens_) {
+        return false;
+    }
+
+    const auto source_key =
+        server_retention_instance_key::for_host_entry(incoming.source_);
+    const server_retention_instance_key provisional_key {
+        common_retention_artifact_kind::live_slot,
+        id_slot,
+        reinterpret_cast<uintptr_t>(replacement.get()),
+    };
+    if (provisional_key.instance == 0 ||
+        retention_obs->artifact_id(provisional_key).v != 0 ||
+        !server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::host_entry, -1,
+            provisional_key, common_retention_artifact_kind::live_slot,
+            id_slot, *replacement, adapter_config_key,
+            int64_t(incoming.prefix_tokens_),
+            server_prompt_cache_prefix_clone_mode::share_source) ||
+        !retention_obs->prepare_for_launch(source_key, provisional_key) ||
+        retention_obs->artifact_id(incumbent_key) != incumbent_artifact) {
+        retention_obs->abandon_prepared_launch(provisional_key);
+        retention_obs->retire(provisional_key);
+        return false;
+    }
+
+    server_prompt_cache_vbr_replacement_ticket prepared;
+    try {
+        prepared.cache_ = this;
+        prepared.incoming_ = std::move(incoming);
+        prepared.recovery_source_ = &*recovery;
+        prepared.recovery_owner_ = recovery_owner;
+        prepared.recovery_pin_ = std::move(recovery_pin);
+        prepared.recovery_ops_ = std::move(recovery_ops);
+        prepared.incumbent_ = &incumbent;
+        prepared.incumbent_family_current_ = &incumbent_family;
+        prepared.incumbent_family_ = incumbent_family;
+        prepared.incoming_family_ = prepared.incoming_.cache_family_;
+        prepared.execution_identity_ = execution_identity;
+        prepared.adapter_config_key_ = adapter_config_key;
+        prepared.replacement_prompt_ = std::move(replacement);
+        prepared.provisional_key_ = provisional_key;
+        prepared.destination_slot_ = id_slot;
+        prepared.incoming_prefix_tokens_ =
+            prepared.incoming_.prefix_tokens_;
+        prepared.incumbent_tokens_ = incumbent_tokens;
+        prepared.incumbent_live_lcp_ = live_lcp;
+        prepared.incumbent_sequence_epoch_ = incumbent.sequence_epoch;
+        prepared.incoming_token_digest_ = incoming_digest;
+        prepared.incumbent_token_digest_ = incumbent_digest;
+        prepared.incumbent_artifact_ = incumbent_artifact;
+        prepared.incumbent_lineage_ =
+            incumbent_retention.lineage.lineage_id;
+        prepared.incoming_owner_artifact_ = incoming_owner_artifact;
+        prepared.recovery_owner_artifact_ = recovery_owner_artifact;
+        prepared.recovery_host_artifact_ =
+            recovery_retention.artifact_id;
+    } catch (...) {
+        retention_obs->abandon_prepared_launch(provisional_key);
+        retention_obs->retire(provisional_key);
+        return false;
+    }
+    if (!prepared.ready()) {
+        return false;
+    }
+    ticket = std::move(prepared);
+    return ticket.ready();
 }
 
 bool server_prompt_cache::prepare_vbr_restore_destination(

@@ -65,7 +65,7 @@ bool capture_digest_nonzero(
         [](uint8_t value) { return value != 0; });
 }
 
-bool capture_policy_equal(
+bool capture_policy_equal_impl(
         const vbr_artifact_controller_policy & lhs,
         const vbr_artifact_controller_policy & rhs) noexcept {
     return lhs.child_id == rhs.child_id &&
@@ -164,13 +164,19 @@ bool capture_cursor_after(
 
 } // namespace
 
+bool vbr_artifact_controller_policy_equal(
+        const vbr_artifact_controller_policy & lhs,
+        const vbr_artifact_controller_policy & rhs) noexcept {
+    return capture_policy_equal_impl(lhs, rhs);
+}
+
 bool vbr_capture_controller_representation_equal(
         const vbr_capture_controller_target & lhs,
         const vbr_capture_controller_target & rhs) noexcept {
     if (lhs.child_id != rhs.child_id ||
         lhs.lineage_uuid != rhs.lineage_uuid ||
         lhs.controller_generation != rhs.controller_generation ||
-        !capture_policy_equal(lhs.policy, rhs.policy) ||
+        !vbr_artifact_controller_policy_equal(lhs.policy, rhs.policy) ||
         lhs.units.size() != rhs.units.size() ||
         lhs.unit_descriptors.size() != rhs.unit_descriptors.size() ||
         lhs.units.size() != lhs.unit_descriptors.size()) {

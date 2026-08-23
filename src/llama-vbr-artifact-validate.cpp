@@ -438,6 +438,16 @@ bool accounting_plan_source(
     };
     for (const auto & unit : units) {
         for (const auto & allocation : unit.payload_allocations) {
+            // A singleton catalog stores descriptor metadata on its sole
+            // blob owner rather than on the reference owner.  Metadata is
+            // minted afresh below and must not be counted as immutable
+            // payload merely because its physical owner is the blob.
+            if (allocation.category ==
+                    llama_cache_acct_category::artifact_descriptor_metadata ||
+                allocation.category ==
+                    llama_cache_acct_category::artifact_reference_metadata) {
+                continue;
+            }
             if (!append_existing(allocation)) {
                 return false;
             }
@@ -503,17 +513,35 @@ bool accounting_plan_source(
             return false;
         }
         const auto category = vbr_artifact_accounting_category(row.role);
-        const auto source_receipt = std::find_if(
-            reference_allocations.begin(),
-            reference_allocations.end(),
-            [&](const vbr_artifact_allocation_view & value) {
-                return value.category == category &&
-                       value.domain == domain &&
-                       value.logical == row.logical_bytes &&
-                       value.resident == row.resident_bytes &&
-                       value.content.v != 0 && value.lineage.v != 0;
-            });
-        if (source_receipt == reference_allocations.end()) {
+        const vbr_artifact_allocation_view * source_receipt = nullptr;
+        const auto consider_source_receipt =
+                [&](const vbr_artifact_allocation_view & value) {
+            if (value.category != category || value.domain != domain ||
+                value.logical != row.logical_bytes ||
+                value.resident != row.resident_bytes ||
+                value.content.v == 0 || value.lineage.v == 0) {
+                return true;
+            }
+            if (source_receipt != nullptr &&
+                source_receipt->allocation != value.allocation) {
+                return false;
+            }
+            source_receipt = &value;
+            return true;
+        };
+        for (const auto & allocation : reference_allocations) {
+            if (!consider_source_receipt(allocation)) {
+                return false;
+            }
+        }
+        for (const auto & unit : units) {
+            for (const auto & allocation : unit.payload_allocations) {
+                if (!consider_source_receipt(allocation)) {
+                    return false;
+                }
+            }
+        }
+        if (source_receipt == nullptr) {
             return false;
         }
         llama_cache_transaction_leaf leaf;
@@ -898,6 +926,7 @@ vbr_validated_manifest & vbr_validated_manifest::operator=(
         other.authenticated_identity_.tokens == &other.token_block_.tokens;
     source_lease_ = std::move(other.source_lease_);
     source_projection_ = std::move(other.source_projection_);
+    occupied_replacement_ = std::move(other.occupied_replacement_);
     decision_ = other.decision_;
     target_ = std::move(other.target_);
     manifest_digest_ = other.manifest_digest_;
@@ -918,6 +947,10 @@ vbr_validated_manifest & vbr_validated_manifest::operator=(
     read_accounting_serial_ = other.read_accounting_serial_;
     read_policy_epoch_ = other.read_policy_epoch_;
     read_transform_tree_digest_ = other.read_transform_tree_digest_;
+    occupied_representation_context_ =
+        other.occupied_representation_context_;
+    occupied_representation_identity_ =
+        other.occupied_representation_identity_;
     return *this;
 }
 vbr_validated_manifest::~vbr_validated_manifest() = default;
@@ -959,6 +992,18 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             }
         }
         const auto & manifest = package.manifest();
+        const bool occupied_replacement =
+            policy.occupied_replacement != nullptr;
+        if (occupied_replacement &&
+            (!policy.occupied_replacement->ready() ||
+             policy.occupied_replacement->destination() !=
+                 policy.destination_sequence ||
+             policy.occupied_replacement->incoming_artifact() !=
+                 package.reference_artifact() ||
+             policy.occupied_representation_identity == nullptr)) {
+            return terminal_result(
+                vbr_manifest_validation_status::unavailable);
+        }
         if (manifest.version <
                 VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT) {
             return terminal_result(
@@ -1001,7 +1046,7 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         if (!target.scheduler_idle) {
             return terminal_result(vbr_manifest_validation_status::target_not_idle);
         }
-        if (!target.destination_sequence_absent) {
+        if (!target.destination_sequence_absent && !occupied_replacement) {
             return terminal_result(vbr_manifest_validation_status::target_not_empty);
         }
         std::set<uint32_t> target_child_ids;
@@ -1021,7 +1066,7 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                     vbr_manifest_validation_status::memory_tree_mismatch);
             }
             target_instances.push_back(child.instance_id);
-            if (!child.empty) {
+            if (!child.empty && !occupied_replacement) {
                 return terminal_result(
                     vbr_manifest_validation_status::target_not_empty);
             }
@@ -1738,8 +1783,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 child.state_serial, child.instance_id,
             });
         }
-        if (policy.recheck_target_empty == nullptr ||
-            !policy.recheck_target_empty(policy.context, fingerprint) ||
+        if ((!occupied_replacement &&
+             (policy.recheck_target_empty == nullptr ||
+              !policy.recheck_target_empty(policy.context, fingerprint))) ||
             policy.read_accounting_serial == nullptr ||
             policy.read_policy_epoch == nullptr ||
             policy.read_accounting_serial(policy.context) !=
@@ -1750,6 +1796,78 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         }
         if (policy.adoption_nonce == 0) {
             return terminal_result(vbr_manifest_validation_status::internal_error);
+        }
+        if (occupied_replacement) {
+            if (target.destination_sequence_absent || target.children.size() != 1 ||
+                target.children.front().empty || !manifest.companions.empty() ||
+                !companion_plans.empty() || needs_transform ||
+                manifest.stream_placements.size() != 1 ||
+                child_plans.empty()) {
+                return terminal_result(
+                    vbr_manifest_validation_status::target_not_empty);
+            }
+            const auto & mappings =
+                policy.occupied_replacement->cell_mapping();
+            const auto & placement = manifest.stream_placements.front();
+            if (mappings.empty() || mappings.size() != placement.cells.size()) {
+                return terminal_result(
+                    vbr_manifest_validation_status::geometry_mismatch);
+            }
+            for (size_t i = 0; i < mappings.size(); ++i) {
+                const auto & mapping = mappings[i];
+                const auto & source = placement.cells[i];
+                if (mapping.source_stream != placement.stream_index ||
+                    mapping.logical_position != source.logical_position ||
+                    mapping.source_physical_cell != source.physical_cell ||
+                    mapping.ext_x != source.ext_x || mapping.ext_y != source.ext_y) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::ownership_mismatch);
+                }
+            }
+            const auto & guard_runs =
+                policy.occupied_replacement->relocation_runs();
+            if (guard_runs.empty() || guard_runs.size() >
+                    VBR_OCCUPIED_REPLACEMENT_MAX_RUNS) {
+                return terminal_result(
+                    vbr_manifest_validation_status::geometry_mismatch);
+            }
+            size_t mapping_index = 0;
+            for (const auto & run : guard_runs) {
+                if (run.cell_count == 0 ||
+                    run.first_source_packed_row == UINT64_MAX ||
+                    run.first_destination_physical_cell == UINT32_MAX ||
+                    run.cell_count > mappings.size()-mapping_index) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::geometry_mismatch);
+                }
+                for (uint32_t offset = 0; offset < run.cell_count; ++offset) {
+                    const auto & mapping = mappings[mapping_index++];
+                    if (run.first_source_packed_row > UINT64_MAX-offset ||
+                        run.first_source_packed_row+offset !=
+                            mapping.source_packed_row ||
+                        uint64_t(run.first_destination_physical_cell)+offset !=
+                            mapping.destination_physical_cell) {
+                        return terminal_result(
+                            vbr_manifest_validation_status::geometry_mismatch);
+                    }
+                }
+            }
+            if (mapping_index != mappings.size()) {
+                return terminal_result(
+                    vbr_manifest_validation_status::geometry_mismatch);
+            }
+            uint64_t shard_count = 0;
+            for (const auto & plan : child_plans) {
+                shard_count += plan.shards.size();
+            }
+            if (shard_count == 0 ||
+                guard_runs.size() > 4096/shard_count) {
+                return terminal_result(
+                    vbr_manifest_validation_status::geometry_mismatch);
+            }
+            // Replacement always publishes a new live-rebased destination;
+            // it never adopts the source's process-local native lineage.
+            decision = vbr_import_decision::live_rebased;
         }
         if (decision != vbr_import_decision::native_import) {
             for (auto & child : tracker.children) {
@@ -1798,6 +1916,11 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         auto proof = std::unique_ptr<vbr_validated_manifest>(
             new vbr_validated_manifest());
         proof->source_lease_ = std::move(retained);
+        if (occupied_replacement) {
+            proof->occupied_replacement_ =
+                std::make_unique<vbr_occupied_replacement_guard>(
+                    std::move(*policy.occupied_replacement));
+        }
         proof->decision_ = decision;
         proof->target_ = std::move(fingerprint);
         proof->manifest_digest_ = manifest.manifest_digest;
@@ -1817,6 +1940,10 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         proof->read_policy_epoch_ = policy.read_policy_epoch;
         proof->read_transform_tree_digest_ =
             policy.read_transform_tree_digest;
+        proof->occupied_representation_context_ =
+            policy.occupied_representation_context;
+        proof->occupied_representation_identity_ =
+            policy.occupied_representation_identity;
 
         vbr_manifest_validation_result result;
         result.status = vbr_manifest_validation_status::validated;

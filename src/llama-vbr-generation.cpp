@@ -1,5 +1,6 @@
 #include "llama-vbr-generation.h"
 
+#include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-artifact-validate.h"
 
 #include "ggml.h"
@@ -739,8 +740,30 @@ bool vbr_generation_tracker::prepare_import_image(
         llama_seq_id destination,
         const std::vector<vbr_artifact_stream_placement> & placements,
         vbr_tracker_import_image & output) noexcept {
+    return prepare_import_image_impl(
+        plan, source, destination, &placements, nullptr, output);
+}
+
+bool vbr_generation_tracker::prepare_relocated_import_image(
+        const vbr_tracker_install_child & plan,
+        const vbr_checkpoint_generation_controller & source,
+        llama_seq_id destination,
+        const vbr_occupied_replacement_guard & replacement,
+        vbr_tracker_import_image & output) noexcept {
+    return prepare_import_image_impl(
+        plan, source, destination, nullptr, &replacement, output);
+}
+
+bool vbr_generation_tracker::prepare_import_image_impl(
+        const vbr_tracker_install_child & plan,
+        const vbr_checkpoint_generation_controller & source,
+        llama_seq_id destination,
+        const std::vector<vbr_artifact_stream_placement> * placements,
+        const vbr_occupied_replacement_guard * replacement,
+        vbr_tracker_import_image & output) noexcept {
     try {
         if (!active() || !stable() || !output.impl_ ||
+            ((placements == nullptr) == (replacement == nullptr)) ||
             plan.child_id != source.child_id ||
             plan.target_instance != instance_id_ ||
             destination < 0 || destination >= LLAMA_MAX_SEQ ||
@@ -749,6 +772,14 @@ bool vbr_generation_tracker::prepare_import_image(
             source.streams.size() != streams_.size() ||
             (plan.transition != vbr_tracker_install_transition::native_clone &&
              plan.transition != vbr_tracker_install_transition::whole_import)) {
+            return false;
+        }
+        if (replacement &&
+            (!replacement->ready() || replacement->destination() != destination ||
+             plan.transition != vbr_tracker_install_transition::whole_import ||
+             source.streams.size() != 1 ||
+             replacement->cell_mapping().empty() ||
+             replacement->cell_mapping().size() > n_cells_)) {
             return false;
         }
         if (plan.transition == vbr_tracker_install_transition::native_clone) {
@@ -813,82 +844,126 @@ bool vbr_generation_tracker::prepare_import_image(
             next->extent_handles.push_back(handle);
         }
 
-        std::set<std::pair<uint32_t, uint32_t>> installed_cells;
-        for (const auto & placement : placements) {
-            if (placement.child_id != plan.child_id ||
-                placement.stream_index >= next->streams.size()) {
-                return false;
-            }
-            const auto source_stream = std::find_if(
-                source.streams.begin(), source.streams.end(),
-                [&](const vbr_checkpoint_generation_stream & value) {
-                    return value.stream_index == placement.stream_index;
-                });
-            if (source_stream == source.streams.end()) {
-                return false;
-            }
-            auto & stream = next->streams[placement.stream_index];
-            for (const auto & cell : placement.cells) {
-                if (cell.physical_cell >= n_cells_) {
+        if (replacement) {
+            // The guard mints this map by walking destination physical cells in
+            // increasing order.  Reassert that least-authority shape here, then
+            // install each destination exactly once without a per-cell tree.
+            uint32_t previous_physical = 0;
+            bool first = true;
+            auto & stream = next->streams.front();
+            const auto handle = import_extents.front();
+            for (const auto & cell : replacement->cell_mapping()) {
+                if (cell.source_stream != 0 ||
+                    cell.destination_physical_cell >= n_cells_ ||
+                    cell.logical_position < 0 ||
+                    (!first && cell.destination_physical_cell <= previous_physical)) {
                     return false;
                 }
-                const uint32_t page =
-                    cell.physical_cell / VBR_GENERATION_PAGE_CELLS;
-                uint32_t generation = 1;
-                if (plan.transition ==
-                        vbr_tracker_install_transition::native_clone) {
-                    const auto page_ref = std::find_if(
-                        source_stream->pages.begin(), source_stream->pages.end(),
-                        [&](const vbr_generation_page_ref & value) {
-                            return value.page_index == page;
-                        });
-                    if (page_ref == source_stream->pages.end() ||
-                        page_ref->captured_page_gen == 0 ||
-                        (page_ref->covered_mask[
-                            (cell.physical_cell % VBR_GENERATION_PAGE_CELLS)/64] &
-                         (uint64_t(1) <<
-                            (cell.physical_cell % 64))) == 0) {
-                        return false;
-                    }
-                    generation = page_ref->captured_page_gen;
-                }
-                const auto installed = std::make_pair(
-                    placement.stream_index, cell.physical_cell);
-                if (!installed_cells.insert(installed).second) {
-                    if (stream.cell_last_dependency_gen[cell.physical_cell] !=
-                            generation ||
-                        stream.cell_last_membership_seq[cell.physical_cell] !=
-                            destination) {
-                        return false;
-                    }
-                    continue;
-                }
+                first = false;
+                previous_physical = cell.destination_physical_cell;
+                const uint32_t physical = cell.destination_physical_cell;
+                const uint32_t page = physical / VBR_GENERATION_PAGE_CELLS;
+                constexpr uint32_t generation = 1;
                 stream.page_event_gen[page] =
                     std::max(stream.page_event_gen[page], generation);
                 stream.page_last_import_gen[page] =
                     std::max(stream.page_last_import_gen[page], generation);
-                stream.cell_last_dependency_gen[cell.physical_cell] = generation;
-                stream.cell_last_membership_gen[cell.physical_cell] = generation;
+                stream.cell_last_dependency_gen[physical] = generation;
+                stream.cell_last_membership_gen[physical] = generation;
                 const uint16_t provenance = pack_provenance(
                     vbr_mutation_family::import,
                     vbr_operation_class::state_api);
-                stream.cell_dependency_provenance[cell.physical_cell] = provenance;
-                stream.cell_membership_provenance[cell.physical_cell] = provenance;
-                stream.cell_last_membership_seq[cell.physical_cell] =
+                stream.cell_dependency_provenance[physical] = provenance;
+                stream.cell_membership_provenance[physical] = provenance;
+                stream.cell_last_membership_seq[physical] =
                     static_cast<int16_t>(destination);
-                const auto handle = import_extents[placement.stream_index];
-                stream.cell_dependency_extent[cell.physical_cell] =
-                    extents_.add_ref(handle);
-                stream.cell_membership_extent[cell.physical_cell] =
-                    extents_.add_ref(handle);
-                if (!stream.cell_dependency_extent[cell.physical_cell] ||
-                    !stream.cell_membership_extent[cell.physical_cell]) {
+                stream.cell_dependency_extent[physical] = extents_.add_ref(handle);
+                stream.cell_membership_extent[physical] = extents_.add_ref(handle);
+                if (!stream.cell_dependency_extent[physical] ||
+                    !stream.cell_membership_extent[physical]) {
                     return false;
                 }
-                set_range_bit(stream.cell_dependency_in_range,
-                              cell.physical_cell, true);
-                set_range_bit(stream.cell_membership_in_range,
-                              cell.physical_cell, true);
+                set_range_bit(stream.cell_dependency_in_range, physical, true);
+                set_range_bit(stream.cell_membership_in_range, physical, true);
+            }
+        } else {
+            std::set<std::pair<uint32_t, uint32_t>> installed_cells;
+            for (const auto & placement : *placements) {
+                if (placement.child_id != plan.child_id ||
+                    placement.stream_index >= next->streams.size()) {
+                    return false;
+                }
+                const auto source_stream = std::find_if(
+                    source.streams.begin(), source.streams.end(),
+                    [&](const vbr_checkpoint_generation_stream & value) {
+                        return value.stream_index == placement.stream_index;
+                    });
+                if (source_stream == source.streams.end()) {
+                    return false;
+                }
+                auto & stream = next->streams[placement.stream_index];
+                for (const auto & cell : placement.cells) {
+                    if (cell.physical_cell >= n_cells_) {
+                        return false;
+                    }
+                    const uint32_t page =
+                        cell.physical_cell / VBR_GENERATION_PAGE_CELLS;
+                    uint32_t generation = 1;
+                    if (plan.transition ==
+                            vbr_tracker_install_transition::native_clone) {
+                        const auto page_ref = std::find_if(
+                            source_stream->pages.begin(), source_stream->pages.end(),
+                            [&](const vbr_generation_page_ref & value) {
+                                return value.page_index == page;
+                            });
+                        if (page_ref == source_stream->pages.end() ||
+                            page_ref->captured_page_gen == 0 ||
+                            (page_ref->covered_mask[
+                                (cell.physical_cell % VBR_GENERATION_PAGE_CELLS)/64] &
+                             (uint64_t(1) <<
+                                (cell.physical_cell % 64))) == 0) {
+                            return false;
+                        }
+                        generation = page_ref->captured_page_gen;
+                    }
+                    const auto installed = std::make_pair(
+                        placement.stream_index, cell.physical_cell);
+                    if (!installed_cells.insert(installed).second) {
+                        if (stream.cell_last_dependency_gen[cell.physical_cell] !=
+                                generation ||
+                            stream.cell_last_membership_seq[cell.physical_cell] !=
+                                destination) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    stream.page_event_gen[page] =
+                        std::max(stream.page_event_gen[page], generation);
+                    stream.page_last_import_gen[page] =
+                        std::max(stream.page_last_import_gen[page], generation);
+                    stream.cell_last_dependency_gen[cell.physical_cell] = generation;
+                    stream.cell_last_membership_gen[cell.physical_cell] = generation;
+                    const uint16_t provenance = pack_provenance(
+                        vbr_mutation_family::import,
+                        vbr_operation_class::state_api);
+                    stream.cell_dependency_provenance[cell.physical_cell] = provenance;
+                    stream.cell_membership_provenance[cell.physical_cell] = provenance;
+                    stream.cell_last_membership_seq[cell.physical_cell] =
+                        static_cast<int16_t>(destination);
+                    const auto handle = import_extents[placement.stream_index];
+                    stream.cell_dependency_extent[cell.physical_cell] =
+                        extents_.add_ref(handle);
+                    stream.cell_membership_extent[cell.physical_cell] =
+                        extents_.add_ref(handle);
+                    if (!stream.cell_dependency_extent[cell.physical_cell] ||
+                        !stream.cell_membership_extent[cell.physical_cell]) {
+                        return false;
+                    }
+                    set_range_bit(stream.cell_dependency_in_range,
+                                  cell.physical_cell, true);
+                    set_range_bit(stream.cell_membership_in_range,
+                                  cell.physical_cell, true);
+                }
             }
         }
 

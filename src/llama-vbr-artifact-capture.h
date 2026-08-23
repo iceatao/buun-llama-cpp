@@ -23,6 +23,12 @@ static constexpr uint64_t VBR_CAPTURE_PINNED_RING_MAX_BYTES =
 // only the chunks they cite plus a bounded proof.
 static constexpr uint32_t VBR_CAPTURE_RANGE_CHUNK_BYTES = 64*1024;
 
+// Canonical equality for the immutable controller-policy currency carried by
+// capture, artifact, and occupied-replacement capabilities.
+bool vbr_artifact_controller_policy_equal(
+    const vbr_artifact_controller_policy & lhs,
+    const vbr_artifact_controller_policy & rhs) noexcept;
+
 enum class vbr_capture_stream_status : uint8_t {
     ok = 0,
     invalid_argument,

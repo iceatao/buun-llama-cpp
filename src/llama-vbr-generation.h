@@ -14,6 +14,7 @@
 struct vbr_artifact_stream_placement;
 struct vbr_tracker_install_child;
 struct vbr_generation_stream_state;
+class vbr_occupied_replacement_guard;
 
 class vbr_tracker_import_image {
   public:
@@ -234,6 +235,15 @@ class vbr_generation_tracker {
         llama_seq_id destination,
         const std::vector<vbr_artifact_stream_placement> & placements,
         vbr_tracker_import_image & output) noexcept;
+    // Occupied replacement already owns a canonical, strictly ordered cell
+    // map.  Consume it in place instead of cloning a million-cell placement
+    // and rebuilding uniqueness through a node-allocating set.
+    bool prepare_relocated_import_image(
+        const vbr_tracker_install_child & plan,
+        const vbr_checkpoint_generation_controller & source,
+        llama_seq_id destination,
+        const vbr_occupied_replacement_guard & replacement,
+        vbr_tracker_import_image & output) noexcept;
     bool import_image_installable(
         const vbr_tracker_import_image & image,
         vbr_operation_id operation_id) const noexcept;
@@ -253,6 +263,13 @@ class vbr_generation_tracker {
     vbr_unit_generation unit_generation(uint32_t unit) const;
 
   private:
+    bool prepare_import_image_impl(
+        const vbr_tracker_install_child & plan,
+        const vbr_checkpoint_generation_controller & source,
+        llama_seq_id destination,
+        const std::vector<vbr_artifact_stream_placement> * placements,
+        const vbr_occupied_replacement_guard * replacement,
+        vbr_tracker_import_image & output) noexcept;
     friend struct vbr_generation_event;
     bool reset_page_generations_before_wrap();
     bool reset_unit_generations_before_wrap();

@@ -5,6 +5,7 @@
 #include "llama-vbr-artifact-catalog.h"
 #include "llama-vbr-operation.h"
 #include "llama-vbr-downward.h"
+#include "llama-vbr-occupied-replacement.h"
 #include "llama-vbr-upward.h"
 
 #include <algorithm>
@@ -13,6 +14,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+struct vbr_explicit_representation_identity;
 
 // F4.1b is a pure evidence classifier. A decision describes the honest next
 // action; the validation status separately says whether the evidence was
@@ -356,6 +359,12 @@ struct vbr_adopt_policy {
     using target_recheck_fn = bool (*)(
         const void * context,
         const vbr_target_empty_fingerprint & expected) noexcept;
+    using representation_identity_fn = bool (*)(
+        const void * context,
+        int32_t current_type,
+        bool value_side,
+        int32_t meansub_model_id,
+        vbr_explicit_representation_identity & output) noexcept;
     using parse_companion_fn = bool (*)(
         const void * context,
         const vbr_artifact_companion_payload & descriptor,
@@ -392,6 +401,12 @@ struct vbr_adopt_policy {
     serial_fn read_accounting_serial = nullptr;
     serial_fn read_policy_epoch = nullptr;
     transform_digest_fn read_transform_tree_digest = nullptr;
+    // Optional one-shot authority for the narrow occupied-target importer.
+    // Validation consumes it only after proving the exact singleton/full-
+    // artifact envelope; ordinary construction-empty imports leave it null.
+    vbr_occupied_replacement_guard * occupied_replacement = nullptr;
+    const void * occupied_representation_context = nullptr;
+    representation_identity_fn occupied_representation_identity = nullptr;
 };
 
 struct vbr_child_empty_fingerprint {
@@ -579,12 +594,25 @@ public:
     bool projection_transfer_ready() const noexcept {
         return source_projection_ && source_projection_.transfer_ready();
     }
+    bool is_occupied_replacement() const noexcept {
+        return occupied_replacement_ != nullptr;
+    }
+    const vbr_occupied_replacement_guard * occupied_replacement() const noexcept {
+        return occupied_replacement_.get();
+    }
+    const std::vector<vbr_occupied_replacement_relocation_run> &
+    relocation_runs() const noexcept {
+        static const std::vector<vbr_occupied_replacement_relocation_run> empty;
+        return occupied_replacement_
+            ? occupied_replacement_->relocation_runs() : empty;
+    }
 
 private:
     vbr_validated_manifest() = default;
 
     vbr_artifact_package_view source_lease_;
     vbr_artifact_attention_prefix_projection source_projection_;
+    std::unique_ptr<vbr_occupied_replacement_guard> occupied_replacement_;
     vbr_import_decision decision_ = vbr_import_decision::reject;
     vbr_target_empty_fingerprint target_;
     vbr_manifest_digest manifest_digest_;
@@ -603,6 +631,9 @@ private:
     vbr_adopt_policy::serial_fn read_policy_epoch_ = nullptr;
     vbr_adopt_policy::transform_digest_fn
         read_transform_tree_digest_ = nullptr;
+    const void * occupied_representation_context_ = nullptr;
+    vbr_adopt_policy::representation_identity_fn
+        occupied_representation_identity_ = nullptr;
 
     friend struct vbr_manifest_validation_result;
     friend vbr_manifest_validation_result vbr_validate_unit_manifest(

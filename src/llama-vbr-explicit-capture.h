@@ -3,10 +3,12 @@
 #include "llama-vbr-artifact-catalog.h"
 #include "llama-vbr-checkpoint-types.h"
 #include "llama-vbr-generation.h"
+#include "llama-vbr-occupied-replacement.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 class llama_memory_i;
@@ -20,12 +22,41 @@ struct vbr_import_schedule_unit;
 struct vbr_explicit_representation_identity;
 enum class vbr_import_schedule_status : uint8_t;
 
-using vbr_explicit_representation_identity_fn = bool (*)(
-    const void * context,
-    int32_t current_type,
-    bool value_side,
-    int32_t meansub_model_id,
-    vbr_explicit_representation_identity & output) noexcept;
+
+// Production factory: one allocating tree/snapshot pass while the incumbent
+// remains untouched, followed by an allocation-free direct KV recheck.
+vbr_occupied_replacement_guard_status
+vbr_explicit_prepare_occupied_replacement_guard(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & incoming,
+    const vbr_artifact_package_view & recovery,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_occupied_replacement_guard & output) noexcept;
+
+vbr_occupied_replacement_guard_status
+vbr_explicit_recheck_occupied_replacement_guard(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_occupied_replacement_guard & guard) noexcept;
+
+// Barrier form: permits only the exact import operation that already armed
+// this same cache. The ordinary overload remains pre-arm-only.
+vbr_occupied_replacement_guard_status
+vbr_explicit_recheck_occupied_replacement_guard(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_operation_id active_import_operation,
+    vbr_occupied_replacement_guard & guard) noexcept;
 
 enum class vbr_explicit_capture_status : uint8_t {
     ok = 0,

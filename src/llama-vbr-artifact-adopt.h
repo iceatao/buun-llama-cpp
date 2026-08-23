@@ -160,11 +160,22 @@ class vbr_adopt_test_seam {
     virtual bool session_recheck(
         uint32_t child_id, const vbr_child_empty_fingerprint & expected,
         bool journal_armed) const noexcept = 0;
+    virtual bool session_recheck_occupied(
+        uint32_t, const vbr_occupied_replacement_guard &,
+        bool) const noexcept {
+        return false;
+    }
     virtual bool session_arm(
         uint32_t child_id, vbr_operation_id operation) noexcept = 0;
     virtual bool session_prepare_backing(
         uint32_t child_id,
         const std::vector<const vbr_validated_child_plan *> & plans) noexcept = 0;
+    virtual bool session_prepare_relocated_backing(
+        uint32_t,
+        const std::vector<const vbr_validated_child_plan *> &,
+        const std::vector<vbr_occupied_replacement_relocation_run> &) noexcept {
+        return false;
+    }
     virtual bool session_transfer(
         uint32_t child_id, const vbr_staged_read_descriptor & read,
         uint64_t fail_completion, vbr_h2d_stats & stats) noexcept = 0;
@@ -208,6 +219,14 @@ class vbr_adopt_test_seam {
         const std::vector<const vbr_validated_child_plan *> & plans,
         const vbr_tracker_install_child & tracker_plan,
         const vbr_checkpoint_generation_controller & source) noexcept = 0;
+    virtual bool session_build_relocated_live_image(
+        uint32_t,
+        const std::vector<const vbr_validated_child_plan *> &,
+        const vbr_tracker_install_child &,
+        const vbr_checkpoint_generation_controller &,
+        const vbr_occupied_replacement_guard &) noexcept {
+        return false;
+    }
     // Test-only ownership mirror for the production shared receipt group. The
     // opaque shared owner lets the model-free real phase driver retain claims
     // across a successful adopt and release them at its simulated erase.

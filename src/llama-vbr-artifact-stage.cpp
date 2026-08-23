@@ -762,6 +762,62 @@ bool stage_projection_child(
     return true;
 }
 
+template<class AppendRead>
+bool stage_relocated_child(
+        const vbr_validated_child_plan & child,
+        const std::vector<vbr_occupied_replacement_relocation_run> & runs,
+        const std::vector<vbr_h2d_lane_binding> & lanes,
+        AppendRead && append_read,
+        vbr_adopt_stage_status & failure) {
+    for (const auto & shard : child.shards) {
+        const uint32_t lane = find_lane(lanes, shard.domain);
+        if (lane >= lanes.size() || !shard.source || shard.row_bytes == 0) {
+            failure = vbr_adopt_stage_status::source_unavailable;
+            return false;
+        }
+        const auto digest = vbr_capture_stream_digest(*shard.source);
+        if (!digest_nonzero(digest)) {
+            failure = vbr_adopt_stage_status::source_hash_mismatch;
+            return false;
+        }
+        for (const auto & run : runs) {
+            if (run.first_source_packed_row > UINT64_MAX/shard.row_bytes ||
+                uint64_t(run.first_destination_physical_cell) >
+                    UINT64_MAX/shard.row_bytes ||
+                uint64_t(run.cell_count) > UINT64_MAX/shard.row_bytes) {
+                failure = vbr_adopt_stage_status::source_unavailable;
+                return false;
+            }
+            const uint64_t source_offset =
+                run.first_source_packed_row*shard.row_bytes;
+            const uint64_t destination_offset =
+                uint64_t(run.first_destination_physical_cell)*shard.row_bytes;
+            const uint64_t size = uint64_t(run.cell_count)*shard.row_bytes;
+            if (run.cell_count == 0 || source_offset > shard.payload_bytes ||
+                size > shard.payload_bytes-source_offset) {
+                failure = vbr_adopt_stage_status::source_unavailable;
+                return false;
+            }
+            vbr_staged_read_descriptor read;
+            read.kind = vbr_staged_read_kind::unit_payload;
+            read.child_id = child.child_id;
+            read.logical_unit_id = child.logical_unit_id;
+            read.shard_index = shard.shard_index;
+            read.lane = lane;
+            read.size = size;
+            read.source = shard.source;
+            read.verified_digest = digest;
+            read.destination_offset = destination_offset;
+            read.projection_ranges.push_back({ source_offset, size });
+            if (!append_read(std::move(read))) {
+                failure = vbr_adopt_stage_status::source_hash_mismatch;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 vbr_adopt_stage_result vbr_stage_validated_manifest(
@@ -817,6 +873,8 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             return out;
         }
         const bool prefix_projection = out.manifest->is_prefix_projection();
+        const bool occupied_replacement =
+            out.manifest->is_occupied_replacement();
         if (prefix_projection) {
             if (!out.manifest->projection_transfer_ready() ||
                 out.manifest->decision() ==
@@ -899,6 +957,10 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             const bool staged = prefix_projection
                 ? stage_projection_child(
                     child, policy.lanes, append_read, out.status)
+                : occupied_replacement
+                    ? stage_relocated_child(
+                        child, out.manifest->relocation_runs(), policy.lanes,
+                        append_read, out.status)
                 : stage_child(
                     child, out.manifest->source_package(), policy.lanes,
                     append_read, out.status);

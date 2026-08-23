@@ -5150,6 +5150,20 @@ static void test_prompt_cache_vbr_longest_feasible_restore_selection() {
     run(10, false);
 }
 
+class occupied_replacement_fallback final :
+        public server_cache_lease_fallback_provider {
+public:
+    server_cache_durable_fallback_proof acquire(
+            const server_cache_lease_subject &,
+            const server_cache_lease_identity &) noexcept override {
+        return server_cache_durable_fallback_proof_for_test(
+            server_cache_lease_fallback_state::available, owner_);
+    }
+
+private:
+    std::shared_ptr<void> owner_ = std::make_shared<int>(1);
+};
+
 static void test_prompt_cache_vbr_atomic_logical_publication() {
     static_assert(!std::is_copy_constructible_v<
         server_prompt_cache_vbr_restore_candidate>);
@@ -5159,6 +5173,14 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         server_prompt_cache_vbr_restore_candidate>);
     static_assert(std::is_nothrow_move_assignable_v<
         server_prompt_cache_vbr_restore_candidate>);
+    static_assert(!std::is_copy_constructible_v<
+        server_prompt_cache_vbr_replacement_ticket>);
+    static_assert(!std::is_copy_assignable_v<
+        server_prompt_cache_vbr_replacement_ticket>);
+    static_assert(std::is_nothrow_move_constructible_v<
+        server_prompt_cache_vbr_replacement_ticket>);
+    static_assert(std::is_nothrow_move_assignable_v<
+        server_prompt_cache_vbr_replacement_ticket>);
     static_assert(!std::is_copy_constructible_v<
         server_prompt_cache_vbr_publication_metadata>);
     static_assert(std::is_nothrow_move_constructible_v<
@@ -5201,6 +5223,8 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     auto payload = server_prompt_cache_payload::from_vbr(owner);
 
     server_cache_authority authority;
+    occupied_replacement_fallback replacement_fallback;
+    authority.leases.bind_fallback_provider(&replacement_fallback);
     server_retention_sidecar_store retention;
     retention.configure(&fixture.ledger, fixture.host, &authority.leases);
     CHECK(retention.enable_prefix_tracking());
@@ -6001,6 +6025,405 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(retention.artifact_id(host_key).v != 0);
     retention.abandon_prepared_launch(restored_live_key);
     retention.retire(restored_live_key);
+
+    // Occupied replacement preparation is independently rollback-safe. The
+    // incoming artifact improves the live LCP, while a second exact durable
+    // VBR host protects recovery of the current prompt. The ticket prepares a
+    // private launch association and never overwrites the canonical slot.
+    server_prompt incumbent_prompt;
+    incumbent_prompt.tokens = server_tokens(
+        llama_tokens { 101, 999 }, false);
+    incumbent_prompt.sequence_epoch = prompt.sequence_epoch;
+    common_cache_family_binding incumbent_family {
+        common_cache_family_id { 88 }, common_cache_family_role::branch,
+    };
+    constexpr int32_t recovery_source_slot = 30;
+    constexpr int32_t replacement_slot = 31;
+    const auto recovery_source_key =
+        server_retention_instance_key::for_slot(recovery_source_slot);
+    const auto replacement_slot_key =
+        server_retention_instance_key::for_slot(replacement_slot);
+    common_chat_msg_spans recovery_spans;
+    recovery_spans.add(
+        COMMON_CHAT_ROLE_USER, 0, incumbent_prompt.n_tokens());
+    CHECK(retention.publish(
+        recovery_source_key, common_retention_pool::attention,
+        recovery_spans, true, incumbent_prompt.n_tokens(),
+        incumbent_prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        retention, recovery_source_key, incumbent_prompt,
+        fixture.package.manifest.identity.adapter_config_identity,
+        incumbent_prompt.n_tokens()));
+    CHECK(retention.clone(recovery_source_key, replacement_slot_key));
+    CHECK(retention.clone_prefix(
+        recovery_source_key, replacement_slot_key));
+    const auto grant_incumbent_soft = [&]() {
+        server_cache_lease_identity identity;
+        CHECK(server_cache_lease_build_identity(
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            incumbent_prompt.tokens, incumbent_prompt.n_tokens(), identity));
+        const server_cache_lease_subject subject {
+            retention.artifact_id(replacement_slot_key),
+            common_retention_artifact_kind::live_slot,
+            replacement_slot,
+        };
+        const auto lease = authority.leases.grant_soft(
+            subject,
+            server_cache_lease_scope::from(
+                authority.leases.new_context_scope()),
+            identity, UINT64_MAX / 2);
+        CHECK(lease);
+        return lease;
+    };
+    auto incumbent_soft = grant_incumbent_soft();
+    const auto original_incumbent_artifact =
+        retention.artifact_id(replacement_slot_key);
+    const auto original_incumbent_tokens =
+        incumbent_prompt.tokens.retention_token_ids();
+
+    // The live sidecar alone is not a recovery source. Preparation refuses
+    // until a matching immutable VBR host node exists.
+    {
+        server_prompt_cache_vbr_restore_candidate missing_recovery;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            missing_recovery));
+        server_prompt_cache_vbr_replacement_ticket refused;
+        CHECK(!cache.prepare_vbr_occupied_replacement(
+            std::move(missing_recovery), incumbent_prompt,
+            incumbent_family, replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            refused));
+        CHECK(!refused.ready());
+        CHECK(retention.artifact_id(replacement_slot_key) ==
+            original_incumbent_artifact);
+    }
+
+    // Publish a genuinely distinct immutable package for the incumbent. The
+    // recovery host must not borrow the incoming package merely because its
+    // scalar frontier happens to have the same length and position.
+    auto recovery_package = make_package(fixture.storage);
+    recovery_package.manifest.identity.token_count = incumbent_prompt.n_tokens();
+    recovery_package.manifest.identity.next_position =
+        incumbent_prompt.tokens.pos_next();
+    CHECK(incumbent_prompt.tokens.media_content_identity(
+        incumbent_prompt.n_tokens(),
+        recovery_package.manifest.identity.media_content_identity));
+    recovery_package.manifest.token_block.tokens =
+        incumbent_prompt.tokens.retention_token_ids();
+    const auto recovery_published = publish_fixture(
+        *fixture.catalog, recovery_package, fixture.completions(),
+        fixture.budget);
+    CHECK(recovery_published.status ==
+              llama_vbr_artifact_publish_status::published ||
+          recovery_published.status ==
+              llama_vbr_artifact_publish_status::adopted);
+    vbr_artifact_package_view recovery_view;
+    CHECK(fixture.catalog->resolve_reference(
+              recovery_published.reference_artifact, recovery_view) ==
+          vbr_artifact_resolve_status::ok);
+    auto recovery_payload_owner =
+        server_prompt_cache_vbr_payload::adopt(std::move(recovery_view));
+    CHECK(recovery_payload_owner);
+    CHECK(recovery_payload_owner->reference_artifact() !=
+          owner->reference_artifact());
+    auto recovery_payload = server_prompt_cache_payload::from_vbr(
+        recovery_payload_owner);
+    server_prompt_cache_vbr_publication_metadata recovery_metadata;
+    CHECK(cache.prepare_vbr_publication_metadata(
+        incumbent_prompt,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        recovery_source_slot, recovery_metadata));
+    server_prompt_cache::iterator recovery_logical;
+    CHECK(cache.publish_vbr(
+        recovery_metadata, recovery_payload, incumbent_family, false,
+        &recovery_logical));
+    CHECK(recovery_logical != cache.states.end());
+    CHECK(cache.states.size() == 2);
+    const auto recovery_host_key =
+        server_retention_instance_key::for_host_entry(&*recovery_logical);
+    CHECK(retention.artifact_id(recovery_host_key).v != 0);
+    CHECK(recovery_logical->payload.vbr_compact_owner()->reference_artifact() ==
+          recovery_published.reference_artifact);
+
+    // A state prompt cannot launder a different sealed token block into a
+    // recovery capability. This simulates a corrupted host association while
+    // retaining the real incumbent publication for the positive path below.
+    {
+        const auto saved_recovery_payload = recovery_logical->payload;
+        recovery_logical->payload = payload;
+        server_prompt_cache_vbr_restore_candidate mismatched_recovery;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            mismatched_recovery));
+        server_prompt_cache_vbr_replacement_ticket refused;
+        server_prompt_cache_vbr_replacement_diagnostics diagnostics;
+        CHECK(!cache.prepare_vbr_occupied_replacement(
+            std::move(mismatched_recovery), incumbent_prompt,
+            incumbent_family, replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            refused, &diagnostics));
+        CHECK(!refused.ready());
+        CHECK(diagnostics.recovery_digest_matches == 1);
+        CHECK(diagnostics.recovery_raw_token_comparisons == 1);
+        recovery_logical->payload = saved_recovery_payload;
+    }
+
+    // Digest-first recovery discovery remains one state-list pass and performs
+    // exactly one collision-defensive raw comparison at the unique match,
+    // independent of host-cache scale.
+    {
+        server_prompt_cache_vbr_restore_candidate scale_candidate;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            scale_candidate));
+        auto first_decoy = cache.states.end();
+        constexpr size_t recovery_scale = 8192;
+        for (size_t i = 0; i < recovery_scale; ++i) {
+            cache.states.emplace_back();
+            auto decoy = std::prev(cache.states.end());
+            if (first_decoy == cache.states.end()) {
+                first_decoy = decoy;
+            }
+            decoy->prompt.tokens = server_tokens(
+                llama_tokens { 101, llama_token(10000 + i) }, false);
+            decoy->prompt.sequence_epoch = incumbent_prompt.sequence_epoch;
+            decoy->payload = payload;
+            decoy->adapter_config_key =
+                fixture.package.manifest.identity.adapter_config_identity;
+            decoy->vbr_execution_identity =
+                fixture.package.manifest.identity.execution_identity;
+            decoy->cache_family = incumbent_family;
+            std::array<uint8_t, 32> warmed_digest = {};
+            CHECK(decoy->prompt.tokens.retention_token_digest(warmed_digest));
+        }
+        server_prompt_cache_vbr_replacement_ticket scale_ticket;
+        server_prompt_cache_vbr_replacement_diagnostics diagnostics;
+        CHECK(cache.prepare_vbr_occupied_replacement(
+            std::move(scale_candidate), incumbent_prompt, incumbent_family,
+            replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            scale_ticket, &diagnostics));
+        CHECK(scale_ticket.ready());
+        CHECK(diagnostics.recovery_states_visited == cache.states.size());
+        CHECK(diagnostics.recovery_digest_matches == 1);
+        CHECK(diagnostics.recovery_raw_token_comparisons == 1);
+        scale_ticket = {};
+        cache.states.erase(first_decoy, cache.states.end());
+        CHECK(cache.states.size() == 2);
+    }
+
+    // A stale host association cannot be substituted by token equality.
+    retention.retire(recovery_host_key);
+    {
+        server_prompt_cache_vbr_restore_candidate stale_recovery;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            stale_recovery));
+        server_prompt_cache_vbr_replacement_ticket refused;
+        CHECK(!cache.prepare_vbr_occupied_replacement(
+            std::move(stale_recovery), incumbent_prompt,
+            incumbent_family, replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            refused));
+    }
+    CHECK(retention.clone(recovery_source_key, recovery_host_key));
+    CHECK(retention.clone_prefix(recovery_source_key, recovery_host_key));
+
+    // Equal and worse live LCPs are rejected before any recovery/provisional
+    // state is acquired.
+    {
+        server_prompt equal_prompt = prompt.clone();
+        server_prompt_cache_vbr_restore_candidate equal;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            equal));
+        server_prompt_cache_vbr_replacement_ticket refused;
+        CHECK(!cache.prepare_vbr_occupied_replacement(
+            std::move(equal), equal_prompt, incumbent_family,
+            replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            refused));
+        server_prompt worse_prompt;
+        worse_prompt.tokens = server_tokens(
+            llama_tokens { 101, 102, 555 }, false);
+        worse_prompt.sequence_epoch = prompt.sequence_epoch;
+        server_prompt_cache_vbr_restore_candidate worse;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            worse));
+        CHECK(!cache.prepare_vbr_occupied_replacement(
+            std::move(worse), worse_prompt, incumbent_family,
+            replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            refused));
+    }
+
+    const uint32_t incoming_pins_before = logical->recovery_pins;
+    const uint32_t recovery_pins_before = recovery_logical->recovery_pins;
+    const uint64_t replacement_ops_before =
+        fixture.ledger.snapshot().live_ops;
+    server_prompt_cache_vbr_restore_candidate replacement_candidate;
+    CHECK(cache.prepare_vbr_restore(
+        extended,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        replacement_candidate));
+    server_prompt_cache_vbr_replacement_ticket replacement_ticket;
+    CHECK(cache.prepare_vbr_occupied_replacement(
+        std::move(replacement_candidate), incumbent_prompt,
+        incumbent_family, replacement_slot,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        replacement_ticket));
+    CHECK(replacement_ticket.ready());
+    CHECK(replacement_ticket.destination_slot() == replacement_slot);
+    CHECK(replacement_ticket.incoming_prefix_tokens() == 2);
+    CHECK(replacement_ticket.incumbent_tokens() == 2);
+    CHECK(replacement_ticket.incumbent_live_lcp() == 1);
+    CHECK(replacement_ticket.replacement_prompt().tokens.
+        retention_token_ids() == prompt.tokens.retention_token_ids());
+    CHECK(replacement_ticket.incumbent_artifact() ==
+        original_incumbent_artifact);
+    CHECK(replacement_ticket.incoming_owner_artifact().v != 0);
+    CHECK(replacement_ticket.recovery_owner_artifact().v != 0);
+    CHECK(replacement_ticket.recovery_host_artifact().v != 0);
+    CHECK(replacement_ticket.provisional_artifact().v != 0);
+    CHECK(replacement_ticket.provisional_artifact() !=
+        replacement_ticket.incumbent_artifact());
+    CHECK(fixture.ledger.snapshot().live_ops ==
+        replacement_ops_before + 1);
+    CHECK(logical->recovery_pins == incoming_pins_before + 1);
+    CHECK(recovery_logical->recovery_pins == recovery_pins_before + 1);
+    CHECK(incumbent_prompt.tokens.retention_token_ids() ==
+        original_incumbent_tokens);
+    CHECK(retention.artifact_id(replacement_slot_key) ==
+        original_incumbent_artifact);
+
+    server_prompt_cache_vbr_replacement_ticket moved_replacement(
+        std::move(replacement_ticket));
+    CHECK(!replacement_ticket.ready());
+    CHECK(moved_replacement.ready());
+    CHECK(logical->recovery_pins == incoming_pins_before + 1);
+    CHECK(recovery_logical->recovery_pins == recovery_pins_before + 1);
+
+    server_cache_lease_identity hard_identity;
+    CHECK(server_cache_lease_build_identity(
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        incumbent_prompt.tokens, incumbent_prompt.n_tokens(), hard_identity));
+    const server_cache_lease_subject hard_subject {
+        retention.artifact_id(replacement_slot_key),
+        common_retention_artifact_kind::live_slot,
+        replacement_slot,
+    };
+    CHECK(authority.leases.release(incumbent_soft));
+    incumbent_soft = {};
+    const auto hard_lease = authority.leases.grant_hard(
+        hard_subject,
+        server_cache_lease_scope::from(
+            authority.leases.new_context_scope()),
+        hard_identity, UINT64_MAX / 2);
+    CHECK(hard_lease);
+    CHECK(!moved_replacement.ready());
+    {
+        server_prompt_cache_vbr_restore_candidate hard_blocked;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            hard_blocked));
+        server_prompt_cache_vbr_replacement_ticket refused;
+        CHECK(!cache.prepare_vbr_occupied_replacement(
+            std::move(hard_blocked), incumbent_prompt,
+            incumbent_family, replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            refused));
+    }
+    CHECK(authority.leases.release(hard_lease));
+    CHECK(moved_replacement.ready());
+
+    // Replacing the canonical sidecar association creates a new immutable
+    // artifact identity. The old ticket fails its ABA recheck and reset
+    // removes only its private provisional association.
+    const auto stale_provisional = moved_replacement.provisional_artifact();
+    retention.retire(replacement_slot_key);
+    CHECK(retention.clone(recovery_source_key, replacement_slot_key));
+    CHECK(retention.clone_prefix(
+        recovery_source_key, replacement_slot_key));
+    CHECK(retention.artifact_id(replacement_slot_key) !=
+        original_incumbent_artifact);
+    CHECK(!moved_replacement.ready());
+    moved_replacement = {};
+    CHECK(retention.artifact_id(replacement_slot_key).v != 0);
+    CHECK(retention.artifact_id(replacement_slot_key) != stale_provisional);
+    CHECK(logical->recovery_pins == incoming_pins_before);
+    CHECK(recovery_logical->recovery_pins == recovery_pins_before);
+    CHECK(fixture.ledger.snapshot().live_ops == replacement_ops_before);
+    incumbent_soft = grant_incumbent_soft();
+
+    // Both host nodes remain physically present under impossible cache
+    // pressure while the fresh ticket holds its independent pins.
+    {
+        server_prompt_cache_vbr_restore_candidate pinned_candidate;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            pinned_candidate));
+        server_prompt_cache_vbr_replacement_ticket pinned_ticket;
+        CHECK(cache.prepare_vbr_occupied_replacement(
+            std::move(pinned_candidate), incumbent_prompt,
+            incumbent_family, replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            pinned_ticket));
+        CHECK(pinned_ticket.ready());
+        cache.limit_tokens = 1;
+        cache.update();
+        CHECK(cache.states.size() == 2);
+        CHECK(pinned_ticket.ready());
+        CHECK(incumbent_prompt.tokens.retention_token_ids() ==
+            original_incumbent_tokens);
+        CHECK(retention.artifact_id(replacement_slot_key).v != 0);
+        cache.limit_tokens = 0;
+    }
+    CHECK(logical->recovery_pins == incoming_pins_before);
+    CHECK(recovery_logical->recovery_pins == recovery_pins_before);
+    CHECK(incumbent_prompt.tokens.retention_token_ids() ==
+        original_incumbent_tokens);
+
+    CHECK(authority.leases.release(incumbent_soft));
+    retention.retire(replacement_slot_key);
+    retention.retire(recovery_source_key);
+    retention.retire(recovery_host_key);
+    cache.states.erase(recovery_logical);
+    recovery_payload = {};
+    recovery_payload_owner.reset();
+    CHECK(fixture.catalog->retire(recovery_published.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(cache.states.size() == 1);
 
     // Live rewind checkpoints are not part of the projected artifact. Their
     // presence must not exclude an ordinary-hybrid source, and the detached
