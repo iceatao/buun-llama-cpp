@@ -4,10 +4,26 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #endif
+#include "common.cuh"
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+
+static bool dflash_cuda_try(cudaError_t result, const char * operation) {
+    if (result == cudaSuccess) {
+        return true;
+    }
+    // These allocation/lifetime paths are intentionally fallible rather than
+    // CUDA_CHECK-fatal.  Still report the originating operation directly so a
+    // later checked call cannot inherit an anonymous sticky error.
+    int device = -1;
+    (void) cudaGetDevice(&device);
+    fprintf(stderr, "dflash CUDA error in %s on device %d: %s (%d)\n",
+            operation, device, cudaGetErrorString(result), (int) result);
+    fflush(stderr);
+    return false;
+}
 
 // GPU cross-attention ring buffer for DFlash speculative decoding.
 // Keeps per-layer ring buffers on GPU and interleaves them into the layout
@@ -57,7 +73,10 @@ extern "C" void * dflash_cross_ring_gpu_alloc(int n_layers, int n_embd, int ring
     }
 
     auto * ring = new dflash_cross_ring_gpu();
-    cudaGetDevice(&ring->device);
+    if (!dflash_cuda_try(cudaGetDevice(&ring->device), "cross-ring cudaGetDevice")) {
+        delete ring;
+        return nullptr;
+    }
     ring->n_layers  = n_layers;
     ring->n_embd    = n_embd;
     ring->ring_size = ring_size;
@@ -65,31 +84,57 @@ extern "C" void * dflash_cross_ring_gpu_alloc(int n_layers, int n_embd, int ring
     ring->h_layer_ptrs = new float*[n_layers];
     for (int l = 0; l < n_layers; l++) {
         cudaError_t err = cudaMalloc(&ring->h_layer_ptrs[l], (size_t)ring_size * n_embd * sizeof(float));
-        if (err != cudaSuccess) {
-            fprintf(stderr, "dflash gpu ring: cudaMalloc failed for layer %d: %s\n", l, cudaGetErrorString(err));
-            for (int j = 0; j < l; j++) cudaFree(ring->h_layer_ptrs[j]);
+        if (!dflash_cuda_try(err, "cross-ring layer cudaMalloc")) {
+            for (int j = 0; j < l; j++) {
+                (void) dflash_cuda_try(cudaFree(ring->h_layer_ptrs[j]), "cross-ring rollback cudaFree");
+            }
             delete[] ring->h_layer_ptrs;
             delete ring;
             return nullptr;
         }
-        cudaMemset(ring->h_layer_ptrs[l], 0, (size_t)ring_size * n_embd * sizeof(float));
+        if (!dflash_cuda_try(
+                cudaMemset(ring->h_layer_ptrs[l], 0,
+                    (size_t)ring_size * n_embd * sizeof(float)),
+                "cross-ring layer cudaMemset")) {
+            for (int j = 0; j <= l; j++) {
+                (void) dflash_cuda_try(cudaFree(ring->h_layer_ptrs[j]), "cross-ring rollback cudaFree");
+            }
+            delete[] ring->h_layer_ptrs;
+            delete ring;
+            return nullptr;
+        }
     }
 
     // device array of layer pointers
     cudaError_t err = cudaMalloc(&ring->d_layer_rings, n_layers * sizeof(float *));
-    if (err != cudaSuccess) {
-        for (int l = 0; l < n_layers; l++) cudaFree(ring->h_layer_ptrs[l]);
+    if (!dflash_cuda_try(err, "cross-ring pointer-table cudaMalloc")) {
+        for (int l = 0; l < n_layers; l++) {
+            (void) dflash_cuda_try(cudaFree(ring->h_layer_ptrs[l]), "cross-ring rollback cudaFree");
+        }
         delete[] ring->h_layer_ptrs;
         delete ring;
         return nullptr;
     }
-    cudaMemcpy(ring->d_layer_rings, ring->h_layer_ptrs, n_layers * sizeof(float *), cudaMemcpyHostToDevice);
+    if (!dflash_cuda_try(
+            cudaMemcpy(ring->d_layer_rings, ring->h_layer_ptrs,
+                n_layers * sizeof(float *), cudaMemcpyHostToDevice),
+            "cross-ring pointer-table cudaMemcpy")) {
+        (void) dflash_cuda_try(cudaFree(ring->d_layer_rings), "cross-ring rollback cudaFree");
+        for (int l = 0; l < n_layers; l++) {
+            (void) dflash_cuda_try(cudaFree(ring->h_layer_ptrs[l]), "cross-ring rollback cudaFree");
+        }
+        delete[] ring->h_layer_ptrs;
+        delete ring;
+        return nullptr;
+    }
 
     // staging buffer for interleaved output
     err = cudaMalloc(&ring->d_staging, (size_t)ring_size * n_layers * n_embd * sizeof(float));
-    if (err != cudaSuccess) {
-        cudaFree(ring->d_layer_rings);
-        for (int l = 0; l < n_layers; l++) cudaFree(ring->h_layer_ptrs[l]);
+    if (!dflash_cuda_try(err, "cross-ring staging cudaMalloc")) {
+        (void) dflash_cuda_try(cudaFree(ring->d_layer_rings), "cross-ring rollback cudaFree");
+        for (int l = 0; l < n_layers; l++) {
+            (void) dflash_cuda_try(cudaFree(ring->h_layer_ptrs[l]), "cross-ring rollback cudaFree");
+        }
         delete[] ring->h_layer_ptrs;
         delete ring;
         return nullptr;
@@ -107,10 +152,10 @@ extern "C" void dflash_cross_ring_gpu_free(void * handle) {
     if (!handle) return;
     auto * ring = (dflash_cross_ring_gpu *)handle;
 
-    cudaFree(ring->d_staging);
-    cudaFree(ring->d_layer_rings);
+    (void) dflash_cuda_try(cudaFree(ring->d_staging), "cross-ring staging cudaFree");
+    (void) dflash_cuda_try(cudaFree(ring->d_layer_rings), "cross-ring pointer-table cudaFree");
     for (int l = 0; l < ring->n_layers; l++) {
-        cudaFree(ring->h_layer_ptrs[l]);
+        (void) dflash_cuda_try(cudaFree(ring->h_layer_ptrs[l]), "cross-ring layer cudaFree");
     }
     delete[] ring->h_layer_ptrs;
     delete ring;
@@ -157,14 +202,16 @@ extern "C" void dflash_cross_ring_gpu_write(
 
     // Ensure cudaStreamPerThread belongs to the ring's device regardless of
     // which GPU the caller (target model decode) last set as current.
-    (void)cudaSetDevice(ring->device);
+    CUDA_CHECK(cudaSetDevice(ring->device));
 
     float * dst = ring->h_layer_ptrs[layer];
     const size_t stride = (size_t)n_embd * sizeof(float);
 
     ring_span_for_each(ring->ring_size, ring_pos, n_tokens, [&](int ring_tok, int src_tok, int n) {
-        cudaMemcpyAsync(dst + (size_t)ring_tok * n_embd, host_data + (size_t)src_tok * n_embd,
-                        (size_t)n * stride, cudaMemcpyHostToDevice, cudaStreamPerThread);
+        CUDA_CHECK(cudaMemcpyAsync(
+                dst + (size_t)ring_tok * n_embd,
+                host_data + (size_t)src_tok * n_embd,
+                (size_t)n * stride, cudaMemcpyHostToDevice, cudaStreamPerThread));
     });
 }
 
@@ -190,7 +237,7 @@ extern "C" void dflash_cross_ring_gpu_write_d2d(
         n_tokens  = ring->ring_size;
     }
 
-    (void)cudaSetDevice(ring->device);
+    CUDA_CHECK(cudaSetDevice(ring->device));
 
     float * dst = ring->h_layer_ptrs[layer];
     const size_t stride = (size_t)n_embd * sizeof(float);
@@ -212,14 +259,16 @@ extern "C" void dflash_cross_ring_gpu_read(
     if (layer < 0 || layer >= ring->n_layers) return;
     if (n_tokens <= 0 || n_tokens > ring->ring_size) return;
 
-    (void)cudaSetDevice(ring->device);
+    CUDA_CHECK(cudaSetDevice(ring->device));
 
     const float * src = ring->h_layer_ptrs[layer];
     const size_t stride = (size_t)n_embd * sizeof(float);
 
     ring_span_for_each(ring->ring_size, ring_pos, n_tokens, [&](int ring_tok, int dst_tok, int n) {
-        cudaMemcpy(host_dst + (size_t)dst_tok * n_embd, src + (size_t)ring_tok * n_embd,
-                   (size_t)n * stride, cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(
+                host_dst + (size_t)dst_tok * n_embd,
+                src + (size_t)ring_tok * n_embd,
+                (size_t)n * stride, cudaMemcpyDeviceToHost));
     });
 }
 
@@ -232,7 +281,7 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
     int cross_len = filled < ctx_window ? filled : ctx_window;
     if (cross_len <= 0) return nullptr;
 
-    (void)cudaSetDevice(ring->device);
+    CUDA_CHECK(cudaSetDevice(ring->device));
 
     int read_start = ((write_pos - cross_len) % ring->ring_size + ring->ring_size) % ring->ring_size;
 
@@ -247,9 +296,10 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
         cross_len,
         ring->n_layers,
         ring->n_embd);
+    CUDA_CHECK(cudaGetLastError());
 
     // sync so staging is ready before drafter decode reads it
-    cudaStreamSynchronize(cudaStreamPerThread);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 
     return ring->d_staging;
 }
@@ -324,7 +374,10 @@ extern "C" void * dflash_crosskv_alloc(int n_layers, int64_t k_row, int64_t v_ro
     }
 
     auto * c = new dflash_crosskv_cache();
-    cudaGetDevice(&c->device);
+    if (!dflash_cuda_try(cudaGetDevice(&c->device), "cross-KV cudaGetDevice")) {
+        delete c;
+        return nullptr;
+    }
     c->n_layers  = n_layers;
     c->ring_size = ring_size;
     c->quant     = quant;
@@ -337,8 +390,12 @@ extern "C" void * dflash_crosskv_alloc(int n_layers, int64_t k_row, int64_t v_ro
 
     auto fail = [&]() {
         for (int l = 0; l < n_layers; l++) {
-            if (c->k_rings[l]) cudaFree(c->k_rings[l]);
-            if (c->v_rings[l]) cudaFree(c->v_rings[l]);
+            if (c->k_rings[l]) {
+                (void) dflash_cuda_try(cudaFree(c->k_rings[l]), "cross-KV rollback K cudaFree");
+            }
+            if (c->v_rings[l]) {
+                (void) dflash_cuda_try(cudaFree(c->v_rings[l]), "cross-KV rollback V cudaFree");
+            }
         }
         delete[] c->k_rings;
         delete[] c->v_rings;
@@ -347,12 +404,26 @@ extern "C" void * dflash_crosskv_alloc(int n_layers, int64_t k_row, int64_t v_ro
     };
 
     for (int l = 0; l < n_layers; l++) {
-        if (cudaMalloc(&c->k_rings[l], (size_t)ring_size * c->k_row_bytes) != cudaSuccess) return fail();
-        if (cudaMalloc(&c->v_rings[l], (size_t)ring_size * c->v_row_bytes) != cudaSuccess) return fail();
+        if (!dflash_cuda_try(
+                cudaMalloc(&c->k_rings[l], (size_t)ring_size * c->k_row_bytes),
+                "cross-KV K cudaMalloc")) {
+            return fail();
+        }
+        if (!dflash_cuda_try(
+                cudaMalloc(&c->v_rings[l], (size_t)ring_size * c->v_row_bytes),
+                "cross-KV V cudaMalloc")) {
+            return fail();
+        }
         // zero-init: cold slots must stay finite (they can be gathered as masked pad;
         // an all-zero q8_0 block dequantizes to zeros)
-        cudaMemset(c->k_rings[l], 0, (size_t)ring_size * c->k_row_bytes);
-        cudaMemset(c->v_rings[l], 0, (size_t)ring_size * c->v_row_bytes);
+        if (!dflash_cuda_try(
+                cudaMemset(c->k_rings[l], 0, (size_t)ring_size * c->k_row_bytes),
+                "cross-KV K cudaMemset") ||
+            !dflash_cuda_try(
+                cudaMemset(c->v_rings[l], 0, (size_t)ring_size * c->v_row_bytes),
+                "cross-KV V cudaMemset")) {
+            return fail();
+        }
     }
 
     size_t total_kb = (size_t)n_layers * ring_size * (c->k_row_bytes + c->v_row_bytes) / 1024;
@@ -365,8 +436,8 @@ extern "C" void dflash_crosskv_free(void * handle) {
     if (!handle) return;
     auto * c = (dflash_crosskv_cache *)handle;
     for (int l = 0; l < c->n_layers; l++) {
-        cudaFree(c->k_rings[l]);
-        cudaFree(c->v_rings[l]);
+        (void) dflash_cuda_try(cudaFree(c->k_rings[l]), "cross-KV K cudaFree");
+        (void) dflash_cuda_try(cudaFree(c->v_rings[l]), "cross-KV V cudaFree");
     }
     delete[] c->k_rings;
     delete[] c->v_rings;
@@ -383,7 +454,7 @@ extern "C" void dflash_crosskv_write(
     auto * c = (dflash_crosskv_cache *)handle;
     if (layer < 0 || layer >= c->n_layers || n_tokens > c->ring_size) return;
 
-    (void)cudaSetDevice(c->device);
+    CUDA_CHECK(cudaSetDevice(c->device));
 
     uint8_t * dst = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
     const int64_t row       = which == 0 ? c->k_row       : c->v_row;
@@ -396,9 +467,13 @@ extern "C" void dflash_crosskv_write(
             const int total = n * gpr;
             k_crosskv_quant_q8_0<<<(total + 255)/256, 256, 0, cudaStreamPerThread>>>(
                 src + (size_t)src_tok * row, dst + (size_t)ring_tok * row_bytes, gpr, row, n);
+            CUDA_CHECK(cudaGetLastError());
         } else {
-            cudaMemcpyAsync(dst + (size_t)ring_tok * row_bytes, src + (size_t)src_tok * row,
-                            (size_t)n * row_bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            CUDA_CHECK(cudaMemcpyAsync(
+                    dst + (size_t)ring_tok * row_bytes,
+                    src + (size_t)src_tok * row,
+                    (size_t)n * row_bytes, cudaMemcpyDeviceToDevice,
+                    cudaStreamPerThread));
         }
     });
 }
@@ -412,7 +487,7 @@ extern "C" void dflash_crosskv_read_window(
     auto * c = (dflash_crosskv_cache *)handle;
     if (layer < 0 || layer >= c->n_layers || n_tokens > c->ring_size) return;
 
-    (void)cudaSetDevice(c->device);
+    CUDA_CHECK(cudaSetDevice(c->device));
 
     const uint8_t * src = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
     const int64_t row       = which == 0 ? c->k_row       : c->v_row;
@@ -426,9 +501,13 @@ extern "C" void dflash_crosskv_read_window(
             k_crosskv_dequant_q8_0<<<(total + 255)/256, 256, 0, cudaStreamPerThread>>>(
                 src + (size_t)ring_tok * row_bytes, (float *)(dst + (size_t)dst_tok * row * sizeof(float)),
                 gpr, row, n);
+            CUDA_CHECK(cudaGetLastError());
         } else {
-            cudaMemcpyAsync(dst + (size_t)dst_tok * row_bytes, src + (size_t)ring_tok * row_bytes,
-                            (size_t)n * row_bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            CUDA_CHECK(cudaMemcpyAsync(
+                    dst + (size_t)dst_tok * row_bytes,
+                    src + (size_t)ring_tok * row_bytes,
+                    (size_t)n * row_bytes, cudaMemcpyDeviceToDevice,
+                    cudaStreamPerThread));
         }
     });
 }
@@ -436,7 +515,7 @@ extern "C" void dflash_crosskv_read_window(
 // Synchronize the stream all ring/cache copies run on. Needed before handing
 // data to a compute path that runs on a different (backend) stream.
 extern "C" void dflash_crosskv_sync(void) {
-    cudaStreamSynchronize(cudaStreamPerThread);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 // D2D copy: from device source to device destination (raw pointers).
@@ -446,15 +525,17 @@ extern "C" void dflash_cross_ring_gpu_set_tensor(
     if (!d_dst || !d_src || size == 0) return;
 
     cudaPointerAttributes dst_attr, src_attr;
-    cudaPointerGetAttributes(&dst_attr, (const char *)d_dst + offset);
-    cudaPointerGetAttributes(&src_attr, d_src);
+    CUDA_CHECK(cudaPointerGetAttributes(&dst_attr, (const char *)d_dst + offset));
+    CUDA_CHECK(cudaPointerGetAttributes(&src_attr, d_src));
 
     if (dst_attr.type == cudaMemoryTypeDevice && src_attr.type == cudaMemoryTypeDevice
             && dst_attr.device != src_attr.device) {
-        cudaMemcpyPeerAsync((char *)d_dst + offset, dst_attr.device,
-                            d_src, src_attr.device, size, cudaStreamPerThread);
+        CUDA_CHECK(cudaMemcpyPeerAsync(
+                (char *)d_dst + offset, dst_attr.device,
+                d_src, src_attr.device, size, cudaStreamPerThread));
     } else {
-        cudaMemcpyAsync((char *)d_dst + offset, d_src, size,
-                         cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        CUDA_CHECK(cudaMemcpyAsync(
+                (char *)d_dst + offset, d_src, size,
+                cudaMemcpyDeviceToDevice, cudaStreamPerThread));
     }
 }

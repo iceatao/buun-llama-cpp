@@ -104,6 +104,13 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     int id = -1; // in case cudaGetDevice fails
     (void)cudaGetDevice(&id);
 
+    // A fatal callback/abort can interrupt buffered logging. Preserve one
+    // complete origin record directly on stderr before entering the common
+    // logger and stack-trace terminal.
+    fprintf(stderr, "%s error: %s; device=%d; function=%s; source=%s:%d; statement=%s\n",
+            GGML_CUDA_NAME, msg, id, func, file, line, stmt);
+    fflush(stderr);
+
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);

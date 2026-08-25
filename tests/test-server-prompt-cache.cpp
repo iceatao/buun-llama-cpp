@@ -1708,6 +1708,11 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     CHECK(vbr_selection.exhausted_tier_used_alternate);
     CHECK(vbr_selection.weak_prefix_preserved_empty);
     CHECK(vbr_selection.weak_prefix_preserved_hot);
+    CHECK(vbr_selection.stem_recovery_allows_selection);
+    CHECK(vbr_selection.stem_recovery_not_proactive);
+    CHECK(vbr_selection.undurable_filter_makes_progress);
+    CHECK(vbr_selection.undurable_selection_makes_progress);
+    CHECK(vbr_selection.full_rebind_clears_stem_authority);
     CHECK(!server_prompt_cache_retention_reuse_is_useful(
         SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS - 1));
     CHECK(server_prompt_cache_retention_reuse_is_useful(
@@ -2610,6 +2615,16 @@ void test_checkpoint_lineage_ignores_retier_but_rejects_content_change() {
     state.checkpoint_epoch--;
     state.checkpoint_epoch_swa++;
     CHECK(!common_prompt_checkpoint_lineage_matches(checkpoint, state));
+}
+
+void test_checkpoint_draft_restore_refuses_without_context() {
+    common_prompt_checkpoint checkpoint;
+    CHECK(checkpoint.try_load_dft(
+        nullptr, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+
+    fill_checkpoint_bytes(checkpoint.data_dft, 8, 3);
+    CHECK(!checkpoint.try_load_dft(
+        nullptr, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 }
 
 void test_checkpoint_suffix_trim_rebases_only_preserved_prefixes() {
@@ -5201,6 +5216,7 @@ int main(int argc, char ** argv) {
     test_lifecycle_retention_capacity_cold_start_prior_ages_to_recency();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
+    test_checkpoint_draft_restore_refuses_without_context();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();
     test_lifecycle_restore_retains_immutable_source();
     test_implicit_soft_append_chain_is_bounded();

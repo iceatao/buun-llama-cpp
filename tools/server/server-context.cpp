@@ -1056,6 +1056,22 @@ struct server_slot {
             context, reason, publication_skip);
     }
 
+    void vbr_idle_capture_source_reset() noexcept {
+        vbr_idle_capture_attempt_identity = {};
+        vbr_idle_capture_retry_after_ms = 0;
+        vbr_idle_capture_terminal = false;
+        vbr_idle_admission_refusals.clear();
+        vbr_idle_support_status =
+            server_vbr_prompt_cache_support_status::supported;
+        vbr_idle_capture_published_identity = {};
+        vbr_idle_capture_representation_valid = false;
+        vbr_idle_stem_source_identity = {};
+        vbr_idle_stem_coverage_tokens = 0;
+        vbr_idle_stem_host_artifact = {};
+        vbr_idle_stem_source_valid = false;
+        vbr_idle_stem_retry = false;
+    }
+
     void server_cache_slot_drop_impl(bool retire_retention = true) {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
         if (retire_retention && retention_obs) {
@@ -1068,7 +1084,9 @@ struct server_slot {
         if (mem.ctx_tgt) {
             mem.seq_rm(id, -1, -1);
         }
-        common_speculative_ring_state_reset(get_spec());
+        common_speculative_sequence_transition(
+            get_spec(), id,
+            common_speculative_sequence_event::full_clear);
 
         if (lifecycle_authority && !prompt.checkpoints.empty()) {
             checkpoint_ring_changed();
@@ -1076,7 +1094,7 @@ struct server_slot {
         prompt.clear();
         cache_family = {};
         vbr_reuse_capture_frontier = 0;
-        vbr_idle_admission_refusals.clear();
+        vbr_idle_capture_source_reset();
         vbr_imported_complete_frontier = 0;
         vbr_frontier_logits.clear();
         vbr_frontier_logits_token_digest = {};
@@ -1370,6 +1388,9 @@ struct server_slot {
         if (clear_draft && ctx_dft) {
             ::server_cache_mandatory_recovery_reset_impl(ctx_dft, id, -1, -1);
         }
+        common_speculative_sequence_transition(
+            get_spec(), id,
+            common_speculative_sequence_event::target_replaced);
     }
 
     void mandatory_recovery_reset(server_cache_destruction_reason reason) {
@@ -4774,19 +4795,35 @@ private:
         return found == slots.end() ? nullptr : &*found;
     }
 
+    enum class vbr_recovery_requirement : uint8_t {
+        full_frontier = 0,
+        full_or_stem,
+        none_for_admission_progress,
+    };
+
     struct vbr_live_retention_filter {
         int except_id = -1;
         int spec_tier = -1;
         const std::vector<uint8_t> * refused_by_seq = nullptr;
+        vbr_recovery_requirement recovery =
+            vbr_recovery_requirement::full_frontier;
     };
 
     bool vbr_idle_reclaim_eligible(
             const server_slot & slot,
             const vbr_live_retention_filter & filter) noexcept {
+        const bool full_durable = slot.id >= 0 &&
+            size_t(slot.id) < vbr_durable_sources_by_seq.size() &&
+            vbr_durable_sources_by_seq[size_t(slot.id)] != 0;
+        const bool stem_durable =
+            filter.recovery != vbr_recovery_requirement::full_frontier &&
+            slot.id >= 0 &&
+            size_t(slot.id) < vbr_durable_stems_by_seq.size() &&
+            vbr_durable_stems_by_seq[size_t(slot.id)] != 0;
         const bool durable = !params_base.vbr_prompt_cache ||
-            (slot.id >= 0 &&
-             size_t(slot.id) < vbr_durable_sources_by_seq.size() &&
-             vbr_durable_sources_by_seq[size_t(slot.id)] != 0);
+            full_durable || stem_durable ||
+            filter.recovery ==
+                vbr_recovery_requirement::none_for_admission_progress;
         const bool refused = filter.refused_by_seq && slot.id >= 0 &&
             size_t(slot.id) < filter.refused_by_seq->size() &&
             (*filter.refused_by_seq)[size_t(slot.id)] != 0;
@@ -4806,20 +4843,56 @@ private:
         vbr_retention_candidate_count = 0;
         vbr_retention_projection_epoch = 0;
         if (params_base.vbr_prompt_cache) {
-            if (vbr_durable_sources_by_seq.size() != slots.size()) {
+            if (vbr_durable_sources_by_seq.size() != slots.size() ||
+                vbr_durable_stems_by_seq.size() != slots.size()) {
                 return false;
             }
             std::fill(
                 vbr_durable_sources_by_seq.begin(),
                 vbr_durable_sources_by_seq.end(), uint8_t(0));
+            std::fill(
+                vbr_durable_stems_by_seq.begin(),
+                vbr_durable_stems_by_seq.end(), uint8_t(0));
             if (sample_durability) {
-                for (const auto & slot : slots) {
-                    if (slot.id >= 0 &&
-                        size_t(slot.id) <
-                            vbr_durable_sources_by_seq.size()) {
-                        vbr_durable_sources_by_seq[size_t(slot.id)] =
-                            vbr_idle_source_durable(slot) ? 1 : 0;
+                size_t query_count = 0;
+                for (auto & slot : slots) {
+                    if (slot.prompt.n_tokens() <= 0) {
+                        continue;
                     }
+                    if (slot.id < 0 || size_t(slot.id) >= slots.size() ||
+                        query_count >= vbr_idle_frontier_queries.size()) {
+                        return false;
+                    }
+                    auto & query = vbr_idle_frontier_queries[query_count++];
+                    query = {};
+                    query.slot_id = slot.id;
+                    query.prompt = &slot.prompt;
+                    server_vbr_artifact_capture_status identity_status;
+                    if (!build_capture_identity_fields(
+                            slot, query.identity, identity_status)) {
+                        query_count--;
+                        continue;
+                    }
+                    query.expected_stem_artifact =
+                        slot.vbr_idle_stem_source_valid
+                            ? slot.vbr_idle_stem_host_artifact
+                            : llama_cache_acct_artifact_id {};
+                }
+                if (query_count != 0 &&
+                    (!prompt_cache || !prompt_cache->mark_vbr_frontiers(
+                        vbr_idle_frontier_queries.data(), query_count))) {
+                    return false;
+                }
+                for (size_t i = 0; i < query_count; ++i) {
+                    const auto & query = vbr_idle_frontier_queries[i];
+                    if (query.slot_id < 0 ||
+                        size_t(query.slot_id) >= slots.size()) {
+                        return false;
+                    }
+                    vbr_durable_sources_by_seq[size_t(query.slot_id)] =
+                        query.durable ? 1 : 0;
+                    vbr_durable_stems_by_seq[size_t(query.slot_id)] =
+                        query.stem_durable ? 1 : 0;
                 }
             }
         }
@@ -5098,6 +5171,47 @@ private:
                 }
             }
             learned_available = false;
+        }
+        return vbr_oldest_idle_slot(filter);
+    }
+
+    // Selection prepares and refreshes one broad immutable wave, then applies
+    // several ordered admission filters without re-reading the host catalog or
+    // retention inventory. No slot or retention mutation occurs between these
+    // calls.
+    server_slot * vbr_retention_victim_prepared(
+            bool & learned_available,
+            const vbr_live_retention_filter & filter) noexcept {
+        if (learned_available) {
+            for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+                auto & candidate = vbr_retention_candidates[i];
+                if (candidate.slot_id < 0 ||
+                    size_t(candidate.slot_id) >= slots.size() ||
+                    slots[size_t(candidate.slot_id)].id !=
+                        candidate.slot_id) {
+                    learned_available = false;
+                    break;
+                }
+                candidate.eligible = candidate.present &&
+                    vbr_idle_reclaim_eligible(
+                        slots[size_t(candidate.slot_id)], filter);
+            }
+        }
+        if (learned_available) {
+            const auto projection = server_live_retention_project_prepared(
+                vbr_retention_candidates.data(),
+                vbr_retention_candidate_count,
+                vbr_retention_projection_epoch);
+            if (projection.complete) {
+                auto * selected = find_slot_by_id(projection.slot_id);
+                if (selected &&
+                    vbr_idle_reclaim_eligible(*selected, filter)) {
+                    return selected;
+                }
+                learned_available = false;
+            } else if (projection.candidate_count != 0) {
+                learned_available = false;
+            }
         }
         return vbr_oldest_idle_slot(filter);
     }
@@ -8604,8 +8718,7 @@ private:
             // the protection-aware historical order within the same capability tier.
             if (ret != nullptr && live_retention_owner() != nullptr &&
                 ret->prompt.n_tokens() > 0) {
-                const auto select_tier = [&](bool spec_tier,
-                        bool & learned) -> server_slot * {
+                const auto empty_in_tier = [&](bool spec_tier) {
                     server_slot * empty = nullptr;
                     for (auto & slot : slots) {
                         if (slot.is_processing() ||
@@ -8619,32 +8732,60 @@ private:
                             empty = &slot;
                         }
                     }
-                    if (empty) {
-                        learned = false;
-                        return empty;
-                    }
-                    const vbr_live_retention_filter filter {
-                        -1, spec_tier ? 1 : 0,
-                    };
-                    bool available = vbr_prepare_retention_wave(
-                        filter, false);
-                    auto * selected = vbr_retention_victim(
-                        available, filter);
-                    learned = available && selected != nullptr;
-                    return selected;
+                    return empty;
                 };
 
                 const bool preferred_tier = ret->can_speculate();
-                bool selected_by_value = false;
-                auto * selected = select_tier(
-                    preferred_tier, selected_by_value);
+                server_slot * selected = empty_in_tier(preferred_tier);
                 if (!selected) {
-                    // Speculation is a preference, not a hard partition. A
-                    // protected preferred tier must not strand a request when
-                    // the alternate tier still has a lawful empty/resident
-                    // slot.
+                    selected = empty_in_tier(!preferred_tier);
+                }
+                bool selected_by_value = false;
+                if (!selected) {
+                    const vbr_live_retention_filter broad_filter {
+                        -1, -1, nullptr,
+                        vbr_recovery_requirement::none_for_admission_progress,
+                    };
+                    bool learned = vbr_prepare_retention_wave(
+                        broad_filter, false);
+                    if (learned &&
+                        !vbr_refresh_retention_wave(broad_filter)) {
+                        learned = false;
+                    }
+                    const auto select_tier = [&](bool spec_tier,
+                            vbr_recovery_requirement recovery) {
+                        const vbr_live_retention_filter filter {
+                            -1, spec_tier ? 1 : 0, nullptr, recovery,
+                        };
+                        auto * tier = vbr_retention_victim_prepared(
+                            learned, filter);
+                        selected_by_value = learned && tier != nullptr;
+                        return tier;
+                    };
+
                     selected = select_tier(
-                        !preferred_tier, selected_by_value);
+                        preferred_tier,
+                        vbr_recovery_requirement::full_or_stem);
+                    if (!selected) {
+                        // Speculation is a preference, not a hard partition.
+                        selected = select_tier(
+                            !preferred_tier,
+                            vbr_recovery_requirement::full_or_stem);
+                    }
+                    if (!selected) {
+                        // Host-cache capacity is protection authority, not
+                        // scheduler admission authority. Only after neither
+                        // tier has a recoverable victim may this final progress
+                        // policy admit an undurable one.
+                        selected = select_tier(
+                            preferred_tier,
+                            vbr_recovery_requirement::none_for_admission_progress);
+                    }
+                    if (!selected) {
+                        selected = select_tier(
+                            !preferred_tier,
+                            vbr_recovery_requirement::none_for_admission_progress);
+                    }
                 }
                 // The fallback returned by vbr_retention_victim is the
                 // protection-aware LRU floor. Always adopt it: retaining the
@@ -15174,6 +15315,9 @@ private:
 
                 slot.observe_live_range_drop(
                     server_cache_destruction_reason::context_shift, true);
+                common_speculative_sequence_transition(
+                    slot.get_spec(), slot.id,
+                    common_speculative_sequence_event::live_range_shift);
                 ::server_cache_live_range_drop_impl(
                     ctx_tgt, slot.id, n_keep, n_keep + n_discard);
                 common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
@@ -15747,6 +15891,17 @@ private:
                                 n_rewind, n_append,
                                 slot.task->params.cache_prompt ? 1 : 0);
 
+                            if (n_rewind > 0) {
+                                // A deferred speculative carry belongs to the discarded
+                                // suffix, even when its numeric positions happen to fall
+                                // below the retained LCP. Preserve the reusable drafter
+                                // prefix, but invalidate branch-local proposal state at
+                                // the scheduler's semantic rewind boundary.
+                                common_speculative_sequence_transition(
+                                    slot.get_spec(), slot.id,
+                                    common_speculative_sequence_event::prompt_rewind);
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -16213,10 +16368,24 @@ private:
                                                 }
                                                 slot.cache_plan->restore_attempt_failed = true;
                                             }
+                                        } else if (!do_reset && !it->try_load_dft(
+                                                       ctx_dft.get(), slot.id,
+                                                       LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                            SLT_ERR(slot,
+                                                    "failed to restore draft checkpoint "
+                                                    "(n_tokens = %" PRId64 ", size = %.3f MiB) -- "
+                                                    "falling back to full prompt processing\n",
+                                                    it->n_tokens,
+                                                    (float) it->data_dft.size() / 1024 / 1024);
+                                            do_reset = true;
+                                            if (slot.cache_plan) {
+                                                if (auto * sel_row = slot.cache_plan->selected_row(
+                                                        common_cache_plan_provider::live_context_checkpoint)) {
+                                                    sel_row->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                                                }
+                                                slot.cache_plan->restore_attempt_failed = true;
+                                            }
                                         } else if (!do_reset) {
-                                            // restore the draft-side state, if any (draft-model checkpoints)
-                                            it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
                                             // restore the drafter's speculative state (per-slot spec or shared)
                                             common_speculative_set_state(
                                                 slot.get_spec(), slot.id,
@@ -16252,6 +16421,17 @@ private:
                                             } else {
                                                 n_past_keep = std::min(n_past_keep, (size_t) it->n_tokens);
                                             }
+
+                                            // Invalidate branch-local state before applying the
+                                            // optional accelerator image. This ordering lets legacy
+                                            // DFlash clear an old ring while preserving the newly
+                                            // authenticated checkpoint ring installed below.
+                                            common_speculative_sequence_transition(
+                                                slot.get_spec(), slot.id,
+                                                !it->data_dft.empty() &&
+                                                        it->data_dft_full_sequence
+                                                    ? common_speculative_sequence_event::checkpoint_complete
+                                                    : common_speculative_sequence_event::checkpoint_reconstruct);
 
                                             bool checkpoint_aux_ok = true;
                                             if (slot.can_speculate() && !it->accel.ring.empty() &&
@@ -16334,6 +16514,13 @@ private:
                                     }
 
                                     if (do_reset) {
+                                        // The restore transaction is being abandoned. Clear
+                                        // speculative branch/ring state at the same semantic
+                                        // boundary; the p0=0 memory trim below performs the
+                                        // corresponding target/draft physical reset.
+                                        common_speculative_sequence_transition(
+                                            slot.get_spec(), slot.id,
+                                            common_speculative_sequence_event::full_clear);
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         // [obs] explain the cold reprocess: a checkpoint rejected for a
@@ -16629,6 +16816,9 @@ private:
                             ::server_cache_mandatory_recovery_reset_impl(
                                 ctx_dft.get(), slot.id, -1, -1);
                         }
+                        common_speculative_sequence_transition(
+                            slot.get_spec(), slot.id,
+                            common_speculative_sequence_event::full_clear);
 
                         slot.server_cache_token_ledger_truncate_impl(0);
                         slot.n_prompt_tokens_cache = 0;
@@ -19132,9 +19322,15 @@ server_vbr_slot_selection_for_test(
             protection_mode protection = protection_mode::none,
             int32_t empty_slot = -1,
             bool mixed_capability = false,
-            bool dynamic_vbr = true) {
+            bool dynamic_vbr = true,
+            bool automatic_vbr_host = false) {
         server_context_impl context;
         context.sleeping = true;
+        context.params_base.vbr_prompt_cache = automatic_vbr_host;
+        if (automatic_vbr_host) {
+            context.prompt_cache =
+                std::make_unique<server_prompt_cache>(0, 0);
+        }
         if (!dynamic_vbr) {
             context.params_base.vbr_cache_type_k = false;
             context.params_base.vbr_cache_type_v = false;
@@ -19245,6 +19441,8 @@ server_vbr_slot_selection_for_test(
         context.vbr_retention_seen_by_seq.resize(context.slots.size());
         context.vbr_exclusive_cells_by_seq.resize(context.slots.size());
         context.vbr_durable_sources_by_seq.resize(context.slots.size());
+        context.vbr_durable_stems_by_seq.resize(context.slots.size());
+        context.vbr_idle_frontier_queries.resize(context.slots.size());
         const std::vector<uint32_t> exclusive { 100, 100, 100 };
         context.vbr_exclusive_cells_for_test = &exclusive;
 
@@ -19351,12 +19549,70 @@ server_vbr_slot_selection_for_test(
         alternate_resident.published &&
         alternate_resident.actual_slot == 0 &&
         alternate_empty.published && alternate_empty.actual_slot == 0;
+    const auto automatic_undurable = run(
+        true, protection_mode::none, -1, false, true, true);
+    result.undurable_selection_makes_progress =
+        automatic_undurable.published &&
+        automatic_undurable.actual_slot >= 0;
     result.weak_prefix_preserved_empty =
         empty.published && empty.weak_prefix_slot == 2 &&
         empty.reuse_selection_was_pure;
     result.weak_prefix_preserved_hot =
         learned.published && learned.weak_prefix_slot != 0 &&
         learned.reuse_selection_was_pure;
+
+    // A batch-authenticated durable stem is sufficient only for scheduling
+    // progress. Background reclaim still requires the exact live frontier.
+    server_context_impl stem_context;
+    stem_context.params_base.vbr_prompt_cache = true;
+    stem_context.slots.emplace_back();
+    stem_context.slots.front().id = 0;
+    stem_context.slots.front().prompt.tokens = server_tokens(
+        llama_tokens { 1, 2, 3 }, false);
+    stem_context.vbr_durable_sources_by_seq = { 0 };
+    stem_context.vbr_durable_stems_by_seq = { 1 };
+    const server_context_impl::vbr_live_retention_filter selection_filter {
+        -1, -1, nullptr,
+        server_context_impl::vbr_recovery_requirement::full_or_stem,
+    };
+    const server_context_impl::vbr_live_retention_filter reclaim_filter;
+    result.stem_recovery_allows_selection =
+        stem_context.vbr_idle_reclaim_eligible(
+            stem_context.slots.front(), selection_filter);
+    result.stem_recovery_not_proactive =
+        !stem_context.vbr_idle_reclaim_eligible(
+            stem_context.slots.front(), reclaim_filter);
+    const server_context_impl::vbr_live_retention_filter progress_filter {
+        -1, -1, nullptr,
+        server_context_impl::vbr_recovery_requirement::none_for_admission_progress,
+    };
+    result.undurable_filter_makes_progress =
+        stem_context.vbr_idle_reclaim_eligible(
+            stem_context.slots.front(), progress_filter);
+    auto & rebound = stem_context.slots.front();
+    rebound.vbr_idle_capture_attempt_identity[0] = 1;
+    rebound.vbr_idle_capture_terminal = true;
+    rebound.vbr_idle_capture_published_identity[0] = 2;
+    rebound.vbr_idle_capture_representation_valid = true;
+    rebound.vbr_idle_stem_source_identity[0] = 3;
+    rebound.vbr_idle_stem_coverage_tokens = 2;
+    rebound.vbr_idle_stem_host_artifact = { 7 };
+    rebound.vbr_idle_stem_source_valid = true;
+    rebound.vbr_idle_stem_retry = true;
+    rebound.server_cache_slot_drop_impl(false);
+    result.full_rebind_clears_stem_authority =
+        rebound.vbr_idle_capture_attempt_identity ==
+            std::array<uint8_t, 32> {} &&
+        !rebound.vbr_idle_capture_terminal &&
+        rebound.vbr_idle_capture_published_identity ==
+            std::array<uint8_t, 32> {} &&
+        !rebound.vbr_idle_capture_representation_valid &&
+        rebound.vbr_idle_stem_source_identity ==
+            std::array<uint8_t, 32> {} &&
+        rebound.vbr_idle_stem_coverage_tokens == 0 &&
+        rebound.vbr_idle_stem_host_artifact.v == 0 &&
+        !rebound.vbr_idle_stem_source_valid &&
+        !rebound.vbr_idle_stem_retry;
     return result;
 }
 

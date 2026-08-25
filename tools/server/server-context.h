@@ -109,6 +109,11 @@ struct server_vbr_slot_selection_result {
     bool exhausted_tier_used_alternate = false;
     bool weak_prefix_preserved_empty = false;
     bool weak_prefix_preserved_hot = false;
+    bool stem_recovery_allows_selection = false;
+    bool stem_recovery_not_proactive = false;
+    bool undurable_filter_makes_progress = false;
+    bool undurable_selection_makes_progress = false;
+    bool full_rebind_clears_stem_authority = false;
 };
 
 server_vbr_slot_selection_result

@@ -2534,21 +2534,27 @@ void common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
+    if (!try_load_dft(ctx, seq_id, flags)) {
+        GGML_ABORT("checkpoint restore rejected: expected %zu bytes\n", data_dft.size());
+    }
+}
+
+bool common_prompt_checkpoint::try_load_dft(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
+    if (data_dft.empty()) {
+        return true;
     }
 
-    if (data_dft.empty()) {
-        return;
+    if (ctx == nullptr) {
+        return false;
     }
 
     const auto restore_flags = data_dft_full_sequence
         ? LLAMA_STATE_SEQ_FLAGS_NONE : flags;
-    const size_t n = llama_state_seq_set_data_ext(
-        ctx, data_dft.data(), data_dft.size(), seq_id, restore_flags);
-    if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
-    }
+    return llama_state_seq_set_data_ext(
+        ctx, data_dft.data(), data_dft.size(), seq_id, restore_flags) == data_dft.size();
 }
 
 void common_prompt_checkpoint::clear_tgt() {

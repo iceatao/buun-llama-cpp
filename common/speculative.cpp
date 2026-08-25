@@ -190,6 +190,12 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
+    // Called after an external sequence lifecycle mutation. Most implementations
+    // have no branch-local state beyond their serialized state and need no action.
+    virtual void sequence_transition(
+            llama_seq_id /*seq_id*/,
+            common_speculative_sequence_event /*event*/) {}
+
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
 
@@ -1353,6 +1359,63 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_batch_free(batch_inject);
     }
 
+    void discard_branch_state(llama_seq_id seq_id) {
+        stash[seq_id] = {};
+        seq_in_gen[seq_id] = false;
+        proposals[seq_id] = {};
+        adpt[seq_id] = {};
+        pregate_empty[seq_id] = 0;
+        pregate_skip [seq_id] = 0;
+    }
+
+    void sequence_transition(
+            llama_seq_id seq_id,
+            common_speculative_sequence_event event) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        // Deferred carry, proposal probabilities, and adaptive/pregate history
+        // describe the branch that was live before the restore. None of them is
+        // part of a context checkpoint, so they must not cross the frontier swap.
+        discard_branch_state(seq_id);
+
+        switch (event) {
+            case common_speculative_sequence_event::checkpoint_reconstruct:
+                llama_memory_seq_rm(
+                    llama_get_memory(params.ctx_dft), seq_id, -1, -1);
+                positions[seq_id].rebase_pending = true;
+                positions[seq_id].rebased = true;
+                break;
+            case common_speculative_sequence_event::target_replaced:
+            case common_speculative_sequence_event::full_clear:
+                positions[seq_id] = {};
+                break;
+            case common_speculative_sequence_event::prompt_rewind:
+            case common_speculative_sequence_event::live_range_shift:
+                break;
+            case common_speculative_sequence_event::checkpoint_complete: {
+                // The compact text drafter and an M-RoPE target can use different
+                // physical positions. A full sequence image restores only the KV,
+                // not this lightweight offset; derive it before the first suffix
+                // injection rather than waiting for draft()-side recovery.
+                const llama_pos target_max = llama_memory_seq_pos_max(
+                    llama_get_memory(params.ctx_tgt), seq_id);
+                const llama_pos draft_max = llama_memory_seq_pos_max(
+                    llama_get_memory(params.ctx_dft), seq_id);
+                if (target_max >= 0 && draft_max >= 0 && target_max >= draft_max) {
+                    positions[seq_id].target_base = target_max - draft_max;
+                    positions[seq_id].rebase_pending = false;
+                    positions[seq_id].rebased = positions[seq_id].target_base != 0;
+                } else {
+                    positions[seq_id].rebase_pending = true;
+                    positions[seq_id].rebased = true;
+                }
+                break;
+            }
+        }
+    }
+
     // standalone injection of a deferred stash out of the carry tensor — the old
     // immediate injection, one cycle late. Used when the fused draft decode did not
     // consume the stash (skipped-draft cycles, request tails, fallback shapes).
@@ -1363,16 +1426,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = params.ctx_dft;
         llama_memory_t mem = llama_get_memory(ctx_dft);
 
-        // a hole below the stash start would trip the position-continuity check —
-        // reset the seq instead; drafts degrade until the next full prefill
+        // A gap below the deferred block proves that a restore/rewind discarded
+        // the carry's branch. Clear the unauthenticated transient drafter
+        // sequence and let ordinary prefill reconstruct it from target hidden
+        // state. A frontier at or beyond the block is a normal DFlash repair
+        // shape: provisional rows are removed below and the authenticated
+        // carry is reapplied.
         const llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id);
         if (pos_max < st.pos0 - 1) {
-            LOG_WRN("%s: drafter seq %d hole below deferred inject (pos_max=%d, pos0=%d) - resetting seq\n",
+            LOG_INF("%s: drafter seq %d rewind crossed deferred inject "
+                    "(pos_max=%d, pos0=%d) - clearing transient sequence\n",
                     __func__, (int) seq_id, (int) pos_max, (int) st.pos0);
             llama_memory_seq_rm(mem, seq_id, -1, -1);
-        } else {
-            llama_memory_seq_rm(mem, seq_id, st.pos0, -1);
+            seq_in_gen[seq_id] = false;
+            proposals[seq_id] = {};
+            adpt[seq_id] = {};
+            pregate_empty[seq_id] = 0;
+            pregate_skip [seq_id] = 0;
+            return true;
         }
+
+        llama_memory_seq_rm(mem, seq_id, st.pos0, -1);
 
         stage_rows.resize(st.n_rows);
         for (int32_t i = 0; i < st.n_rows; ++i) {
@@ -4372,6 +4446,27 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
     }
 
+    void sequence_transition(
+            llama_seq_id /*seq_id*/,
+            common_speculative_sequence_event event) override {
+        switch (event) {
+            case common_speculative_sequence_event::prompt_rewind:
+            case common_speculative_sequence_event::checkpoint_reconstruct:
+            case common_speculative_sequence_event::checkpoint_complete:
+            case common_speculative_sequence_event::live_range_shift:
+            case common_speculative_sequence_event::target_replaced:
+            case common_speculative_sequence_event::full_clear:
+                // Checkpoint restoration publishes this transition before it
+                // installs an authenticated ring image. Rewinds/replacements
+                // invalidate the old committed frontier outright. A live-range
+                // shift can overlap the retained ring and carries no row-level
+                // proof, so it also resets; the next ordinary target decode
+                // appends one verified hidden row and resumes drafting safely.
+                ring_state_reset();
+                break;
+        }
+    }
+
     void ring_state_currency(
             common_speculative_ring_state_currency & output) const {
         output.serialized_bytes = ring_state_size();
@@ -5508,6 +5603,19 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
+    }
+}
+
+void common_speculative_sequence_transition(
+        common_speculative * spec,
+        llama_seq_id         seq_id,
+        common_speculative_sequence_event event) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->sequence_transition(seq_id, event);
     }
 }
 

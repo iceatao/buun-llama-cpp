@@ -1569,6 +1569,14 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
+    // Server restore paths must be able to reject an incompatible draft image
+    // without terminating the process. The aborting load_dft() wrapper remains
+    // for callers whose checkpoint mismatch is an invariant violation.
+    bool try_load_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
     void clear_tgt();
     void clear_dft();
 };

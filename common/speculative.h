@@ -107,6 +107,22 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+enum class common_speculative_sequence_event : uint8_t {
+    prompt_rewind = 0,       // retained draft prefix remains installed
+    checkpoint_reconstruct,  // no complete draft sequence was restored
+    checkpoint_complete,     // a complete draft sequence was restored
+    live_range_shift,        // live target/draft positions were renumbered
+    target_replaced,         // target replaced; draft sequence was cleared
+    full_clear,              // target and draft sequences were cleared
+};
+
+// One owner for external sequence lifecycle mutations. Implementations discard
+// branch-local state and apply the event-specific memory/ring policy.
+void common_speculative_sequence_transition(
+        common_speculative * spec,
+        llama_seq_id         seq_id,
+        common_speculative_sequence_event event);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
