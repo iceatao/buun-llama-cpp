@@ -2,7 +2,9 @@
 #include "llama-bit-ops.h"
 
 #include "common.h"
+#include "speculative.h"
 #include "llama-context.h"
+#include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-vbr-generation.h"
 #include "llama-vbr-operation.h"
@@ -57,6 +59,60 @@ static void test_epoch_capacity_preflight() {
 // Friend-only harness view for post-adopt checks and deliberate live-degrade
 // setup. Import inspection and reservation use the production public doors.
 struct llama_kv_cache_vbr_epoch_test {
+    static bool snapshot_sequence_rows(
+            const llama_kv_cache * cache,
+            llama_seq_id sequence,
+            uint32_t rows,
+            std::vector<uint8_t> & output) {
+        output.clear();
+        if (!cache || cache->v_cells.size() != 1 || rows == 0) {
+            return false;
+        }
+        std::vector<uint32_t> physical(rows, UINT32_MAX);
+        const auto & cells = cache->v_cells.front();
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.seq_has(cell, sequence)) {
+                const llama_pos position = cells.pos_get(cell);
+                if (position >= 0 && uint64_t(position) < rows) {
+                    if (physical[size_t(position)] != UINT32_MAX) {
+                        return false;
+                    }
+                    physical[size_t(position)] = cell;
+                }
+            }
+        }
+        if (std::find(physical.begin(), physical.end(), UINT32_MAX) !=
+                physical.end()) {
+            return false;
+        }
+        try {
+            for (const auto & layer : cache->layers) {
+                for (const auto * tensor : { layer.k, layer.v }) {
+                    if (!tensor || tensor->ne[1] <= 0) {
+                        return false;
+                    }
+                    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+                    const size_t mark = output.size();
+                    output.resize(mark + size_t(rows)*row_bytes);
+                    for (uint32_t position = 0; position < rows; ++position) {
+                        const uint32_t cell = physical[position];
+                        if (cell >= uint64_t(tensor->ne[1]) ||
+                            cell > SIZE_MAX/tensor->nb[1]) {
+                            return false;
+                        }
+                        ggml_backend_tensor_get(
+                            tensor, output.data()+mark+size_t(position)*row_bytes,
+                            size_t(cell)*tensor->nb[1], row_bytes);
+                    }
+                }
+            }
+            return true;
+        } catch (...) {
+            output.clear();
+            return false;
+        }
+    }
+
     static bool adopted_matches(
             const llama_kv_cache * cache,
             const vbr_artifact_package_view & package,
@@ -268,7 +324,7 @@ struct llama_kv_cache_vbr_epoch_test {
         return false;
     }
 
-    // F5-only target constructor: the live source schedule is produced by the
+    // Live-schedule target constructor: the source schedule is produced by the
     // shipped controller, then a separate context repeats it.  A normal empty
     // boundary deliberately full-resets tiers to F16, so it cannot construct
     // the same-tier native-import target.  Retire the repeated context's VMM
@@ -314,7 +370,7 @@ struct llama_kv_cache_vbr_epoch_test {
     }
 };
 
-struct f42a_harness_target {
+struct model_adoption_harness_target {
     llama_memory_i * memory = nullptr;
     llama_cache_acct_ledger * ledger = nullptr;
     std::array<uint8_t, 32> downward_tree_digest = {};
@@ -327,18 +383,18 @@ struct f42a_harness_target {
     llama_seq_id destination = 0;
 
     static uint64_t accounting_serial(const void * context) noexcept {
-        const auto * self = static_cast<const f42a_harness_target *>(context);
+        const auto * self = static_cast<const model_adoption_harness_target *>(context);
         return self && self->ledger ? self->ledger->snapshot().serial : 0;
     }
     static uint64_t policy_serial(const void * context) noexcept {
-        const auto * self = static_cast<const f42a_harness_target *>(context);
+        const auto * self = static_cast<const model_adoption_harness_target *>(context);
         return self && self->memory
             ? vbr_explicit_import_policy_epoch(*self->memory) : 0;
     }
     static bool transform_tree(
             const void * context,
             std::array<uint8_t, 32> & output) noexcept {
-        const auto * self = static_cast<const f42a_harness_target *>(context);
+        const auto * self = static_cast<const model_adoption_harness_target *>(context);
         if (!self || !self->memory || !self->package ||
             !self->bindings || !self->schedule_quote) {
             return false;
@@ -352,7 +408,7 @@ struct f42a_harness_target {
     static bool recheck(
             const void * context,
             const vbr_target_empty_fingerprint & expected) noexcept {
-        const auto * self = static_cast<const f42a_harness_target *>(context);
+        const auto * self = static_cast<const model_adoption_harness_target *>(context);
         return self && self->memory && self->ledger &&
             expected.accounting_serial == self->ledger->snapshot().serial &&
             vbr_explicit_import_target_recheck(
@@ -360,7 +416,7 @@ struct f42a_harness_target {
     }
 };
 
-struct f42a_representation_drift_context {
+struct model_adoption_representation_drift_context {
     enum class kind : uint8_t {
         codec_version = 0,
         codebook_digest,
@@ -370,14 +426,14 @@ struct f42a_representation_drift_context {
     int32_t source_type = GGML_TYPE_COUNT;
 };
 
-static bool f42a_representation_identity_with_source_drift(
+static bool model_adoption_representation_identity_with_source_drift(
         const void * context,
         int32_t current_type,
         bool value_side,
         int32_t meansub_model_id,
         vbr_explicit_representation_identity & output) noexcept {
     const auto * drift =
-        static_cast<const f42a_representation_drift_context *>(context);
+        static_cast<const model_adoption_representation_drift_context *>(context);
     if (!drift || !drift->policy ||
         !vbr_explicit_capture_representation_identity(
             drift->policy, current_type, value_side,
@@ -386,13 +442,13 @@ static bool f42a_representation_identity_with_source_drift(
     }
     if (current_type == drift->source_type) {
         switch (drift->drift) {
-            case f42a_representation_drift_context::kind::codec_version:
+            case model_adoption_representation_drift_context::kind::codec_version:
                 ++output.codec_version;
                 break;
-            case f42a_representation_drift_context::kind::codebook_digest:
+            case model_adoption_representation_drift_context::kind::codebook_digest:
                 output.codebook_digest[0] ^= 0x5a;
                 break;
-            case f42a_representation_drift_context::kind::rotation_digest:
+            case model_adoption_representation_drift_context::kind::rotation_digest:
                 output.rotation_digest[0] ^= 0xa5;
                 break;
         }
@@ -400,7 +456,7 @@ static bool f42a_representation_identity_with_source_drift(
     return true;
 }
 
-static bool f42a_reserve_transform(
+static bool model_adoption_reserve_transform(
         void * context,
         const std::vector<vbr_validated_child_plan> & plans,
         llama_cache_acct_ledger & ledger,
@@ -411,14 +467,14 @@ static bool f42a_reserve_transform(
         *memory, plans, ledger, budget, output);
 }
 
-static bool f42a_owner_token(
+static bool model_adoption_owner_token(
         const void * context,
         const void * token,
         const llama_memory_i * target) noexcept {
     return context != nullptr && token == context && target == context;
 }
 
-static bool f42a_decode(
+static bool model_adoption_decode(
         llama_context * context,
         const std::vector<llama_token> & tokens,
         llama_pos first_position) {
@@ -447,7 +503,7 @@ static bool f42a_decode(
     return true;
 }
 
-static bool f42a_initialize_accounting(
+static bool model_adoption_initialize_accounting(
         llama_cache_acct_ledger & ledger,
         const std::vector<llama_cache_acct_resource_domain> & domains) {
     std::vector<llama_cache_acct_completeness_requirement> required;
@@ -485,7 +541,7 @@ static bool f42a_initialize_accounting(
     return true;
 }
 
-static llama_cache_budget_config f42a_budget(
+static llama_cache_budget_config model_adoption_budget(
         ggml_backend_dev_t device,
         const llama_cache_acct_resource_domain & domain) {
     llama_cache_budget_config budget;
@@ -493,7 +549,7 @@ static llama_cache_budget_config f42a_budget(
     input.backend_device = device;
     input.domain = domain;
     input.physical_total = 1ull << 40;
-    // The catalog's device-resident artifact receipts participate in D-S2.
+    // The catalog's device-resident artifact receipts participate in capacity accounting.
     // Keep the synthetic physical sample internally consistent with that
     // nonzero resident baseline; total==free would correctly make fits()
     // unavailable once a live capture has been charged.
@@ -510,14 +566,14 @@ static llama_cache_budget_config f42a_budget(
     return budget;
 }
 
-struct h2_occupied_budget_source {
+struct occupied_budget_source {
     llama_cache_budget_config budget;
 };
 
-static bool h2_occupied_sample_budget(
+static bool occupied_sample_budget(
         void * opaque, llama_cache_budget_config & output) noexcept {
     try {
-        output = static_cast<h2_occupied_budget_source *>(opaque)->budget;
+        output = static_cast<occupied_budget_source *>(opaque)->budget;
         return true;
     } catch (...) {
         output = {};
@@ -846,7 +902,7 @@ static void test_complete_tree_barrier_fail_closed() {
           vbr_adopt_status::required_companion_unavailable);
 }
 
-namespace g2 {
+namespace adoption_fixture {
 
 struct byte_source {
     std::vector<uint8_t> bytes;
@@ -913,7 +969,8 @@ static vbr_artifact_portable_topology topology() {
 }
 
 static vbr_artifact_shard_descriptor shard(
-        uint32_t index, const byte_source & source) {
+        uint32_t index, const byte_source & source,
+        uint64_t row_bytes = 1) {
     vbr_artifact_shard_descriptor out;
     out.shard_index = index;
     out.topology_index = 0;
@@ -921,8 +978,8 @@ static vbr_artifact_shard_descriptor shard(
     out.logical_offset = 0;
     out.row_count = 5;
     out.column_count = 1;
-    out.row_bytes = 1;
-    out.payload_bytes = 5;
+    out.row_bytes = row_bytes;
+    out.payload_bytes = 5*row_bytes;
     out.payload = source.source();
     return out;
 }
@@ -934,7 +991,17 @@ static vbr_artifact_package package(
         vbr_artifact_clean_stash_state stash_state =
             vbr_artifact_clean_stash_state::absent_at_source,
         bool partial_stash = false,
-        uint32_t child_count = 2) {
+        uint32_t child_count = 2,
+        uint64_t row_bytes = 1,
+        vbr_artifact_companion_kind companion_kind =
+            vbr_artifact_companion_kind::recurrent) {
+    for (auto & payload : bytes.payload) {
+        const size_t old = payload.bytes.size();
+        payload.bytes.resize(size_t(5*row_bytes));
+        for (size_t i = old; i < payload.bytes.size(); ++i) {
+            payload.bytes[i] = uint8_t(0x30 + (i & 0x3f));
+        }
+    }
     vbr_artifact_package out;
     out.topologies.push_back(topology());
     auto & manifest = out.manifest;
@@ -987,8 +1054,8 @@ static vbr_artifact_package package(
         descriptor.meansub_layer = int32_t(child_id);
         descriptor.meansub_baked = true;
         descriptor.shards = {
-            shard(0, bytes.payload[child_id*2]),
-            shard(1, bytes.payload[child_id*2+1]),
+            shard(0, bytes.payload[child_id*2], row_bytes),
+            shard(1, bytes.payload[child_id*2+1], row_bytes),
         };
         descriptor.clean_stash_state = stash_state;
         if (stash_state == vbr_artifact_clean_stash_state::present) {
@@ -1093,10 +1160,10 @@ static vbr_artifact_package package(
     };
     manifest.accounting = {
         { vbr_artifact_accounting_role::unit_payload,
-          device0, 5*child_count, 5*child_count,
+          device0, 5*row_bytes*child_count, 5*row_bytes*child_count,
           llama_cache_acct_attr_kind::artifact },
         { vbr_artifact_accounting_role::unit_payload,
-          device1, 5*child_count, 5*child_count,
+          device1, 5*row_bytes*child_count, 5*row_bytes*child_count,
           llama_cache_acct_attr_kind::artifact },
         { vbr_artifact_accounting_role::descriptor_metadata,
           host, 512, 512, llama_cache_acct_attr_kind::artifact },
@@ -1117,7 +1184,7 @@ static vbr_artifact_package package(
     }
     if (companion) {
         vbr_artifact_companion_payload row;
-        row.kind = vbr_artifact_companion_kind::recurrent;
+        row.kind = companion_kind;
         row.format_version = 1;
         row.build_identity_digest = marker(0xa1);
         row.domain = host;
@@ -1125,7 +1192,9 @@ static vbr_artifact_package package(
         row.payload = bytes.companion.source();
         out.companions.push_back(row);
         manifest.accounting.push_back({
-            vbr_artifact_accounting_role::recurrent_payload,
+            companion_kind == vbr_artifact_companion_kind::recurrent
+                ? vbr_artifact_accounting_role::recurrent_payload
+                : vbr_artifact_accounting_role::typed_accelerator_payload,
             host, row.payload_bytes, row.payload_bytes,
             llama_cache_acct_attr_kind::artifact,
         });
@@ -1135,10 +1204,16 @@ static vbr_artifact_package package(
 
 class parsed_companion final : public vbr_parsed_companion_image {
   public:
+    explicit parsed_companion(vbr_artifact_companion_kind kind)
+        : kind_(kind) {}
+
     vbr_artifact_companion_kind kind() const noexcept override {
-        return vbr_artifact_companion_kind::recurrent;
+        return kind_;
     }
     uint32_t format_version() const noexcept override { return 1; }
+
+  private:
+    vbr_artifact_companion_kind kind_;
 };
 
 struct child_state {
@@ -1159,12 +1234,16 @@ struct child_state {
 };
 
 struct recurrent_state {
+    vbr_artifact_companion_kind kind =
+        vbr_artifact_companion_kind::recurrent;
     bool empty = true;
     bool prepared = false;
     bool published = false;
     bool fail_prepare = false;
     bool report_nonempty = false;
     uint32_t rollbacks = 0;
+    uint32_t replacement_prepares = 0;
+    uint8_t live_image = 0;
 };
 
 class fake_memory final : public llama_memory_i {
@@ -1240,6 +1319,7 @@ struct seam final : vbr_adopt_test_seam {
     uint32_t upward_syncs = 0;
     bool occupied_mode = false;
     bool recycle_mode = false;
+    bool transformed_recycle_mode = false;
     bool operation_quarantined = false;
     bool fail_recovery_sync = false;
     uint32_t occupied_rechecks = 0;
@@ -1572,6 +1652,12 @@ struct seam final : vbr_adopt_test_seam {
             plan.descriptor.wm_cells == 0) {
             return false;
         }
+        if (recycle_mode && transformed_recycle_mode) {
+            // Model the production alias initialization that clears the
+            // wider incoming source representation over compact incumbent
+            // backing. Recovery must already be armed before this mutation.
+            children[child_id].destination.fill(0);
+        }
         ++downward_zero_inits;
         return true;
     }
@@ -1875,7 +1961,9 @@ struct validation_context {
             const artifact_segment_chain & source,
             const vbr_target_companion_snapshot & target,
             std::unique_ptr<vbr_parsed_companion_image> & output) noexcept {
-        if (descriptor.kind != vbr_artifact_companion_kind::recurrent ||
+        if ((descriptor.kind != vbr_artifact_companion_kind::recurrent &&
+             descriptor.kind !=
+                 vbr_artifact_companion_kind::required_spec_payload) ||
             descriptor.format_version != 1 || !target.available ||
             target.kind != descriptor.kind ||
             target.format_version != descriptor.format_version ||
@@ -1883,7 +1971,7 @@ struct validation_context {
             source.size() != descriptor.payload_bytes) {
             return false;
         }
-        output = std::make_unique<parsed_companion>();
+        output = std::make_unique<parsed_companion>(descriptor.kind);
         return true;
     }
 };
@@ -1902,11 +1990,32 @@ static bool companion_prepare(
     auto * state = const_cast<recurrent_state *>(
         static_cast<const recurrent_state *>(context));
     if (!state || !state->empty || state->prepared || state->fail_prepare ||
-        !parsed || parsed->kind() != vbr_artifact_companion_kind::recurrent) {
+        !parsed || parsed->kind() != state->kind) {
         return false;
     }
     state->prepared = true;
     output = std::make_unique<prepared_companion>();
+    return true;
+}
+
+static bool companion_prepare_replacement(
+        const void * context,
+        std::unique_ptr<vbr_parsed_companion_image> incoming,
+        std::unique_ptr<vbr_parsed_companion_image> recovery,
+        llama_seq_id,
+        std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+    auto * state = const_cast<recurrent_state *>(
+        static_cast<const recurrent_state *>(context));
+    if (!state || state->empty || state->prepared || state->live_image != 1 ||
+        !incoming || !recovery || incoming->kind() != state->kind ||
+        recovery->kind() != state->kind) {
+        return false;
+    }
+    // Publish the recovery owner before the first destructive mutation.
+    output = std::make_unique<prepared_companion>();
+    state->prepared = true;
+    state->live_image = 2;
+    ++state->replacement_prepares;
     return true;
 }
 
@@ -1920,7 +2029,8 @@ static bool companion_recheck(
         const void * context,
         const vbr_prepared_companion_image &) noexcept {
     const auto * state = static_cast<const recurrent_state *>(context);
-    return state && state->prepared && companion_empty(context);
+    return state && state->prepared &&
+        !state->empty && state->live_image == 2;
 }
 
 static void companion_publish(
@@ -1930,6 +2040,7 @@ static void companion_publish(
     state->prepared = false;
     state->published = true;
     state->empty = false;
+    state->live_image = 2;
 }
 
 static bool companion_rollback(
@@ -1938,6 +2049,11 @@ static bool companion_rollback(
         static_cast<const recurrent_state *>(context));
     state->prepared = false;
     state->report_nonempty = false;
+    if (state->live_image != 0) {
+        state->empty = false;
+        state->published = true;
+        state->live_image = 1;
+    }
     ++state->rollbacks;
     return true;
 }
@@ -1985,6 +2101,7 @@ struct fixture {
     seam target;
     validation_context validation;
     vbr_target_validation_snapshot snapshot;
+    vbr_target_validation_snapshot occupied_live_snapshot;
     vbr_adopt_policy policy;
     uint64_t catalog_live_ops = 0;
     bool with_companion = false;
@@ -1994,7 +2111,9 @@ struct fixture {
     ggml_type upward_target_type = GGML_TYPE_F16;
     bool mixed_exact_upward = false;
     bool occupied = false;
+    bool occupied_spec_companion = false;
     bool recycle = false;
+    bool transformed_recycle = false;
     vbr_occupied_replacement_guard occupied_guard;
     vbr_downward_policy_projection downward_projection;
     vbr_import_destination_projection upward_destination;
@@ -2015,7 +2134,9 @@ struct fixture {
                      bool mixed_exact = false,
                      bool partial_stash = false,
                      bool occupied_import = false,
-                     bool recycle_import = false)
+                     bool recycle_import = false,
+                     bool transformed_recycle_import = false,
+                     bool occupied_spec_companion_import = false)
         : source(package(
               bytes, companion,
               upward_import ? upward_source : GGML_TYPE_TURBO8_0,
@@ -2023,19 +2144,35 @@ struct fixture {
               upward_import ? stash_state :
                   vbr_artifact_clean_stash_state::absent_at_source,
               upward_import && partial_stash,
-              occupied_import ? 1 : 2)),
+              occupied_import ? 1 : 2,
+              transformed_recycle_import ? 2 : 1,
+              occupied_spec_companion_import
+                  ? vbr_artifact_companion_kind::required_spec_payload
+                  : vbr_artifact_companion_kind::recurrent)),
           catalog(ledger),
           with_companion(companion), downward(downward_import),
           upward(upward_import), upward_source_type(upward_source),
           upward_target_type(upward_target),
           mixed_exact_upward(mixed_exact), occupied(occupied_import),
-          recycle(recycle_import) {
+          occupied_spec_companion(occupied_spec_companion_import),
+          recycle(recycle_import),
+          transformed_recycle(transformed_recycle_import) {
         CHECK(!(downward && upward));
         CHECK(!recycle || occupied);
         if (occupied) {
             target.live.resize(1);
             target.occupied_mode = true;
             target.recycle_mode = recycle;
+            target.transformed_recycle_mode = transformed_recycle;
+        }
+        if (with_companion && occupied) {
+            CHECK(with_companion && occupied);
+            target.recurrent.kind = occupied_spec_companion
+                ? vbr_artifact_companion_kind::required_spec_payload
+                : vbr_artifact_companion_kind::recurrent;
+            target.recurrent.empty = false;
+            target.recurrent.published = true;
+            target.recurrent.live_image = 1;
         }
         if (downward) {
             for (auto & controller : source.manifest.controller_policy) {
@@ -2044,7 +2181,7 @@ struct fixture {
         }
         const auto prepared = vbr_artifact_prepare(source);
         if (prepared != vbr_artifact_status::ok) {
-            std::fprintf(stderr, "G2 prepare status=%s source=%s hops=%u stash=%u\n",
+            std::fprintf(stderr, "VBR adoption prepare status=%s source=%s hops=%u stash=%u\n",
                          vbr_artifact_status_name(prepared),
                          ggml_type_name(upward_source),
                          unsigned(source_promote_hops), unsigned(stash_state));
@@ -2157,7 +2294,7 @@ struct fixture {
         }
         const auto published = build->publish_reference();
         if (published.status != vbr_capture_stream_status::ok) {
-            std::fprintf(stderr, "G2 publish status=%s\n",
+            std::fprintf(stderr, "VBR adoption publish status=%s\n",
                          vbr_capture_stream_status_name(published.status));
         }
         CHECK(published.status == vbr_capture_stream_status::ok);
@@ -2174,12 +2311,26 @@ struct fixture {
                     value ^= 0x5a;
                 }
             }
+            const ggml_type recovery_type =
+                transformed_recycle && downward
+                    ? GGML_TYPE_TURBO3_TCQ
+                    : ggml_type(source.unit_blobs.front().descriptor.
+                        current_type);
             auto recovery_source = package(
-                recovery_bytes, false,
-                ggml_type(source.unit_blobs.front().descriptor.current_type),
+                recovery_bytes, with_companion,
+                recovery_type,
                 source.unit_blobs.front().descriptor.promote_hops,
                 vbr_artifact_clean_stash_state::absent_at_source,
-                false, 1);
+                false, 1, 1,
+                occupied_spec_companion
+                    ? vbr_artifact_companion_kind::required_spec_payload
+                    : vbr_artifact_companion_kind::recurrent);
+            for (size_t i = 0;
+                 i < recovery_source.manifest.controller_policy.size() &&
+                 i < source.manifest.controller_policy.size(); ++i) {
+                recovery_source.manifest.controller_policy[i].floor_type =
+                    source.manifest.controller_policy[i].floor_type;
+            }
             CHECK(vbr_artifact_prepare(recovery_source) ==
                   vbr_artifact_status::ok);
             CHECK(catalog.configure_accounting(recovery_source));
@@ -2205,6 +2356,19 @@ struct fixture {
                           vbr_capture_stream_status::ok);
                 }
                 CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+            }
+            if (with_companion) {
+                auto chain = std::make_shared<artifact_segment_chain>();
+                CHECK(chain->append(
+                    recovery_bytes.companion.bytes.data(),
+                    recovery_bytes.companion.bytes.size()));
+                vbr_verified_companion verified;
+                verified.companion_index = 0;
+                verified.bytes = std::move(chain);
+                verified.streaming_digest =
+                    vbr_capture_stream_digest(*verified.bytes);
+                CHECK(recovery_build->accept_verified_companion(verified) ==
+                      vbr_capture_stream_status::ok);
             }
             const auto recovery_published =
                 recovery_build->publish_reference();
@@ -2244,9 +2408,11 @@ struct fixture {
                 cells[i] = { 0, i, llama_pos(i), llama_pos(10+i),
                     llama_pos(20+i), 0, 1 };
             }
-            const auto & descriptor = view.units().front().descriptor;
-            const auto & captured =
-                view.manifest().generation.controllers.front().units.front();
+            const auto & live_view = transformed_recycle
+                ? recovery_view : view;
+            const auto & descriptor = live_view.units().front().descriptor;
+            const auto & captured = live_view.manifest().generation.
+                controllers.front().units.front();
             const vbr_occupied_replacement_unit_currency unit {
                 0, descriptor.logical_unit_id,
                 { captured.repr_gen, 0, captured.current_type,
@@ -2259,9 +2425,22 @@ struct fixture {
                 snapshot.children.front().state_serial, recycle ? 5u : 10u,
                 cells.data(), cells.size(), &unit, 1,
             };
-            CHECK(vbr_prepare_occupied_replacement_guard(
-                snapshot, view, recovery_view, observation, occupied_guard) ==
-                vbr_occupied_replacement_guard_status::ready);
+            const auto occupied_status =
+                vbr_prepare_occupied_replacement_guard(
+                    transformed_recycle
+                        ? occupied_live_snapshot : snapshot,
+                    snapshot,
+                    view, recovery_view, observation, occupied_guard,
+                    transformed_recycle ? &schedule_quote : nullptr,
+                    nullptr);
+            if (occupied_status !=
+                    vbr_occupied_replacement_guard_status::ready) {
+                std::fprintf(stderr, "VBR occupied guard status=%s\n",
+                    vbr_occupied_replacement_guard_status_name(
+                        occupied_status));
+            }
+            CHECK(occupied_status ==
+                  vbr_occupied_replacement_guard_status::ready);
             CHECK(occupied_guard.incoming_artifact() == reference);
             CHECK(occupied_guard.recovery_artifact() == recovery_reference);
             CHECK(occupied_guard.incoming_artifact() !=
@@ -2305,7 +2484,10 @@ struct fixture {
         snapshot.scheduler_idle = true;
         snapshot.destination_sequence_absent = true;
         for (uint32_t child_id = 0; child_id < view.units().size(); ++child_id) {
-            const auto & descriptor = view.units()[child_id].descriptor;
+            const auto & target_view = transformed_recycle
+                ? recovery_view : view;
+            const auto & descriptor =
+                target_view.units()[child_id].descriptor;
             vbr_target_child_snapshot child;
             child.child_id = child_id;
             child.dependency_mode =
@@ -2315,14 +2497,15 @@ struct fixture {
             child.dedicated = true;
             child.armed = true;
             child.lineage_uuid = occupied
-                ? view.manifest().generation.controllers[child_id].lineage_uuid
+                ? recovery_view.manifest().generation.controllers[child_id].
+                    lineage_uuid
                 : vbr_lineage_uuid { 0x7000+child_id, 0x8000+child_id };
             child.instance_id = target.children[child_id].instance;
             child.state_serial = snapshot.target_state_serial;
             child.previously_observed = occupied;
             child.policy_epoch = snapshot.policy_epoch;
             child.controller_policy =
-                view.manifest().controller_policy[child_id];
+                target_view.manifest().controller_policy[child_id];
             vbr_target_unit_snapshot unit;
             unit.child_id = child_id;
             unit.logical_unit_id = descriptor.logical_unit_id;
@@ -2344,7 +2527,8 @@ struct fixture {
             unit.layout = descriptor.layout;
             unit.row_codec_version = descriptor.row_codec_version;
             unit.current_domain =
-                view.manifest().generation.controllers[child_id].units[0].domain;
+                target_view.manifest().generation.controllers[child_id].
+                    units[0].domain;
             unit.codebook_digest = descriptor.codebook_digest;
             unit.rotation_digest = descriptor.rotation_digest;
             unit.meansub_digest = descriptor.meansub_digest;
@@ -2381,6 +2565,7 @@ struct fixture {
             snapshot.children.push_back(std::move(child));
         }
         snapshot.destination_sequence_absent = !occupied;
+        occupied_live_snapshot = snapshot;
         if (downward) {
             std::vector<vbr_downward_policy_child> projected;
             projected.reserve(snapshot.children.size());
@@ -2404,8 +2589,10 @@ struct fixture {
                     source_type, target_type, GGML_TYPE_TURBO1_TCQ, true,
                     unit.downward_recipe) ==
                     vbr_downward_recipe_status::resolved);
-                unit.downward_row_bytes = unit.shards[0].row_bytes;
-                unit.downward_mapped_bytes = unit.shards[0].mapped_bytes;
+                unit.downward_row_bytes = transformed_recycle ? 1 :
+                    unit.shards[0].row_bytes;
+                unit.downward_mapped_bytes = uint64_t(unit.wm_cells)*
+                    unit.downward_row_bytes;
                 unit.downward_transfer_bytes =
                     view.units()[child.child_id].descriptor.shards[0].payload_bytes;
                 unit.downward_codec_workspace_bytes = 64;
@@ -2446,6 +2633,9 @@ struct fixture {
                         downward_projection.tree_digest);
             }
             validation.downward_tree_digest = downward_projection.tree_digest;
+            CHECK(vbr_quote_import_schedule(snapshot, view, schedule_quote));
+            CHECK(schedule_quote.status() ==
+                  vbr_import_schedule_status::downward);
         }
         if (upward) {
             std::vector<vbr_import_destination_child> destination_children;
@@ -2566,11 +2756,15 @@ struct fixture {
                 descriptor.build_identity_digest, true,
                 &target.recurrent,
             });
-            target.live.push_back({
-                2, nullptr,
-                reinterpret_cast<llama_memory_recurrent *>(&target.recurrent),
-                checkpoint_child_dependency_mode::payload_complete,
-            });
+            if (descriptor.kind ==
+                    vbr_artifact_companion_kind::recurrent) {
+                target.live.push_back({
+                    2, nullptr,
+                    reinterpret_cast<llama_memory_recurrent *>(
+                        &target.recurrent),
+                    checkpoint_child_dependency_mode::payload_complete,
+                });
+            }
         }
     }
 
@@ -2618,6 +2812,8 @@ struct fixture {
     void refresh() {
         snapshot_accounting = ledger.snapshot();
         snapshot.accounting_serial = snapshot_accounting.serial;
+        occupied_live_snapshot.accounting_serial =
+            snapshot_accounting.serial;
         policy.accounting_snapshot = &snapshot_accounting;
         if (downward || upward) {
             downward_plan.accounting_serial = snapshot_accounting.serial;
@@ -2701,10 +2897,11 @@ struct fixture {
 
     vbr_companion_adoption_provider companion_provider() {
         vbr_companion_adoption_provider out;
-        out.kind = vbr_artifact_companion_kind::recurrent;
+        out.kind = target.recurrent.kind;
         out.target_cookie = &target.recurrent;
         out.context = &target.recurrent;
         out.prepare = companion_prepare;
+        out.prepare_replacement = companion_prepare_replacement;
         out.target_empty = companion_empty;
         out.recheck = companion_recheck;
         out.publish_swap = companion_publish;
@@ -2741,11 +2938,11 @@ static vbr_adopt_result adopt(
         std::move(*staged.staged), f.ledger, hooks);
 }
 
-static void test_g2_real_driver_smoke() {
+static void test_real_driver_smoke() {
     fixture f;
     const auto result = adopt(f);
     if (result.status != vbr_adopt_status::adopted) {
-        std::fprintf(stderr, "G2 adopt status=%s phase=%s accounting=%d\n",
+        std::fprintf(stderr, "VBR adopt status=%s phase=%s accounting=%d\n",
                      vbr_adopt_status_name(result.status),
                      vbr_adopt_phase_name(result.phase),
                      int(result.accounting_status));
@@ -2758,7 +2955,7 @@ static void test_g2_real_driver_smoke() {
     CHECK(f.target.mark_calls == 2);
     CHECK(f.target.publish_calls == 2);
     if (f.ledger.snapshot().live_ops <= f.catalog_live_ops) {
-        std::fprintf(stderr, "G2 live_ops=%llu baseline=%llu\n",
+        std::fprintf(stderr, "VBR live_ops=%llu baseline=%llu\n",
                      (unsigned long long) f.ledger.snapshot().live_ops,
                      (unsigned long long) f.catalog_live_ops);
     }
@@ -2776,11 +2973,15 @@ static vbr_adopt_result adopt_occupied(
     if (!staged.manifest || !staged.staged) {
         return {};
     }
-    CHECK(staged.staged->read_count() == (f.recycle ? 4u : 2u));
+    CHECK(staged.staged->read_count() ==
+          (f.recycle ? 4u : 2u) + (f.with_companion ? 1u : 0u));
     vbr_composite_publish_hooks hooks;
     hooks.context = &f.target.target;
     hooks.owner_token = &f.target.target;
     hooks.validate_owner_token = owner_token_valid;
+    if (f.with_companion) {
+        hooks.companions.push_back(f.companion_provider());
+    }
     vbr_adopt_test_control test;
     test.target = &f.target;
     if (fail_after) {
@@ -2792,6 +2993,46 @@ static vbr_adopt_result adopt_occupied(
     return vbr_adopt_empty_manifest(
         f.target.target, 0, std::move(*staged.manifest),
         std::move(*staged.staged), f.ledger, hooks);
+}
+
+static void test_occupied_spec_companion_replacement_and_rollback() {
+    fixture success(
+        true, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 0,
+        vbr_artifact_clean_stash_state::absent_at_source,
+        false, false, true, true, false, true);
+    const auto adopted = adopt_occupied(success);
+    CHECK(adopted.status == vbr_adopt_status::adopted);
+    CHECK(adopted.companions == 1);
+    CHECK(success.target.recurrent.replacement_prepares == 1);
+    CHECK(success.target.recurrent.rollbacks == 0);
+    CHECK(success.target.recurrent.live_image == 2);
+    CHECK(success.target.recurrent.published);
+
+    fixture late(
+        true, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 0,
+        vbr_artifact_clean_stash_state::absent_at_source,
+        false, false, true, true, false, true);
+    const auto refused = adopt_occupied(
+        late, vbr_adopt_phase::complete_tree_barrier, false);
+    CHECK(refused.status != vbr_adopt_status::adopted);
+    CHECK(refused.recovery == vbr_adopt_recovery_outcome::replayed);
+    CHECK(late.target.recurrent.replacement_prepares == 1);
+    CHECK(late.target.recurrent.rollbacks == 1);
+    CHECK(late.target.recurrent.live_image == 1);
+    CHECK(late.target.recurrent.published);
+    CHECK(!late.target.operation_quarantined);
+
+    fixture recurrent(
+        true, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 0,
+        vbr_artifact_clean_stash_state::absent_at_source,
+        false, false, true);
+    const auto recurrent_adopted = adopt_occupied(recurrent);
+    CHECK(recurrent_adopted.status == vbr_adopt_status::adopted);
+    CHECK(recurrent_adopted.companions == 1);
+    CHECK(recurrent.target.recurrent.kind ==
+          vbr_artifact_companion_kind::recurrent);
+    CHECK(recurrent.target.recurrent.replacement_prepares == 1);
+    CHECK(recurrent.target.recurrent.live_image == 2);
 }
 
 static uint64_t device_transfer_staging_reserved(
@@ -2956,6 +3197,60 @@ static void test_occupied_recycle_replay_failure_quarantines() {
     CHECK(f.target.publish_calls == 0);
 }
 
+static void test_occupied_transformed_recycle_uses_recovery_geometry() {
+    fixture f(false, true, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true, true, true);
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.staged);
+    if (!staged.manifest || !staged.staged) {
+        return;
+    }
+    uint32_t incoming = 0;
+    uint32_t recovery = 0;
+    for (const auto & read : staged.staged->reads()) {
+        if (read.kind == vbr_staged_read_kind::unit_payload) {
+            ++incoming;
+            CHECK(read.size == 10);
+        } else if (read.kind ==
+                       vbr_staged_read_kind::recovery_unit_payload) {
+            ++recovery;
+            CHECK(read.size == 5);
+            CHECK(read.destination_type == GGML_TYPE_TURBO3_TCQ);
+        }
+    }
+    CHECK(incoming == 2);
+    CHECK(recovery == 2);
+
+    f.target.fail_incoming_transfer_at = 0;
+    f.target.fail_incoming_after_bytes = 3;
+    vbr_composite_publish_hooks hooks;
+    hooks.context = &f.target.target;
+    hooks.owner_token = &f.target.target;
+    hooks.validate_owner_token = owner_token_valid;
+    vbr_adopt_test_control test;
+    test.target = &f.target;
+    hooks.test = &test;
+    const auto result = vbr_adopt_empty_manifest(
+        f.target.target, 0, std::move(*staged.manifest),
+        std::move(*staged.staged), f.ledger, hooks);
+    CHECK(result.status == vbr_adopt_status::transfer_failed);
+    CHECK(result.recovery == vbr_adopt_recovery_outcome::replayed);
+    CHECK(result.recovery_h2d_bytes == 10);
+    CHECK(f.target.recovery_transfer_calls == 2);
+    // Only the compact incumbent row geometry is authoritative after replay;
+    // the wider source alias tail is scratch and may remain cleared.
+    for (const size_t base : { size_t(0), size_t(8) }) {
+        CHECK(std::equal(
+            f.target.children[0].destination.begin() + base,
+            f.target.children[0].destination.begin() + base + 5,
+            f.target.incumbent_image.begin() + base));
+    }
+    CHECK(!f.target.children[0].published);
+    CHECK(!f.target.operation_quarantined);
+}
+
 static void test_occupied_replacement_tracker_consumes_canonical_map() {
     fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
               0, vbr_artifact_clean_stash_state::absent_at_source,
@@ -3009,7 +3304,7 @@ static void test_occupied_replacement_tracker_consumes_canonical_map() {
     CHECK(operation.close(vbr_operation_outcome::committed));
 }
 
-static void test_g2_erase_releases_receipt_for_second_adopt() {
+static void test_erase_releases_receipt_for_second_adopt() {
     fixture f;
     const auto first = adopt(f);
     CHECK(first.status == vbr_adopt_status::adopted);
@@ -3038,10 +3333,10 @@ static void check_failed_transaction(
     CHECK(f.view.validate() == vbr_artifact_status::ok);
 }
 
-static void test_g2_phase_fault_matrix() {
-    // Phases 1-11 are fallible on both sides of their work. Phase 12 has only
-    // the pre-boundary seam; phase 12 publication through phase 13 close is
-    // the deliberately seam-free no-fail region.
+static void test_phase_fault_matrix() {
+    // Every phase through tracker preparation is fallible on both sides of
+    // its work. Composite publication has only the pre-boundary seam; its
+    // publication and close are the deliberately seam-free no-fail region.
     for (uint8_t raw = uint8_t(vbr_adopt_phase::consume_capabilities);
          raw <= uint8_t(vbr_adopt_phase::tracker_prepare); ++raw) {
         for (const bool after : { false, true }) {
@@ -3085,7 +3380,7 @@ static void test_g2_phase_fault_matrix() {
     }
 }
 
-static void test_g2_shard_child_and_partial_map_matrix() {
+static void test_shard_child_and_partial_map_matrix() {
     for (uint32_t child = 0; child < 2; ++child) {
         for (uint32_t shard_index = 0; shard_index < 2; ++shard_index) {
             fixture f;
@@ -3125,7 +3420,7 @@ static void test_g2_shard_child_and_partial_map_matrix() {
     }
 }
 
-static void test_g2_complete_tree_barrier_matrix() {
+static void test_complete_tree_barrier_matrix() {
     {
         fixture f;
         f.target.drop_attention_at_barrier = true;
@@ -3168,7 +3463,7 @@ static void test_g2_complete_tree_barrier_matrix() {
     }
 }
 
-static void test_g2_serial_and_admission_faults() {
+static void test_serial_and_admission_faults() {
     {
         fixture f;
         f.target.drift_serial_at_phase3 = true;
@@ -3213,7 +3508,7 @@ static void test_g2_serial_and_admission_faults() {
     }
 }
 
-static void test_g2_downward_subphase_matrix() {
+static void test_downward_subphase_matrix() {
     {
         fixture f(false, true);
         const auto result = adopt(f);
@@ -3310,7 +3605,7 @@ static void test_g2_downward_subphase_matrix() {
     }
 }
 
-static void test_g2_upward_reconstruction() {
+static void test_upward_reconstruction() {
     {
         fixture f(false, false, true);
         uint64_t compact_bytes = 0;
@@ -3568,7 +3863,7 @@ static void test_g2_upward_reconstruction() {
     }
 }
 
-} // namespace g2
+} // namespace adoption_fixture
 
 namespace {
 
@@ -3779,7 +4074,7 @@ static void test_cuda_h2d_adapter() {
     ggml_backend_free(backend);
 }
 
-static bool f42a_model_backed_adoption(
+static bool model_backed_adoption(
         const char * model_path, bool downward_mode,
         ggml_type source_type = GGML_TYPE_F16,
         ggml_type target_type = GGML_TYPE_F16,
@@ -3808,7 +4103,8 @@ static bool f42a_model_backed_adoption(
             : vbr_import_schedule_status::exact;
     ggml_backend_load_all();
     if (live_matrix) {
-        // F5 validates the shipped, model-matched order. The older homogeneous
+        // The live-schedule gate validates the shipped, model-matched order.
+        // The older homogeneous
         // tier oracle intentionally keeps the generic test order.
         unsetenv("VBR_FORCE_GENERIC");
     } else {
@@ -3864,7 +4160,7 @@ static bool f42a_model_backed_adoption(
         prompt.clear();
         prompt.reserve(live_token_count*8);
         for (size_t i = 0; i < live_token_count; ++i) {
-            prompt += " F5 ledger row ";
+            prompt += " VBR ledger row ";
             prompt += std::to_string(i);
             prompt += " preserves deterministic controller pressure.";
         }
@@ -3890,8 +4186,8 @@ static bool f42a_model_backed_adoption(
         // Build the uninterrupted oracle first, destroy it, then reproduce the
         // frozen schedule in the context that will be captured. This proves
         // schedule reproducibility without mutating the sealed controller.
-        CHECK(f42a_decode(source.get(), tokens, 0));
-        CHECK(f42a_decode(
+        CHECK(model_adoption_decode(source.get(), tokens, 0));
+        CHECK(model_adoption_decode(
             source.get(), { continuation }, llama_pos(tokens.size())));
         float * logits = llama_get_logits_ith(source.get(), -1);
         CHECK(logits != nullptr && vocab_size > 0);
@@ -3907,11 +4203,11 @@ static bool f42a_model_backed_adoption(
             return false;
         }
     }
-    CHECK(f42a_decode(source.get(), tokens, 0));
+    CHECK(model_adoption_decode(source.get(), tokens, 0));
     if (failures) {
         return false;
     }
-    // Explicit capture is an idle decode-thread transaction. Long F5 prefills
+    // Explicit capture is an idle decode-thread transaction. Long live-schedule prefills
     // span several scheduler submissions, so close the final submitted VBR
     // operation before asking the capture door to prove quiescence.
     llama_synchronize(source.get());
@@ -3949,9 +4245,9 @@ static bool f42a_model_backed_adoption(
         llama_cache_acct_residency::pageable_host);
     const auto pinned = llama_cache_acct_resource_domain::non_device(
         llama_cache_acct_residency::pinned_host);
-    CHECK(f42a_initialize_accounting(
+    CHECK(model_adoption_initialize_accounting(
         ledger, { bindings[0].domain, host, pinned }));
-    auto budget = f42a_budget(device, bindings[0].domain);
+    auto budget = model_adoption_budget(device, bindings[0].domain);
 
     std::vector<vbr_capture_lane> capture_lanes = {
         { device, source_backend, false },
@@ -3968,7 +4264,7 @@ static bool f42a_model_backed_adoption(
     vbr_explicit_capture_request request;
     request.sequence = 0;
     request.identity = {
-        "f42a:model", "f42a:no-adapter", "f42a:text-only",
+        "vbr:model", "vbr:no-adapter", "vbr:text-only",
         1, int64_t(tokens.size()), llama_pos(tokens.size()),
     };
     request.token_block = tokens;
@@ -3996,7 +4292,7 @@ static bool f42a_model_backed_adoption(
         });
     }
     const vbr_explicit_representation_policy representation_policy {
-        "f42a-model-harness", sizeof("f42a-model-harness")-1,
+        "vbr-model-harness", sizeof("vbr-model-harness")-1,
     };
     request.representation_context = &representation_policy;
     request.representation_identity =
@@ -4011,6 +4307,166 @@ static bool f42a_model_backed_adoption(
         return static_cast<llama_vbr_artifact_catalog *>(context)
             ->prepare_capture_package(package);
     };
+
+    // CR-1: the exact/stateful route must quote and refuse before begin_capture
+    // or D2H, rather than discovering its size by copying the artifact. The
+    // cancellation probe is likewise before accounting/ring work.
+    struct exact_pretransfer_probe {
+        uint32_t admission_calls = 0;
+        uint32_t continuation_calls = 0;
+        bool continue_allowed = true;
+    } exact_probe;
+    auto refused_request = request;
+    refused_request.max_packed_bytes = 1;
+    refused_request.pretransfer_context = &exact_probe;
+    refused_request.pretransfer_admit = [](
+            void * opaque,
+            const vbr_explicit_capture_pretransfer_quote &) noexcept {
+        auto * probe = static_cast<exact_pretransfer_probe *>(opaque);
+        ++probe->admission_calls;
+        return true;
+    };
+    const auto refused_capture = vbr_capture_explicit_manifest(
+        *source_memory, refused_request, catalog, capture_accounting);
+    CHECK(refused_capture.status ==
+          vbr_explicit_capture_status::admission_refused);
+    CHECK(refused_capture.phase ==
+          vbr_explicit_capture_phase::reservation_preparation);
+    CHECK(refused_capture.pretransfer.planned_packed_bytes > 1);
+    CHECK(refused_capture.chunks == 0);
+    CHECK(refused_capture.payload_bytes == 0);
+    CHECK(refused_capture.stash_bytes == 0);
+    CHECK(exact_probe.admission_calls == 0);
+
+    auto cancelled_request = request;
+    exact_probe = {};
+    exact_probe.continue_allowed = false;
+    cancelled_request.max_packed_bytes = UINT64_MAX;
+    cancelled_request.pretransfer_context = &exact_probe;
+    cancelled_request.pretransfer_admit = refused_request.pretransfer_admit;
+    cancelled_request.continue_context = &exact_probe;
+    cancelled_request.continue_transfer = [](void * opaque) noexcept {
+        auto * probe = static_cast<exact_pretransfer_probe *>(opaque);
+        ++probe->continuation_calls;
+        return probe->continue_allowed;
+    };
+    const auto cancelled_capture = vbr_capture_explicit_manifest(
+        *source_memory, cancelled_request, catalog, capture_accounting);
+    CHECK(cancelled_capture.status == vbr_explicit_capture_status::cancelled);
+    CHECK(cancelled_capture.phase ==
+          vbr_explicit_capture_phase::reservation_preparation);
+    CHECK(cancelled_capture.chunks == 0);
+    CHECK(cancelled_capture.payload_bytes == 0);
+    CHECK(cancelled_capture.stash_bytes == 0);
+    CHECK(exact_probe.admission_calls == 1);
+    CHECK(exact_probe.continuation_calls == 1);
+
+    auto cancelled_during_admit = request;
+    exact_probe = {};
+    cancelled_during_admit.max_packed_bytes = UINT64_MAX;
+    cancelled_during_admit.pretransfer_context = &exact_probe;
+    cancelled_during_admit.pretransfer_admit = [](
+            void * opaque,
+            const vbr_explicit_capture_pretransfer_quote &) noexcept {
+        auto * probe = static_cast<exact_pretransfer_probe *>(opaque);
+        ++probe->admission_calls;
+        probe->continue_allowed = false;
+        return false;
+    };
+    cancelled_during_admit.continue_context = &exact_probe;
+    cancelled_during_admit.continue_transfer =
+        cancelled_request.continue_transfer;
+    const auto cancelled_from_admit = vbr_capture_explicit_manifest(
+        *source_memory, cancelled_during_admit, catalog,
+        capture_accounting);
+    CHECK(cancelled_from_admit.status ==
+          vbr_explicit_capture_status::cancelled);
+    CHECK(cancelled_from_admit.phase ==
+          vbr_explicit_capture_phase::reservation_preparation);
+    CHECK(cancelled_from_admit.chunks == 0);
+    CHECK(exact_probe.admission_calls == 1);
+    CHECK(exact_probe.continuation_calls == 1);
+
+    // A stateful provider writes directly into the bounded chain writer. A
+    // task arrival after the first 1 MiB quantum must terminate the private
+    // operation without publishing or reaching attention D2H.
+    struct bounded_companion_probe {
+        uint32_t completed_writes = 0;
+        std::array<uint8_t, 1024*1024> bytes = {};
+    } bounded_probe;
+    auto bounded_request = request;
+    vbr_explicit_companion_provider bounded;
+    bounded.kind = vbr_artifact_companion_kind::typed_accelerator;
+    bounded.build_identity_digest.fill(7);
+    bounded.domain = {
+        llama_cache_acct_residency::pageable_host,
+        llama_cache_acct_domain_kind::not_applicable,
+        UINT32_MAX, UINT16_MAX,
+    };
+    bounded.context = &bounded_probe;
+    bounded.size = [](
+            const void *, llama_seq_id, uint64_t & output) noexcept {
+        output = 3ull*1024ull*1024ull;
+        return true;
+    };
+    bounded.capture_stream = [](
+            const void * opaque,
+            llama_seq_id,
+            llama_io_write_i & output) {
+        auto * probe = const_cast<bounded_companion_probe *>(
+            static_cast<const bounded_companion_probe *>(opaque));
+        for (uint32_t i = 0; i < 3; ++i) {
+            output.write(probe->bytes.data(), probe->bytes.size());
+            ++probe->completed_writes;
+        }
+        return true;
+    };
+    bounded_request.companions.push_back(bounded);
+    bounded_request.max_packed_bytes = UINT64_MAX;
+    bounded_request.continue_context = &bounded_probe;
+    bounded_request.continue_transfer = [](void * opaque) noexcept {
+        const auto * probe =
+            static_cast<const bounded_companion_probe *>(opaque);
+        return probe && probe->completed_writes == 0;
+    };
+    const auto catalog_before_bounded = catalog.snapshot();
+    vbr_explicit_capture_operation bounded_operation;
+    const auto bounded_prepared = vbr_prepare_explicit_manifest(
+        *source_memory, bounded_request, catalog, capture_accounting,
+        bounded_operation);
+    CHECK(bounded_prepared.status == vbr_explicit_capture_status::ok);
+    CHECK(bounded_operation.ready_for_transfer());
+    const auto bounded_cancelled =
+        vbr_transfer_explicit_manifest(bounded_operation);
+    CHECK(bounded_cancelled.status ==
+          vbr_explicit_capture_status::cancelled);
+    CHECK(bounded_cancelled.phase ==
+          vbr_explicit_capture_phase::companion_capture);
+    CHECK(bounded_probe.completed_writes == 1);
+    CHECK(bounded_cancelled.chunks == 0);
+    CHECK(!bounded_operation.ready_for_publication());
+    bounded_operation.reset();
+    const auto catalog_after_bounded = catalog.snapshot();
+    CHECK(catalog_after_bounded.references ==
+          catalog_before_bounded.references);
+    CHECK(catalog_after_bounded.published ==
+          catalog_before_bounded.published);
+
+    bounded_probe.completed_writes = 0;
+    bounded_request.continue_context = nullptr;
+    bounded_request.continue_transfer = nullptr;
+    const auto bounded_complete = vbr_capture_explicit_manifest(
+        *source_memory, bounded_request, catalog, capture_accounting);
+    CHECK(bounded_complete.status == vbr_explicit_capture_status::ok);
+    CHECK(bounded_complete.companions == 1);
+    CHECK(bounded_probe.completed_writes == 3);
+    CHECK(bounded_complete.sink.reference_artifact.v != 0);
+    if (bounded_complete.sink.reference_artifact.v != 0) {
+        CHECK(catalog.discard_unowned_reference(
+            bounded_complete.sink.reference_artifact) ==
+            vbr_artifact_retire_status::retired);
+    }
+
     const auto captured = vbr_capture_explicit_manifest(
         *source_memory, request, catalog, capture_accounting);
     CHECK(captured.status == vbr_explicit_capture_status::ok);
@@ -4053,7 +4509,7 @@ static bool f42a_model_backed_adoption(
                     controller.units[unit.descriptor.logical_unit_id].domain !=
                         vbr_repr_domain::full) {
                     std::fprintf(stderr,
-                        "F5 tapped-without-stash unit=%u type=%d domain=%u\n",
+                        "VBR tapped-without-stash unit=%u type=%d domain=%u\n",
                         unit.descriptor.logical_unit_id,
                         unit.descriptor.current_type,
                         unsigned(controller.units[
@@ -4081,7 +4537,7 @@ static bool f42a_model_backed_adoption(
                         }
                     }
                     std::fprintf(stderr,
-                        "F5 stash unit=%u rows=%" PRIu64
+                        "VBR stash unit=%u rows=%" PRIu64
                         " captured=%u covered=%" PRIu64 " pages=%zu\n",
                         unit.descriptor.logical_unit_id,
                         reference->stash_reference.valid_rows,
@@ -4115,7 +4571,7 @@ static bool f42a_model_backed_adoption(
             }
         }
         std::fprintf(stderr,
-            "F5 source_state tokens=%zu budget_mib=%" PRIu64
+            "VBR source_state tokens=%zu budget_mib=%" PRIu64
             " types=%zu straddled=%d stash_absent=%zu stash_present=%zu "
             "stash_omitted=%zu\n",
             tokens.size(), live_budget_mib, types.size(), straddled,
@@ -4125,7 +4581,7 @@ static bool f42a_model_backed_adoption(
                 vbr_artifact_clean_stash_state::present)],
             stash_states[size_t(
                 vbr_artifact_clean_stash_state::omitted_source_present)]);
-        std::fprintf(stderr, "F5 manifest_consistency=%u\n",
+        std::fprintf(stderr, "VBR manifest_consistency=%u\n",
             unsigned(package.manifest().consistency.kind));
         CHECK(types.size() > 1);
         CHECK(!require_straddled || straddled);
@@ -4144,7 +4600,7 @@ static bool f42a_model_backed_adoption(
 
     std::vector<float> source_logits = std::move(live_source_logits);
     if (!live_matrix) {
-        CHECK(f42a_decode(
+        CHECK(model_adoption_decode(
             source.get(), { continuation }, llama_pos(tokens.size())));
         float * source_logits_ptr = llama_get_logits_ith(source.get(), -1);
         CHECK(source_logits_ptr != nullptr && vocab_size > 0);
@@ -4162,7 +4618,7 @@ static bool f42a_model_backed_adoption(
         source.reset();
     }
 
-    // P3 two-standard oracle: the ordinary F4.2a cell remains byte-exact to
+    // Two-standard oracle: the ordinary native adoption cell remains byte-exact to
     // its F16 source. Downward compares encoded rows against the shipped live
     // degrade path and continuation against a separate context that encoded
     // the same tokens natively at the declared final tier.
@@ -4176,7 +4632,7 @@ static bool f42a_model_backed_adoption(
         CHECK(live_degrade_reference != nullptr);
         std::vector<llama_memory_tree_child> degrade_tree;
         if (!live_degrade_reference ||
-            !f42a_decode(live_degrade_reference.get(), tokens, 0)) {
+            !model_adoption_decode(live_degrade_reference.get(), tokens, 0)) {
             return false;
         }
         llama_synchronize(live_degrade_reference.get());
@@ -4192,8 +4648,8 @@ static bool f42a_model_backed_adoption(
 
         auto same_tier = make_context(final_oracle_type);
         CHECK(same_tier != nullptr);
-        if (!same_tier || !f42a_decode(same_tier.get(), tokens, 0) ||
-            !f42a_decode(same_tier.get(), { continuation },
+        if (!same_tier || !model_adoption_decode(same_tier.get(), tokens, 0) ||
+            !model_adoption_decode(same_tier.get(), { continuation },
                          llama_pos(tokens.size()))) {
             return false;
         }
@@ -4271,7 +4727,7 @@ static bool f42a_model_backed_adoption(
         CHECK(baseline_fit.state == llama_cache_budget_fit_state::fits);
         if (baseline_fit.state != llama_cache_budget_fit_state::fits) {
             std::fprintf(stderr,
-                "F5 baseline budget state=%u cells=%zu completeness=%zu\n",
+                "VBR baseline budget state=%u cells=%zu completeness=%zu\n",
                 unsigned(baseline_fit.state), accounting_snapshot.cells.size(),
                 accounting_snapshot.completeness.size());
             for (const auto & row : accounting_snapshot.cells) {
@@ -4283,7 +4739,7 @@ static bool f42a_model_backed_adoption(
                     resident.state != llama_cache_acct_known::known ||
                     reserved.state != llama_cache_acct_known::known) {
                     std::fprintf(stderr,
-                        "F5 accounting category=%u residency=%u cert=%u "
+                        "VBR accounting category=%u residency=%u cert=%u "
                         "resident=%u reserved=%u\n",
                         unsigned(row.category), unsigned(row.domain.residency),
                         unsigned(row.certification), unsigned(resident.state),
@@ -4297,11 +4753,11 @@ static bool f42a_model_backed_adoption(
         vbr_import_schedule_quote schedule_quote;
         if (destination_upward) {
             for (auto drift_kind : {
-                    f42a_representation_drift_context::kind::codec_version,
-                    f42a_representation_drift_context::kind::codebook_digest,
-                    f42a_representation_drift_context::kind::rotation_digest,
+                    model_adoption_representation_drift_context::kind::codec_version,
+                    model_adoption_representation_drift_context::kind::codebook_digest,
+                    model_adoption_representation_drift_context::kind::rotation_digest,
                  }) {
-                f42a_representation_drift_context drift_context {
+                model_adoption_representation_drift_context drift_context {
                     drift_kind, &representation_policy,
                     int32_t(source_type),
                 };
@@ -4313,7 +4769,7 @@ static bool f42a_model_backed_adoption(
                     *target_memory, 0, package, bindings,
                     previously_observed, accounting_snapshot.serial,
                     &drift_context,
-                    f42a_representation_identity_with_source_drift,
+                    model_adoption_representation_identity_with_source_drift,
                     drifted_target, drifted_projection,
                     drifted_downward, drifted_quote) ==
                     vbr_import_target_snapshot_status::unavailable);
@@ -4360,7 +4816,7 @@ static bool f42a_model_backed_adoption(
         const auto target_lineage = target_snapshot.children[0].lineage_uuid;
         const auto target_instance = target_snapshot.children[0].instance_id;
 
-        f42a_harness_target target_owner;
+        model_adoption_harness_target target_owner;
         target_owner.memory = target_memory;
         target_owner.ledger = &ledger;
         target_owner.package = &package;
@@ -4394,10 +4850,10 @@ static bool f42a_model_backed_adoption(
         policy.budget_config = &budget;
         policy.schedule_quote = &schedule_quote;
         policy.context = &target_owner;
-        policy.recheck_target_empty = f42a_harness_target::recheck;
+        policy.recheck_target_empty = model_adoption_harness_target::recheck;
         policy.read_accounting_serial =
-            f42a_harness_target::accounting_serial;
-        policy.read_policy_epoch = f42a_harness_target::policy_serial;
+            model_adoption_harness_target::accounting_serial;
+        policy.read_policy_epoch = model_adoption_harness_target::policy_serial;
         policy.parse_companion = vbr_parse_recurrent_companion;
         llama_cache_budget_plan transform_budget_plan;
         if (needs_transform) {
@@ -4407,7 +4863,7 @@ static bool f42a_model_backed_adoption(
             policy.downward_projection = downward_mode
                 ? &downward_projection : nullptr;
             policy.read_transform_tree_digest =
-                f42a_harness_target::transform_tree;
+                model_adoption_harness_target::transform_tree;
         }
 
         auto validated = vbr_validate_unit_manifest_snapshot(
@@ -4415,7 +4871,7 @@ static bool f42a_model_backed_adoption(
         if (validated.status != vbr_manifest_validation_status::validated ||
             validated.decision != expected_decision || !validated.proof) {
             std::fprintf(stderr,
-                "F5 validation failed status=%s decision=%s expected=%s "
+                "VBR validation failed status=%s decision=%s expected=%s "
                 "observed=%d downward=%d\n",
                 vbr_manifest_validation_status_name(validated.status),
                 vbr_import_decision_name(validated.decision),
@@ -4446,7 +4902,7 @@ static bool f42a_model_backed_adoption(
                     source_unit.representation.checkpoint_codec_hops !=
                         found->checkpoint_codec_hops) {
                     std::fprintf(stderr,
-                        "F5 representation unit=%u type=%d/%d source=%d/%d "
+                        "VBR representation unit=%u type=%d/%d source=%d/%d "
                         "hops=%u/%u transition=%u/%u loss=%u/%u codec=%u/%u\n",
                         source_unit.logical_unit_id,
                         source_unit.current_type, found->current_type,
@@ -4484,7 +4940,7 @@ static bool f42a_model_backed_adoption(
         });
         if (needs_transform) {
             stage_policy.transform_context = target_memory;
-            stage_policy.reserve_transform = f42a_reserve_transform;
+            stage_policy.reserve_transform = model_adoption_reserve_transform;
         }
         auto staged = vbr_stage_validated_manifest(
             std::move(validated.proof), stage_policy);
@@ -4497,7 +4953,7 @@ static bool f42a_model_backed_adoption(
         vbr_composite_publish_hooks hooks;
         hooks.context = target_memory;
         hooks.owner_token = target_memory;
-        hooks.validate_owner_token = f42a_owner_token;
+        hooks.validate_owner_token = model_adoption_owner_token;
         std::vector<llama_memory_tree_child> adoption_tree;
         CHECK(llama_memory_tree_collect(target_memory, adoption_tree));
         for (const auto & child : adoption_tree) {
@@ -4519,13 +4975,16 @@ static bool f42a_model_backed_adoption(
             vbr_target_validation_snapshot rolled_back;
             vbr_downward_policy_projection rolled_back_projection;
             bool rolled_back_downward = false;
-            CHECK(vbr_explicit_import_target_snapshot(
+            vbr_import_schedule_quote rolled_back_quote;
+            CHECK(vbr_explicit_import_target_schedule_snapshot(
                 *target_memory, 0, package, bindings, previously_observed,
                 ledger.snapshot().serial,
                 &representation_policy,
                 vbr_explicit_capture_representation_identity,
                 rolled_back,
-                &rolled_back_projection, &rolled_back_downward));
+                rolled_back_projection, rolled_back_downward,
+                rolled_back_quote) ==
+                vbr_import_target_snapshot_status::actionable);
             CHECK(std::all_of(
                 rolled_back.children.begin(), rolled_back.children.end(),
                 [](const vbr_target_child_snapshot & child) {
@@ -4594,7 +5053,7 @@ static bool f42a_model_backed_adoption(
                 schedule_quote.destination().final_types[0]));
         }
 
-        CHECK(f42a_decode(target_context.get(),
+        CHECK(model_adoption_decode(target_context.get(),
                           { continuation }, llama_pos(tokens.size())));
         float * target_logits = llama_get_logits_ith(target_context.get(), -1);
         CHECK(target_logits != nullptr);
@@ -4616,7 +5075,7 @@ static bool f42a_model_backed_adoption(
                     max_abs, std::abs(expected_logits[i]-target_logits[i]));
             }
             std::fprintf(stderr,
-                "F5 representation-level continuation max_abs=%g\n",
+                "VBR representation-level continuation max_abs=%g\n",
                 double(max_abs));
             // The target representation is deterministic on pinned kernels;
             // the retained 27B gate records this metric and applies the
@@ -4637,7 +5096,7 @@ static bool f42a_model_backed_adoption(
 
     // Every fallible boundary from operation-open through the final
     // pre-publication checkpoint is driven on a real target. A fail-before
-    // at phase N is also the fail-after oracle for phase N-1. Composite
+    // at a boundary also proves rollback after the preceding boundary. Composite
     // publication and close deliberately have no post-boundary fault seam.
     if (live_matrix) {
         CHECK(run_import(false, require_straddled
@@ -4668,7 +5127,7 @@ static bool f42a_model_backed_adoption(
     return failures == 0;
 }
 
-static bool h2_model_backed_occupied_store(
+static bool model_backed_occupied_store(
         const char * model_path, ggml_type entry_type) {
     ggml_backend_load_all();
     setenv("VBR_FORCE_GENERIC", "1", 1);
@@ -4741,7 +5200,14 @@ static bool h2_model_backed_occupied_store(
             (uint32_t(incumbent_tokens.back()) + 1u) % uint32_t(vocab_size));
     }
 
-    CHECK(f42a_decode(context.get(), incoming_tokens, 0));
+    const size_t prefix_count = std::min<size_t>(8, incoming_tokens.size()-1);
+    const llama_token prefix_continuation = incoming_tokens[prefix_count];
+    llama_tokens prefix_tokens(
+        incoming_tokens.begin(), incoming_tokens.begin()+prefix_count);
+    std::vector<uint8_t> prefix_expected_rows;
+    std::vector<float> prefix_expected_logits;
+
+    CHECK(model_adoption_decode(context.get(), incoming_tokens, 0));
     llama_synchronize(context.get());
     llama_memory_i * memory = llama_get_memory(context.get());
     std::vector<vbr_explicit_capture_runtime_pool> pools;
@@ -4782,10 +5248,10 @@ static bool h2_model_backed_occupied_store(
         llama_cache_acct_residency::pageable_host);
     const auto pinned_domain = llama_cache_acct_resource_domain::non_device(
         llama_cache_acct_residency::pinned_host);
-    CHECK(f42a_initialize_accounting(
+    CHECK(model_adoption_initialize_accounting(
         ledger, { device_domain, host_domain, pinned_domain }));
-    h2_occupied_budget_source budget_source {
-        f42a_budget(first_pool.backend_device, device_domain),
+    occupied_budget_source budget_source {
+        model_adoption_budget(first_pool.backend_device, device_domain),
     };
     server_vbr_artifact_store_config store_config;
     store_config.ledger = &ledger;
@@ -4803,7 +5269,7 @@ static bool h2_model_backed_occupied_store(
     store_config.ring_bytes = 64ull*1024*1024;
     store_config.chunk_bytes = 8ull*1024*1024;
     store_config.budget_context = &budget_source;
-    store_config.sample_budget = h2_occupied_sample_budget;
+    store_config.sample_budget = occupied_sample_budget;
     server_vbr_artifact_capture_status store_status;
     auto store = server_vbr_artifact_store::create(
         store_config, store_status);
@@ -4812,20 +5278,15 @@ static bool h2_model_backed_occupied_store(
         return false;
     }
 
-    static constexpr char execution_identity[] = "h2:occupied:model";
-    static constexpr char adapter_identity[] = "h2:occupied:no-adapter";
-    static constexpr char tenant[] = "h2:occupied:test-tenant";
-    const auto capture_owner = [&] (
-            const llama_tokens & tokens,
-            std::shared_ptr<const server_prompt_cache_vbr_payload> & owner) {
+    static constexpr char execution_identity[] = "vbr:occupied:model";
+    static constexpr char adapter_identity[] = "vbr:occupied:no-adapter";
+    const auto make_host_capture_request = [&] (const llama_tokens & tokens) {
         server_prompt prompt;
         prompt.tokens = server_tokens(tokens, false);
         prompt.sequence_epoch = 1;
         std::string media_identity;
-        if (!prompt.tokens.media_content_identity(
-                prompt.n_tokens(), media_identity)) {
-            return false;
-        }
+        CHECK(prompt.tokens.media_content_identity(
+            prompt.n_tokens(), media_identity));
         vbr_explicit_capture_request request;
         request.sequence = 0;
         request.identity = {
@@ -4850,34 +5311,98 @@ static bool h2_model_backed_occupied_store(
         request.frontier.token_count = request.identity.token_count;
         request.frontier.next_position = request.identity.next_position;
         request.idle_decode_thread = true;
-        const auto captured = store->capture(*memory, std::move(request), tenant);
+        return request;
+    };
+    const auto capture_owner = [&] (
+            const llama_tokens & tokens,
+            std::shared_ptr<const server_prompt_cache_vbr_payload> & owner) {
+        server_vbr_explicit_host_capture operation;
+        const auto prepared = store->prepare_host_payload(
+            *memory, make_host_capture_request(tokens), operation);
+        const auto transferred = prepared.status ==
+                    server_vbr_artifact_capture_status::ok &&
+                operation.ready_for_transfer()
+            ? store->transfer_host_payload(operation)
+            : prepared;
+        const auto captured = transferred.status ==
+                    server_vbr_artifact_capture_status::ok &&
+                operation.ready_for_publication()
+            ? store->publish_host_payload(operation, owner)
+            : transferred;
         const bool ok =
             captured.status == server_vbr_artifact_capture_status::ok &&
-            !captured.reference.empty() &&
-            store->retain_host_payload(captured.reference, tenant, owner) &&
             owner && owner->package();
         if (!ok) {
             std::fprintf(stderr,
-                "H2 occupied capture failed: store=%s library=%s phase=%s "
-                "generation=%s size=%s reference=%zu owner=%d package=%d\n",
+                "VBR occupied capture failed: store=%s library=%s phase=%s "
+                "generation=%s size=%s owner=%d package=%d\n",
                 server_vbr_artifact_capture_status_name(captured.status),
                 vbr_explicit_capture_status_name(captured.library_status),
                 vbr_explicit_capture_phase_name(captured.phase),
                 vbr_explicit_generation_failure_name(captured.generation_failure),
                 vbr_explicit_size_failure_name(captured.size_failure),
-                captured.reference.size(), bool(owner),
-                bool(owner && owner->package()));
+                bool(owner), bool(owner && owner->package()));
         }
         return ok;
     };
+
+    // Prefix derivation is intentionally parent-bound to a projected-sealed
+    // artifact (it retains the authenticated range tree that an exact whole
+    // capture does not need). Capture a short parent from the still-live full
+    // sequence so this hardware arm exercises the same production owner used
+    // by automatic projected host publication.
+    const size_t projected_parent_count = incoming_tokens.size();
+    vbr_projected_capture_manifest_request projected_manifest;
+    projected_manifest.manifest_id = 1;
+    projected_manifest.sequence = 0;
+    projected_manifest.token_block.assign(
+        incoming_tokens.begin(),
+        incoming_tokens.begin() + projected_parent_count);
+    projected_manifest.identity =
+        make_host_capture_request(projected_manifest.token_block).identity;
+    projected_manifest.text_only = true;
+    std::vector<server_vbr_projected_host_publish_result> projected_results;
+    server_vbr_projected_host_capture_diagnostics projected_diagnostics;
+    CHECK(store->capture_projected_host_batch(
+        *memory, { std::move(projected_manifest) },
+        256ull*1024*1024, projected_results, nullptr,
+        &projected_diagnostics));
+    CHECK(projected_results.size() == 1);
+    std::shared_ptr<const server_prompt_cache_vbr_payload> projected_owner =
+        projected_results.size() == 1 ? projected_results.front().payload
+                                      : nullptr;
+    CHECK(projected_owner && projected_owner->package());
+
+    // The scheduler may abandon an admitted operation after preparation. The
+    // private catalog build and its ledger claims must disappear without a
+    // host-visible publication or a successful-capture counter increment.
+    const auto ledger_before_abandon = ledger.snapshot();
+    const auto counters_before_abandon = store->counters();
+    {
+        server_vbr_explicit_host_capture abandoned;
+        const auto prepared = store->prepare_host_payload(
+            *memory, make_host_capture_request(incoming_tokens), abandoned);
+        CHECK(prepared.status == server_vbr_artifact_capture_status::ok);
+        CHECK(abandoned.ready_for_transfer());
+        abandoned.reset();
+        CHECK(!abandoned.ready_for_transfer());
+        CHECK(!abandoned.ready_for_publication());
+    }
+    const auto ledger_after_abandon = ledger.snapshot();
+    CHECK(ledger_after_abandon.live_ops == ledger_before_abandon.live_ops);
+    CHECK(ledger_after_abandon.allocations.size() ==
+          ledger_before_abandon.allocations.size());
+    CHECK(store->counters().exact_published ==
+          counters_before_abandon.exact_published);
 
     std::shared_ptr<const server_prompt_cache_vbr_payload> incoming_owner;
     CHECK(capture_owner(incoming_tokens, incoming_owner));
     if (!incoming_owner) {
         return false;
     }
-    CHECK(f42a_decode(
+    CHECK(model_adoption_decode(
         context.get(), { continuation }, llama_pos(incoming_tokens.size())));
+    llama_synchronize(context.get());
     float * expected_logits_ptr = llama_get_logits_ith(context.get(), -1);
     CHECK(expected_logits_ptr != nullptr);
     if (!expected_logits_ptr) {
@@ -4885,9 +5410,26 @@ static bool h2_model_backed_occupied_store(
     }
     std::vector<float> expected_logits(
         expected_logits_ptr, expected_logits_ptr + vocab_size);
+    // Build the prefix oracle from the exact rows used by the projected parent.
+    // A separately decoded short prompt may take a different GEMM shape and is
+    // not a byte-exact cache oracle even though it is semantically equivalent.
+    CHECK(llama_memory_seq_rm(
+        memory, 0, llama_pos(prefix_count), -1));
     llama_synchronize(context.get());
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        static_cast<llama_kv_cache *>(memory), 0, uint32_t(prefix_count),
+        prefix_expected_rows));
+    CHECK(model_adoption_decode(
+        context.get(), { prefix_continuation }, llama_pos(prefix_count)));
+    llama_synchronize(context.get());
+    float * prefix_expected_ptr = llama_get_logits_ith(context.get(), -1);
+    CHECK(prefix_expected_ptr != nullptr);
+    if (prefix_expected_ptr) {
+        prefix_expected_logits.assign(
+            prefix_expected_ptr, prefix_expected_ptr+vocab_size);
+    }
     llama_memory_clear(memory, true);
-    CHECK(f42a_decode(context.get(), incumbent_tokens, 0));
+    CHECK(model_adoption_decode(context.get(), incumbent_tokens, 0));
     llama_synchronize(context.get());
     CHECK(memory->seq_pos_min(0) == 0);
     CHECK(memory->seq_pos_max(0) ==
@@ -5075,7 +5617,7 @@ static bool h2_model_backed_occupied_store(
         imported.adopt_status != vbr_adopt_status::adopted ||
         !state.published) {
         std::fprintf(stderr,
-            "H2 occupied import failed: store=%s validation=%s stage=%s "
+            "VBR occupied import failed: store=%s validation=%s stage=%s "
             "reserve=%s adopt=%s recovery=%s phase=%s schedule=%s "
             "destination=%s decision=%s attempted=%d published=%d\n",
             server_vbr_artifact_import_status_name(imported.status),
@@ -5109,8 +5651,9 @@ static bool h2_model_backed_occupied_store(
         ticket, incumbent_prompt, incumbent_family, destination_slot);
     CHECK(!ticket.ready());
 
-    CHECK(f42a_decode(
+    CHECK(model_adoption_decode(
         context.get(), { continuation }, llama_pos(incoming_tokens.size())));
+    llama_synchronize(context.get());
     float * actual_logits = llama_get_logits_ith(context.get(), -1);
     CHECK(actual_logits != nullptr);
     if (actual_logits) {
@@ -5118,10 +5661,125 @@ static bool h2_model_backed_occupied_store(
             expected_logits.data(), actual_logits,
             expected_logits.size()*sizeof(float)) == 0);
     }
-    llama_synchronize(context.get());
     // The no-fail sidecar swap retired the displaced live artifact and its
     // soft lease. Drop the now-stale local handle without a second terminal.
     incumbent_lease = {};
+
+    // PT production composition: derive a true shorter/divergent prefix from
+    // the same store-owned parent, import it through the real empty-target
+    // store door, and prove that no suffix row was needed for continuation
+    // parity.
+    llama_memory_clear(memory, true);
+    CHECK(llama_kv_cache_vbr_epoch_test::
+        make_construction_empty_preserve_tiers(occupied_cache));
+    llama_tokens divergent_request = prefix_tokens;
+    llama_token divergent = llama_token(
+        (uint32_t(prefix_continuation)+1u)%uint32_t(vocab_size));
+    if (divergent == prefix_continuation) {
+        divergent = llama_token(
+            (uint32_t(divergent)+1u)%uint32_t(vocab_size));
+    }
+    divergent_request.push_back(divergent);
+    vbr_artifact_attention_prefix_projection prefix_projection;
+    CHECK(store->prepare_host_prefix_projection(
+        projected_owner, divergent_request, prefix_count,
+        prefix_projection) ==
+        vbr_artifact_prefix_projection_status::projected);
+    struct prefix_publish_state {
+        const llama_tokens * expected = nullptr;
+        bool published = false;
+    } prefix_state { &prefix_tokens, false };
+    server_vbr_artifact_import_target prefix_request;
+    prefix_request.memory = memory;
+    prefix_request.destination = destination_slot;
+    prefix_request.execution_identity = execution_key;
+    prefix_request.adapter_config_identity = adapter_key;
+    prefix_request.previously_observed = true;
+    prefix_request.publish_context = &prefix_state;
+    prefix_request.prepare_publish = [](
+            void * opaque,
+            const std::vector<llama_token> & tokens,
+            uint64_t sequence_epoch) noexcept {
+        const auto * state = static_cast<const prefix_publish_state *>(opaque);
+        return state && state->expected && sequence_epoch == 1 &&
+            tokens == *state->expected;
+    };
+    prefix_request.publish = [](void * opaque) noexcept {
+        static_cast<prefix_publish_state *>(opaque)->published = true;
+    };
+    const auto prefix_import = store->import_host_prefix_payload(
+        std::move(prefix_request), projected_owner,
+        std::move(prefix_projection));
+    if (prefix_import.status != server_vbr_artifact_import_status::ok ||
+        prefix_import.adopt_status != vbr_adopt_status::adopted ||
+        !prefix_state.published) {
+        std::fprintf(stderr,
+            "VBR prefix import failed: store=%s validation=%s stage=%s "
+            "reserve=%s adopt=%s phase=%s schedule=%s destination=%s "
+            "decision=%s attempted=%d published=%d\n",
+            server_vbr_artifact_import_status_name(prefix_import.status),
+            vbr_manifest_validation_status_name(
+                prefix_import.validation_status),
+            vbr_adopt_stage_status_name(prefix_import.stage_status),
+            vbr_downward_reserve_status_name(
+                prefix_import.downward_reserve_status),
+            vbr_adopt_status_name(prefix_import.adopt_status),
+            vbr_adopt_phase_name(prefix_import.phase),
+            vbr_import_schedule_status_name(prefix_import.schedule_status),
+            vbr_import_destination_status_name(
+                prefix_import.destination_status),
+            vbr_import_decision_name(prefix_import.decision),
+            prefix_import.adopt_attempted, prefix_state.published);
+    }
+    CHECK(prefix_import.status == server_vbr_artifact_import_status::ok);
+    CHECK(prefix_import.adopt_status == vbr_adopt_status::adopted);
+    CHECK(prefix_state.published);
+    CHECK(memory->seq_pos_min(destination_slot) == 0);
+    CHECK(memory->seq_pos_max(destination_slot) ==
+          llama_pos(prefix_count-1));
+    std::vector<uint8_t> prefix_actual_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, destination_slot, uint32_t(prefix_count),
+        prefix_actual_rows));
+    if (prefix_actual_rows != prefix_expected_rows) {
+        size_t mismatch = 0;
+        while (mismatch < prefix_actual_rows.size() &&
+               mismatch < prefix_expected_rows.size() &&
+               prefix_actual_rows[mismatch] == prefix_expected_rows[mismatch]) {
+            ++mismatch;
+        }
+        std::fprintf(stderr,
+            "VBR prefix KV mismatch byte=%zu expected_size=%zu actual_size=%zu\n",
+            mismatch, prefix_expected_rows.size(), prefix_actual_rows.size());
+    }
+    CHECK(prefix_actual_rows == prefix_expected_rows);
+    CHECK(model_adoption_decode(
+        context.get(), { prefix_continuation }, llama_pos(prefix_count)));
+    llama_synchronize(context.get());
+    float * prefix_actual = llama_get_logits_ith(context.get(), -1);
+    CHECK(prefix_actual != nullptr);
+    if (prefix_actual && !prefix_expected_logits.empty()) {
+        const bool equal = std::memcmp(
+            prefix_expected_logits.data(), prefix_actual,
+            prefix_expected_logits.size()*sizeof(float)) == 0;
+        if (!equal) {
+            float max_abs = 0.0f;
+            size_t max_index = 0;
+            for (size_t i = 0; i < prefix_expected_logits.size(); ++i) {
+                const float delta = std::fabs(
+                    prefix_expected_logits[i] - prefix_actual[i]);
+                if (delta > max_abs) {
+                    max_abs = delta;
+                    max_index = i;
+                }
+            }
+            std::fprintf(stderr,
+                "VBR prefix parity mismatch max_abs=%g index=%zu expected=%g actual=%g\n",
+                max_abs, max_index, prefix_expected_logits[max_index],
+                prefix_actual[max_index]);
+        }
+        CHECK(equal);
+    }
     return failures == 0;
 }
 
@@ -5155,7 +5813,67 @@ static void test_final_recheck_excludes_only_own_reservation() {
     operation.close(vbr_operation_outcome::aborted);
 }
 
-static bool f42b_parse_type(const std::string & name, ggml_type & output) {
+static void test_checkpoint_recurrent_frontier_header() {
+    std::array<uint8_t,
+        2*sizeof(uint32_t)+sizeof(llama_seq_id)+sizeof(llama_pos)> bytes = {};
+    const uint32_t magic = 0xaf143cd8;
+    const llama_seq_id sequence = 3;
+    const uint32_t cell_count = 1;
+    const llama_pos terminal = 37;
+    size_t cursor = 0;
+    std::memcpy(bytes.data()+cursor, &magic, sizeof(magic));
+    cursor += sizeof(magic);
+    std::memcpy(bytes.data()+cursor, &sequence, sizeof(sequence));
+    cursor += sizeof(sequence);
+    std::memcpy(bytes.data()+cursor, &cell_count, sizeof(cell_count));
+    cursor += sizeof(cell_count);
+    std::memcpy(bytes.data()+cursor, &terminal,
+                sizeof(terminal));
+    llama_pos parsed = -1;
+    CHECK(vbr_explicit_recurrent_companion_terminal(
+        bytes.data(), bytes.size(), parsed));
+    CHECK(parsed == terminal);
+
+    const llama_pos swapped_frontier = 19;
+    std::memcpy(bytes.data()+cursor, &swapped_frontier,
+                sizeof(swapped_frontier));
+    CHECK(vbr_explicit_recurrent_companion_terminal(
+        bytes.data(), bytes.size(), parsed));
+    CHECK(parsed != terminal);
+    const uint32_t multiple_cells = 2;
+    std::memcpy(bytes.data()+cursor-sizeof(cell_count), &multiple_cells,
+                sizeof(multiple_cells));
+    CHECK(!vbr_explicit_recurrent_companion_terminal(
+        bytes.data(), bytes.size(), parsed));
+}
+
+static void test_dflash_ring_frontier_header() {
+    std::array<uint8_t, 6*sizeof(int32_t)> bytes = {};
+    auto * header = reinterpret_cast<int32_t *>(bytes.data());
+    header[0] = 1;
+    header[1] = 1;
+    header[2] = 38;
+    header[3] = 1;
+    header[4] = 1;
+    header[5] = 1;
+    llama_pos terminal = -1;
+    CHECK(common_speculative_ring_state_serialized_terminal(
+        bytes.data(), bytes.size(), terminal));
+    CHECK(terminal == 37);
+    header[2] = 19;
+    CHECK(common_speculative_ring_state_serialized_terminal(
+        bytes.data(), bytes.size(), terminal));
+    CHECK(terminal == 18);
+    header[2] = -1;
+    CHECK(!common_speculative_ring_state_serialized_terminal(
+        bytes.data(), bytes.size(), terminal));
+    header[2] = INT32_MAX;
+    CHECK(common_speculative_ring_state_serialized_terminal(
+        bytes.data(), bytes.size(), terminal));
+    CHECK(terminal == llama_pos(INT32_MAX)-1);
+}
+
+static bool parse_vbr_type(const std::string & name, ggml_type & output) {
     if (name == "f16") {
         output = GGML_TYPE_F16;
     } else if (name == "t8") {
@@ -5175,53 +5893,58 @@ static bool f42b_parse_type(const std::string & name, ggml_type & output) {
 }
 
 int main(int argc, char ** argv) {
-    g2::test_occupied_replacement_free_cell_adoption();
-    g2::test_occupied_replacement_fault_preserves_incumbent();
-    g2::test_occupied_recycle_success_and_zero_growth();
-    g2::test_occupied_recycle_partial_write_and_late_fault_matrix();
-    g2::test_occupied_recycle_replay_failure_quarantines();
-    g2::test_occupied_replacement_tracker_consumes_canonical_map();
+    adoption_fixture::test_occupied_replacement_free_cell_adoption();
+    adoption_fixture::test_occupied_replacement_fault_preserves_incumbent();
+    adoption_fixture::test_occupied_spec_companion_replacement_and_rollback();
+    adoption_fixture::test_occupied_recycle_success_and_zero_growth();
+    adoption_fixture::test_occupied_recycle_partial_write_and_late_fault_matrix();
+    adoption_fixture::test_occupied_recycle_replay_failure_quarantines();
+    adoption_fixture::test_occupied_transformed_recycle_uses_recovery_geometry();
+    adoption_fixture::test_occupied_replacement_tracker_consumes_canonical_map();
+    test_checkpoint_recurrent_frontier_header();
+    test_dflash_ring_frontier_header();
     test_epoch_capacity_preflight();
     test_closed_vocabularies();
     test_complete_tree_barrier_fail_closed();
-    g2::test_g2_real_driver_smoke();
-    g2::test_g2_erase_releases_receipt_for_second_adopt();
-    g2::test_g2_phase_fault_matrix();
-    g2::test_g2_shard_child_and_partial_map_matrix();
-    g2::test_g2_complete_tree_barrier_matrix();
-    g2::test_g2_serial_and_admission_faults();
-    g2::test_g2_downward_subphase_matrix();
-    g2::test_g2_upward_reconstruction();
+    adoption_fixture::test_real_driver_smoke();
+    adoption_fixture::test_erase_releases_receipt_for_second_adopt();
+    adoption_fixture::test_phase_fault_matrix();
+    adoption_fixture::test_shard_child_and_partial_map_matrix();
+    adoption_fixture::test_complete_tree_barrier_matrix();
+    adoption_fixture::test_serial_and_admission_faults();
+    adoption_fixture::test_downward_subphase_matrix();
+    adoption_fixture::test_upward_reconstruction();
     test_final_recheck_excludes_only_own_reservation();
     test_native_tracker_image_preserves_lineage_and_runtime();
     test_real_tracker_import_settle_and_teardown();
     test_live_rebased_tracker_image_is_fresh();
     test_native_tracker_rejects_uncovered_cell_and_tuple_splice();
     if (argc >= 2 &&
-        (std::string(argv[1]) == "--f42a-cuda" ||
-         std::string(argv[1]) == "--f42b-cuda" ||
-         std::string(argv[1]) == "--f5-cuda" ||
-         std::string(argv[1]) == "--h2-destination-cuda" ||
-         std::string(argv[1]) == "--h2-occupied-cuda")) {
-        const bool downward = std::string(argv[1]) == "--f42b-cuda";
-        const bool f5 = std::string(argv[1]) == "--f5-cuda";
-        const bool h2_destination =
-            std::string(argv[1]) == "--h2-destination-cuda";
-        const bool h2_occupied =
-            std::string(argv[1]) == "--h2-occupied-cuda";
-        if ((!downward && !f5 && !h2_destination && !h2_occupied &&
+        (std::string(argv[1]) == "--vbr-adopt-cuda" ||
+         std::string(argv[1]) == "--vbr-transform-cuda" ||
+         std::string(argv[1]) == "--vbr-live-schedule-cuda" ||
+         std::string(argv[1]) == "--vbr-transformed-destination-cuda" ||
+         std::string(argv[1]) == "--vbr-occupied-restore-cuda")) {
+        const bool downward = std::string(argv[1]) == "--vbr-transform-cuda";
+        const bool live_schedule =
+            std::string(argv[1]) == "--vbr-live-schedule-cuda";
+        const bool transformed_destination =
+            std::string(argv[1]) == "--vbr-transformed-destination-cuda";
+        const bool occupied_restore =
+            std::string(argv[1]) == "--vbr-occupied-restore-cuda";
+        if ((!downward && !live_schedule && !transformed_destination && !occupied_restore &&
                  argc != 3) ||
-            (f5 && argc != 6) ||
+            (live_schedule && argc != 6) ||
             (downward && argc != 3 && argc != 5) ||
-            (h2_destination && argc != 7) ||
-            (h2_occupied && argc != 4)) {
+            (transformed_destination && argc != 7) ||
+            (occupied_restore && argc != 4)) {
             std::fprintf(stderr,
-                "usage: %s --f42a-cuda MODEL\n"
-                "       %s --f42b-cuda MODEL [SOURCE TARGET]\n"
-                "       %s --h2-destination-cuda MODEL SOURCE ENTRY "
+                "usage: %s --vbr-adopt-cuda MODEL\n"
+                "       %s --vbr-transform-cuda MODEL [SOURCE TARGET]\n"
+                "       %s --vbr-transformed-destination-cuda MODEL SOURCE ENTRY "
                 "EXPECTED BUDGET_MIB\n"
-                "       %s --h2-occupied-cuda MODEL ENTRY\n"
-                "       %s --f5-cuda MODEL BUDGET_MIB TOKENS "
+                "       %s --vbr-occupied-restore-cuda MODEL ENTRY\n"
+                "       %s --vbr-live-schedule-cuda MODEL BUDGET_MIB TOKENS "
                 "mixed|straddled\n"
                 "tiers: f16 t8 t4 t3 t2 t1\n",
                 argv[0], argv[0], argv[0], argv[0], argv[0]);
@@ -5231,9 +5954,9 @@ int main(int argc, char ** argv) {
         ggml_type target_type = downward ?
             GGML_TYPE_TURBO3_TCQ : GGML_TYPE_F16;
         if (downward && argc == 5 &&
-            (!f42b_parse_type(argv[3], source_type) ||
-             !f42b_parse_type(argv[4], target_type))) {
-            std::fprintf(stderr, "invalid F4.2b tier pair: %s -> %s\n",
+            (!parse_vbr_type(argv[3], source_type) ||
+             !parse_vbr_type(argv[4], target_type))) {
+            std::fprintf(stderr, "invalid VBR transform tier pair: %s -> %s\n",
                 argv[3], argv[4]);
             return 2;
         }
@@ -5241,16 +5964,16 @@ int main(int argc, char ** argv) {
         ggml_type expected_destination_type = GGML_TYPE_COUNT;
         uint64_t destination_budget_mib = 0;
         bool destination_downward = downward;
-        if (h2_occupied && !f42b_parse_type(argv[3], target_type)) {
-            std::fprintf(stderr, "invalid H2 occupied entry tier: %s\n", argv[3]);
+        if (occupied_restore && !parse_vbr_type(argv[3], target_type)) {
+            std::fprintf(stderr, "invalid occupied-restore entry tier: %s\n", argv[3]);
             return 2;
         }
-        if (h2_destination) {
+        if (transformed_destination) {
             char * budget_end = nullptr;
-            if (!f42b_parse_type(argv[3], source_type) ||
-                !f42b_parse_type(argv[4], target_type) ||
-                !f42b_parse_type(argv[5], expected_destination_type)) {
-                std::fprintf(stderr, "invalid H2 destination tier\n");
+            if (!parse_vbr_type(argv[3], source_type) ||
+                !parse_vbr_type(argv[4], target_type) ||
+                !parse_vbr_type(argv[5], expected_destination_type)) {
+                std::fprintf(stderr, "invalid transformed-destination tier\n");
                 return 2;
             }
             destination_budget_mib = std::strtoull(
@@ -5273,14 +5996,14 @@ int main(int argc, char ** argv) {
                 (relation != vbr_downward_recipe_status::resolved &&
                  relation != vbr_downward_recipe_status::equal_tier &&
                  !destination_upward)) {
-                std::fprintf(stderr, "invalid H2 destination schedule\n");
+                std::fprintf(stderr, "invalid transformed-destination schedule\n");
                 return 2;
             }
         }
         if (downward && vbr_downward_resolve_recipe(
                 source_type, target_type, GGML_TYPE_TURBO1_TCQ, true,
                 requested_recipe) != vbr_downward_recipe_status::resolved) {
-            std::fprintf(stderr, "unsupported F4.2b tier pair: %s -> %s\n",
+            std::fprintf(stderr, "unsupported VBR transform tier pair: %s -> %s\n",
                 argc == 5 ? argv[3] : "f16",
                 argc == 5 ? argv[4] : "t3");
             return 2;
@@ -5289,14 +6012,14 @@ int main(int argc, char ** argv) {
         test_packed_h2d_projection_max_ranges();
         test_cuda_h2d_adapter();
         if (failures == 0) {
-            if (h2_occupied) {
-                h2_model_backed_occupied_store(argv[2], target_type);
-            } else if (h2_destination) {
-                f42a_model_backed_adoption(
+            if (occupied_restore) {
+                model_backed_occupied_store(argv[2], target_type);
+            } else if (transformed_destination) {
+                model_backed_adoption(
                     argv[2], destination_downward,
                     source_type, target_type, 0, 0, false,
                     destination_budget_mib, expected_destination_type);
-            } else if (f5) {
+            } else if (live_schedule) {
                 char * budget_end = nullptr;
                 char * tokens_end = nullptr;
                 const uint64_t budget = std::strtoull(
@@ -5306,20 +6029,20 @@ int main(int argc, char ** argv) {
                 const bool straddled = std::string(argv[5]) == "straddled";
                 if (!budget || !n_tokens || *budget_end || *tokens_end ||
                     (!straddled && std::string(argv[5]) != "mixed")) {
-                    std::fprintf(stderr, "invalid F5 live-matrix arguments\n");
+                    std::fprintf(stderr, "invalid VBR live-schedule arguments\n");
                     return 2;
                 }
-                f42a_model_backed_adoption(
+                model_backed_adoption(
                     argv[2], false, GGML_TYPE_F16, GGML_TYPE_F16,
                     budget, size_t(n_tokens), straddled);
             } else {
-                f42a_model_backed_adoption(
+                model_backed_adoption(
                     argv[2], downward, source_type, target_type);
             }
         }
     }
     if (failures != 0) {
-        std::fprintf(stderr, "%d F4.2a adoption test(s) failed\n", failures);
+        std::fprintf(stderr, "%d VBR adoption test(s) failed\n", failures);
         return 1;
     }
     std::printf("VBR artifact adoption: PASS\n");

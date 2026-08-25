@@ -25,9 +25,9 @@ struct server_cache_live_checkpoint_admission {
     std::vector<llama_cache_acct_op_id> committed;
 };
 
-// D-A3's process-local policy seams. The weight callback is deliberately a
-// dimensionless fixed-point multiplier: fitted B restore cost remains the
-// economic base, while E1/capstone policy can replace the provisional
+// Process-local retention-policy seams. The weight callback is deliberately a
+// dimensionless fixed-point multiplier: fitted restore cost remains the
+// economic base, while policy can replace the provisional
 // automatic weight without changing the victim ladder. A weight callback that
 // returns false, or returns true with weight_milli == 0, refuses pricing for
 // that victim (fail-closed); zero never means free-to-evict. The recovery callback
@@ -110,11 +110,11 @@ struct server_cache_checkpoint_trade_plan {
         common_cache_plan_destruction_reason::recovery_unavailable;
 };
 
-// D-A4's policy-free checkpoint-member optimum. Inputs already encode the
+// Policy-free checkpoint-member optimum. Inputs already encode the
 // ownership/recovery relation; the pure chooser refuses incomplete evidence,
 // protects the best-effort seam heuristic and the mandatory/hard rows, and
-// uses B's fitted replay plus restore formula with the same fixed-point
-// retention weights as D-A3. Bounded same-lineage replay, not this heuristic,
+// uses the fitted replay-plus-restore formula with the same fixed-point
+// retention weights as host eviction. Bounded same-lineage replay, not this heuristic,
 // is the correctness guarantee for a selected thinning.
 server_cache_checkpoint_trade_plan server_cache_plan_checkpoint_thinning(
     const std::vector<server_cache_checkpoint_trade_input> & candidates,
@@ -220,10 +220,10 @@ private:
     };
 };
 
-// D-A4 checkpoint ownership is prompt-cache authority work even though its
+// Checkpoint ownership is prompt-cache authority work even though its
 // physical list belongs to a live slot. The slot supplies this narrow view and
 // retains only the raw X-macro eraser plus thin adapters; policy, quoting,
-// capability preparation, evidence, and ranking live beside the D-A2/D-A3
+// capability preparation, evidence, and ranking live beside the
 // prompt-cache authority orchestration.
 struct server_cache_checkpoint_authority_context {
     using checkpoint_list = std::list<common_prompt_checkpoint>;
@@ -304,7 +304,7 @@ using server_cache_host_recovery_fn = bool (*)(
     const server_prompt_cache_state & victim,
     server_cache_host_recovery_evidence & out) noexcept;
 
-// P2 F0 authority substrate. The debug observer is only a serialization layer over this
+// Prompt-cache authority substrate. The debug observer is only a serialization layer over this
 // independently-owned state; --cache-lifecycle can therefore enforce accounting with debug off.
 // Member order is lifetime order: retention releases lease memberships and accounting operations,
 // so the ledger and leases must outlive it.
@@ -348,23 +348,23 @@ struct server_cache_authority {
             uint64_t pending_host_bytes = 0) noexcept;
 
     // Lower one exact accounting union into the capacity domains that its
-    // release would affect. D-A2+ share this one projection door.
+    // release would affect. Every destruction class shares this projection door.
     bool project_release(
             const llama_cache_acct_release_set_preview & release,
             std::vector<common_cache_plan_yield_domain> & out) noexcept;
 
     // Re-sample the affected accounting domains after a committed release.
-    // D-A actual yield is derived from this post-mutation observation, never
+    // Actual yield is derived from this post-mutation observation, never
     // relabeled from the quote-time projection.
     bool observe_release_domains(
             const std::vector<common_cache_plan_yield_domain> & projected,
             std::vector<common_cache_plan_yield_domain> & out) noexcept;
 
-    // F0b's first authoritative producer: admit/stage/commit all host-entry payload leaves as one
+    // The cache plan's first authoritative producer: admit, stage, and commit all host-entry payload leaves as one
     // all-or-nothing server transaction. Publication itself remains the caller's no-throw splice.
     bool admit_host_entry(server_prompt_cache_state & entry) noexcept;
 
-    // D-A4: charge independently owned live-checkpoint payloads. The caller
+    // Charge independently owned live-checkpoint payloads. The caller
     // publishes sidecar identities first, then attaches these exact operations
     // in the same scheduler turn before any planner can observe the members.
     // The batch is one all-or-nothing reservation transaction; host-entry
@@ -379,7 +379,7 @@ struct server_cache_authority {
         const common_prompt_checkpoint & checkpoint,
         std::vector<llama_cache_acct_op_id> & committed) noexcept;
 
-    // Bounded process-local D-A receipt publication for destruction work that
+    // Bounded process-local receipt publication for destruction work that
     // occurs during host-cache maintenance rather than one B request record.
     void observe_host_destruction(
         common_cache_plan_destruction_receipt receipt,

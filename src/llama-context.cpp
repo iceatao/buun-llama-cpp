@@ -640,7 +640,7 @@ llama_context::llama_context(
         }
     }
 
-    // co-tenancy presence (P3): every fork process holding device memory publishes a
+    // Co-tenancy presence: every fork process holding device memory publishes a
     // marker - vbr:0 here for the general case (peers scale their headroom by the census:
     // this process's lazy CUDA pools are real pressure too). A VBR cache in this process
     // REPUBLISHES vbr:1 with offers from its scan path; publish-if-absent keeps a later
@@ -1091,7 +1091,7 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
-    // A2 (Rev 5.1): the scheduler fence above is the per-family success boundary for the
+    // The scheduler fence above is the per-family success boundary for the
     // deferred append/reuse extents — promote submitted -> committed here. No new fences.
     if (memory) {
         memory->vbr_commit_submitted();
@@ -4465,13 +4465,13 @@ namespace {
 // apply; every early return/exception finishes THIS decode's pending operations FAILED by
 // construction. succeed() is called exactly once, at the successful tail. Awaiting-commit
 // records from prior submitted decodes are untouched — their terminal result belongs to the
-// scheduler fence alone (v3 review B1).
+// scheduler fence alone.
 struct vbr_decode_txn {
     llama_memory_i * mem = nullptr;
     bool             ok  = false;
 
     explicit vbr_decode_txn(llama_memory_i * memory) : mem(memory) {
-        // v3 review B1: NO promotion here — submitted evidence commits only at the real
+        // No promotion here: submitted evidence commits only at the real
         // scheduler fence (synchronize). Awaiting records simply keep waiting.
     }
     void succeed() { ok = true; }
@@ -6096,6 +6096,37 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         return state_seq_write_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_write_data_stream(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    io.write(&io_magic, sizeof(io_magic));
+    io.write(&seq_id, sizeof(seq_id));
+    return state_seq_write_data(io, seq_id, flags);
+}
+
+size_t llama_context::state_seq_read_data_stream(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    try {
+        uint32_t magic_read = 0;
+        io.read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+        llama_seq_id source_sequence = -1;
+        io.read(&source_sequence, sizeof(source_sequence));
+        if (source_sequence < 0) {
+            throw std::runtime_error("invalid source sequence id");
+        }
+        return state_seq_read_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
     }
 }

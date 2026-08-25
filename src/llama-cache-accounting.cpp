@@ -713,7 +713,7 @@ llama_cache_acct_op_id llama_cache_acct_ledger::reserve_locked(
         // Preflight the reserved aggregate: a reservation cell_add cannot record (target already
         // unavailable, or the checked add would overflow) must fail-closed BEFORE minting an op.
         // Otherwise reserve_if_serial would report `admitted` for a reservation the ledger never
-        // actually took, since cell_add is void and latches silently (Sol F0a review blocker 2).
+        // actually took, since cell_add is void and latches silently.
         // No phantom op, no next_op consumed.
         auto & reserved = row->cell.measures[size_t(llama_cache_acct_measure::reserved)];
         if (reserved.state == llama_cache_acct_known::unavailable) {
@@ -1613,6 +1613,14 @@ void llama_cache_acct_ledger::gauge_set(
     }
     auto & cell = row->cell.measures[size_t(measure)];
     if (cell.state != llama_cache_acct_known::unavailable) {
+        // A gauge observation is accounting currency only when it changes
+        // the observable ledger state.  Re-reporting the same known value is
+        // common for live-memory sampling and must not invalidate optimistic
+        // claims or mutation-driven retry witnesses.
+        if (cell.state == llama_cache_acct_known::known &&
+            cell.value == value) {
+            return;
+        }
         cell.value = value;
         cell.state = llama_cache_acct_known::known;
         bump_serial();

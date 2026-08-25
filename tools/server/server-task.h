@@ -2,7 +2,7 @@
 
 #include "common.h"
 #include "common-cache-family.h"
-#include "common-cache-plan.h" // B0 shadow observer row + C0 ledger types [P2]
+#include "common-cache-plan.h" // Cache-plan observer row and accounting-ledger types.
 #include "llama.h"
 #include "server-cache-lifecycle.h"
 #include "server-cache-lease.h"
@@ -12,6 +12,7 @@
 #include "server-retention-sidecar.h"
 #include "../../src/llama-vbr-artifact.h"
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <string>
@@ -183,7 +184,7 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
-    // Optional E1 declared-family policy input. E1.2 supplies only this
+    // Optional declared-family policy input. The wire layer supplies only this
     // opaque token; scheduler launch resolves the strong binding locally, so
     // an HTTP worker cannot inject a policy value into a task.
     server_cache_control_token cache_family_binding_token;
@@ -229,12 +230,12 @@ struct server_task {
     };
     cache_import_action cache_import;
 
-    // E1.1a scheduler-internal control task. E1.2 is the only unit allowed to
+    // Scheduler-internal control task. The wire layer is the only unit allowed to
     // construct this from HTTP; until then production has no caller.
     std::shared_ptr<const server_cache_control_request> cache_control;
 
-    // E1.2 wire selectors carry semantic inputs only. The scheduler resolves
-    // these into exact retention keys before invoking the E1.1a authority.
+    // Wire selectors carry semantic inputs only. The scheduler resolves
+    // these into exact retention keys before invoking the cache-control authority.
     struct cache_control_semantic_selector {
         int32_t slot_id = -1;
         std::shared_ptr<const server_tokens> tokens;
@@ -726,7 +727,7 @@ struct server_task_result_cache_import : server_task_result {
     virtual json to_json() override;
 };
 
-// Internal E0.1 scheduler result. E0.2 adds the deliberately redacted wire
+// Internal scheduler result. The public adapter adds the deliberately redacted wire
 // serializer; until then no route can serialize this task result.
 struct server_task_result_cache_plan_preflight : server_task_result {
     server_cache_plan_preflight_view view;
@@ -775,7 +776,7 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
-    // Server-local lineage for the computation-frontier migration [WS-4].
+    // Server-local lineage for computation-frontier migration.
     // It moves with host-cache/child-slot prompt clones and resets whenever
     // the prompt ledger is structurally cleared.
     uint64_t sequence_epoch = 0;
@@ -803,7 +804,7 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_cache_payload payload;
 
-    // canonical identity of the adapter configuration this state was computed under [I6]; a load is
+    // Canonical identity of the adapter configuration this state was computed under; a load is
     // only served from an entry whose key matches the requesting slot's current adapter config
     std::string adapter_config_key;
 
@@ -819,14 +820,14 @@ struct server_prompt_cache_state {
     std::vector<llama_cache_acct_op_id> acct_ops;
     bool accounting_complete = false;
 
-    // D-A2's non-policy recovery guard. List nodes are stable; authoritative
+    // recovery proof's non-policy recovery guard. List nodes are stable; authoritative
     // redundant eviction increments this before prepare and the raw eraser
     // refuses to destroy the cited survivor until capability close.
     uint32_t recovery_pins = 0;
 
-    // Automatic pre-E1 family signal. A save sourced from a parent/main slot
-    // receives the provisional D-A3 retention weight; child-task saves do not.
-    // E1 declared identity replaces this heuristic rather than stacking with it.
+    // Automatic pre- family signal. A save sourced from a parent/main slot
+    // receives the provisional lease boundary retention weight; child-task saves do not.
+    // Declared identity replaces this heuristic rather than stacking with it.
     bool main_family = false;
     common_cache_family_binding cache_family;
 
@@ -1199,7 +1200,7 @@ struct server_prompt_cache_shadow_lineage_slot {
     common_retention_pool pool = common_retention_pool::attention;
 };
 
-struct server_prompt_cache_df2_live_transition {
+struct server_prompt_cache_retention_capacity_live_transition {
     bool lookup_host = false;
     bool preserve_source = false;
 };
@@ -1210,8 +1211,34 @@ struct server_prompt_cache_df2_live_transition {
 constexpr size_t SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS = 256;
 
 inline bool server_prompt_cache_retention_reuse_is_useful(
-        size_t reused_tokens) noexcept {
-    return reused_tokens >= SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS;
+        size_t reused_tokens,
+        const common_chat_msg_spans * message_spans = nullptr) noexcept {
+    if (reused_tokens >= SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS) {
+        return true;
+    }
+    if (reused_tokens == 0 || !message_spans) {
+        return false;
+    }
+    // A complete system/instruction prefix reaching the start of user content
+    // is semantically valuable even when a compact template tokenizes below
+    // the generic anti-noise floor. The raw token LCP may continue into shared
+    // user boilerplate; the later restore seam narrows credit to the frontier
+    // that was actually installed. This admits short shared-system fleets
+    // without promoting ubiquitous BOS/header overlaps.
+    bool complete_system_prefix = false;
+    for (const auto & span : message_spans->spans) {
+        if (span.role == COMMON_CHAT_ROLE_SYSTEM &&
+            span.pos <= reused_tokens &&
+            span.len <= reused_tokens - span.pos) {
+            complete_system_prefix = true;
+        }
+        if (complete_system_prefix &&
+            span.role == COMMON_CHAT_ROLE_USER &&
+            span.pos <= reused_tokens) {
+            return true;
+        }
+    }
+    return false;
 }
 
 enum class server_slot_prompt_admission : uint8_t {
@@ -1238,28 +1265,12 @@ inline server_slot_prompt_admission server_slot_prompt_admission_check(
     return server_slot_prompt_admission::accepted;
 }
 
-enum class server_prompt_cache_df2_rollout : uint8_t {
-    enabled,
-    disabled,
-    invalid,
-};
-
-inline server_prompt_cache_df2_rollout
-server_prompt_cache_df2_rollout_parse(const char * value) noexcept {
-    if (value == nullptr || value[0] == '\0' ||
-        std::string_view(value) == "1") {
-        return server_prompt_cache_df2_rollout::enabled;
-    }
-    if (std::string_view(value) == "0") {
-        return server_prompt_cache_df2_rollout::disabled;
-    }
-    return server_prompt_cache_df2_rollout::invalid;
-}
-
-inline bool server_prompt_cache_lifecycle_default(
+inline bool server_cache_lifecycle_default(
         bool explicitly_enabled,
-        bool prompt_cache_enabled) noexcept {
-    return explicitly_enabled || prompt_cache_enabled;
+        bool prompt_cache_enabled,
+        bool cache_control_api_enabled) noexcept {
+    return explicitly_enabled || prompt_cache_enabled ||
+        cache_control_api_enabled;
 }
 
 // Retention metadata is payload-independent. Fixed host caching and dynamic VBR both need the
@@ -1281,7 +1292,7 @@ inline server_retention_owner_plan server_retention_owner_plan_for(
         bool cache_lifecycle,
         bool prompt_cache_enabled,
         bool vbr_dynamic,
-        bool retention_df2) noexcept {
+        bool retention_capacity) noexcept {
     server_retention_owner_plan out;
     if (cache_debug || cache_lifecycle) {
         out.owner = server_retention_owner_kind::authority;
@@ -1290,7 +1301,7 @@ inline server_retention_owner_plan server_retention_owner_plan_for(
     }
     out.prompt_shadow_workspace = prompt_cache_enabled &&
         (out.owner == server_retention_owner_kind::standalone_metadata ||
-         cache_debug || retention_df2);
+         cache_debug || retention_capacity);
     out.prefix_tracking = vbr_dynamic || out.prompt_shadow_workspace;
     return out;
 }
@@ -1302,21 +1313,23 @@ inline uint32_t server_prompt_cache_retention_prior_milli(
         ? 2000 : 1000;
 }
 
-inline server_prompt_cache_df2_live_transition
-server_prompt_cache_df2_live_transition_for(
+inline server_prompt_cache_retention_capacity_live_transition
+server_prompt_cache_retention_capacity_live_transition_for(
         bool enabled,
         bool completion,
         bool selection_deferred_busy,
         size_t live_tokens,
         size_t retained_prefix,
-        const common_retention_lineage_record * lineage) noexcept {
+        const common_retention_lineage_record * lineage,
+        const common_chat_msg_spans * message_spans = nullptr) noexcept {
     if (!enabled || !completion || selection_deferred_busy ||
         live_tokens == 0 || retained_prefix >= live_tokens) {
         return {};
     }
     return {
         true,
-        server_prompt_cache_retention_reuse_is_useful(retained_prefix) &&
+        server_prompt_cache_retention_reuse_is_useful(
+            retained_prefix, message_spans) &&
             lineage && lineage->reuse_hits != 0,
     };
 }
@@ -1345,7 +1358,7 @@ struct server_prompt_cache {
     // compact-only configuration: anchors are optional and are stripped
     // without invalidating their compact current artifact.
     size_t limit_anchor_size = 0;
-    // Explicit H2 product gate. Keeping this false preserves literal zero
+    // Explicit VBR restore product gate. Keeping this false preserves literal zero
     // anchor work unless a nonzero --vbr-anchor-cache-mib pool is requested.
     bool quality_anchor_budget_enabled = false;
 
@@ -1358,7 +1371,7 @@ struct server_prompt_cache {
     size_t n_tokens() const;
 
     // true if a token-identical entry with the SAME adapter identity is already fully cached, i.e.
-    // the state is durable and the live slot may be safely cleared without saving again [I6/I7].
+    // the state is durable and the live slot may be safely cleared without saving again.
     bool contains(const server_tokens & tokens, const std::string & adapter_config_key) const;
 
     // Exact immutable VBR-frontier presence query. This alone is not a clear
@@ -1396,6 +1409,14 @@ struct server_prompt_cache {
         const std::string & execution_identity,
         const std::string & adapter_config_key,
         int32_t source_slot) noexcept;
+    // Conservative pre-D2H replacement check for refresh.  The final refresh
+    // transaction remeasures exact shared accounting; this preview only
+    // authorizes transfer when the quoted compact cannot exceed the hard cap.
+    bool preview_vbr_compact_refresh_capacity(
+        const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        uint64_t incoming_compact_bytes) const noexcept;
 
     // Preallocate and provisionally index one fresh logical VBR host node.
     // Dropping the move-only metadata rolls back its retention association.
@@ -1511,7 +1532,7 @@ struct server_prompt_cache {
         int32_t id_slot) noexcept;
 
     // Resolve the exact durable host state used by prompt_save's durability
-    // predicate and pin its three-payload accounting source. D-A5 calls this
+    // predicate and pin its three-payload accounting source. recovery source calls this
     // after the same-flow save and before preparing live-slot destruction.
     bool acquire_durable_recovery(
             const server_tokens & tokens,
@@ -1531,7 +1552,7 @@ struct server_prompt_cache {
         server_prompt_cache_state & state,
         int32_t & source_id) noexcept;
 
-    // Transactional save is a stage -> fill -> publish sequence [I7]. stage() allocates a DETACHED
+    // Transactional save is a stage -> fill -> publish sequence. stage() allocates a detached
     // single-node list WITHOUT touching `states`; any allocation failure there leaves the cache
     // completely untouched (no eviction, no limit change). The caller fills + validates the state
     // bytes; publish() then removes now-obsolete entries and splices the completed node in (no
@@ -1541,9 +1562,9 @@ struct server_prompt_cache {
     // previously retained hard-leased/recovery-pinned entry remains untouched.
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
 
-    // H1 detached logical publication for an already-sealed catalog payload.
+    // Detached logical publication for an already-sealed catalog payload.
     // This validates the exact capture frontier and allocates/clones all
-    // logical metadata without copying artifact bytes. H2 will later consume
+    // logical metadata without copying artifact bytes. VBR restore consumes
     // these entries through the VBR restore transaction.
     std::list<server_prompt_cache_state> stage_vbr(
         const server_prompt & prompt,
@@ -1565,16 +1586,16 @@ struct server_prompt_cache {
             int32_t source_slot = -1,
             iterator * published = nullptr);
 
-    // `obs` is the B0 shadow observer row for the host_cache_entry candidate (nullptr = observer
-    // off). It only receives values this selection already computes — never a re-scan [B-a].
+    // `obs` is the cache-plan observer row for the host_cache_entry candidate (nullptr = observer
+    // off). It only receives values this selection already computes and never triggers a rescan.
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
-    // candidate loop is the pre-B0 loop with zero observer branches.
+    // candidate loop is the original loop with zero observer branches.
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_family_binding * restored_family = nullptr);
 
     template <bool Observed>
     bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family);
 
-    // D-A1's two-phase immutable host restore. prepare() runs before either
+    // Two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.
     // Public only so the model-free server cache test can pin the storage
     // transaction without constructing a llama_context.
@@ -1630,18 +1651,18 @@ private:
 
 public:
 
-    // Exact D-A2 proof over snapshot, checkpoint-ring, and typed accelerator
+    // Exact recovery proof over snapshot, checkpoint-ring, and typed accelerator
     // payloads. Token coverage is necessary but never sufficient.
     static bool exactly_redundant(
             const server_prompt_cache_state & victim,
             const server_prompt_cache_state & survivor) noexcept;
 
-    // C0 ledger (nullptr = off). Debug-only retains shadow semantics; lifecycle publication
+    // Accounting ledger (nullptr = off). Debug-only retains shadow semantics; lifecycle publication
     // and explicit host erasure use its reservation/prepared-release authority. Every path
     // that removes an entry from `states` releases its ops, including whole-cache replacement,
     // or the surviving ledger would carry phantom bytes. It outlives this cache by member order.
     llama_cache_acct_ledger * acct = nullptr;
-    // F0b/D-A1 lifecycle authority. Null keeps the consuming legacy path. When present, it
+    // Immutable-host-restore lifecycle authority. Null keeps the consuming legacy path. When present, it
     // gates publication, makes restore non-consuming, and prepares explicit-eviction releases.
     server_cache_authority * publish_authority = nullptr;
     server_cache_destruction_observer * destruction_obs = nullptr;
@@ -1651,7 +1672,7 @@ public:
     // Explicit emission gate. An observed load also exists under B authority,
     // so rec != nullptr is not evidence that --cache-debug was enabled.
     bool debug_observability = false;
-    bool retention_df2_authority = false;
+    bool retention_capacity_authority = false;
     uint64_t debug_lifecycle_emissions = 0;
     uint64_t debug_destruction_emissions = 0;
     uint64_t debug_recovery_pin_exclusions = 0;
@@ -1713,7 +1734,7 @@ private:
     void refuse_incoming_under_pressure(
         iterator incoming,
         server_cache_destruction_reason reason);
-    bool destroy_df2_entry(
+    bool destroy_retention_capacity_entry(
         iterator it,
         server_cache_destruction_reason reason,
         vbr_artifact_prepared_retire * vbr_retire = nullptr,
@@ -1752,7 +1773,7 @@ private:
     server_prompt_cache_shadow_snapshot retention_shadow;
 };
 
-// E1.1a proof adapter over the same list-node recovery counter consulted by
+// Proof adapter over the same list-node recovery counter consulted by
 // every host victim selector and by the raw eraser assertion. The semantic
 // selector is resolved against the current list before the pin is acquired.
 server_cache_durable_fallback_proof

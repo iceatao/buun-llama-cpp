@@ -561,7 +561,7 @@ static void test_by_id_execution_shapes_and_target_binding() {
           authoritative());
 
     // The full fixture's legacy counterfactual is the host+checkpoint chain;
-    // a non-destructive live disagreement remains inside the pre-D-A envelope.
+    // a non-destructive live disagreement remains within non-destructive authority.
     auto copy = rec;
     CHECK(authorize_choice(authority, copy,
               int32_t(live - rec.inventory.data()), target).authoritative());
@@ -576,7 +576,7 @@ static void test_by_id_execution_shapes_and_target_binding() {
     CHECK(copy.authority.fallback_reason ==
           common_cache_plan_authority_fallback::internal_fault);
 
-    // Before D-A, an authority disagreement may avoid destruction but may not
+    // Without a destruction certificate, an authority disagreement may avoid destruction but may not
     // consume a different retained host entry or turn reuse into cold.
     auto * foreign_host = add_viable(
         rec, common_cache_plan_provider::host_cache_entry, 12, target);
@@ -808,7 +808,7 @@ static void test_similarity_crossover_and_safety_envelope() {
     CHECK(execution.authoritative());
     CHECK(restore_ordinal == 0);
 
-    // Cross-target similarity execution remains pre-D-A fail-closed unless it
+    // Cross-target similarity execution remains fail-closed unless it
     // retains the target's complete live prefix (the zero-destruction case).
     common_cache_plan_record cross;
     auto * legacy_live = add_viable(
@@ -928,7 +928,7 @@ static void test_route_home_authority_domain() {
 
     // A BOS-only cross-target choice needs retention/destruction economics the
     // current fit does not carry. Dynamic VBR cannot durabilize the displaced
-    // target in a host cache, so this shape remains typed legacy until D-A.
+    // target in a host cache, so this shape remains typed legacy without a destruction certificate.
     common_cache_plan_record trivial;
     auto * legacy_bos = add_viable(
         trivial, common_cache_plan_provider::live_slot,
@@ -994,7 +994,7 @@ static void test_lru_authority_domain_and_eviction_fence() {
     CHECK(server_cache_plan_cold_target_current(execution, true, true));
     CHECK(!server_cache_plan_cold_target_current(execution, false, true));
 
-    // Occupied same-target reuse remains inside the pre-D-A envelope.
+    // Occupied same-target reuse remains within non-destructive authority.
     common_cache_plan_record occupied;
     auto * live = add_viable(
         occupied, common_cache_plan_provider::live_slot,
@@ -1009,7 +1009,7 @@ static void test_lru_authority_domain_and_eviction_fence() {
     CHECK(execution.kind == server_cache_plan_execution_kind::live_replay);
 
     // Cross-target replacement has no certified eviction/retention evidence
-    // before D-A. Schema 5 uses its existing availability spelling rather than
+    // without a destruction certificate. Schema 5 uses its existing availability spelling rather than
     // adding a new wire enum value.
     auto * foreign = add_viable(
         occupied, common_cache_plan_provider::live_slot,
@@ -1030,8 +1030,8 @@ static void test_lru_authority_domain_and_eviction_fence() {
             occupied.authority.legacy_plan_candidate),
         common_cache_plan_destruction_effect::cross_target_displacement));
 
-    // Same-target cold replacement is the frozen B-A4 eviction-evidence
-    // shape and remains closed without a D-A certificate.
+    // Same-target cold replacement requires eviction evidence and remains closed
+    // without a destruction certificate.
     auto * occupied_cold = add_viable(
         occupied, common_cache_plan_provider::cold_replay,
         COMMON_CACHE_PLAN_SOURCE_AGGREGATE, legacy_target,
@@ -1060,7 +1060,7 @@ static void test_lru_authority_domain_and_eviction_fence() {
             lifecycle_effects),
         common_cache_plan_destruction_effect::same_target_cold_replacement));
 
-    // Lifecycle-on introduces that D-A5 class but keeps it closed until the
+    // Lifecycle tracking introduces that class but keeps it closed until the
     // selected effect is certified.
     execution = authorize_choice(
         lru, occupied, int32_t(occupied_cold - occupied.inventory.data()),
@@ -1071,7 +1071,7 @@ static void test_lru_authority_domain_and_eviction_fence() {
           common_cache_plan_authority_fallback::
               budget_or_lease_unavailable);
 
-    // D-A5 opens exactly the certified effect bit. The same occupied cold
+    // The certificate opens exactly its effect bit. The same occupied cold
     // replacement remains refused above with no capability evidence.
     const auto certified_cold = common_cache_plan_destruction_effect_bit(
         common_cache_plan_destruction_effect::same_target_cold_replacement);

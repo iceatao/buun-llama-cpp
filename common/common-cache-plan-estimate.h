@@ -17,17 +17,17 @@ std::string common_cache_plan_sha256_hex_digest(
 // Versioned, policy-free cost estimation over the schema-v2 candidate inventory. SHADOW
 // ONLY: fills per-candidate cost terms, predicted totals, and the shadow choice/tie set on
 // a finalized-being record; never touches a shipped decision. Runs strictly inside the
-// finalize planner boundary (A2) — throwing is tolerated there (the boundary clears planner
+// finalize planner boundary; throwing is tolerated there because the boundary clears planner
 // outputs), but these functions avoid allocation and do not throw on their own.
 //
-// B-2 discipline: coefficients come ONLY from a fitted calibration profile. No profile →
+// Coefficients come only from a fitted calibration profile. No profile means
 // no estimates (typed-unavailable), never a default coefficient. Measured actuals are
 // separate record fields and are never substituted.
 
 struct common_cache_plan_calib {
     const char * profile;            // stable id: "{model class}/{hardware class}/b{batch}"
     uint32_t     estimator_version;  // bumped on ANY coefficient or formula change
-    // fitted coefficients (dorei microbench sweep; see tools/server/bench/cache-plan-calibrate.py)
+    // fitted coefficients (RTX 3090 microbench sweep; see tools/server/bench/cache-plan-calibrate.py)
     double replay_us_per_token;      // forward replay cost per prompt token
     double restore_us_per_byte;      // pageable-host -> device state install, per byte
     double workspace_setup_us;       // fixed per-restore setup overhead
@@ -37,7 +37,7 @@ struct common_cache_plan_calib {
 // profile has no fitted entry — the caller then leaves planner outputs unavailable.
 const common_cache_plan_calib * common_cache_plan_calib_find(const std::string & profile);
 
-// One versioned/trust-checked restore formula for B estimates and D-A host
+// One versioned/trust-checked restore formula for planner estimates and host
 // retention pricing. False means the fitted formula cannot be trusted.
 bool common_cache_plan_restore_us(
         const common_cache_plan_calib & calib,
@@ -55,7 +55,7 @@ std::string common_cache_plan_calib_profile(const std::string & model_stem,
                                             const std::string & hw_desc, int n_batch,
                                             const std::string & kv_desc);
 
-// EFFECTIVE VBR regime identity (D-pins r2 finding 2): requested CLI strings are NOT the
+// Effective VBR regime identity: requested CLI strings are not the
 // regime — `auto` resolves to a selected family/policy/schedule, the aggregate floor
 // resolves to a capacity, and documented developer env overrides (VBR_BUDGET_MIB,
 // VBR_MIN_BITS, VBR_POLICY_LADDER) can move the controller's budget AFTER CLI resolution.
@@ -85,7 +85,7 @@ enum class common_cache_plan_vbr_value_grammar : uint8_t {
     X("VBR_DEGRADE_ORDER",             1, path)                        \
     X("VBR_FORCE_GENERIC",             1, scalar)                      \
     X("VBR_FREEZE",                    1, scalar)                      \
-    X("VBR_F5_PRESERVE_EMPTY_TIERS",  1, scalar)                      \
+    X("VBR_FREEZE_PRESERVE_EMPTY_TIERS", 1, scalar)                   \
     X("VBR_GROWTH_HEADROOM_MIB",       1, scalar)                      \
     X("VBR_LAYER_SCHEDULE",            1, inline_or_path)              \
     X("VBR_LAYER_SCHEDULE_FROM_POLICY",0, scalar)                      \
@@ -146,7 +146,7 @@ bool common_cache_plan_vbr_override_identity(const std::string & name,
                                              common_cache_plan_vbr_value_grammar grammar,
                                              std::string & identity);
 
-// Calibration-identity file digest. This does not change B0 record identity digests or
+// Calibration-identity file digest. This does not change cache-plan record identity digests or
 // sampled-prefix telemetry.
 bool common_cache_plan_sha256_file_identity(const std::string & path, std::string & identity);
 
@@ -170,7 +170,7 @@ std::string common_cache_plan_calib_hw(const std::vector<std::string> & gpu_desc
 // Tie resolution floor (planner-owned, deterministic): candidates whose predicted totals
 // are within max(5% of the minimum, 100us) of the minimum form the tie set. The recorded
 // shadow choice is the tie-set member with the smallest (provider, source_id, ordinal) key
-// — NEVER a function of the shipped choice (r2 finding 3); agreement is computed offline
+// and never a function of the shipped choice; agreement is computed offline
 // as shipped-in-tie-set.
 constexpr double COMMON_CACHE_PLAN_TIE_REL_FLOOR = 0.05;
 constexpr double COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US = 100.0;
@@ -185,12 +185,12 @@ constexpr double COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US = 100.0;
 //   incomplete_evidence — provider overflow, a dropped derived plan, an unresolved visited
 //       candidate (disposition unavailable), a valid row missing the scalars estimation
 //       needs, unknown n_prompt, or an empty participant set — never a partial optimum.
-// B-covered terms are restore/replay/workspace. D may prefill transfer or
+// Covered terms are restore/replay/workspace. Callers may prefill transfer or
 // eviction; the same total/optimum consumes those optional terms.
 common_cache_plan_planner_status common_cache_plan_estimate_and_choose(
         common_cache_plan_record & rec, const common_cache_plan_calib & calib);
 
-// The single planner attempt boundary shared by pre-mutation B-A staging and
+// The single planner attempt boundary shared by pre-mutation planner staging and
 // legacy finalize fallback. It owns profile lookup and exception isolation.
 common_cache_plan_planner_status common_cache_plan_run_planner(
         common_cache_plan_record & rec) noexcept;

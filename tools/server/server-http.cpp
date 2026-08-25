@@ -315,7 +315,7 @@ bool server_http_context::init(const common_params & params) {
         return true;
     };
 
-    // Cache receipts protect every dynamic response. E0's route-local rule is
+    // Cache receipts protect every dynamic response. Cache-plan preflight's route-local rule is
     // narrower but must also cover middleware-generated 401/503 responses,
     // which never reach its handler. Install this hook only when one feature
     // needs it so both features remain zero-work while disabled.

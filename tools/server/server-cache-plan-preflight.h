@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-// E0.1 is an internal scheduler result only. E0.2 owns the public JSON schema;
+// This is an internal scheduler result only. The public adapter owns the JSON schema;
 // none of these values is a reservation, capability, or replayable claim.
 enum class server_cache_plan_preflight_status : uint8_t {
     ok = 0,
@@ -20,7 +20,7 @@ enum class server_cache_plan_preflight_status : uint8_t {
     _count,
 };
 
-// Closed E0 expected-path vocabulary. New public semantics require an E0 wire
+// Closed  expected-path vocabulary. New public semantics require an  wire
 // schema revision rather than a synonym or intermediate state here.
 enum class server_cache_plan_preflight_expected_path : uint8_t {
     legacy = 0,
@@ -101,14 +101,14 @@ struct server_cache_plan_preflight_view {
     std::vector<server_cache_plan_preflight_miss_reason> miss_reasons;
 };
 
-// E0 v1 public projection. This is deliberately independent of the schema-7
+// Public v1 projection. This is deliberately independent of the schema-7
 // debug serializer: identities, digests, accounting rows, ordinals, serials,
 // leases, and recovery-source handles have no representation here.
 nlohmann::ordered_json server_cache_plan_preflight_json(
     const server_cache_plan_preflight_view & view);
 
 // Exposure remains opt-in and single-principal. The existing API-key
-// middleware authenticates zero/one configured key; E0 refuses configurations
+// middleware authenticates zero/one configured key;  refuses configurations
 // where that middleware represents multiple principals.
 bool server_cache_plan_preflight_exposure_allowed(
     const std::string & hostname,

@@ -773,7 +773,7 @@ static void test_quantifiers() {
         "min / max repetition",
         // Grammar
         R"""(
-            root ::= ("0x" [A-F0-9]{2} " "?){3,5}
+            root ::= ("0x" [A--9]{2} " "?){3,5}
         )""",
         // Passing strings
         {

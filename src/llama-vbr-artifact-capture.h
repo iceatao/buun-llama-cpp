@@ -13,7 +13,7 @@
 #include <memory>
 #include <vector>
 
-// F3.1 bounded streaming substrate. These types are internal to libllama:
+// Bounded streaming substrate. These types are internal to libllama:
 // no live KV/cache or server policy enters this unit.
 static constexpr uint64_t VBR_CAPTURE_PINNED_RING_MAX_BYTES =
     VBR_PINNED_RING_MAX_BYTES;
@@ -323,7 +323,7 @@ struct vbr_capture_stream_stats {
     std::array<uint8_t, 32> streaming_digest = {};
 };
 
-// H1 sequence-projected capture planning. Each logical manifest contributes
+// Sequence-projected capture planning. Each logical manifest contributes
 // exact live placement evidence; the planner lowers their physical-row union
 // into deterministic runs whose dependency sets identify precisely which
 // manifests must be cancelled if that run cannot be sealed. This is a

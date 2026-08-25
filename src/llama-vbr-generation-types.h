@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-// Immutable Revision-9 record vocabulary shared with the disabled oracle trust domain. Live
+// Immutable VBR generation-record vocabulary shared with the disabled oracle trust domain. Live
 // tracker/index/mutation helpers deliberately do not appear in this header.
 constexpr uint32_t VBR_GENERATION_PAGE_CELLS = 256;
 constexpr uint32_t VBR_GENERATION_MASK_WORDS = VBR_GENERATION_PAGE_CELLS / (8u * sizeof(uint64_t));
@@ -56,7 +56,7 @@ struct vbr_generation_page_ref {
     std::array<uint64_t, VBR_GENERATION_MASK_WORDS> covered_mask      = {};
 };
 static_assert(sizeof(vbr_generation_page_ref) == 40,
-              "Revision-9 checkpoint page references are fixed at 40 bytes");
+              "VBR checkpoint page references are fixed at 40 bytes");
 
 struct vbr_checkpoint_generation_stream {
     uint32_t                             stream_index              = 0;

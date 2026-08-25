@@ -44,35 +44,39 @@ struct recurrent_tensor_row {
 
 class recurrent_cursor {
   public:
-    explicit recurrent_cursor(std::vector<uint8_t> bytes)
-        : bytes_(std::move(bytes)) {}
+    explicit recurrent_cursor(const artifact_segment_chain & source)
+        : source_(source), size_(source.size()) {}
 
     template <typename T>
     bool scalar(T & value) noexcept {
-        if (offset_ > bytes_.size() ||
-            sizeof(T) > bytes_.size() - offset_) {
+        if (offset_ > size_ || sizeof(T) > size_ - offset_ ||
+            !source_.read(offset_, reinterpret_cast<uint8_t *>(&value),
+                          sizeof(T))) {
             return false;
         }
-        std::memcpy(&value, bytes_.data() + offset_, sizeof(T));
         offset_ += sizeof(T);
         return true;
     }
 
     bool block(std::vector<uint8_t> & value, size_t size) {
-        if (offset_ > bytes_.size() || size > bytes_.size() - offset_) {
+        if (offset_ > size_ || size > size_ - offset_) {
             return false;
         }
-        value.assign(bytes_.begin() + offset_,
-                     bytes_.begin() + offset_ + size);
+        value.resize(size);
+        if (!source_.read(offset_, value.data(), size)) {
+            value.clear();
+            return false;
+        }
         offset_ += size;
         return true;
     }
 
-    bool finished() const noexcept { return offset_ == bytes_.size(); }
+    bool finished() const noexcept { return offset_ == size_; }
 
   private:
-    std::vector<uint8_t> bytes_;
-    size_t offset_ = 0;
+    const artifact_segment_chain & source_;
+    uint64_t size_ = 0;
+    uint64_t offset_ = 0;
 };
 
 class vbr_recurrent_parsed_image final :
@@ -102,11 +106,113 @@ class vbr_recurrent_prepared_image final :
     int32_t rs_z = -1;
     std::vector<uint32_t> rs_idx;
     std::vector<uint32_t> rollback_valid_depth;
-    std::vector<ggml_tensor *> r_l;
-    std::vector<ggml_tensor *> s_l;
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    std::unique_ptr<vbr_recurrent_parsed_image> recovery;
+    bool destination_was_empty = false;
+    size_t replacement_physical = 0;
+    llama_pos replacement_position = -1;
+    uint64_t replacement_binding_epoch = 0;
 
-    static bool prepare(
+    static bool parsed_compatible(
+            const llama_memory_recurrent & target,
+            const vbr_recurrent_parsed_image & parsed) noexcept {
+        if (parsed.target != &target || parsed.position < 0 ||
+            parsed.r.size() != target.r_l.size() ||
+            parsed.s.size() != target.s_l.size()) {
+            return false;
+        }
+        const auto rows_compatible = [](
+                const std::vector<ggml_tensor *> & tensors,
+                const std::vector<recurrent_tensor_row> & rows) {
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                const auto * tensor = tensors[i];
+                const auto & row = rows[i];
+                if ((tensor != nullptr) != row.present) {
+                    return false;
+                }
+                if (tensor && (row.type != tensor->type ||
+                    row.row_bytes != uint64_t(ggml_row_size(
+                        tensor->type, tensor->ne[0])) ||
+                    row.row_bytes == 0 ||
+                    row.bytes.size() != row.row_bytes)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        return rows_compatible(target.r_l, parsed.r) &&
+               rows_compatible(target.s_l, parsed.s);
+    }
+
+    static bool live_location(
+            const llama_memory_recurrent & target,
+            llama_seq_id destination, size_t & physical,
+            uint32_t & row) noexcept {
+        if (destination < 0 || uint32_t(destination) >= target.n_seq_max ||
+            target.used != 1) {
+            return false;
+        }
+        physical = target.cells.size();
+        for (size_t i = 0; i < target.cells.size(); ++i) {
+            if (!target.cells[i].has_seq_id(destination)) {
+                continue;
+            }
+            if (physical != target.cells.size()) {
+                return false;
+            }
+            physical = i;
+        }
+        if (physical == target.cells.size()) {
+            return false;
+        }
+        uint32_t rollback = 0;
+        if (target.n_rs_seq != 0) {
+            if (size_t(destination) >= target.rs_idx.size()) {
+                return false;
+            }
+            rollback = target.rs_idx[size_t(destination)];
+        }
+        const int32_t source = target.cells[physical].src >= 0
+            ? target.cells[physical].src : int32_t(physical);
+        if (source < 0 || uint64_t(rollback)*target.size +
+                uint32_t(source) > UINT32_MAX) {
+            return false;
+        }
+        row = rollback*target.size + uint32_t(source);
+        return true;
+    }
+
+    static bool write_rows(
+            llama_memory_recurrent & target, uint32_t row,
+            const vbr_recurrent_parsed_image & parsed) noexcept {
+        try {
+            if (!parsed_compatible(target, parsed)) {
+                return false;
+            }
+            const auto write = [row](
+                    const std::vector<ggml_tensor *> & tensors,
+                    const std::vector<recurrent_tensor_row> & rows) {
+                for (size_t i = 0; i < tensors.size(); ++i) {
+                    if (!tensors[i]) {
+                        continue;
+                    }
+                    if (uint64_t(row) >= uint64_t(tensors[i]->ne[1])) {
+                        return false;
+                    }
+                    ggml_backend_tensor_set(
+                        tensors[i], rows[i].bytes.data(),
+                        size_t(row)*size_t(rows[i].row_bytes),
+                        rows[i].bytes.size());
+                }
+                return true;
+            };
+            return write(target.r_l, parsed.r) &&
+                   write(target.s_l, parsed.s);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static bool prepare_empty(
             const void * context,
             std::unique_ptr<vbr_parsed_companion_image> parsed_base,
             llama_seq_id destination,
@@ -119,11 +225,11 @@ class vbr_recurrent_prepared_image final :
             if (!target || !parsed || parsed->target != target ||
                 destination < 0 ||
                 uint32_t(destination) >= target->n_seq_max ||
-                target->used != 0 ||
-                std::any_of(target->cells.begin(), target->cells.end(),
-                    [](const llama_memory_recurrent::mem_cell & cell) {
-                        return !cell.is_empty();
-                    }) ||
+                (target->used != 0 ||
+                  std::any_of(target->cells.begin(), target->cells.end(),
+                      [](const llama_memory_recurrent::mem_cell & cell) {
+                          return !cell.is_empty();
+                      })) ||
                 parsed->r.size() != target->r_l.size() ||
                 parsed->s.size() != target->s_l.size()) {
                 return false;
@@ -144,81 +250,149 @@ class vbr_recurrent_prepared_image final :
             cell.seq_id.insert(destination);
             image->cells[size_t(destination)].tail = 0;
 
-            std::map<ggml_backend_buffer_type_t, ggml_context_ptr,
-                     ggml_backend_buft_comparator> contexts;
-            const size_t context_bytes = std::max<size_t>(
-                2*target->r_l.size()*ggml_tensor_overhead(),
-                2*ggml_tensor_overhead());
-            const auto context_for = [&](ggml_backend_buffer_type_t buft)
-                    -> ggml_context * {
-                auto found = contexts.find(buft);
-                if (found != contexts.end()) {
-                    return found->second.get();
-                }
-                ggml_init_params params = { context_bytes, nullptr, true };
-                ggml_context * created = ggml_init(params);
-                if (!created) {
-                    return nullptr;
-                }
-                contexts.emplace(buft, created);
-                return created;
-            };
-
-            image->r_l.resize(target->r_l.size());
-            image->s_l.resize(target->s_l.size());
-            for (size_t i = 0; i < target->r_l.size(); ++i) {
-                ggml_backend_buffer_type_t buft = nullptr;
-                if (target->r_l[i]) {
-                    buft = ggml_backend_buffer_get_type(target->r_l[i]->buffer);
-                } else if (target->s_l[i]) {
-                    buft = ggml_backend_buffer_get_type(target->s_l[i]->buffer);
-                }
-                if (!buft) {
-                    if (parsed->r[i].present || parsed->s[i].present) {
-                        return false;
-                    }
-                    continue;
-                }
-                ggml_context * ggml_ctx = context_for(buft);
-                if (!ggml_ctx) {
-                    return false;
-                }
-                if (target->r_l[i]) {
-                    image->r_l[i] = ggml_dup_tensor(ggml_ctx, target->r_l[i]);
-                }
-                if (target->s_l[i]) {
-                    image->s_l[i] = ggml_dup_tensor(ggml_ctx, target->s_l[i]);
-                }
+            if (!parsed_compatible(*target, *parsed)) {
+                return false;
             }
-            for (auto & entry : contexts) {
-                ggml_backend_buffer_t buffer =
-                    ggml_backend_alloc_ctx_tensors_from_buft(
-                        entry.second.get(), entry.first);
-                if (!buffer) {
-                    return false;
-                }
-                ggml_backend_buffer_clear(buffer, 0);
-                image->ctxs_bufs.emplace_back(
-                    std::move(entry.second), buffer);
-            }
-            for (size_t i = 0; i < image->r_l.size(); ++i) {
-                if (image->r_l[i]) {
-                    ggml_backend_tensor_set(
-                        image->r_l[i], parsed->r[i].bytes.data(), 0,
-                        parsed->r[i].bytes.size());
-                }
-                if (image->s_l[i]) {
-                    ggml_backend_tensor_set(
-                        image->s_l[i], parsed->s[i].bytes.data(), 0,
-                        parsed->s[i].bytes.size());
-                }
-            }
+            // An empty controller has no live row: its backing bytes are not
+            // part of the logical state and cannot be observed until metadata
+            // publication. Every successful import or first decode overwrites
+            // the complete active R/S row. Therefore a failed construction-
+            // empty import needs no D2H rollback journal; leaving the target
+            // logically empty is the exact rollback state.
+            image->destination_was_empty = true;
+            image->replacement_physical = 0;
+            image->replacement_position = parsed->position;
+            image->replacement_binding_epoch = target->tensor_binding_epoch_;
             output = std::move(image);
-            return true;
+            return write_rows(*target, 0, *parsed);
         } catch (...) {
             output.reset();
             return false;
         }
+    }
+
+    static bool prepare(
+            const void * context,
+            std::unique_ptr<vbr_parsed_companion_image> parsed,
+            llama_seq_id destination,
+            std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+        return prepare_empty(
+            context, std::move(parsed), destination, output);
+    }
+
+    static bool live_matches(
+            const llama_memory_recurrent & target,
+            llama_seq_id destination,
+            const vbr_recurrent_parsed_image & expected) noexcept {
+        try {
+            if (destination < 0 ||
+                uint32_t(destination) >= target.n_seq_max ||
+                expected.target != &target || target.used != 1 ||
+                expected.r.size() != target.r_l.size() ||
+                expected.s.size() != target.s_l.size()) {
+                return false;
+            }
+            size_t physical = 0;
+            uint32_t row = 0;
+            if (!live_location(target, destination, physical, row) ||
+                target.cells[physical].pos != expected.position) {
+                return false;
+            }
+            size_t max_row_bytes = 0;
+            for (const auto & value : expected.r) {
+                max_row_bytes = std::max(
+                    max_row_bytes, size_t(value.row_bytes));
+            }
+            for (const auto & value : expected.s) {
+                max_row_bytes = std::max(
+                    max_row_bytes, size_t(value.row_bytes));
+            }
+            if (max_row_bytes == 0) {
+                return false;
+            }
+            std::vector<uint8_t> live(std::min<size_t>(
+                size_t(1) << 20, max_row_bytes));
+            const auto rows_match = [row, &live](
+                    const std::vector<ggml_tensor *> & tensors,
+                    const std::vector<recurrent_tensor_row> & rows) {
+                for (size_t i = 0; i < tensors.size(); ++i) {
+                    const auto * tensor = tensors[i];
+                    const auto & expected_row = rows[i];
+                    if ((tensor != nullptr) != expected_row.present) {
+                        return false;
+                    }
+                    if (!tensor) {
+                        continue;
+                    }
+                    const uint64_t row_bytes = ggml_row_size(
+                        tensor->type, tensor->ne[0]);
+                    if (expected_row.type != tensor->type ||
+                        expected_row.row_bytes != row_bytes ||
+                        expected_row.bytes.size() != row_bytes ||
+                        uint64_t(row) >= uint64_t(tensor->ne[1])) {
+                        return false;
+                    }
+                    for (size_t offset = 0; offset < row_bytes;) {
+                        const size_t take = std::min(
+                            live.size(), size_t(row_bytes)-offset);
+                        ggml_backend_tensor_get(
+                            tensor, live.data(),
+                            size_t(row)*size_t(row_bytes)+offset, take);
+                        if (std::memcmp(
+                                live.data(), expected_row.bytes.data()+offset,
+                                take) != 0) {
+                            return false;
+                        }
+                        offset += take;
+                    }
+                }
+                return true;
+            };
+            return rows_match(target.r_l, expected.r) &&
+                   rows_match(target.s_l, expected.s);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static bool prepare_replacement(
+            const void * context,
+            std::unique_ptr<vbr_parsed_companion_image> incoming,
+            std::unique_ptr<vbr_parsed_companion_image> recovery_base,
+            llama_seq_id destination,
+            std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+        output.reset();
+        auto * target = static_cast<llama_memory_recurrent *>(
+            const_cast<void *>(context));
+        auto * parsed = dynamic_cast<vbr_recurrent_parsed_image *>(
+            incoming.get());
+        auto * recovery = dynamic_cast<vbr_recurrent_parsed_image *>(
+            recovery_base.get());
+        size_t physical = 0;
+        uint32_t row = 0;
+        if (!target || !parsed || !recovery ||
+            !parsed_compatible(*target, *parsed) ||
+            !live_matches(*target, destination, *recovery) ||
+            !live_location(*target, destination, physical, row) ||
+            row != physical) {
+            return false;
+        }
+        // Occupied import already owns the controller operation exclusively.
+        // Authenticate the incumbent row once, then overwrite that same row
+        // and retain its parsed bytes for rollback.  Allocating a second
+        // full-size recurrent tensor set here would create an unquoted device
+        // peak even though the artifact contains only one active row.
+        auto image = std::make_unique<vbr_recurrent_prepared_image>();
+        image->target = target;
+        image->destination = destination;
+        image->destination_was_empty = false;
+        image->replacement_physical = physical;
+        image->replacement_position = parsed->position;
+        image->replacement_binding_epoch = target->tensor_binding_epoch_;
+        image->recovery.reset(static_cast<vbr_recurrent_parsed_image *>(
+            recovery_base.release()));
+        output = std::move(image);
+        return write_rows(*target, uint32_t(physical), *parsed);
     }
 
     static void publish(
@@ -229,16 +403,22 @@ class vbr_recurrent_prepared_image final :
             const_cast<void *>(context));
         auto & image = static_cast<vbr_recurrent_prepared_image &>(base);
         GGML_ASSERT(target && image.target == target && image.destination >= 0);
-        target->cells.swap(image.cells);
-        std::swap(target->head, image.head);
-        std::swap(target->used, image.used);
-        std::swap(target->rs_z, image.rs_z);
-        target->rs_idx.swap(image.rs_idx);
-        target->rollback_valid_depth.swap(image.rollback_valid_depth);
-        target->r_l.swap(image.r_l);
-        target->s_l.swap(image.s_l);
-        target->ctxs_bufs.swap(image.ctxs_bufs);
-        target->bump_tensor_binding_epoch();
+        if (image.destination_was_empty) {
+            target->cells.swap(image.cells);
+            std::swap(target->head, image.head);
+            std::swap(target->used, image.used);
+            std::swap(target->rs_z, image.rs_z);
+            target->rs_idx.swap(image.rs_idx);
+            target->rollback_valid_depth.swap(
+                image.rollback_valid_depth);
+        } else {
+            GGML_ASSERT(image.replacement_physical < target->cells.size());
+            auto & cell = target->cells[image.replacement_physical];
+            cell.pos = image.replacement_position;
+            cell.src = int32_t(image.replacement_physical);
+            cell.src0 = -1;
+            target->reset_rollback_state(image.destination);
+        }
         image.target = nullptr;
         // END VBR_IMPORT_RECURRENT_METADATA_SWAP
     }
@@ -248,13 +428,42 @@ class vbr_recurrent_prepared_image final :
             const vbr_prepared_companion_image & base) noexcept {
         const auto * image =
             static_cast<const vbr_recurrent_prepared_image *>(&base);
-        return image && image->target == context && target_empty(context);
+        if (!image || image->target != context) {
+            return false;
+        }
+        const auto * target = static_cast<const llama_memory_recurrent *>(context);
+        if (image->destination_was_empty) {
+            return target->tensor_binding_epoch_ ==
+                    image->replacement_binding_epoch &&
+                target_empty(context);
+        }
+        size_t physical = 0;
+        uint32_t row = 0;
+        // The controller operation excludes decode writers until the no-fail
+        // publish. Recheck structural/binding currency here; rescanning the
+        // full row would duplicate the authenticated D2H comparison performed
+        // immediately before the controlled write.
+        return image->recovery &&
+            target->tensor_binding_epoch_ ==
+                image->replacement_binding_epoch &&
+            live_location(*target, image->destination, physical, row) &&
+            physical == image->replacement_physical && row == physical &&
+            target->cells[physical].pos == image->recovery->position;
     }
 
     static bool rollback(
-            const void *, vbr_prepared_companion_image &) noexcept {
-        // All resources remain owned by the off-side image until publish.
-        return true;
+            const void *, vbr_prepared_companion_image & base) noexcept {
+        auto & image = static_cast<vbr_recurrent_prepared_image &>(base);
+        if (!image.target) {
+            return false;
+        }
+        if (image.destination_was_empty) {
+            return true;
+        }
+        return image.recovery &&
+            image.replacement_physical <= UINT32_MAX &&
+            write_rows(*image.target, uint32_t(image.replacement_physical),
+                       *image.recovery);
     }
 
     static bool target_empty(const void * context) noexcept {
@@ -284,17 +493,18 @@ bool vbr_parse_recurrent_companion(
             source.size() > std::numeric_limits<size_t>::max()) {
             return false;
         }
-        std::vector<uint8_t> bytes(size_t(source.size()));
-        if (!source.read(0, bytes.data(), bytes.size())) {
-            return false;
-        }
-        recurrent_cursor cursor(std::move(bytes));
+        recurrent_cursor cursor(source);
+        static constexpr uint32_t SEQUENCE_STATE_MAGIC = 0xaf143cd8;
+        uint32_t magic = 0;
+        llama_seq_id source_sequence = -1;
         uint32_t cell_count = 0;
         llama_pos position = -1;
         uint32_t n_seq_id = 0;
         uint32_t s_trans = 0;
         uint32_t n_layer = 0;
-        if (!cursor.scalar(cell_count) || cell_count != 1 ||
+        if (!cursor.scalar(magic) || magic != SEQUENCE_STATE_MAGIC ||
+            !cursor.scalar(source_sequence) || source_sequence < 0 ||
+            !cursor.scalar(cell_count) || cell_count != 1 ||
             !cursor.scalar(position) || position < 0 ||
             !cursor.scalar(n_seq_id) || n_seq_id != 0 ||
             !cursor.scalar(s_trans) || s_trans != 0 ||
@@ -348,6 +558,8 @@ vbr_companion_adoption_provider vbr_recurrent_companion_adoption_provider(
     provider.target_cookie = &target;
     provider.context = &target;
     provider.prepare = &vbr_recurrent_prepared_image::prepare;
+    provider.prepare_replacement =
+        &vbr_recurrent_prepared_image::prepare_replacement;
     provider.target_empty = &vbr_recurrent_prepared_image::target_empty;
     provider.recheck = &vbr_recurrent_prepared_image::recheck;
     provider.publish_swap = &vbr_recurrent_prepared_image::publish;
@@ -1009,6 +1221,17 @@ int llama_memory_recurrent::get_cell_count(llama_seq_id seq_id) const {
         }
     }
     return count;
+}
+
+bool llama_memory_recurrent::vbr_capture_readiness_cells(
+        uint64_t,
+        uint64_t & committed,
+        uint64_t & projected,
+        uint64_t & capacity) const {
+    committed = used;
+    projected = used;
+    capacity = size;
+    return capacity != 0;
 }
 
 bool llama_memory_recurrent::expand(uint32_t new_mem_size) {

@@ -42,7 +42,7 @@ enum class server_cache_control_status : uint8_t {
 const char * server_cache_control_status_name(
     server_cache_control_status status) noexcept;
 
-// Scheduler task-door precheck. E1's two-copy guarantee relies on lifecycle
+// Scheduler task-door precheck. Cache control's two-copy guarantee relies on lifecycle
 // publication/floor enforcement; debug-only authority is observability and
 // must refuse rather than construct a lease whose pin its erasers ignore.
 server_cache_control_status server_cache_control_task_precheck(
@@ -135,7 +135,7 @@ enum class server_cache_control_protection_state : uint8_t {
 struct server_cache_control_selector {
     server_cache_control_subject_kind kind =
         server_cache_control_subject_kind::live_prefix;
-    // E1.1a is scheduler-internal. E1.2 converts semantic wire selectors into
+    // This authority is scheduler-internal. The wire layer converts semantic selectors into
     // this exact association; raw keys never cross the HTTP boundary.
     server_retention_instance_key retention_key;
     std::string reference;
@@ -152,7 +152,7 @@ struct server_cache_control_request {
     server_cache_control_token family_binding;
     common_cache_family_role family_role = common_cache_family_role::_count;
     std::string family_label;
-    // E1.2 supplies a bounded client idempotency digest. Zero is allowed only
+    // The wire layer supplies a bounded client idempotency digest. Zero is allowed only
     // for scheduler-internal tests and receives no response-loss replay.
     uint64_t idempotency_key = 0;
     server_cache_lease_class requested_class = server_cache_lease_class::soft;
@@ -206,7 +206,7 @@ struct server_cache_control_result {
     server_cache_control_token lease;
     server_cache_control_token family;
     server_cache_control_token family_binding;
-    // Scheduler-internal resolved value. E1.2 serializes only opaque handles.
+    // Scheduler-internal resolved value. The wire layer serializes only opaque handles.
     common_cache_family_binding cache_family;
     std::string family_label;
     server_cache_lease_class granted_class = server_cache_lease_class::none;
@@ -325,12 +325,12 @@ struct server_cache_control_config {
     size_t max_families = 1024;
     size_t max_family_bindings = 4096;
     // Model-free allocation-fault seams. Production must leave both defaults;
-    // the E1 contract scan forbids assignments outside tests.
+    // production code must never assign them outside tests.
     size_t test_fail_note_after = std::numeric_limits<size_t>::max();
     bool test_fail_remember = false;
 };
 
-// Scheduler-owned E1 authority. It is also the lease table's one fallback
+// Scheduler-owned cache-control authority. It is also the lease table's one fallback
 // provider: a proof is staged only while one scheduler transaction calls the
 // existing grant/renew door, then consumed exactly once by acquire().
 class server_cache_control_authority final :

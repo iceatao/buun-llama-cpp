@@ -1952,7 +1952,7 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
         // KNOWN LIMITATION: ggml's asynchronous copy/event APIs return no
         // transfer result. The synthetic seam can report transfer_failed,
         // while a real device error can only surface later as a length or
-        // digest mismatch; the F3.2 hardware gate must account for that.
+        // digest mismatch; the capture hardware gate must account for that.
         if (ordinal == context.source->fail_completion_at) {
             return uint32_t(vbr_capture_stream_status::transfer_failed);
         }

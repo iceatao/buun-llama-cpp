@@ -101,6 +101,11 @@ public:
 
     llama_memory_vbr_state_data_v2 memory_vbr_state_v2(
             llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
+    bool vbr_capture_readiness_cells(
+            uint64_t logical_growth,
+            uint64_t & committed,
+            uint64_t & projected,
+            uint64_t & capacity) const override;
     bool vbr_operation_armed() const override;
     bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
     void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
@@ -120,7 +125,7 @@ public:
                kv_swa ->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
     }
 
-    // #88: NOT summed — both children share one per-device scratch sized by the widest attended
+    // Not summed: both children share one per-device scratch sized by the widest attended
     // range, and the SWA cache's range is window-bound (n-invariant at depth). Only the base
     // (full-attention) cache's scratch scales with context.
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override {
@@ -128,7 +133,7 @@ public:
     }
 
     // per-child forwarding is for POOL maintenance only (both children can hold deferred
-    // VBR unmaps); the P2 tick's ledger scan/demand servicing happens at the parent level,
+    // VBR unmaps); the periodic ledger scan and demand servicing happen at the parent level,
     // never per child
     void breathe() override { kv_base->breathe(); kv_swa->breathe(); }
 
@@ -265,7 +270,7 @@ public:
     const llama_kv_cache_context * get_swa()  const;
 
 private:
-    llama_kv_cache_iswa * kv = nullptr;  // C1: composite decode-op owner needs the caches
+    llama_kv_cache_iswa * kv = nullptr;  // Composite decode-operation owner needs the caches.
 
     // the index of the next ubatch to process
     size_t i_next = 0;

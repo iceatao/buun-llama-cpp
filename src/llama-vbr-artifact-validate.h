@@ -17,7 +17,7 @@
 
 struct vbr_explicit_representation_identity;
 
-// F4.1b is a pure evidence classifier. A decision describes the honest next
+// This is a pure evidence classifier. A decision describes the honest next
 // action; the validation status separately says whether the evidence was
 // complete enough to trust that decision.
 enum class vbr_import_decision : uint8_t {
@@ -165,6 +165,11 @@ private:
         const vbr_import_schedule_quote &,
         const vbr_target_validation_snapshot &,
         const vbr_artifact_package_view &) noexcept;
+    friend bool vbr_import_schedule_quote_matches_source(
+        const vbr_import_schedule_quote &,
+        const vbr_target_validation_snapshot &,
+        const vbr_artifact_reference_manifest &,
+        const std::vector<vbr_artifact_unit_view> &) noexcept;
     friend bool vbr_rebind_import_schedule_quote(
         const vbr_target_validation_snapshot &,
         const vbr_artifact_package_view &,
@@ -244,7 +249,7 @@ struct vbr_target_unit_snapshot {
     uint64_t downward_mapped_bytes = 0;
     uint64_t downward_transfer_bytes = 0;
     uint64_t downward_codec_workspace_bytes = 0;
-    // F4.2 proof inputs. Each transform direction carries its one canonical
+    // Transform proof inputs. Each direction carries its one canonical
     // recipe and build identity; both bind the controller-owned selected tree.
     vbr_downward_recipe downward_recipe;
     int32_t downward_meansub_model_id = -1;
@@ -294,7 +299,7 @@ struct vbr_target_companion_snapshot {
 };
 
 // Provider-specific, allocation-only parse result. Validators may build this
-// bounded CPU image, but it exposes no installation method; F4.2 must consume
+// bounded CPU image, but it exposes no installation method; adoption must consume
 // it under the adoption journal rather than invoking legacy state_read().
 class vbr_parsed_companion_image {
 public:
@@ -341,6 +346,11 @@ bool vbr_import_schedule_quote_matches(
     const vbr_import_schedule_quote & quote,
     const vbr_target_validation_snapshot & target,
     const vbr_artifact_package_view & package) noexcept;
+bool vbr_import_schedule_quote_matches_source(
+    const vbr_import_schedule_quote & quote,
+    const vbr_target_validation_snapshot & target,
+    const vbr_artifact_reference_manifest & manifest,
+    const std::vector<vbr_artifact_unit_view> & units) noexcept;
 
 struct vbr_target_empty_fingerprint;
 class vbr_staged_payloads;
@@ -510,6 +520,12 @@ struct vbr_validated_companion_plan {
     const void * target_cookie = nullptr;
     std::shared_ptr<const artifact_segment_chain> source;
     std::unique_ptr<vbr_parsed_companion_image> parsed;
+    // Occupied draft/accelerator replacement carries the independently
+    // authenticated incumbent image through the same adoption journal.
+    // Non-destructive companions (for example frontier logits) leave these
+    // fields empty and retain their existing off-side swap behavior.
+    std::shared_ptr<const artifact_segment_chain> recovery_source;
+    std::unique_ptr<vbr_parsed_companion_image> recovery_parsed;
 };
 
 enum class vbr_tracker_install_transition : uint8_t {
@@ -577,7 +593,7 @@ public:
             ? source_projection_.parent_artifact()
             : source_lease_.reference_artifact();
     }
-    // F4.2 staging retains this lease through the proof and uses the same
+    // Staging retains this lease through the proof and uses the same
     // canonical package door for its pre-transfer repeatability check.
     const vbr_artifact_package_view & source_package() const noexcept {
         return source_lease_;

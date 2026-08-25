@@ -25,7 +25,7 @@ struct server_vbr_occupied_quarantine_reset_result {
 server_vbr_occupied_quarantine_reset_result
 server_vbr_occupied_quarantine_reset_for_test();
 
-// TEST-ONLY E1.1b door. It constructs the private server_slot, resolves a
+// TEST-ONLY door. It constructs the private server_slot, resolves a
 // scheduler family token, exercises the real no-restore cache load, and then
 // verifies that host/checkpoint carriers are sourced from that same slot.
 struct server_cache_family_slot_round_trip_result {
@@ -80,7 +80,12 @@ struct server_vbr_reclaim_policy_result {
     bool mixed_host_kept_hot = false;
     bool mixed_host_removed_cold = false;
     bool token_identity_distinguishes_attempt = false;
+    bool successful_attempt_is_state_sealed = false;
     bool multi_fresh_pressure_isolated = false;
+    bool unchanged_admission_refusal_is_suppressed = false;
+    bool checkpoint_admission_refusals_are_independent = false;
+    bool admission_refusal_reopens_on_currency_change = false;
+    bool admission_refusal_reopens_at_lease_expiry = false;
 };
 
 server_vbr_reclaim_policy_result
@@ -90,13 +95,20 @@ struct server_vbr_slot_selection_result {
     bool learned_selected_cold = false;
     bool learned_kept_hot = false;
     bool selection_was_pure = false;
+    bool fixed_learned_selected_cold = false;
+    bool fixed_learned_kept_hot = false;
+    bool fixed_selection_was_pure = false;
+    bool fixed_incomplete_used_lru = false;
+    bool fixed_protected_fallback_was_safe = false;
+    bool fixed_capability_tier_was_preserved = false;
     bool incomplete_used_lru = false;
     bool protected_fallback_was_safe = false;
     bool all_protected_has_no_target = false;
     bool empty_slot_was_preferred = false;
     bool capability_tier_was_preserved = false;
     bool exhausted_tier_used_alternate = false;
-    bool route_home_unchanged = false;
+    bool weak_prefix_preserved_empty = false;
+    bool weak_prefix_preserved_hot = false;
 };
 
 server_vbr_slot_selection_result

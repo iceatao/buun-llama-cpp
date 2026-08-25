@@ -353,8 +353,8 @@ llama_cache_budget_result llama_cache_budget_coordinator::fits(
             if (!device_scope && !host_scope) {
                 continue;
             }
-            // F2 capacity rows are dormant until their producer observes at
-            // least one capacity measure. This preserves the pre-F2 budget
+            // Artifact-capacity rows are dormant until their producer observes at
+            // least one capacity measure. This preserves the pre-artifact budget
             // surface when artifact machinery is not allocated, while a
             // partially-observed active row still fails closed below.
             const auto resident =

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cache-plan-calibrate.py — B-2 calibration sweep + fit. Drives a --cache-debug server
+# cache-plan-calibrate.py — cache-plan calibration sweep and fit. Drives a --cache-debug server
 # with controlled probes, reads the measured actuals back out of its CACHE_PLAN records,
 # and fits the common_cache_plan_calib coefficients:
 #   replay_us_per_token — least-squares over COLD records (ttft vs n_replayed_tokens)
@@ -7,7 +7,7 @@
 #       records (ttft minus fitted replay share vs payload bytes)
 # Emits a C++ initializer snippet for common/common-cache-plan-estimate.cpp's checked-in
 # table (data reviewed like code) plus fit diagnostics. The profile id is read from the
-# records themselves (B-2: the server composes it; this script never invents one).
+# records themselves; the server composes it and this script never invents one.
 #
 # Usage: point at a FRESH server log + run the sweep, e.g.
 #   cache-plan-calibrate.py --server http://localhost:8241 --log server.log
@@ -160,7 +160,7 @@ def main():
                 restored.append((plan["payload_bytes"], nre, ttft))
 
     # one fit = one profile: mixing hardware/model regimes in a single log would fit
-    # garbage coefficients under whichever profile string came last (verify-r1 finding 6)
+    # garbage coefficients under whichever profile string came last.
     if len(profiles) > 1:
         print(f"error: log mixes {len(profiles)} calibration profiles: {sorted(profiles)}; "
               "fit each regime from its own log", file=sys.stderr)

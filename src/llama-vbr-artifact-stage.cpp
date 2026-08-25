@@ -763,6 +763,71 @@ bool stage_projection_child(
 }
 
 template<class AppendRead>
+bool stage_projection_relocated_child(
+        const vbr_validated_child_plan & child,
+        const std::vector<vbr_occupied_replacement_relocation_run> & runs,
+        const std::vector<vbr_h2d_lane_binding> & lanes,
+        AppendRead && append_read,
+        vbr_adopt_stage_status & failure) {
+    if (runs.empty()) {
+        failure = vbr_adopt_stage_status::invalid_proof;
+        return false;
+    }
+    for (const auto & shard : child.shards) {
+        const uint32_t lane = find_lane(lanes, shard.domain);
+        if (lane >= lanes.size() || !shard.source ||
+            !shard.projection_proof || shard.row_bytes == 0) {
+            failure = vbr_adopt_stage_status::source_unavailable;
+            return false;
+        }
+        uint64_t proof_verified_bytes = 0;
+        if (!vbr_capture_range_verify(
+                shard.projection_proof, shard.source->source(),
+                &proof_verified_bytes) || proof_verified_bytes == 0) {
+            failure = vbr_adopt_stage_status::source_hash_mismatch;
+            return false;
+        }
+        for (const auto & run : runs) {
+            if (run.cell_count == 0 ||
+                run.first_source_packed_row > UINT64_MAX/shard.row_bytes ||
+                uint64_t(run.first_destination_physical_cell) >
+                    UINT64_MAX/shard.row_bytes ||
+                uint64_t(run.cell_count) > UINT64_MAX/shard.row_bytes) {
+                failure = vbr_adopt_stage_status::invalid_proof;
+                return false;
+            }
+            const uint64_t source_offset =
+                run.first_source_packed_row*shard.row_bytes;
+            const uint64_t destination_offset =
+                uint64_t(run.first_destination_physical_cell)*shard.row_bytes;
+            const uint64_t size = uint64_t(run.cell_count)*shard.row_bytes;
+            if (source_offset > shard.source->size() ||
+                size > shard.source->size()-source_offset) {
+                failure = vbr_adopt_stage_status::source_unavailable;
+                return false;
+            }
+            vbr_staged_read_descriptor read;
+            read.kind = vbr_staged_read_kind::unit_payload;
+            read.child_id = child.child_id;
+            read.logical_unit_id = child.logical_unit_id;
+            read.shard_index = shard.shard_index;
+            read.lane = lane;
+            read.size = size;
+            read.source = shard.source;
+            read.verified_digest = shard.projection_proof.root();
+            read.destination_offset = destination_offset;
+            read.projection_ranges.push_back({ source_offset, size });
+            read.proof_verified_bytes = proof_verified_bytes;
+            if (!append_read(std::move(read))) {
+                failure = vbr_adopt_stage_status::source_hash_mismatch;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+template<class AppendRead>
 bool stage_relocated_child(
         const vbr_validated_child_plan & child,
         const std::vector<vbr_occupied_replacement_relocation_run> & runs,
@@ -780,6 +845,7 @@ bool stage_relocated_child(
         (kind != vbr_staged_read_kind::recovery_unit_payload ||
          recovery_unit->descriptor.child_id != child.child_id ||
          recovery_unit->descriptor.logical_unit_id != child.logical_unit_id ||
+         recovery_unit->descriptor.shards.size() != child.shards.size() ||
          recovery_unit->payload_shards.size() != child.shards.size())) {
         failure = vbr_adopt_stage_status::invalid_proof;
         return false;
@@ -795,9 +861,17 @@ bool stage_relocated_child(
         const auto source = recovery_unit
             ? recovery_unit->payload_shards[shard.shard_index]
             : shard.source;
+        const auto * recovery_shard = recovery_unit
+            ? &recovery_unit->descriptor.shards[shard.shard_index]
+            : nullptr;
+        const uint64_t row_bytes = recovery_shard
+            ? recovery_shard->row_bytes : shard.row_bytes;
         const uint64_t source_bytes = recovery_unit && source
             ? source->size() : shard.payload_bytes;
-        if (lane >= lanes.size() || !source || shard.row_bytes == 0) {
+        if (lane >= lanes.size() || !source || row_bytes == 0 ||
+            (recovery_shard &&
+             (recovery_shard->shard_index != shard.shard_index ||
+              recovery_shard->payload_bytes != source_bytes))) {
             failure = vbr_adopt_stage_status::source_unavailable;
             return false;
         }
@@ -807,18 +881,18 @@ bool stage_relocated_child(
             return false;
         }
         for (const auto & run : runs) {
-            if (run.first_source_packed_row > UINT64_MAX/shard.row_bytes ||
+            if (run.first_source_packed_row > UINT64_MAX/row_bytes ||
                 uint64_t(run.first_destination_physical_cell) >
-                    UINT64_MAX/shard.row_bytes ||
-                uint64_t(run.cell_count) > UINT64_MAX/shard.row_bytes) {
+                    UINT64_MAX/row_bytes ||
+                uint64_t(run.cell_count) > UINT64_MAX/row_bytes) {
                 failure = vbr_adopt_stage_status::source_unavailable;
                 return false;
             }
             const uint64_t source_offset =
-                run.first_source_packed_row*shard.row_bytes;
+                run.first_source_packed_row*row_bytes;
             const uint64_t destination_offset =
-                uint64_t(run.first_destination_physical_cell)*shard.row_bytes;
-            const uint64_t size = uint64_t(run.cell_count)*shard.row_bytes;
+                uint64_t(run.first_destination_physical_cell)*row_bytes;
+            const uint64_t size = uint64_t(run.cell_count)*row_bytes;
             if (run.cell_count == 0 || source_offset > source_bytes ||
                 size > source_bytes-source_offset) {
                 failure = vbr_adopt_stage_status::source_unavailable;
@@ -835,6 +909,9 @@ bool stage_relocated_child(
             read.verified_digest = digest;
             read.destination_offset = destination_offset;
             read.projection_ranges.push_back({ source_offset, size });
+            if (recovery_unit) {
+                read.destination_type = recovery_unit->descriptor.current_type;
+            }
             if (!append_read(std::move(read))) {
                 failure = vbr_adopt_stage_status::source_hash_mismatch;
                 return false;
@@ -903,10 +980,6 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             out.manifest->is_occupied_replacement();
         if (prefix_projection) {
             if (!out.manifest->projection_transfer_ready() ||
-                out.manifest->decision() ==
-                    vbr_import_decision::downward_rebase ||
-                out.manifest->decision() ==
-                    vbr_import_decision::upward_reconstruct ||
                 !out.manifest->companions().empty()) {
                 out.status = vbr_adopt_stage_status::invalid_proof;
                 return out;
@@ -982,8 +1055,12 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
 
         for (const auto & child : out.manifest->children()) {
             const bool staged = prefix_projection
-                ? stage_projection_child(
-                    child, policy.lanes, append_read, out.status)
+                ? occupied_replacement
+                    ? stage_projection_relocated_child(
+                        child, out.manifest->relocation_runs(), policy.lanes,
+                        append_read, out.status)
+                    : stage_projection_child(
+                        child, policy.lanes, append_read, out.status)
                 : occupied_replacement
                     ? stage_relocated_child(
                         child, out.manifest->relocation_runs(),

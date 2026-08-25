@@ -144,6 +144,15 @@ bool execute_shared_payload_claims(
         authority.admission_rollbacks += transaction.rolled_back;
         if (transaction.status !=
                 llama_cache_transaction_status::committed) {
+            SRV_DBG(
+                "CACHE_AUTHORITY shared payload transaction status=%s "
+                "admission=%s failed_leaf=%zu pending_bytes=%" PRIu64
+                " attempts=%u serial_retries=%" PRIu64 "\n",
+                llama_cache_transaction_status_name(transaction.status),
+                llama_cache_admission_status_name(
+                    transaction.admission_status),
+                transaction.failed_leaf, pending, transaction.attempts,
+                transaction.serial_retries);
             return false;
         }
         size_t bound = 0;
@@ -471,9 +480,9 @@ bool server_cache_authority::sample_budget(
 
         config.host.pinned_cap = 0;
         config.host.pinned_state =
-            llama_cache_budget_capacity_state::known;
-        config.host.total_state =
             llama_cache_budget_capacity_state::unbounded;
+        config.host.total_state =
+            llama_cache_budget_capacity_state::unavailable;
         config.global_cap_state =
             llama_cache_budget_capacity_state::unbounded;
 
@@ -529,16 +538,39 @@ bool server_cache_authority::sample_budget(
             return true;
         }
 
+        uint64_t host_before = 0;
+        for (const auto & current_row : current.domains) {
+            if (current_row.resource.residency !=
+                    llama_cache_acct_residency::pageable_host &&
+                current_row.resource.residency !=
+                    llama_cache_acct_residency::pinned_host) {
+                continue;
+            }
+            if (current_row.before.state !=
+                    llama_cache_acct_known::known ||
+                !add_checked(
+                    host_before, current_row.before.value, host_before)) {
+                config.host.pageable_state =
+                    llama_cache_budget_capacity_state::unavailable;
+                return true;
+            }
+        }
+
         uint64_t available = 0;
         uint64_t cap = 0;
+        uint64_t total_cap = 0;
         if (!add_checked(uint64_t(free), pending_host_bytes, available) ||
-            !add_checked(row->before.value, available, cap)) {
+            !add_checked(row->before.value, available, cap) ||
+            !add_checked(host_before, available, total_cap)) {
             config.host.pageable_state =
                 llama_cache_budget_capacity_state::unavailable;
             return true;
         }
         config.host.pageable_cap = cap;
         config.host.pageable_state =
+            llama_cache_budget_capacity_state::known;
+        config.host.total_cap = total_cap;
+        config.host.total_state =
             llama_cache_budget_capacity_state::known;
         return true;
     } catch (...) {

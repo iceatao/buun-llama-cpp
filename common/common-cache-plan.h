@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-// common-cache-plan.h — P2 B0/B/D-S/B-A/D-A decision record, schema version 7.
+// common-cache-plan.h — prompt-cache decision record, schema version 7.
 //
 // §7.7 decision records + §7.5 shadow-planner inventory: the ONE closed plan-reason enum
 // shared by server and tests, the orthogonal candidate disposition, the closed provider
@@ -17,24 +17,24 @@
 // SHADOW-ONLY: the record observes the shipped selection path; `slot.cache_status` and the
 // live four-tier logic remain authoritative and untouched. Everything here is inert unless
 // the --cache-debug observer is enabled, and the disabled branch performs strictly zero
-// observer work (B-a).
+// observer work.
 //
-// v1 → v2 (B pins, CONCUR-TERMINAL r4): the four per-provider summary rows are replaced by
+// In schema v2, the four per-provider summary rows were replaced by
 // a bounded per-entry CANDIDATE INVENTORY — one row per candidate instance the shipped
 // selectors actually visited (every evaluated live slot across the three slot loops, every
 // scanned host entry, every visited checkpoint sibling), merged across selector phases by
 // (provider, request-local source id). The declared candidate domain is exactly this
-// shipped-visited set (B-a forbids observer re-scans); per-provider inventory-state markers
+// shipped-visited set (observers never rescan); per-provider inventory-state markers
 // record truncation (shipped short-circuit) and overflow. Cost terms move from the record
 // to each row; shadow choice / tie set are planner outputs, typed-unavailable until the
-// B chooser fills them. Candidate observation transport is noexcept by construction: fixed
+// planner fills them. Candidate observation transport is noexcept by construction: fixed
 // capacity in the record, append-or-mark-overflowed, no allocation in selector hooks.
-// v3 embeds accounting schema v2. v4 adds the D-S shadow yield projection: selected
+// v3 embeds accounting schema v2. v4 adds the shadow yield projection: selected
 // artifacts and exact union-level projected domain values, plus an explicitly
-// not_observed actual-yield slot reserved for later D-A authority. v5 adds the
-// B-A authority receipt and target-qualified candidate identity without changing
+// not_observed actual-yield slot reserved for authoritative mutation. v5 adds the
+// authority receipt and target-qualified candidate identity without changing
 // the established meaning of `shadow_choice` (the planner counterfactual). v6 adds
-// D-A's shadow destruction quote/receipt; accounting remains schema 2. v7 names the
+// the shadow destruction quote/receipt; accounting remains schema 2. v7 names the
 // host payload representation independently of the provider so fixed state and sealed
 // VBR artifacts remain distinguishable throughout the control plane.
 
@@ -50,10 +50,10 @@ constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
               LLAMA_CACHE_ACCT_SCHEMA_VERSION);
 
-// Bounded inventory capacity (fixed-in-record option of the A2 transport contract). No
+// Bounded inventory capacity fixed in the record. No
 // fixed bound can cover the unconstrained slot x host-state x checkpoint product. A failed
 // append therefore latches typed saturation, immediately stops the authority scan, and
-// makes planner qualification unavailable; B0 emission and the shipped path continue.
+// makes planner qualification unavailable; record emission and the shipped path continue.
 constexpr size_t COMMON_CACHE_PLAN_MAX_CANDIDATES = 96;
 
 // Bounded component references for composed candidate plans (host entry + checkpoint
@@ -119,7 +119,7 @@ enum common_cache_plan_reason : uint16_t {
 #define COMMON_CACHE_PLAN_REASON_ENUM_MEMBER(sym, name, val) COMMON_CACHE_PLAN_REASON_##sym = val,
     COMMON_CACHE_PLAN_REASON_LIST(COMMON_CACHE_PLAN_REASON_ENUM_MEMBER)
 #undef COMMON_CACHE_PLAN_REASON_ENUM_MEMBER
-    // closed-set sentinel (v2 pin): one past the last member
+    // Closed-set sentinel: one past the last member.
     COMMON_CACHE_PLAN_REASON_COUNT_SENTINEL,
 };
 
@@ -207,7 +207,7 @@ enum class common_cache_plan_outcome : uint8_t {
     _count,
 };
 
-// How the shipped path picked the slot (stage 1).
+// How the shipped path picked the slot before cache-plan preflight.
 enum class common_cache_plan_selection : uint8_t {
     none = 0,
     by_id,
@@ -234,7 +234,7 @@ constexpr bool common_cache_plan_origin_in_domain(
            uint8_t(origin) <= uint8_t(decision);
 }
 
-// B-A schema-v5 authority vocabulary. The configured level is graduated: each
+// Schema-v5 authority vocabulary. The configured level is graduated: each
 // level includes every earlier tier. The receipt distinguishes the legacy
 // counterfactual, planner result, and actually executed complete plan without
 // changing schema-v4 `shadow_choice` semantics.
@@ -288,8 +288,8 @@ struct common_cache_plan_authority_receipt {
 };
 
 // Process-local, fixed-size authority telemetry. JSON remains debug-gated; this
-// POD is the bounded receipt/counter surface that B-A0b moves into the independent
-// debug||authority substrate. B-A0a exercises it from the existing observer only.
+// POD is the bounded receipt/counter surface used by the independent
+// debug-or-authority substrate. Shadow mode exercises it from the existing observer only.
 struct common_cache_plan_authority_counters {
     std::array<uint64_t, size_t(common_cache_plan_selection::_count)> observed{};
     std::array<uint64_t, size_t(common_cache_plan_selection::_count)> authority_eligible{};
@@ -308,9 +308,9 @@ struct common_cache_plan_authority_counters {
                  bool qualified = false) noexcept;
 };
 
-// D-A schema-v6 destruction evidence. These are wire-layer mirrors of the
+// Cache-destruction evidence. These are wire-layer mirrors of the
 // server-only lifecycle vocabulary; common/ must not depend on tools/server.
-// D-A0a established the quote shape; D-A2 freezes the resolved recovery-source
+// The maintenance receipt freezes the resolved recovery-source
 // citation used by certified and executed redundant-host evictions.
 constexpr uint32_t COMMON_CACHE_PLAN_DESTRUCTION_POLICY_VERSION = 1;
 
@@ -350,11 +350,11 @@ enum class common_cache_plan_destruction_effect : uint8_t {
     cross_target_displacement,
     destructive_similarity_retarget,
     same_target_cold_replacement,
-    // Physical host-artifact retirement. A B restore uses the consumption
-    // spelling; D-A2's maintenance receipt distinguishes certified redundant
+    // Physical host-artifact retirement. A restore uses the consumption
+    // spelling; the maintenance receipt distinguishes certified redundant
     // eviction with displaced_fate=exact_duplicate and a resolved citation.
     different_host_source_consumption,
-    // D-A4 owns one independently accounted member of a live checkpoint ring.
+    // One independently accounted member of a live checkpoint ring.
     checkpoint_member_drop,
     _count,
 };
@@ -518,8 +518,8 @@ struct common_cache_plan_destruction_receipt {
     std::vector<llama_cache_acct_artifact_id> selected_attention;
     std::vector<llama_cache_acct_artifact_id> selected_recurrent;
     // Schema-v6 recovery-source detail retained by schema v7. A resolved citation is legal without
-    // these fields: B-path recovery can resolve a logical/durable source that
-    // has no D-A artifact pin. When D-A resolves a concrete protected source,
+    // these fields: recovery can resolve a logical/durable source that
+    // has no artifact pin. When it resolves a concrete protected source,
     // the artifact plus a tagged digest over its canonical op set identifies
     // that survivor without leaking process-local C handles onto the wire.
     // Prospective and unavailable citations also leave both fields unavailable.
@@ -567,7 +567,7 @@ struct common_cache_plan_destruction_counters {
 
 // Which authoritative shipped scan observed a candidate (bitmask on the row). A physical
 // candidate visited by several phases keeps ONE row (merge key = provider + source id);
-// each phase ORs its bit and adds only the scalars that phase computed (r3 reading 1).
+// each phase ORs its bit and adds only the scalars that phase computed.
 enum common_cache_plan_phase : uint8_t {
     COMMON_CACHE_PLAN_PHASE_BY_ID      = 1 << 0,
     COMMON_CACHE_PLAN_PHASE_SIMILARITY = 1 << 1,
@@ -589,7 +589,7 @@ constexpr common_cache_plan_selection common_cache_plan_origin_for_phase(uint8_t
 // Per-provider observed-inventory completeness over the DECLARED domain (= the shipped-
 // visited set). `truncated_by_shipped_short_circuit` marks scans the shipped path cut off
 // (checkpoint reverse find_if): entries beyond it are outside the domain, and such a record
-// is scoped evidence only — never full-inventory absorption evidence (r3 reading 2).
+// is scoped evidence only, never full-inventory absorption evidence.
 // `overflowed` = the fixed inventory filled; shadow choice is then unavailable, never an
 // optimum over a partial set.
 enum class common_cache_plan_inventory_state : uint8_t {
@@ -600,7 +600,7 @@ enum class common_cache_plan_inventory_state : uint8_t {
     _count,
 };
 
-// Closed planner-attempt status (verify-r1 finding 8): every finalized record says exactly
+// Closed planner-attempt status: every finalized record says exactly
 // what the planner did, and an ordinary refusal is countable without conflating "no fitted
 // profile exists" with an internal fault.
 enum class common_cache_plan_planner_status : uint8_t {
@@ -614,10 +614,10 @@ enum class common_cache_plan_planner_status : uint8_t {
     _count,
 };
 
-// D-S7 schema-v4 yield projection. The selected artifact rows and projected domain
+// Schema-v4 yield projection. The selected artifact rows and projected domain
 // values describe the shadow planner's selected UNION. They are never measured yield:
-// D-S does not execute an eviction, so the actual side stays explicitly not_observed
-// until D-A supplies an authoritative post-mutation measurement.
+// Shadow projection does not execute an eviction, so the actual side stays explicitly not_observed
+// until an authoritative post-mutation measurement is available.
 enum class common_cache_plan_yield_status : uint8_t {
     fits = 0,
     insufficient_yield,
@@ -710,7 +710,7 @@ common_cache_plan_default_cost_terms() {
 // derived chain over such instances). Membership in the inventory IS presence — no row, no
 // observation, never a vacuous verdict. `delivered` = this candidate actually applied state
 // to the slot — recorded as data at the delivery site, never inferred.
-// Trivially copyable and written only through noexcept record methods (A2 transport).
+// Trivially copyable and written only through noexcept record methods.
 struct common_cache_plan_candidate {
     common_cache_plan_provider provider = common_cache_plan_provider::cold_replay;
     common_cache_plan_payload_kind payload_kind =
@@ -728,7 +728,7 @@ struct common_cache_plan_candidate {
 
     bool delivered = false;
 
-    // root-feasibility (verify-r1 finding 1): a row whose state was only reachable through
+    // Root feasibility: a row whose state was only reachable through
     // a delivered base component (e.g. a checkpoint exposed by a host restore) is EVIDENCE
     // and a chain component, but not a standalone plan — it never enters the root optimum.
     bool component_only = false;
@@ -742,7 +742,7 @@ struct common_cache_plan_candidate {
     common_cache_plan_disposition disposition = common_cache_plan_disposition::unavailable;
     common_cache_plan_reason      reason      = COMMON_CACHE_PLAN_REASON_NONE;
 
-    // diagnostics transported from the shipped path's own computation (B-a: never re-derived;
+    // Diagnostics transported from the shipped path's own computation (never re-derived;
     // a scalar the visiting loop did not compute stays typed unknown)
     llama_cache_acct_value lcp_tokens;
     llama_cache_acct_value payload_bytes;
@@ -800,15 +800,15 @@ struct common_cache_plan_candidate {
 // (slot routing → host-cache load → context-checkpoint selection); candidate rows
 // accumulate at each stage and the record is finalized exactly once (outcome flips off
 // `unknown`), after the actual restore/cold path and measured TTFT are known. Fields no
-// shipped computation produced remain typed unknown/unavailable. D-S yield data is
+// shipped computation produced remain typed unknown/unavailable. Yield data is
 // populated later at finalize inside its own observer-only boundary.
 //
-// A2 transport contract (pins v4, verbatim contract): this base record exists independently
+// Transport contract: this base record exists independently
 // of planner outputs; the inventory is FIXED-CAPACITY in the record, so every selector hook
 // is allocation-free and noexcept — append either succeeds into reserved storage or latches
 // the provider's inventory state `overflowed` without touching the shipped loop. The
 // planner (estimation, composed-plan construction, tie set, shadow choice) runs later,
-// inside its own boundary in finalize, and its failure clears planner outputs only: the B0
+// inside its own boundary in finalize, and its failure clears planner outputs only: the base
 // record is always emitted.
 struct common_cache_plan_record {
     uint32_t schema_version = COMMON_CACHE_PLAN_SCHEMA_VERSION;
@@ -821,7 +821,7 @@ struct common_cache_plan_record {
 
     common_cache_plan_identity_evidence identity;
 
-    // B-2: stable calibration-profile id ({model class}/{hardware class}/{batch regime});
+    // Stable calibration-profile id ({model class}/{hardware class}/{batch regime});
     // empty = no matching profile (typed unknown on the wire) — estimators then refuse.
     // Set once at record creation (inside the creation try), never from selector hooks.
     std::string calibration_profile;
@@ -839,12 +839,12 @@ struct common_cache_plan_record {
     common_cache_plan_provider chosen  = common_cache_plan_provider::cold_replay;
     common_cache_plan_outcome  outcome = common_cache_plan_outcome::unknown; // != unknown ⇔ finalized
 
-    // the COMPLETE shipped plan as a candidate ordinal (verify-r1 finding 1): the chain row
+    // the complete shipped plan as a candidate ordinal: the chain row
     // when the delivery was composed, else the terminal provider's selected row. `chosen`
     // stays the outcome summary; offline agreement runs against THIS ordinal.
     int32_t shipped_plan_candidate = -1;
 
-    // a derived plan (chain) could not be recorded at capacity (verify-r1 finding 4): the
+    // a derived plan (chain) could not be recorded at capacity: the
     // plan set is incomplete even though every provider inventory looks intact — the
     // planner must refuse.
     bool derived_plans_incomplete = false;
@@ -861,12 +861,12 @@ struct common_cache_plan_record {
         return false;
     }
 
-    // closed planner-attempt outcome, set at finalize (verify-r1 finding 8)
+    // Closed planner-attempt outcome, set at finalize.
     common_cache_plan_planner_status planner_status = common_cache_plan_planner_status::not_attempted;
 
-    // Schema-v5 three-plan authority receipt. In B-A0a it is always shadow/off:
+    // Schema-v5 three-plan authority receipt. In shadow mode it is always off:
     // legacy/executed name the shipped plan and planner names `shadow_choice`.
-    // B-A0b planner evidence is a pre-mutation counterfactual. Agreement stats
+    // Planner evidence is a pre-mutation counterfactual. Agreement stats
     // therefore include known structural noise: save-before-load can introduce
     // a fresh host entry absent from the planner inventory; the legacy
     // counterfactual does not model the seam's pos_min/SWA/recurrent coverage
@@ -881,7 +881,7 @@ struct common_cache_plan_record {
     // while the inventory still records legacy physical coverage. Ratchet gates
     // must separate these classes rather than treating every disagreement as an
     // economic-policy miss. Route-home cross-target disagreements are also
-    // receipt-only before D-A: dynamic VBR has no host cache to preserve the
+    // receipt-only before destruction authority: dynamic VBR has no host cache to preserve the
     // displaced target, and schema 5 carries no priced retention loss. A
     // BOS-only apparent home therefore stays legacy rather than being treated
     // as a free retarget. Shared-system-prefix fleets add a second safe noise
@@ -896,11 +896,11 @@ struct common_cache_plan_record {
     // host source remains destruction_authority_required at every tier.
     // Schema 5 has no separate execution_failed fallback;
     // a genuine post-authorization restore failure is recorded as internal_fault
-    // rather than silently extending the frozen vocabulary in B-A1.
+    // rather than silently extending the frozen vocabulary.
     common_cache_plan_authority_receipt authority;
 
-    // Schema-v6 D-A receipt. `destruction_quotes` is process-local staging:
-    // every destructive B candidate is quoted before minimization, then the
+    // Schema-v6 destruction receipt. `destruction_quotes` is process-local staging:
+    // every destructive candidate is quoted before minimization, then the
     // winning candidate's quote is projected into `destruction` for the wire.
     common_cache_plan_destruction_receipt destruction;
     std::vector<common_cache_plan_destruction_quote> destruction_quotes;
@@ -909,7 +909,7 @@ struct common_cache_plan_record {
     // non-destructive selected row from a missing destructive quote.
     int32_t destruction_legacy_plan_candidate = -1;
 
-    // Process-local B-A staging state; deliberately not serialized. A
+    // Process-local planner staging state; deliberately not serialized. A
     // precomputed planner result survives legacy mutation/finalization, while
     // the receipt remains the schema-v5 wire surface.
     bool planner_precomputed = false;
@@ -931,10 +931,10 @@ struct common_cache_plan_record {
     std::array<int32_t, COMMON_CACHE_PLAN_MAX_CANDIDATES> shadow_tie_set = {};   // valid [0, n_shadow_ties)
     uint32_t n_shadow_ties = 0;
 
-    // D-S yield is a separate observer projection, not a B chooser output.
+    // Yield is a separate observer projection, not a planner output.
     common_cache_plan_yield_record yield;
 
-    // C0 accounting snapshot; meaningful once outcome != unknown
+    // Accounting snapshot, meaningful once outcome != unknown.
     llama_cache_acct_snapshot acct;
 
     // Find the row for (target_slot_id, provider, source_id) or append one — the cross-phase merge point:
@@ -1009,7 +1009,7 @@ struct common_cache_plan_record {
     common_cache_plan_candidate * add_chain(common_cache_plan_provider base_provider,
                                             int32_t comp0, int32_t comp1) noexcept {
         if (n_inventory >= COMMON_CACHE_PLAN_MAX_CANDIDATES) {
-            derived_plans_incomplete = true; // plan set incomplete; planner refuses [F4]
+            derived_plans_incomplete = true; // Incomplete plan set; the planner refuses it.
             return nullptr;
         }
         auto & c = inventory[n_inventory++];
@@ -1080,7 +1080,7 @@ struct common_cache_plan_record {
         }
     }
 
-    // planner-fault cleanup (A2): clear every planner output, leave the B0 evidence intact
+    // Planner-fault cleanup: clear every planner output and leave the observed evidence intact.
     void clear_planner_outputs() noexcept {
         shadow_choice = -1;
         n_shadow_ties = 0;
@@ -1092,7 +1092,7 @@ struct common_cache_plan_record {
 };
 
 // Exhaustive name tables (presentation layer; switch-based so -Wswitch enforces coverage).
-// The C0 accounting enums are named here too: src/llama-cache-accounting.h stays policy- and
+// The accounting enums are named here too: src/llama-cache-accounting.h stays policy- and
 // string-free, and these are the only spellings — CI bans replicas.
 const char * common_cache_plan_reason_name(common_cache_plan_reason r);
 const char * common_cache_plan_disposition_name(common_cache_plan_disposition d);
@@ -1116,7 +1116,7 @@ const char * common_cache_plan_displaced_fate_name(common_cache_plan_displaced_f
 const char * common_cache_plan_recovery_citation_name(common_cache_plan_recovery_citation citation);
 const char * common_cache_plan_destruction_comparison_name(
     common_cache_plan_destruction_comparison comparison);
-// Populate the B-A0a shadow/off receipt after the planner attempt. This is observation
+// Populate the shadow/off receipt after the planner attempt. This is observation
 // only: it does not alter selection, delivery, shadow choice, or any shipped state.
 void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec) noexcept;
 void common_cache_plan_derive_shadow_authority(
@@ -1153,7 +1153,7 @@ const char * common_cache_acct_cost_kind_name(llama_cache_acct_cost_kind k);
 nlohmann::ordered_json common_cache_plan_value_json(
         const llama_cache_acct_value & value);
 
-// One JSON shape for both B0 surfaces (the --cache-debug log line and /slots.cache_plan).
+// One JSON shape for both cache-plan surfaces: the --cache-debug log and /slots.cache_plan.
 // Identities stay opaque by construction: no prompt bytes, no raw adapter/media identities —
 // only closed-enum names, counts, and sizes. Only present rows and non-unknown accounting
 // cells are emitted.

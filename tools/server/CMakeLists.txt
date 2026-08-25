@@ -33,6 +33,8 @@ add_library(${TARGET} STATIC
     server-prompt-cache-payload.h
     server-vbr-artifact-store.cpp
     server-vbr-artifact-store.h
+    server-vbr-capture-readiness.cpp
+    server-vbr-capture-readiness.h
     server-vbr-prompt-cache-support.cpp
     server-vbr-prompt-cache-support.h
     server-retention-sidecar.cpp
@@ -111,22 +113,22 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
     add_test(NAME test-server-prompt-cache COMMAND test-server-prompt-cache)
     set_property(TEST test-server-prompt-cache PROPERTY LABELS main)
-    set_property(TEST test-server-prompt-cache APPEND PROPERTY LABELS vbr-h1)
+    set_property(TEST test-server-prompt-cache APPEND PROPERTY LABELS vbr-cache)
     add_test(NAME test-server-prompt-cache-clone-fault
         COMMAND test-server-prompt-cache --clone-fault)
     set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
-        LABELS "main;vbr-h1"
+        LABELS "main;vbr-cache"
         ENVIRONMENT "LLAMA_SERVER_FAULT=load_clone_fail")
     add_test(NAME test-server-prompt-cache-accounting-fault
         COMMAND test-server-prompt-cache --accounting-fault)
     set_tests_properties(test-server-prompt-cache-accounting-fault PROPERTIES
-        LABELS "main;vbr-h1"
+        LABELS "main;vbr-cache"
         ENVIRONMENT "LLAMA_SERVER_FAULT=cache_lifecycle_after_commit")
     add_test(NAME test-server-prompt-cache-restore-checkpoint-fault
         COMMAND test-server-prompt-cache --restore-checkpoint-fault)
     set_tests_properties(
         test-server-prompt-cache-restore-checkpoint-fault PROPERTIES
-        LABELS "main;vbr-h1"
+        LABELS "main;vbr-cache"
         ENVIRONMENT "LLAMA_SERVER_FAULT=restore_checkpoint_artifact_missing")
 
     # The catalog test target is declared before the server targets. Add the
@@ -142,41 +144,43 @@ if (LLAMA_BUILD_TESTS)
         add_test(NAME test-vbr-artifact-vbr-prefix-fault
             COMMAND test-vbr-artifact)
         set_tests_properties(test-vbr-artifact-vbr-prefix-fault PROPERTIES
-            LABELS "main;vbr-h1"
+            LABELS "main;vbr-cache"
             ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_prompt_cache_prefix_fail")
         add_test(NAME test-vbr-artifact-vbr-anchor-prepare-fault
             COMMAND test-vbr-artifact)
         set_tests_properties(
             test-vbr-artifact-vbr-anchor-prepare-fault PROPERTIES
-            LABELS "main;vbr-h1"
+            LABELS "main;vbr-cache"
             ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_anchor_prepare_fail")
         add_test(NAME test-vbr-artifact-vbr-pair-prepare-fault
             COMMAND test-vbr-artifact)
         set_tests_properties(
             test-vbr-artifact-vbr-pair-prepare-fault PROPERTIES
-            LABELS "main;vbr-h1"
+            LABELS "main;vbr-cache"
             ENVIRONMENT "LLAMA_SERVER_FAULT=vbr_prompt_cache_pair_prepare_fail")
     endif()
 
     if (TARGET test-vbr-artifact AND
         TARGET test-vbr-artifact-capture AND
+        TARGET test-vbr-artifact-adopt AND
         TARGET test-retention-sidecar AND
         TARGET test-vbr-representation-epoch)
-        add_custom_target(vbr-h1-capstone
+        add_custom_target(vbr-cache-gate
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 ${CMAKE_BINARY_DIR}/tmp
             COMMAND ${CMAKE_COMMAND} -E env
                 TMPDIR=${CMAKE_BINARY_DIR}/tmp
                 ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR}
-                    --output-on-failure -L vbr-h1
+                    --output-on-failure -L vbr-cache
             DEPENDS
                 test-server-prompt-cache
                 test-vbr-artifact
                 test-vbr-artifact-capture
+                test-vbr-artifact-adopt
                 test-retention-sidecar
                 test-vbr-representation-epoch
             USES_TERMINAL
-            COMMENT "Run the CPU-deterministic VBR-H1 capstone gate")
+            COMMENT "Run the CPU-deterministic VBR prompt-cache release gate")
     endif()
 
     # The deferred occupied-destination hardware gate composes the real store,

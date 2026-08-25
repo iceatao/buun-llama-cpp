@@ -1777,7 +1777,7 @@ bool server_prompt_cache::enable_retention_shadow() noexcept {
             server_prompt_cache_shadow_row[
                 SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES]);
     }
-    if (!retention_shadow_rows || !retention_df2_authority) {
+    if (!retention_shadow_rows || !retention_capacity_authority) {
         return bool(retention_shadow_rows);
     }
     if (retention_shadow_artifacts && retention_shadow_lineages) {
@@ -2242,12 +2242,12 @@ server_prompt_cache::iterator server_prompt_cache::find_state_exact(
         const server_tokens & tokens,
         const std::string & adapter_config_key) noexcept {
     return std::find_if(states.begin(), states.end(), [&](const auto & state) {
-        // Identity-scoped [I6]: token equality under another adapter is not a
+        // Identity-scoped: token equality under another adapter is not a
         // durable copy. Equal length closes the recurrent/hybrid prefix hole.
         // contains() is the existing durable-recovery predicate used before
-        // a live slot may be cleared. A published H1 VBR logical node is not
-        // recovery authority until H2 wires its restore transaction.
-        return state.payload.restorable() &&
+        // a live slot may be cleared. VBR artifacts use their separate typed
+        // restore/recovery authority and are intentionally excluded here.
+        return state.payload.fixed_state_restorable() &&
                state.adapter_config_key == adapter_config_key &&
                state.prompt.tokens.size() == tokens.size() &&
                state.prompt.tokens.get_common_prefix(tokens) == tokens.size();
@@ -2353,7 +2353,7 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
     // Allocate the entry as a DETACHED single-node list, entirely outside `states`. Every allocation
     // that can throw (the list node, the state vectors, the token clone, the checkpoint copy) is
     // performed here; on any failure we return an empty list and leave the cache completely
-    // untouched — no eviction, no limit reduction for a save that did not happen [I7]. publish()
+    // untouched: no eviction or limit reduction for a save that did not happen. publish()
     // then splices this node in without allocating.
     std::list<server_prompt_cache_state> staged;
     try {
@@ -2855,6 +2855,59 @@ server_prompt_cache::refresh_vbr_compact(
     }
 }
 
+bool server_prompt_cache::preview_vbr_compact_refresh_capacity(
+        const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        uint64_t incoming_compact_bytes) const noexcept {
+    if (incoming_compact_bytes == 0 || execution_identity.empty() ||
+        adapter_config_key.empty()) {
+        return false;
+    }
+    try {
+        const_iterator target = states.end();
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->payload.kind() !=
+                    server_prompt_cache_payload_kind::vbr_artifact ||
+                it->adapter_config_key != adapter_config_key ||
+                it->vbr_execution_identity != execution_identity ||
+                !server_prompt_cache_vbr_frontier_matches(
+                    source_prompt, it->payload, execution_identity,
+                    adapter_config_key)) {
+                continue;
+            }
+            if (target != states.end()) {
+                return false;
+            }
+            target = it;
+        }
+        if (target == states.end() || target->recovery_pins != 0) {
+            return false;
+        }
+        if (limit_size == 0) {
+            return true;
+        }
+        const auto * variants = target->payload.vbr_variants();
+        const auto compact = variants ? variants->compact_current() : nullptr;
+        if (!compact) {
+            return false;
+        }
+        const uint64_t committed = size();
+        // Only claim release credit when this logical row is the sole compact
+        // owner. Shared owners remain charged until the exact refresh terminal
+        // proves their union after publication.
+        const uint64_t replaceable =
+            target->payload.vbr_retirement_exclusive()
+                ? compact->resident_bytes() : 0;
+        const uint64_t base = committed >= replaceable
+            ? committed-replaceable : committed;
+        return incoming_compact_bytes <= UINT64_MAX-base &&
+            base+incoming_compact_bytes <= limit_size;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool server_prompt_cache::prepare_vbr_restore(
         const server_tokens & request_tokens,
         const std::string & execution_identity,
@@ -3232,7 +3285,7 @@ server_prompt_cache_vbr_replacement_ticket::operator=(
 
 bool server_prompt_cache_vbr_replacement_ticket::ready() const noexcept {
     if (published_ || !cache_ || !incoming_.ready() || incoming_.cache_ != cache_ ||
-        incoming_.requires_prefix_projection_ || !recovery_source_ ||
+        !recovery_source_ ||
         !recovery_owner_ || !recovery_pin_ || !recovery_pin_->valid() ||
         !incumbent_ || !incumbent_family_current_ ||
         *incumbent_family_current_ != incumbent_family_ ||
@@ -3250,7 +3303,6 @@ bool server_prompt_cache_vbr_replacement_ticket::ready() const noexcept {
         incumbent_->n_tokens() <= 0 ||
         uint64_t(incumbent_->n_tokens()) != incumbent_tokens_ ||
         incumbent_->tokens.has_media() ||
-        !incumbent_->checkpoints.empty() ||
         replacement_prompt_->tokens.has_media() ||
         !replacement_prompt_->checkpoints.empty() ||
         replacement_prompt_->sequence_epoch !=
@@ -3287,8 +3339,7 @@ bool server_prompt_cache_vbr_replacement_ticket::ready() const noexcept {
     const auto recovery_key =
         server_retention_instance_key::for_host_entry(recovery_source_);
     if (!incumbent_->tokens.retention_token_digest(digest) ||
-        !incoming_.source_->prompt.tokens.retention_token_digest(
-            incoming_digest) ||
+        !replacement_prompt_->tokens.retention_token_digest(incoming_digest) ||
         !recovery_source_->prompt.tokens.retention_token_digest(
             recovery_digest)) {
         return false;
@@ -3511,7 +3562,7 @@ bool server_prompt_cache::payload_leaves(
     return true;
 }
 
-// C0 shadow producer [P2]: one accounting transaction per charged leaf category of a published
+// Shadow-accounting producer: one transaction per charged leaf category of a published
 // entry, at the publication boundary (the splice into `states`), released when the entry leaves
 // `states` on any path. Aggregate entry size is a provider grouping and is NEVER charged — the
 // leaves below are mutually exclusive so their sum cannot double-count. The fill-failure abort
@@ -3534,7 +3585,7 @@ void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
     std::array<server_prompt_cache_payload_leaf, 3> leaves;
     const bool sums_ok = payload_leaves(st, leaves);
 
-    if (!sums_ok || server_fault("acct_unavailable")) { // [P2 gate] shipped-path invariance seam
+    if (!sums_ok || server_fault("acct_unavailable")) { // Shipped-path invariance seam.
         for (const auto & leaf : leaves) {
             server_cache_acct_mark_shadow_unavailable(
                 *acct, leaf.category, domain,
@@ -3755,7 +3806,7 @@ static bool server_prompt_cache_mirror_artifact_clone(
     switch (prefix_mode) {
         case server_prompt_cache_prefix_clone_mode::publish_stem:
             cloned = source_turn_tokens > 0 && coverage_tokens > 0 &&
-                coverage_tokens < source_turn_tokens &&
+                coverage_tokens <= source_turn_tokens &&
                 cache.retention_obs->publish(
                     destination_key, common_retention_pool::attention,
                     no_spans, true, uint64_t(source_turn_tokens),
@@ -3769,7 +3820,7 @@ static bool server_prompt_cache_mirror_artifact_clone(
                     uint64_t(coverage_tokens), true);
             break;
         case server_prompt_cache_prefix_clone_mode::publish_from_prompt:
-            if (source_turn_tokens > 0 && coverage_tokens > 0) {
+            if (coverage_tokens > 0) {
                 std::string scope;
                 cloned = server_prompt_retention_exact_scope(
                         prompt, adapter_identity, coverage_tokens, scope) &&
@@ -3851,8 +3902,7 @@ bool server_prompt_cache::prepare_vbr_publication_metadata_impl(
         source_prompt.tokens.empty() ||
         coverage_tokens <= 0 ||
         coverage_tokens > source_prompt.n_tokens() ||
-        (stem && (coverage_tokens == source_prompt.n_tokens() ||
-                  source_prompt.sequence_epoch == 0)) ||
+        (stem && source_prompt.sequence_epoch == 0) ||
         !retention_obs->prefix_tracking_enabled() ||
         !retention_obs->prefix_tracking_available() ||
         !vbr_retention_source_available(source_slot)) {
@@ -4791,6 +4841,7 @@ bool checkpoint_payload_equal(
            a.computation_frontier == b.computation_frontier &&
            a.data_tgt == b.data_tgt &&
            a.data_dft == b.data_dft &&
+           a.data_dft_full_sequence == b.data_dft_full_sequence &&
            a.accel.ring == b.accel.ring &&
            a.accel.spec == b.accel.spec;
 }
@@ -5006,8 +5057,8 @@ void server_prompt_cache_observe_host_destruction(
             : json(nullptr);
         payload["legacy_fallbacks"] = cache.destruction_obs
             ? cache.destruction_obs->host_trade_legacy_fallbacks : uint64_t(0);
-        payload["df2_executed"] = cache.destruction_obs
-            ? cache.destruction_obs->host_trade_df2_executed : uint64_t(0);
+        payload["retention_capacity_executed"] = cache.destruction_obs
+            ? cache.destruction_obs->host_trade_retention_capacity_executed : uint64_t(0);
         payload["publication_skips"] = cache.destruction_obs
             ? cache.destruction_obs->host_trade_publication_skips : uint64_t(0);
         cache.debug_destruction_emissions++;
@@ -5135,7 +5186,7 @@ host_destruction_certification certify_host_destruction(
     llama_cache_acct_artifact_id recovery_artifact;
     common_cache_plan_displaced_fate recovery_fate =
         common_cache_plan_displaced_fate::unavailable;
-    // D-A2 taxonomy: a named survivor that is not an exact three-payload
+    // recovery proof taxonomy: a named survivor that is not an exact three-payload
     // duplicate is recovery_unavailable even when the victim's artifact
     // manifest is independently incomplete. Redundancy is the outer proof.
     if (survivor_state != cache.states.end() &&
@@ -5441,8 +5492,8 @@ bool host_trade_price(
                 out.marginal_resident_known = true;
             }
             out.retirement_ready = true;
-            // VBR payloads are not restore authorities until H2. They enter
-            // the DF2 avoided-prefill projection below, but never the fixed
+            // VBR payloads use typed restore authority. They enter the
+            // avoided-prefill projection below, but never the legacy fixed
             // calibrated exact-recovery ladder.
             return true;
         }
@@ -5450,7 +5501,7 @@ bool host_trade_price(
             out.release_ops = artifact.candidate.release_ops;
             // Retain a complete diagnostic proposal until the inventory-wide
             // one-lock marginal preview below replaces it with exact physical
-            // release evidence. Unknown evidence never authorizes DF2.
+            // release evidence. Unknown evidence never authorizes retention-capacity eviction.
             uint64_t snapshot_bytes = 0;
             uint64_t checkpoint_bytes = 0;
             uint64_t accelerator_bytes = 0;
@@ -5592,7 +5643,7 @@ bool populate_vbr_host_trade_marginals_conditioned(
     }
 }
 
-struct host_trade_df2_projection {
+struct host_trade_retention_capacity_projection {
     bool complete = false;
     bool release_evidence_complete = true;
     uint64_t candidate_count = 0;
@@ -5603,13 +5654,13 @@ struct host_trade_df2_projection {
     uint64_t resource = 0;
 };
 
-// Allocation-free singleton projection for DF2's synchronous authority seam.
+// Allocation-free singleton projection for the synchronous retention-capacity authority.
 // Fixed checkpoint planes may be shared by host/live aliases, so each fixed
 // candidate carries the exact ledger marginal computed during inventory
 // construction. A zero singleton yield is not executable here and remains on
 // the legacy floor. The broader counterfactual projector retains compound
 // support for debug/model-free analysis.
-host_trade_df2_projection project_host_trade_df2(
+host_trade_retention_capacity_projection project_host_trade_retention_capacity(
         server_prompt_cache & cache,
         server_cache_destruction_reason reason,
         server_prompt_cache::iterator incoming,
@@ -5619,7 +5670,7 @@ host_trade_df2_projection project_host_trade_df2(
         server_prompt_cache_shadow_lineage_slot * lineages,
         llama_cache_acct_artifact_id ignored_artifact = {},
         llama_cache_acct_artifact_id excluded_artifact = {}) noexcept {
-    host_trade_df2_projection result;
+    host_trade_retention_capacity_projection result;
     if (!rows || !artifacts || !lineages || !cache.retention_obs || !cache.acct ||
         candidates.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
         return result;
@@ -6023,7 +6074,7 @@ static bool server_prompt_cache_plan_vbr_pressure(
         } catch (...) {
             return false;
         }
-        const auto projection = project_host_trade_df2(
+        const auto projection = project_host_trade_retention_capacity(
             cache, reason,
             cache.states.end(), candidates,
             shadow_rows, shadow_artifacts, shadow_lineages,
@@ -6065,7 +6116,7 @@ static bool server_prompt_cache_plan_vbr_pressure(
             return true;
         }
         // The bounded compound terminal follows two consecutive byte-pressure
-        // decisions only. A token-only second step can have a different DF2
+        // decisions only. A token-only second step can have a different retention-capacity
         // order and remains an explicit unsupported shape.
         if (max_victims < 2 || !byte_pressure ||
             cache.limit_size == 0 || after_bytes <= cache.limit_size ||
@@ -6078,7 +6129,7 @@ static bool server_prompt_cache_plan_vbr_pressure(
             plan = {};
             return false;
         }
-        const auto second_projection = project_host_trade_df2(
+        const auto second_projection = project_host_trade_retention_capacity(
             cache, reason, cache.states.end(), candidates,
             shadow_rows, shadow_artifacts, shadow_lineages,
             ignored_artifact, selected->ranking.artifact_id);
@@ -6355,7 +6406,7 @@ void server_prompt_cache::observe_retention_pressure_choice(
     // Lifecycle shadow uses the same immutable catalog, evaluated leases and
     // serial-bound accounting release preview as the certified authority. It
     // remains counterfactual: the already-selected lifecycle victim is the
-    // incumbent and no projection result can authorize mutation in DF1.
+    // incumbent and no projection result can authorize mutation during observation.
     if (publish_authority) {
         if (!competition_wave_valid || !retention_shadow_rows || !acct ||
             !lease_obs || !lease_execution_identity ||
@@ -6747,7 +6798,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
             // authority may inspect or retire a VBR capability. Keep it as
             // durable retained coverage instead of bypassing a potentially
             // hard lease through the fixed-state terminal.
-            if (!it->payload.restorable()) {
+            if (!it->payload.fixed_state_restorable()) {
                 continue;
             }
             if (it->recovery_pins != 0) {
@@ -6764,7 +6815,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
         return false;
     }
 
-    // D-A3 is an execution-time lease boundary. Expire first, then inspect
+    // lease boundary is an execution-time lease boundary. Expire first, then inspect
     // each immutable host artifact once for pricing. Soft protection raises
     // price; only a hard lease makes a candidate ineligible. If every priced
     // candidate fails certification, the caller deliberately executes the
@@ -6772,7 +6823,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
     lease_obs->lifecycle_point();
     // The retained calibration profile prices pageable-host bytes. It has no
     // lawful token-yield currency, so token pressure proceeds directly to
-    // DF2's exact token denominator (or the deterministic FIFO floor).
+    // The retention-capacity policy's exact token denominator (or the deterministic FIFO floor).
     const auto * calib = reason ==
             server_cache_destruction_reason::host_capacity
         ? common_cache_plan_calib_find(
@@ -6852,7 +6903,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
     }
 
     // Exact shared-owner aliases are zero-value logical cleanup, not a
-    // positive-byte DF2 alternative. Execute the first lawful alias before
+    // positive-byte retention-capacity alternative. Execute the first lawful alias before
     // calibrated or learned victim selection; the outer pressure loop then
     // remeasures and prices the now-exclusive survivor. This preserves pins,
     // hard leases, and incoming protection while ensuring redundant aliases
@@ -6875,7 +6926,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
         SRV_WRN(
             " - removing redundant VBR host alias source_id=%d\n",
             alias->victim->cache_plan_source_id);
-        return destroy_df2_entry(
+        return destroy_retention_capacity_entry(
             alias->victim, reason, nullptr,
             &released_bytes, &released_tokens);
     }
@@ -6981,7 +7032,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
             chosen->victim->cache_plan_source_id,
             chosen->victim->size() / (1024.0 * 1024.0));
         server_prompt_cache_destroy_entry_impl(*this, chosen->victim);
-        // D-A3 uses the same no-interleaving terminal as D-A2. Pricing and all
+        // lease boundary uses the same no-interleaving terminal as recovery proof. Pricing and all
         // fallible recovery work completed before the physical erase; the raw
         // list mutation has no callback/C writer, and capability commit is the
         // immediately following operation on update_slots' owner thread.
@@ -7010,7 +7061,7 @@ bool server_prompt_cache::destroy_priced_host_entry(
     // Candidates without a fitted/complete price never join a partial
     // optimum. Emit one typed refusal per skipped victim, then retain the
     // exact historical FIFO terminal. No new request is refused merely
-    // because D-A evidence is incomplete.
+    // because destruction evidence is incomplete.
     if (reason == server_cache_destruction_reason::host_capacity) {
         for (auto & candidate : candidates) {
             if (candidate.vbr || candidate.attempted ||
@@ -7046,22 +7097,22 @@ bool server_prompt_cache::destroy_priced_host_entry(
             common_cache_plan_destruction_reason::hard_lease_blocked;
     }
 
-    // DF2 replaces only the lawful lifecycle fallback. Host capacity uses
+    // Retention capacity replaces only the lawful lifecycle fallback. Host capacity uses
     // exact resident payload bytes; token pressure uses exact prompt tokens.
     // The calibrated/certified byte ladder above, hard leases, pins, and
     // incoming publication retain precedence. Reproject on every victim;
     // record only the first decision in a multi-removal competition wave.
-    if (retention_df2_authority &&
+    if (retention_capacity_authority &&
         (reason == server_cache_destruction_reason::host_capacity ||
          reason == server_cache_destruction_reason::host_token_limit) &&
         legacy_floor != states.end()) {
         const auto projection = competition_wave_valid
-            ? project_host_trade_df2(
+            ? project_host_trade_retention_capacity(
                   *this, reason, incoming, candidates,
                   retention_shadow_rows.get(),
                   retention_shadow_artifacts.get(),
                   retention_shadow_lineages.get())
-            : host_trade_df2_projection {};
+            : host_trade_retention_capacity_projection {};
         const auto proposed = projection.artifact;
         if (observe_retention_shadow) {
             const auto increment = [](uint64_t & value) noexcept {
@@ -7145,15 +7196,15 @@ bool server_prompt_cache::destroy_priced_host_entry(
                     }
                     selected_retire_ptr = &selected_retire;
                 }
-                if (destroy_df2_entry(
+                if (destroy_retention_capacity_entry(
                         selected->victim, reason,
                         selected_retire_ptr,
                         &released_bytes, &released_tokens)) {
                     if (destruction_obs) {
-                        destruction_obs->host_trade_df2_executed++;
+                        destruction_obs->host_trade_retention_capacity_executed++;
                     }
                     SRV_WRN(
-                        " - removing DF2 host entry source_id=%d (size = %.3f MiB)\n",
+                        " - removing retention-capacity host entry source_id=%d (size = %.3f MiB)\n",
                         source_id, victim_bytes / (1024.0 * 1024.0));
                     return true;
                 }
@@ -7180,7 +7231,7 @@ void server_prompt_cache::refuse_incoming_under_pressure(
         if (!acct ||
             (!alias_only && !incoming->payload.prepare_vbr_retire(
                 acct->serial(), prepared)) ||
-            !destroy_df2_entry(
+            !destroy_retention_capacity_entry(
                 incoming, reason,
                 alias_only ? nullptr : &prepared)) {
             destroy_entry(incoming, reason);
@@ -7238,7 +7289,7 @@ bool server_prompt_cache::evict_front_under_pressure(
                 if (it == incoming || it->recovery_pins != 0) {
                     continue;
                 }
-                if (it->payload.restorable()) {
+                if (it->payload.fixed_state_restorable()) {
                     legacy_floor = it;
                     break;
                 }
@@ -7274,13 +7325,13 @@ bool server_prompt_cache::evict_front_under_pressure(
                 (alias_only ||
                  legacy_floor->payload.prepare_vbr_retire(
                      acct->serial(), prepared)) &&
-                destroy_df2_entry(
+                destroy_retention_capacity_entry(
                     legacy_floor, reason,
                     alias_only ? nullptr : &prepared,
                     &released_bytes, &released_tokens);
         } else {
             if (publish_authority && acct) {
-                floor_evicted = destroy_df2_entry(
+                floor_evicted = destroy_retention_capacity_entry(
                     legacy_floor, reason, nullptr,
                     &released_bytes, &released_tokens);
             } else {
@@ -7329,7 +7380,7 @@ bool server_prompt_cache::evict_front_under_pressure(
     return false;
 }
 
-bool server_prompt_cache::destroy_df2_entry(
+bool server_prompt_cache::destroy_retention_capacity_entry(
         iterator it,
         server_cache_destruction_reason reason,
         vbr_artifact_prepared_retire * vbr_retire,
@@ -7548,14 +7599,14 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
     const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
     // This pass-through owns exactly one accounting terminal outside the raw
     // physical primitive. Victim ordering belongs to the caller (historical
-    // lifecycle floor or the gated DF2 authority); either route executes the
+    // lifecycle floor or retention-capacity authority); either route executes the
     // same exact terminal through a freshly prepared capability.
     const auto & release_ops = it->release_ops();
     const std::thread::id scheduler_owner = std::this_thread::get_id();
 
     llama_cache_prepared_release_set prepared;
     server_prompt_cache_retirement_manifest retirement;
-    // The legacy-fallback manifest is captured independently from D-A2's
+    // The legacy-fallback manifest is captured independently from recovery proof's
     // certified manifest: a refused exact-redundancy proof must still execute
     // the historical retirement terminal. Both are read-only snapshots; only
     // the selected terminal retires them after the physical erase.
@@ -7596,7 +7647,7 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
     }
     auto next = server_prompt_cache_destroy_entry_impl(*this, it);
     if (redundant.ready) {
-        // D-A2 certify→mutate→commit boundary. Like D-A1, publication and
+        // recovery proof certify→mutate→commit boundary. Like immutable host restore, publication and
         // dedup run synchronously on update_slots. The physical list erase has
         // no callback or C producer; the immediate capability commit is the
         // only ledger terminal, so no ledger write can interleave. The
@@ -7610,7 +7661,7 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
         }
     } else if (capability_ready) {
         GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
-        // D-A1 prepare→mutate→commit boundary. destroy_entry() is called
+        // immutable host restore prepare→mutate→commit boundary. destroy_entry() is called
         // synchronously by update_slots-owned prompt-cache publication/load
         // maintenance. The raw erase only destroys value storage: it has no
         // callback and no C producer. The very next operation commits the
@@ -7629,7 +7680,7 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
         }
     } else if (acct) {
         // Preparation is fail-closed with respect to the new capability, but
-        // D-A1 does not yet own host victim selection: retain the bounded
+        // immutable host restore does not yet own host victim selection: retain the bounded
         // legacy FIFO/dedup behavior and its exactly-one release terminal.
         for (const auto op : release_ops) {
             if (op) {
@@ -7964,7 +8015,7 @@ bool server_prompt_cache::publish_impl(
         }
     }
 
-    // F0b authority boundary: the detached entry is complete, but no shipped cache state has
+    // Publication-authority boundary: the detached entry is complete, but no shipped cache state has
     // changed yet. Refusal drops only this detached node; the live slot remains the sole copy.
     // The callback commits all accounting leaves before returning true, and states.splice below
     // is allocation-free/noexcept, so accounting can never lag a published entry.
@@ -8027,7 +8078,7 @@ bool server_prompt_cache::publish_impl(
 
     // Splice the pre-allocated node in FIRST (no allocation, no throw) so the new entry is durably
     // linked before any potentially-throwing comparison below. Then remove cached prompts of the
-    // SAME adapter identity fully contained in the new (larger) prompt [I6] -- a contained entry
+    // same adapter identity fully contained in the new (larger) prompt: a contained entry
     // under a different adapter config is a distinct valid state and is kept. If a comparison throws
     // (OOM) mid-loop, the new entry is already safely in `states`; at worst a few obsolete entries
     // remain (benign, FIFO-evicted later) -- never a lost node or partial corruption.
@@ -8119,12 +8170,12 @@ bool server_prompt_cache::publish_impl(
                 if (obsolete) {
                     len = it->prompt.n_tokens();
                 }
-            } else if (it->payload.restorable()) {
+            } else if (it->payload.fixed_state_restorable()) {
                 len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
                 obsolete = len == (int) it->prompt.tokens.size();
             }
             if (obsolete) {
-                // A D-A recovery citation outlives its destruction commit
+                // A recovery citation outlives its destruction commit
                 // through the dependent B execution. Dedup is another victim
                 // enumerator: it must leave the cited physical host node in
                 // place rather than reaching the raw eraser's invariant
@@ -8375,7 +8426,6 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
         *diagnostics = {};
     }
     if (!incoming.ready() || incoming.cache_ != this || id_slot < 0 ||
-        incoming.requires_prefix_projection_ ||
         incoming.prepared_slot_ >= 0 || incoming.prepared_destination_ ||
         incoming.adopted_destination_ || incoming.prepared_prompt_ ||
         !incoming.source_ || !retention_obs || !lease_obs ||
@@ -8383,12 +8433,12 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
         !lease_execution_identity ||
         *lease_execution_identity != execution_identity ||
         incumbent.tokens.empty() || incumbent.tokens.has_media() ||
-        !incumbent.checkpoints.empty() || incumbent.sequence_epoch == 0 ||
+        incumbent.sequence_epoch == 0 ||
         incoming.source_->prompt.tokens.has_media() ||
         !incoming.source_->prompt.checkpoints.empty() ||
-        incoming.prefix_tokens_ != incoming.source_tokens_ ||
         uint64_t(incoming.source_->prompt.n_tokens()) !=
-            incoming.prefix_tokens_) {
+            incoming.source_tokens_ ||
+        incoming.prefix_tokens_ > incoming.source_tokens_) {
         return false;
     }
     const uint64_t incumbent_tokens = uint64_t(incumbent.n_tokens());
@@ -8417,8 +8467,6 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
     std::array<uint8_t, 32> incoming_digest = {};
     server_cache_lease_identity incumbent_lease_identity;
     if (!incumbent.tokens.retention_token_digest(incumbent_digest) ||
-        !incoming.source_->prompt.tokens.retention_token_digest(
-            incoming_digest) ||
         !server_cache_lease_build_identity(
             execution_identity, adapter_config_key, incumbent.tokens,
             int64_t(incumbent_tokens), incumbent_lease_identity)) {
@@ -8511,14 +8559,24 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
         }
         recovery_pin = std::make_unique<server_cache_recovery_pin>(
             std::move(pin));
-        replacement = std::make_unique<server_prompt>(
-            incoming.source_->prompt.clone());
+        replacement = std::make_unique<server_prompt>();
+        if (incoming.requires_prefix_projection_) {
+            replacement->tokens =
+                incoming.source_->prompt.tokens.clone_text_prefix(
+                    size_t(incoming.prefix_tokens_));
+            replacement->sequence_epoch =
+                incoming.source_->prompt.sequence_epoch;
+        } else {
+            *replacement = incoming.source_->prompt.clone();
+        }
     } catch (...) {
         return false;
     }
     if (!replacement || replacement->tokens.has_media() ||
         !replacement->checkpoints.empty() ||
-        uint64_t(replacement->n_tokens()) != incoming.prefix_tokens_) {
+        uint64_t(replacement->n_tokens()) != incoming.prefix_tokens_ ||
+        replacement->tokens.pos_next() != incoming.selected_next_position_ ||
+        !replacement->tokens.retention_token_digest(incoming_digest)) {
         return false;
     }
 
@@ -8537,7 +8595,9 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
             provisional_key, common_retention_artifact_kind::live_slot,
             id_slot, *replacement, adapter_config_key,
             int64_t(incoming.prefix_tokens_),
-            server_prompt_cache_prefix_clone_mode::share_source) ||
+            incoming.requires_prefix_projection_
+                ? server_prompt_cache_prefix_clone_mode::branch_prefix
+                : server_prompt_cache_prefix_clone_mode::share_source) ||
         !retention_obs->prepare_for_launch(source_key, provisional_key) ||
         retention_obs->artifact_id(incumbent_key) != incumbent_artifact) {
         retention_obs->abandon_prepared_launch(provisional_key);
@@ -8883,8 +8943,8 @@ void server_prompt_cache::commit_restore_delivery(
         source, server_cache_destruction_reason::host_consumed_restore);
 }
 
-// The observed/unobserved split is a compile-time instantiation (F8/B-a): with the observer
-// off, load() runs the pre-B0 candidate loop with zero observer branches. Single source —
+// The observed/unobserved split is a compile-time instantiation: with the observer
+// off, load() runs the pre-cache-plan observer candidate loop with zero observer branches. Single source —
 // every `if constexpr (Observed)` block vanishes from the <false> instantiation.
 template <bool Observed>
 bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family) {
@@ -8901,23 +8961,23 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     auto it_best = states.end();
 
-    // observer tallies [B-a]: these exist only in the observed instantiation, and only carry
+    // Observer tallies exist only in the observed instantiation and only carry
     // values this selection computes anyway
     [[maybe_unused]] int32_t obs_source_best = -1;
     [[maybe_unused]] int     obs_lcp_sel  = 0;
     int reuse_lcp_best = 0;
 
     // find the most similar cached prompt, that would also preserve the most context.
-    // Observer transport [A2, noexcept]: ONE row per visited entry, keyed by its
+    // Observer transport [observer, noexcept]: ONE row per visited entry, keyed by its
     // request-local immutable source id; every evaluated survivor starts as a cost loser and
     // the shipped winner is promoted to accepted after the scan. find_or_add returning
     // nullptr = inventory overflow — the provider's state latches and rows stop, the
     // shipped scan is untouched.
     for (auto it = states.begin(); it != states.end(); ++it) {
-        // Keep execution inventory byte-identical to the planner: an H1 VBR
-        // node is retained metadata, not yet a restore candidate. Reject it
-        // before assigning a bounded source ID or scanning its long prefix.
-        if (!it->payload.restorable()) {
+        // Keep fixed-state inventory byte-identical to the planner. VBR nodes
+        // use the typed restore selector; reject them before assigning a
+        // bounded fixed source ID or scanning their long prefix here.
+        if (!it->payload.fixed_state_restorable()) {
             continue;
         }
         [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
@@ -8954,13 +9014,13 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         if constexpr (Observed) {
             lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
             server_cache_plan_apply_host(row, server_cache_plan_evaluate_host(
-                it->payload.restorable(),
+                it->payload.fixed_state_restorable(),
                 it->adapter_config_key == adapter_config_key,
                 lcp_cur, tokens_new.size(), it->prompt.tokens.size(),
                 it->payload.size()));
         }
 
-        // never serve state built under a different adapter configuration [I6]: token-LCP alone
+        // never serve state built under a different adapter configuration: token LCP alone
         // would hand adapter A's KV to a base/adapter-B request. Live-slot rebinds are caught at
         // launch, but a host-cache entry is restored here during prefill, after that check.
         if (it->adapter_config_key != adapter_config_key) {
@@ -8968,7 +9028,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         }
 
         if constexpr (!Observed) {
-            // Preserve the pre-B-A shipped instantiation: the potentially O(n)
+            // Preserve the shipped instantiation: the potentially O(n)
             // LCP scan occurs only after both O(1) reject guards.
             lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
         }
@@ -8985,7 +9045,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
         if constexpr (Observed) {
             if (required_source_id >= 0) {
-                // B-A1 exact-provider authority: the planner already selected
+                // primary cache planner exact-provider authority: the planner already selected
                 // this complete host plan. Preserve all structural/identity
                 // guards above, but do not re-run the legacy two-axis choice.
                 it_best = it;
@@ -9025,7 +9085,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
                 win->accept(); // shipped winner: promote over the scan-time cost-loser default
                 win->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) obs_lcp_sel);
                 // bytes the restore actually installs (main+draft state) — NOT entry
-                // size(), which also sums every retained checkpoint (verify-r1 finding 3)
+                // size(), which also sums every retained checkpoint.
                 win->payload_bytes = llama_cache_acct_value::measured(
                     (uint64_t) it_best->payload.size());
                 rec->select(common_cache_plan_provider::host_cache_entry, win);
@@ -9045,7 +9105,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-    // D-A1 stages the immutable source copy before either main or draft
+    // immutable host restore stages the immutable source copy before either main or draft
     // context is touched. Allocation failure therefore leaves the source and
     // both target contexts at the caller-owned pre-restore boundary.
     server_prompt_cache_restore_delivery delivery;
@@ -9065,7 +9125,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         size_t n_tgt = llama_state_seq_set_data_ext(
             ctx_tgt, fixed->main.data(), size_tgt,
             id_slot, 0);
-        if (server_fault("load_fail")) { n_tgt = size_tgt > 0 ? size_tgt - 1 : 0; } // [P0 gate]
+        if (server_fault("load_fail")) { n_tgt = size_tgt > 0 ? size_tgt - 1 : 0; } // Restore fault seam.
         if (n_tgt != size_tgt) {
             SRV_ERR("failed to restore target state (%zu != %zu bytes)\n", n_tgt, size_tgt);
             if constexpr (Observed) {
@@ -9101,7 +9161,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     // the historical move+release+erase terminal.
     if constexpr (Observed) {
         if (auto * sel = rec->selected_row(common_cache_plan_provider::host_cache_entry)) {
-            sel->delivered = true; // recorded at the delivery point, never inferred [B0]
+            sel->delivered = true; // recorded at the delivery point, never inferred [cache-plan observer]
         }
     }
     if (restored_family) {
@@ -9120,7 +9180,7 @@ template bool server_prompt_cache::load_impl<true>(server_prompt &, const server
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family) {
     GGML_ASSERT(rec != nullptr || required_source_id < 0);
-    // one dispatch outside every loop: the off path is the pre-B0 loop [F8/B-a]
+    // One dispatch outside every loop: the off path is the original loop.
     return rec != nullptr
         ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_family)
         : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_family);
@@ -9602,7 +9662,7 @@ bool server_prompt_cache::update_impl(
                         return false;
                     }
                     if (destruction_obs) {
-                        destruction_obs->host_trade_df2_executed += 2;
+                        destruction_obs->host_trade_retention_capacity_executed += 2;
                     }
                     required_victims = {};
                     retention_shadow_observed |= observe_shadow;

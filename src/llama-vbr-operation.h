@@ -107,7 +107,7 @@ struct vbr_operation_range {
     llama_pos p1 = -1;
 };
 
-// C2 (v3.2 design, Sol CONCUR): the complete closed authentication tuple, PER TARGET. A
+// The complete closed authentication tuple, per target. A
 // multi-sequence ubatch carries one target per touched sequence; sequence ops carry one.
 // empty instance = target valid for any controller (single-cache ops); seq -1 = wildcard sequence
 // (whole-cache edits); range {-1,-1} = whole range. Wildcards are themselves authenticated —
@@ -127,7 +127,7 @@ struct vbr_operation_target {
     llama_seq_id        seq_id  = -1;
     vbr_operation_range range   = {};
 
-    // The ONE spelling of the instance-wildcard predicate (C2 load-bearing semantics).
+    // The one spelling of the load-bearing instance-wildcard predicate.
     bool instance_matches(vbr_controller_instance_id instance) const {
         return !vbr_controller_instance_id_is_set(instance_id) || instance_id == instance;
     }
@@ -142,7 +142,7 @@ struct vbr_operation_target {
                (registrant_mask & registrant_bit) != 0 &&
                child_phase == vbr_operation_phase::mutate;
     }
-    // P1v2 (v6): per-stamp coverage predicates. Wildcards match only where the manifest
+    // Per-stamp coverage predicates. Wildcards match only where the manifest
     // DECLARED them (seq -1 / range {-1,-1}); an unknown position (-1) is covered only by a
     // whole-range target — whole-cache edits stamp cells whose position is not consulted.
     bool seq_covers(llama_seq_id seq) const {
@@ -187,7 +187,7 @@ struct vbr_operation_binding {
         return nullptr;
     }
 
-    // P1v2 (v6): per-stamp covering-target selection — the full authenticated tuple INCLUDING
+    // Per-stamp covering-target selection: the full authenticated tuple including
     // the stamped (seq, pre-mutation position). The target index is returned so per-target
     // evidence (lazy extents) binds to the SELECTED record, never a scope-global one.
     const vbr_operation_target * find_covering_target_at(vbr_controller_instance_id instance,
@@ -247,7 +247,7 @@ struct vbr_mutation_registration {
 };
 
 // Closed mutation-registration inventory. apply_ubatch owns assignment registration; find_slot
-// remains a read-only planner and is intentionally absent. This table is inert in A0; subsequent
+// remains a read-only planner and is intentionally absent. This table is inert in operation registry; subsequent
 // WS-A commits attach dispatch at these audited sites without reopening the vocabulary.
 constexpr std::array<vbr_mutation_registration,
         static_cast<size_t>(vbr_mutation_registrant::count)> VBR_MUTATION_REGISTRY = {{
@@ -408,7 +408,7 @@ constexpr bool vbr_stable_read_registry_is_exhaustive() {
 static_assert(vbr_stable_read_registry_is_exhaustive(),
         "capture, export, and oracle stable-read guards must stay exhaustive");
 
-// A2: extent-entry family for an operation, derived from its authenticated kind/class rather
+// Extent-entry family for an operation, derived from its authenticated kind/class rather
 // than caller-supplied strings. swa_wrap is the one class whose provenance family is
 // occupied_reuse regardless of kind (§5.5 row 2).
 constexpr vbr_mutation_family vbr_operation_kind_family(vbr_operation_kind  kind,
@@ -424,7 +424,7 @@ constexpr vbr_mutation_family vbr_operation_kind_family(vbr_operation_kind  kind
                                                            : vbr_mutation_family::clear;
 }
 
-// C2: closed registrant masks per operation kind — the manifest declares which registrants an
+// Closed registrant masks per operation kind: the manifest declares which registrants an
 // operation may authorize; begin_event checks membership. Derived once here, never per-site.
 constexpr uint32_t vbr_registrant_bit(vbr_mutation_registrant registrant) {
     return uint32_t(1u) << static_cast<uint8_t>(registrant);
@@ -472,7 +472,7 @@ constexpr uint32_t vbr_operation_kind_registrants(vbr_operation_kind kind) {
                : 0;
 }
 
-// P5v2 (v6): raw public-API range sentinels (-1) normalize to canonical [0, max) BEFORE any
+// Raw public-API range sentinels (-1) normalize to canonical [0, max) before any
 // manifest is built, so the closed mint range rules below see canonical values — the ONE
 // spelling of that clamp (recovery/controller_retier legitimately keep {-1,-1} and never
 // route through it).
@@ -485,7 +485,7 @@ inline void vbr_normalize_edit_range(llama_pos & p0, llama_pos & p1) {
     }
 }
 
-// P5v2 (v6): closed per-kind range enumeration for mutate-phase targets. Range-bearing kinds
+// Closed per-kind range enumeration for mutate-phase targets. Range-bearing kinds
 // require a nonempty canonical p0 < p1. The two special forms are ENUMERATED, never generic:
 //   {-1,-1} wildcard -> recovery (capability-subset-restricted afterwards) and
 //                       controller_retier (unit-level representation ops carry no cell range)
@@ -505,7 +505,7 @@ constexpr bool vbr_target_range_valid(vbr_operation_kind kind, vbr_operation_ran
 
 // One construction rule for mutation-shaped bindings (child_phase = mutate is the stated
 // convention, not a per-site choice). Used by the cache scope, wrapper adoption, and tests.
-// The class and registrant mask are authenticated INTO the manifest here (C2).
+// The class and registrant mask are authenticated into the manifest here.
 constexpr vbr_operation_target vbr_make_target(vbr_operation_kind  kind,
                                                vbr_operation_class operation_class,
                                                vbr_controller_instance_id instance,
@@ -561,16 +561,16 @@ constexpr vbr_operation_binding vbr_mutation_binding(vbr_operation_kind  kind,
 vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding);
 bool vbr_operation_registry_end(vbr_operation_id operation_id);
 bool vbr_operation_registry_is_live(vbr_operation_id operation_id);
-// P4v2 (v6): re-arm capacity probe — true when the bounded live-operation registry has at
+// Re-arm capacity probe: true when the bounded live-operation registry has at
 // least one free slot, checked under the registry mutex (boundary-rate only).
 bool vbr_operation_registry_has_capacity();
 
-// A2: the registry retains the immutable binding while the operation is live, so mutation
+// The registry retains the immutable binding while the operation is live, so mutation
 // events and extent entries can be validated against the authenticated (registrant-checked)
 // kind/seq/range instead of caller-supplied values. Returns false once the operation ended.
 bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation_binding & out);
 
-// Read-only F3 stable-reader probe. It scans the fixed registry under the
+// Read-only stable-reader probe. It scans the fixed registry under the
 // existing mutex and never allocates or mints an operation id.
 bool vbr_operation_registry_quiescent_for(
     const vbr_controller_instance_id * instances,
@@ -580,7 +580,7 @@ bool vbr_operation_registry_quiescent_for_except(
     size_t n_instances,
     vbr_operation_id allowed) noexcept;
 
-// A2 explicit close semantics (design D-A2-4v3). `vbr_operation_registry_end` remains the
+// Explicit operation close semantics. `vbr_operation_registry_end` remains the
 // committed-close alias for the non-mutating legacy callers (freeze scopes).
 enum class vbr_operation_outcome : uint8_t {
     committed,
@@ -590,7 +590,7 @@ enum class vbr_operation_outcome : uint8_t {
 bool vbr_operation_registry_close(vbr_operation_id operation_id, vbr_operation_outcome outcome);
 
 // ---------------------------------------------------------------------------
-// A2 authenticated recovery (design D-A2-5v3): registry-owned failed-operation records with a
+// Authenticated operation recovery: registry-owned failed-operation records with a
 // monotone state machine and single-use, target-restricted capabilities. Records are RESERVED
 // at operation begin for every fence-spanning/destructive operation — before any potentially
 // observable mutation — so an odd controller serial can never exist without an authenticated
@@ -603,7 +603,7 @@ enum class vbr_recovery_state : uint8_t {
     reserved,             // reserved at op begin; released unused at clean commit
     recorded,             // operation terminated without commit
     capability_minted,    // single mint consumed the record's mint right
-    awaiting_ack,         // C4: quarantined — retains targets until the owning tracker acks
+    awaiting_ack,         // Quarantined: retains targets until the owning tracker acknowledges.
 };
 
 enum class vbr_recovery_failure_site : uint8_t {
@@ -620,18 +620,18 @@ struct vbr_failed_operation_record {
     vbr_recovery_failure_site failure_site          = vbr_recovery_failure_site::none;
     bool                      dest_bytes_observable = false;
     vbr_recovery_state        state                 = vbr_recovery_state::free_slot;
-    // v4 review F2: the reservation's immutable owner instance — takes/advances match THIS,
+    // The reservation's immutable owner instance: takes and advances match this,
     // never the (possibly composite) manifest, so the base child can never service the SWA
     // child's failure.
     vbr_controller_instance_id owner_instance       = {};
-    // v3 review B8: in-service marker — a taken record cannot be re-taken, and only the
+    // In-service marker: a taken record cannot be retaken, and only the
     // taking instance's ack (validated below) reclaims it.
     bool                      taken                 = false;
     vbr_controller_instance_id taker_instance       = {};
     uint16_t                  src_stream            = 0;
     uint16_t                  dst_stream            = 0;
     vbr_operation_range       src_range             = {};
-    // Source-stability token (design Rev 5 pin 2): the source stream's A1 page generations
+    // Source-stability token: the source stream's generation tracker page generations
     // over the copied source range, captured at reserve. Bounded (<= pages * 4 B).
     std::vector<uint32_t>     src_page_gens;
 };
@@ -686,7 +686,7 @@ class vbr_recovery_capability {
 
 vbr_recovery_capability vbr_recovery_mint(int32_t record_index);
 
-// C4 (v3.2, Sol CONCUR): tokenized invalidate-then-ack quarantine on the fixed ring. A
+// Tokenized invalidate-then-ack quarantine on the fixed ring. A
 // quarantined record (explicit resolve_quarantined or fail-closed capability destruction)
 // transitions to awaiting_ack RETAINING its manifest targets. The owning tracker's cache takes
 // the pending quarantine for ITS instance at the next decode boundary, performs the target/global
@@ -710,11 +710,11 @@ struct vbr_quarantine_work {
 // Take one pending quarantine owned by `instance` (or a legacy wildcard-owner record).
 // Returns an empty optional-like work item (token false) when none is serviceable.
 vbr_quarantine_work vbr_recovery_take_quarantine(vbr_controller_instance_id instance);
-// v3 review B3: production advancement of `recorded` failures — transitions this instance's
+// Production advancement of `recorded` failures transitions this instance's
 // recorded slots to awaiting_ack (quarantine) so the take/ack drain resolves them. Returns
 // the number advanced.
 int32_t vbr_recovery_advance_recorded(vbr_controller_instance_id instance);
-// v4 review F3: any unresolved recovery work (recorded/awaiting/taken) serviceable here?
+// Is any unresolved recovery work (recorded/awaiting/taken) serviceable here?
 bool vbr_recovery_pending_for(vbr_controller_instance_id instance);
 // Import opens its authenticated recovery reservation before the final empty
 // target recheck. Ignore only that operation's still-reserved record; every
@@ -722,11 +722,11 @@ bool vbr_recovery_pending_for(vbr_controller_instance_id instance);
 bool vbr_recovery_pending_for_except(
     vbr_controller_instance_id instance,
     vbr_operation_id allowed_reserved_operation);
-// F4.0 retirement is narrower than service routing: a legacy wildcard record is serviceable
+// Retirement is narrower than service routing: a legacy wildcard record is serviceable
 // by any controller, but it is not owned by every controller.
 bool vbr_recovery_owned_by(vbr_controller_instance_id instance);
 // Acknowledge with the token AFTER performing the invalidation; only the instance that took the
-// record may ack (v3 review B8); reclaims the slot.
+// record may acknowledge it; this reclaims the slot.
 bool vbr_recovery_ack_quarantine(vbr_quarantine_token token,
                                  vbr_controller_instance_id instance);
 // Release an un-serviced take (invalidation could not run): the record becomes takeable again
@@ -734,7 +734,7 @@ bool vbr_recovery_ack_quarantine(vbr_quarantine_token token,
 bool vbr_recovery_untake_quarantine(vbr_quarantine_token token,
                                     vbr_controller_instance_id instance);
 
-// A2 (review F10/CI): the ONLY generic mint-owning RAII. All operation minting outside the
+// The only generic mint-owning RAII. All operation minting outside the
 // legacy freeze wrapper flows through this type, keeping registry_begin call sites confined to
 // this translation unit. Close is outcome-coded; destruction without close commits.
 class vbr_scoped_operation {
@@ -752,7 +752,7 @@ class vbr_scoped_operation {
     const vbr_operation_binding & binding() const { return binding_; }
 
     bool close(vbr_operation_outcome outcome);
-    // Transfer ownership of the open operation (deferred decode lifetime, review F3): the
+    // Transfer ownership of the open operation for deferred decode lifetime: the
     // receiver becomes responsible for the outcome-coded close.
     vbr_operation_id release();
 

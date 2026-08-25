@@ -794,9 +794,9 @@ static void test_prepared_release_capability() {
     CHECK(project()(released, quote.projected_domains));
     auto overlapping = server_cache_recovery_pin::acquire(
         &releases, release_pin, { { 1 } }, {});
-    // D-A2 duplicate-pair guard: selecting both the victim and its cited
+    // Duplicate-pair guard: selecting both the victim and its cited
     // survivor in one ladder union must fail the fourth conjunct before any
-    // physical mutation. D-S6 is otherwise allowed to select both members.
+    // physical mutation. The release-set planner may otherwise select both members.
     CHECK(!overlapping.disjoint({ { 1 }, { 2 } }, { op2 }));
     auto refused = server_cache_prepare_release_set(
         quote, { current }, second, serial2, project(), std::move(overlapping));

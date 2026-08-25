@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <vector>
 
-// A2 committed-extent store + dual-view ownership index (design Rev 5.1, worklog 2026-07-27).
+// Committed-extent store and dual-view ownership index.
 //
 // The extent store is the durable admission evidence that replaces the forbidden debug ring:
 // every destructive/import mutation records its committed [p0,p1) extent here, and expected-
@@ -115,13 +115,13 @@ class vbr_extent_store {
     bool                          exhausted_ = false;
 };
 
-// Dual-view ownership index (design D-A2-1v2): physical per-(stream,seq) page masks for
+// Dual-view ownership index: physical per-(stream,seq) page masks for
 // canonical dependency-set enumeration + a lazily allocated per-active-seq logical-position
 // Fenwick tree for exact rank-below-frontier. Positions outside [0, n_cells) mark the
 // (stream,seq) view unavailable (fail-closed shadow-unavailable; legacy never consults this).
 class vbr_ownership_index {
   public:
-    // One page geometry for the whole generation subsystem (reuse review): capture assumes the
+    // One page geometry for the whole generation subsystem: capture assumes the
     // index's pages match the tracker's, so the constants must be the same symbols.
     static constexpr uint32_t MASK_WORDS_PER_PAGE = VBR_GENERATION_MASK_WORDS;
 
@@ -155,7 +155,7 @@ class vbr_ownership_index {
     // was populated and later failed the bounded logical-position contract.
     bool initialized(uint32_t stream, llama_seq_id seq_id) const;
 
-    // Memory note (design Rev 4 item 7): the Fenwick domain is n_cells positions * 4 B,
+    // Memory note: the Fenwick domain is n_cells positions * 4 bytes,
     // ~800 KB per ACTIVE seq at 200k cells, lazily allocated on first add; capacity is
     // RETAINED at clear_seq for seq-id reuse. Masks cost pages * 32 B per active seq.
 
@@ -170,7 +170,7 @@ class vbr_ownership_index {
     uint32_t n_cells_   = 0;
     uint32_t n_pages_   = 0;
 
-    // Flat O(1) map (efficiency review): slot = stream * n_seq_max + seq_id. Views are lazily
+    // Flat O(1) map: slot = stream * n_seq_max + seq_id. Views are lazily
     // initialized and keep their vector capacity across clear_seq for seq-id reuse.
     std::vector<seq_view> views_;
 };

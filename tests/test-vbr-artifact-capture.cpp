@@ -37,6 +37,42 @@ struct synthetic_source {
     uint64_t fail_at = UINT64_MAX;
 };
 
+static void test_exact_capture_pretransfer_quote() {
+    vbr_explicit_capture_pretransfer_quote quote;
+    quote.payload_bytes = 40;
+    quote.stash_bytes = 8;
+    quote.companion_bytes = 12;
+    quote.metadata_bytes = 4;
+    quote.planned_packed_bytes = 60;
+    quote.conservative_host_resident_bytes = 64;
+    quote.controllers = 2;
+    quote.units = 16;
+    quote.companions = 3;
+
+    CHECK(vbr_explicit_capture_pretransfer_quote_admissible(quote, 0));
+    CHECK(vbr_explicit_capture_pretransfer_quote_admissible(quote, 60));
+    CHECK(!vbr_explicit_capture_pretransfer_quote_admissible(quote, 59));
+
+    auto mutant = quote;
+    mutant.planned_packed_bytes++;
+    CHECK(!vbr_explicit_capture_pretransfer_quote_admissible(mutant, 0));
+    mutant = quote;
+    mutant.conservative_host_resident_bytes++;
+    CHECK(!vbr_explicit_capture_pretransfer_quote_admissible(mutant, 0));
+    mutant = quote;
+    mutant.controllers = 0;
+    CHECK(!vbr_explicit_capture_pretransfer_quote_admissible(mutant, 0));
+    mutant = quote;
+    mutant.units = 0;
+    CHECK(!vbr_explicit_capture_pretransfer_quote_admissible(mutant, 0));
+    mutant = quote;
+    mutant.payload_bytes = UINT64_MAX;
+    mutant.stash_bytes = 1;
+    mutant.planned_packed_bytes = UINT64_MAX;
+    mutant.conservative_host_resident_bytes = UINT64_MAX;
+    CHECK(!vbr_explicit_capture_pretransfer_quote_admissible(mutant, 0));
+}
+
 static bool read_synthetic(
         const void * opaque, uint64_t offset,
         uint8_t * destination, size_t size) noexcept {
@@ -82,6 +118,7 @@ struct prefix_validator_serials {
     uint64_t memory = 0;
     uint64_t state = 0;
     uint64_t tree = 0;
+    std::array<uint8_t, 32> transform_tree = {};
 
     static bool recheck(
             const void * opaque,
@@ -102,6 +139,16 @@ struct prefix_validator_serials {
 
     static uint64_t read_policy(const void * opaque) noexcept {
         return static_cast<const prefix_validator_serials *>(opaque)->policy;
+    }
+
+    static bool read_transform_tree(
+            const void * opaque,
+            std::array<uint8_t, 32> & output) noexcept {
+        output = static_cast<const prefix_validator_serials *>(opaque)
+            ->transform_tree;
+        return std::any_of(output.begin(), output.end(), [](uint8_t value) {
+            return value != 0;
+        });
     }
 };
 
@@ -1752,7 +1799,8 @@ static bool publish_occupied_guard_package(
         uint64_t schedule_seed = 0,
         uint64_t source_capacity_override = 0,
         uint32_t proof_count = 1,
-        uint8_t payload_salt = 0) {
+        uint8_t payload_salt = 0,
+        ggml_type representation_type = GGML_TYPE_F16) {
     reference = {};
     view.reset();
     if (token_count == 0 || proof_count == 0 || proof_count > 4096) {
@@ -1765,13 +1813,14 @@ static bool publish_occupied_guard_package(
     const uint64_t seed = schedule_seed == 0 ? manifest_id : schedule_seed;
     auto target = projected_target(
         manifest_id, 0, 5000 + seed,
-        projected_generation(6000 + seed));
+        projected_generation(6000 + seed, representation_type));
     const uint64_t source_capacity = source_capacity_override != 0
         ? source_capacity_override
         : alternating_physical_cells ? uint64_t(token_count)*2 : token_count;
     target.policy.wm_cells = source_capacity;
     target.policy.current_type_vector_digest =
-        vbr_type_vector_digest(std::vector<ggml_type> { GGML_TYPE_F16 });
+        vbr_type_vector_digest(
+            std::vector<ggml_type> { representation_type });
     auto & descriptor = target.unit_descriptors.front();
     descriptor.wm_cells = source_capacity;
     descriptor.dimensions[0] = source_capacity;
@@ -1781,7 +1830,7 @@ static bool publish_occupied_guard_package(
     const auto descriptor_template = descriptor;
     target.units.resize(proof_count, generation);
     target.unit_descriptors.resize(proof_count, descriptor_template);
-    std::vector<ggml_type> types(proof_count, GGML_TYPE_F16);
+    std::vector<ggml_type> types(proof_count, representation_type);
     target.policy.current_type_vector_digest = vbr_type_vector_digest(types);
     for (uint32_t i = 0; i < proof_count; ++i) {
         target.unit_descriptors[i].logical_unit_id = i;
@@ -2563,6 +2612,231 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(catalog.retire(distinct_recovery_reference) ==
           vbr_artifact_retire_status::retired);
 
+    // A transformed occupied capability is legal only on the bounded dense
+    // recycle strategy. The incoming F16 bytes are authenticated against the
+    // live TURBO8 destination schedule, while the independent TURBO8 recovery
+    // package remains the byte-exact rollback authority.
+    llama_cache_acct_artifact_id transform_recovery_reference;
+    llama_cache_acct_artifact_id transform_incoming_reference;
+    vbr_artifact_package_view transform_recovery;
+    vbr_artifact_package_view transform_incoming;
+    CHECK(publish_occupied_guard_package(
+        catalog, topology, budget, 195, 8, false,
+        transform_recovery_reference, transform_recovery,
+        1000, 8, 1, 3, GGML_TYPE_TURBO8_0));
+    CHECK(publish_occupied_guard_package(
+        catalog, topology, budget, 196, 8, false,
+        transform_incoming_reference, transform_incoming,
+        1000, 8, 1, 4, GGML_TYPE_F16));
+    occupied_guard_fixture transform_fixture;
+    CHECK(make_occupied_guard_fixture(
+        transform_recovery, 195, 8, transform_fixture));
+    vbr_import_schedule_quote transform_incoming_quote;
+    vbr_import_schedule_quote transform_recovery_quote;
+    CHECK(vbr_quote_import_schedule(
+        transform_fixture.target, transform_incoming,
+        transform_incoming_quote));
+    CHECK(transform_incoming_quote.status() ==
+          vbr_import_schedule_status::downward);
+    CHECK(vbr_quote_import_schedule(
+        transform_fixture.target, transform_recovery,
+        transform_recovery_quote));
+    CHECK(transform_recovery_quote.status() ==
+          vbr_import_schedule_status::exact);
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              transform_fixture.target, transform_incoming,
+              transform_recovery, transform_fixture.observation,
+              occupied_guard, &transform_incoming_quote,
+              &transform_recovery_quote) ==
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(occupied_guard.strategy() ==
+          vbr_occupied_replacement_strategy::recycle_incumbent_cells);
+    CHECK(occupied_guard.relocation_runs().size() == 1);
+    CHECK(occupied_guard.recovery_runs().size() == 1);
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              occupied_guard, transform_fixture.target,
+              transform_fixture.observation) ==
+          vbr_occupied_replacement_guard_status::ready);
+    occupied_guard.reset();
+
+    auto transformed_validation_target = transform_fixture.target;
+    const auto transformed_accounting = ledger.snapshot();
+    transformed_validation_target.accounting_serial =
+        transformed_accounting.serial;
+    auto & transformed_live_child =
+        transformed_validation_target.children.front();
+    auto & transformed_live_unit = transformed_live_child.units.front();
+    transformed_live_unit.shards.front().domain = device;
+    transformed_live_unit.shards.front().mapped_bytes = 8;
+    transformed_live_unit.downward_supported = true;
+    transformed_live_unit.downward_movable = true;
+    transformed_live_unit.controller_floor_type = GGML_TYPE_TURBO1_TCQ;
+    transformed_live_unit.downward_type = GGML_TYPE_TURBO8_0;
+    transformed_live_unit.downward_domain = vbr_repr_domain::full;
+    transformed_live_unit.downward_recipe_id = VBR_DOWNWARD_RECIPE_ID;
+    transformed_live_unit.downward_recipe_version =
+        VBR_DOWNWARD_RECIPE_VERSION;
+    CHECK(vbr_downward_resolve_recipe(
+              GGML_TYPE_F16, GGML_TYPE_TURBO8_0,
+              GGML_TYPE_TURBO1_TCQ, true,
+              transformed_live_unit.downward_recipe) ==
+          vbr_downward_recipe_status::resolved);
+    transformed_live_unit.downward_row_bytes = 1;
+    transformed_live_unit.downward_mapped_bytes = 8;
+    transformed_live_unit.downward_transfer_bytes = 8;
+    transformed_live_unit.downward_codec_workspace_bytes = 64;
+    transformed_live_unit.downward_meansub_model_id = 7;
+    vbr_downward_policy_child occupied_downward_child;
+    occupied_downward_child.initial_types = { GGML_TYPE_F16 };
+    occupied_downward_child.target_types = { GGML_TYPE_TURBO8_0 };
+    occupied_downward_child.initial_cursor =
+        transform_incoming.manifest().controller_policy.front().cursor;
+    const auto & occupied_edge =
+        transformed_live_unit.downward_recipe.edges.front();
+    occupied_downward_child.policy.steps.push_back({
+        0, 0,
+        int32_t(occupied_edge.source_type),
+        int32_t(occupied_edge.target_type), 1,
+    });
+    occupied_downward_child.policy.terminal_progress = 1;
+    const auto occupied_downward_projection =
+        vbr_downward_project_policy_prefix({ occupied_downward_child });
+    CHECK(occupied_downward_projection.status ==
+          vbr_downward_policy_status::coherent);
+    transformed_live_child.controller_policy.cursor =
+        occupied_downward_projection.final_cursors.front();
+    transformed_live_child.controller_policy.current_type_vector_digest =
+        occupied_downward_projection.child_type_digests.front();
+    transformed_live_unit.downward_build_identity_digest =
+        vbr_downward_build_identity(
+            transformed_live_unit.downward_recipe,
+            transformed_live_unit.downward_meansub_model_id,
+            transformed_live_unit.meansub_digest,
+            occupied_downward_projection.child_type_digests.front(),
+            occupied_downward_projection.tree_digest);
+    vbr_import_destination_projection occupied_destination;
+    occupied_destination.status =
+        vbr_import_destination_status::feasible_degraded;
+    occupied_destination.prefix = occupied_downward_projection.prefix;
+    occupied_destination.initial_types = { { GGML_TYPE_F16 } };
+    occupied_destination.initial_cursors = {
+        occupied_downward_child.initial_cursor,
+    };
+    occupied_destination.final_types =
+        occupied_downward_projection.final_types;
+    occupied_destination.final_cursors =
+        occupied_downward_projection.final_cursors;
+    occupied_destination.child_type_digests =
+        occupied_downward_projection.child_type_digests;
+    occupied_destination.tree_digest =
+        occupied_downward_projection.tree_digest;
+    vbr_import_schedule_quote occupied_transform_quote;
+    CHECK(vbr_quote_import_schedule(
+        transformed_validation_target, transform_incoming,
+        occupied_transform_quote));
+    CHECK(vbr_rebind_import_schedule_quote(
+        transformed_validation_target, transform_incoming,
+        occupied_destination, occupied_transform_quote));
+    vbr_import_schedule_quote occupied_recovery_quote;
+    CHECK(vbr_quote_import_schedule(
+        transformed_validation_target, transform_recovery,
+        occupied_recovery_quote));
+    vbr_occupied_replacement_guard validated_transform_guard;
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              transformed_validation_target, transform_incoming,
+              transform_recovery, transform_fixture.observation,
+              validated_transform_guard, &occupied_transform_quote,
+              &occupied_recovery_quote) ==
+          vbr_occupied_replacement_guard_status::ready);
+    prefix_validator_serials transformed_serials;
+    transformed_serials.accounting = transformed_accounting.serial;
+    transformed_serials.policy = transformed_validation_target.policy_epoch;
+    transformed_serials.memory =
+        transformed_validation_target.memory_instance_cookie;
+    transformed_serials.state =
+        transformed_validation_target.target_state_serial;
+    transformed_serials.tree =
+        transformed_validation_target.tree_shape_digest;
+    transformed_serials.transform_tree =
+        occupied_downward_projection.tree_digest;
+    llama_cache_budget_plan occupied_transform_plan;
+    occupied_transform_plan.accounting_serial =
+        transformed_accounting.serial;
+    vbr_adopt_policy occupied_transform_policy;
+    occupied_transform_policy.authorized = true;
+    occupied_transform_policy.identity.execution_identity =
+        transform_incoming.manifest().identity.execution_identity;
+    occupied_transform_policy.identity.adapter_config_identity =
+        transform_incoming.manifest().identity.adapter_config_identity;
+    occupied_transform_policy.identity.media_content_identity =
+        transform_incoming.manifest().identity.media_content_identity;
+    occupied_transform_policy.identity.sequence_epoch =
+        transform_incoming.manifest().identity.sequence_epoch;
+    occupied_transform_policy.identity.requested_frontier =
+        transform_incoming.manifest().identity.next_position;
+    occupied_transform_policy.identity.tokens =
+        &transform_incoming.manifest().token_block.tokens;
+    occupied_transform_policy.destination_sequence = 195;
+    occupied_transform_policy.adoption_nonce = 0x4195;
+    occupied_transform_policy.domain_bindings = bindings;
+    occupied_transform_policy.domain_bindings.push_back({
+        UINT32_MAX, UINT16_MAX, host,
+    });
+    occupied_transform_policy.accounting_snapshot =
+        &transformed_accounting;
+    occupied_transform_policy.budget_config = &budget;
+    occupied_transform_policy.transform_budget_plan =
+        &occupied_transform_plan;
+    occupied_transform_policy.downward_projection =
+        &occupied_downward_projection;
+    occupied_transform_policy.schedule_quote = &occupied_transform_quote;
+    occupied_transform_policy.context = &transformed_serials;
+    occupied_transform_policy.read_accounting_serial =
+        prefix_validator_serials::read_accounting;
+    occupied_transform_policy.read_policy_epoch =
+        prefix_validator_serials::read_policy;
+    occupied_transform_policy.read_transform_tree_digest =
+        prefix_validator_serials::read_transform_tree;
+    occupied_transform_policy.occupied_replacement =
+        &validated_transform_guard;
+    occupied_transform_policy.occupied_representation_identity = [](
+            const void *, int32_t, bool, int32_t,
+            vbr_explicit_representation_identity &) noexcept {
+        return false;
+    };
+    auto occupied_transformed = vbr_validate_unit_manifest_snapshot(
+        transformed_validation_target, transform_incoming,
+        occupied_transform_policy);
+    CHECK(occupied_transformed.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(occupied_transformed.decision ==
+          vbr_import_decision::downward_rebase);
+    CHECK(occupied_transformed.proof);
+    CHECK(!validated_transform_guard.ready());
+    if (occupied_transformed.proof) {
+        CHECK(occupied_transformed.proof->is_occupied_replacement());
+        CHECK(occupied_transformed.proof->children().size() == 1);
+        CHECK(occupied_transformed.proof->children().front().transform_kind ==
+              vbr_import_transform_kind::downward);
+    }
+    occupied_transformed.proof.reset();
+    occupied_guard_fixture transform_free_fixture;
+    CHECK(make_occupied_guard_fixture(
+        transform_recovery, 195, 16, transform_free_fixture));
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              transform_free_fixture.target, transform_incoming,
+              transform_recovery, transform_free_fixture.observation,
+              occupied_guard, &transform_incoming_quote,
+              &transform_recovery_quote) ==
+          vbr_occupied_replacement_guard_status::unsupported_layout);
+    CHECK(!occupied_guard.ready());
+    transform_incoming.reset();
+    transform_recovery.reset();
+    CHECK(catalog.retire(transform_incoming_reference) ==
+          vbr_artifact_retire_status::retired);
+    CHECK(catalog.retire(transform_recovery_reference) ==
+          vbr_artifact_retire_status::retired);
+
     const auto validate_recycle_fanout = [&](uint32_t proof_count,
                                              uint64_t manifest_base,
                                              bool accepted) {
@@ -3329,6 +3603,188 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(staged_prefix.manifest &&
           staged_prefix.manifest->projection_transfer_ready());
 
+    // Prefix selection and representation selection compose into one
+    // authenticated transaction. The sparse two-row prefix is read using the
+    // compact F16 source geometry, while its fresh destination image is sized
+    // and addressed using the wider TURBO8 geometry. No parent suffix row is
+    // admitted to the staged reads.
+    vbr_artifact_attention_prefix_projection transformed_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {}, transformed_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    auto transformed_target = validation_target;
+    const auto transform_accounting = ledger.snapshot();
+    transformed_target.accounting_serial = transform_accounting.serial;
+    validation_serials.accounting = transform_accounting.serial;
+    auto & transformed_child = transformed_target.children[0];
+    vbr_downward_policy_child downward_child;
+    downward_child.initial_cursor = transformed_child.controller_policy.cursor;
+    for (size_t unit_index = 0;
+         unit_index < transformed_child.units.size(); ++unit_index) {
+        auto & unit = transformed_child.units[unit_index];
+        const auto source_type = static_cast<ggml_type>(
+            prefix_parent.units()[unit_index].descriptor.current_type);
+        const auto target_type = GGML_TYPE_TURBO8_0;
+        downward_child.initial_types.push_back(source_type);
+        downward_child.target_types.push_back(target_type);
+        unit.current_type = target_type;
+        unit.current_domain = vbr_repr_domain::full;
+        unit.downward_supported = true;
+        unit.downward_movable = true;
+        unit.controller_floor_type = GGML_TYPE_TURBO1_TCQ;
+        unit.downward_type = target_type;
+        unit.downward_domain = vbr_repr_domain::full;
+        unit.downward_recipe_id = VBR_DOWNWARD_RECIPE_ID;
+        unit.downward_recipe_version = VBR_DOWNWARD_RECIPE_VERSION;
+        CHECK(vbr_downward_resolve_recipe(
+                  source_type, target_type, GGML_TYPE_TURBO1_TCQ, true,
+                  unit.downward_recipe) ==
+              vbr_downward_recipe_status::resolved);
+        CHECK(unit.downward_recipe.n_edges != 0);
+        for (size_t edge_index = 0;
+             edge_index < unit.downward_recipe.n_edges; ++edge_index) {
+            const auto & edge = unit.downward_recipe.edges[edge_index];
+            downward_child.policy.steps.push_back({
+                downward_child.policy.steps.size(), unit_index,
+                int32_t(edge.source_type),
+                int32_t(edge.target_type), 1,
+            });
+        }
+        unit.downward_row_bytes = 2;
+        unit.downward_mapped_bytes = 16;
+        unit.downward_transfer_bytes = 2;
+        unit.downward_codec_workspace_bytes = 64;
+        unit.downward_meansub_model_id = 7;
+        unit.shards[0].row_bytes = 2;
+        unit.shards[0].mapped_bytes = 16;
+    }
+    downward_child.policy.terminal_progress =
+        int64_t(downward_child.policy.steps.size());
+    const auto downward_projection =
+        vbr_downward_project_policy_prefix({ downward_child });
+    CHECK(downward_projection.status ==
+          vbr_downward_policy_status::coherent);
+    transformed_child.controller_policy.cursor =
+        downward_projection.final_cursors[0];
+    transformed_child.controller_policy.current_type_vector_digest =
+        downward_projection.child_type_digests[0];
+    for (auto & unit : transformed_child.units) {
+        unit.downward_build_identity_digest = vbr_downward_build_identity(
+            unit.downward_recipe, unit.downward_meansub_model_id,
+            unit.meansub_digest,
+            downward_projection.child_type_digests[0],
+            downward_projection.tree_digest);
+    }
+    vbr_import_destination_projection destination;
+    destination.status =
+        vbr_import_destination_status::feasible_degraded;
+    destination.prefix = downward_projection.prefix;
+    destination.initial_types = { downward_child.initial_types };
+    destination.initial_cursors = { downward_child.initial_cursor };
+    destination.final_types = downward_projection.final_types;
+    destination.final_cursors = {
+        transformed_child.controller_policy.cursor,
+    };
+    destination.child_type_digests =
+        downward_projection.child_type_digests;
+    destination.tree_digest = downward_projection.tree_digest;
+    vbr_import_schedule_quote transformed_quote;
+    CHECK(vbr_quote_import_schedule(
+        transformed_target, prefix_parent, transformed_quote));
+    CHECK(transformed_quote.status() ==
+          vbr_import_schedule_status::downward);
+    CHECK(vbr_rebind_import_schedule_quote(
+        transformed_target, prefix_parent, destination,
+        transformed_quote));
+    llama_cache_budget_plan transform_plan;
+    transform_plan.accounting_serial = transform_accounting.serial;
+    auto transformed_policy = validation_policy;
+    transformed_policy.accounting_snapshot = &transform_accounting;
+    transformed_policy.adoption_nonce = 0x906;
+    transformed_policy.schedule_quote = &transformed_quote;
+    transformed_policy.downward_projection = &downward_projection;
+    transformed_policy.transform_budget_plan = &transform_plan;
+    validation_serials.transform_tree = downward_projection.tree_digest;
+    transformed_policy.read_transform_tree_digest =
+        prefix_validator_serials::read_transform_tree;
+    auto transformed = vbr_validate_attention_prefix_projection(
+        transformed_target, std::move(transformed_projection),
+        transformed_policy);
+    CHECK(transformed.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(transformed.decision ==
+          vbr_import_decision::downward_rebase);
+    CHECK(transformed.proof);
+    CHECK(transformed.proof->children().size() == 2);
+    for (const auto & plan : transformed.proof->children()) {
+        CHECK(plan.transform_kind ==
+              vbr_import_transform_kind::downward);
+        CHECK(plan.transfer_bytes == 2);
+        CHECK(plan.target_mapped_bytes == 4);
+        CHECK(plan.shards.size() == 1);
+        CHECK(plan.shards[0].row_bytes == 1);
+        CHECK(plan.shards[0].target_row_bytes == 2);
+        CHECK(plan.shards[0].payload_bytes == 2);
+        CHECK(plan.shards[0].target_mapped_bytes == 4);
+    }
+    auto transformed_stage_policy = prefix_stage_policy;
+    transformed_stage_policy.transform_context = nullptr;
+    transformed_stage_policy.reserve_transform = [](
+            void *, const std::vector<vbr_validated_child_plan> & plans,
+            llama_cache_acct_ledger &,
+            const llama_cache_budget_config &,
+            vbr_downward_stage_reservation & output) noexcept {
+        if (plans.size() != 2 || std::any_of(
+                plans.begin(), plans.end(),
+                [](const vbr_validated_child_plan & plan) {
+                    return plan.transform_kind !=
+                        vbr_import_transform_kind::downward;
+                })) {
+            return false;
+        }
+        output.status = vbr_downward_reserve_status::reserved;
+        return true;
+    };
+    auto staged_transform = vbr_stage_validated_manifest(
+        std::move(transformed.proof), transformed_stage_policy);
+    if (staged_transform.status != vbr_adopt_stage_status::staged) {
+        fprintf(stderr, "transformed prefix stage status: %s\n",
+            vbr_adopt_stage_status_name(staged_transform.status));
+    }
+    CHECK(staged_transform.status == vbr_adopt_stage_status::staged);
+    CHECK(staged_transform.manifest);
+    CHECK(staged_transform.manifest->decision() ==
+          vbr_import_decision::downward_rebase);
+    CHECK(staged_transform.staged);
+    CHECK(staged_transform.staged->read_count() == 2);
+    if (staged_transform.staged) {
+        for (const auto & read : staged_transform.staged->reads()) {
+            CHECK(read.size == 2);
+            CHECK(read.destination_offset == 0);
+            CHECK(read.projection_ranges.size() == 2);
+            CHECK(read.projection_ranges[0].source_offset == 7);
+            CHECK(read.projection_ranges[1].source_offset == 2);
+        }
+    }
+    staged_transform.staged.reset();
+    staged_transform.manifest.reset();
+
+    // The prefix path consumes the same immutable schedule capability as the
+    // full-frontier validator. A target snapshot drift must not be accepted
+    // merely because the quoted direction still says "downward".
+    vbr_artifact_attention_prefix_projection stale_quote_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {}, stale_quote_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    auto stale_quote_target = transformed_target;
+    ++stale_quote_target.target_state_serial;
+    auto stale_quote_result = vbr_validate_attention_prefix_projection(
+        stale_quote_target, std::move(stale_quote_projection),
+        transformed_policy);
+    CHECK(stale_quote_result.status ==
+          vbr_manifest_validation_status::unavailable);
+    CHECK(!stale_quote_result.proof);
+
     // A target topology mutation consumes and releases the attempted
     // capability without affecting the already-validated sibling proof.
     vbr_artifact_attention_prefix_projection topology_mutant_projection;
@@ -3983,7 +4439,7 @@ static void test_h2d_bounded_streaming() {
           vbr_h2d_status::transfer_failed);
     CHECK(failed.operations.empty());
 
-    // H1 production uses one physical direction-neutral ring. The two
+    // Production uses one physical direction-neutral ring. The two
     // adapters share its exact capacity and contend at the whole-operation
     // boundary rather than consuming one another's outstanding chunks.
     vbr_pinned_ring_create_failure failure;
@@ -4126,7 +4582,7 @@ static void test_ring_accounting_once() {
     CHECK(failure ==
           vbr_capture_ring_create_failure::budget_exceeded);
 
-    // M1: a fault raised after physical chunk allocation but during the final
+    // A fault raised after physical chunk allocation but during the final
     // C gauge remains accounting_unavailable, exactly as before ring factoring.
     ring_charge_fault_context fault_context { &ledger };
     auto charge_fault_accounting = accounting;
@@ -5326,7 +5782,7 @@ static void test_cuda_ring() {
         }
     }
     if (!device) {
-        fprintf(stderr, "FAIL: no GPU backend for F3.1 CUDA synthetic gate\n");
+        fprintf(stderr, "FAIL: no GPU backend for VBR streaming CUDA synthetic gate\n");
         failures++;
         return;
     }
@@ -5463,6 +5919,7 @@ int main(int argc, char ** argv) {
         benchmark_fragmented_range_packing();
         return failures == 0 ? 0 : 1;
     }
+    test_exact_capture_pretransfer_quote();
     test_attention_stem_prefix_planner();
     test_segment_chain_offsets();
     test_authenticated_range_tree();
@@ -5488,7 +5945,7 @@ int main(int argc, char ** argv) {
         test_cuda_ring();
     }
     if (failures != 0) {
-        fprintf(stderr, "%d F3.1 capture test(s) failed\n", failures);
+        fprintf(stderr, "%d VBR streaming capture test(s) failed\n", failures);
         return 1;
     }
     printf("VBR artifact capture: PASS\n");

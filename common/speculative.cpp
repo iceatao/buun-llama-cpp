@@ -11,6 +11,7 @@
 #include "suffix-tree.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-io.h"
 
 #include <algorithm>
 #include <cassert>
@@ -3776,13 +3777,14 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     int ring_write_pos = 0;    // next write slot (0..RING_SIZE-1)
     int ring_filled = 0;       // how many valid slots (0..RING_SIZE)
     int committed_len = 0;     // total tokens committed (unbounded counter)
+    uint64_t ring_mutation_epoch = 1;
     bool prefill_flushed = false; // true if flush_prefill() was called during this request
 
     // Interleaved cross-attention buffer — rebuilt from ring on each draft call
     // Only holds ctx_window tokens worth of data
     std::vector<float> cross_buf;
 
-    // A2: sliding window limit for drafter context (0 = unlimited)
+    // Sliding-window limit for the drafter context (0 = unlimited).
     static constexpr int ctx_window = LLAMA_DFLASH_PER_SLOT_CTX;
 
     // GPU cross-attention ring (nullptr = CPU fallback)
@@ -3998,58 +4000,108 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                (size_t)n_entries * n_embd * sizeof(float) * n_target_layers;
     }
 
-    void ring_state_save(uint8_t * buf, size_t size) const {
-        // materialize the host mirror if D2D staged writes bypassed it (logically
-        // const: the ring contents don't change, only where they are readable from)
-        const_cast<common_speculative_impl_dflash *>(this)->sync_cpu_ring_from_gpu();
-        int n_entries = std::min(ring_filled, RING_SIZE);
-        size_t expected = 6 * sizeof(int32_t) +
-                          (size_t)n_entries * n_embd * sizeof(float) * n_target_layers;
-        if (size < expected) return;
-
-        int32_t * hdr = (int32_t *)buf;
-        hdr[0] = ring_write_pos;
-        hdr[1] = ring_filled;
-        hdr[2] = committed_len;
-        hdr[3] = n_target_layers;
-        hdr[4] = n_embd;
-        hdr[5] = n_entries;
-
-        uint8_t * dst = buf + 6 * sizeof(int32_t);
-        size_t layer_bytes = (size_t)n_entries * n_embd * sizeof(float);
-
-        for (int l = 0; l < n_target_layers; ++l) {
-            memcpy(dst, ring_buf[l].data(), layer_bytes);
-            dst += layer_bytes;
+    template <typename Sink>
+    bool ring_state_emit(Sink && sink) const {
+        auto * self = const_cast<common_speculative_impl_dflash *>(this);
+        const int n_entries = std::min(ring_filled, RING_SIZE);
+        const int32_t header[6] = {
+            ring_write_pos, ring_filled, committed_len,
+            n_target_layers, n_embd, n_entries,
+        };
+        if (!sink(reinterpret_cast<const uint8_t *>(header), sizeof(header))) {
+            return false;
         }
+        constexpr size_t MAX_QUANTUM = 1u << 20;
+        const size_t layer_bytes = size_t(n_entries)*n_embd*sizeof(float);
+        const int stale_entries = cpu_ring_stale && gpu_ring_handle
+            ? std::min({ ring_filled, ctx_window, staged_since_sync })
+            : 0;
+        if (stale_entries > 0) {
+            self->sync_tmp.resize(size_t(stale_entries)*n_embd);
+        }
+        const int gpu_pos = stale_entries > 0
+            ? ((ring_write_pos-stale_entries)%ctx_window+ctx_window)%ctx_window
+            : 0;
+        for (int l = 0; l < n_target_layers; ++l) {
+            // Materialize and emit one layer at a time. The chain writer
+            // checks cancellation at each <=1 MiB write, so request arrival
+            // never waits for a whole multi-layer ring image to be rebuilt
+            // before the provider can yield.
+            if (stale_entries > 0) {
+                if (!llama_dflash_cross_ring_gpu_read(
+                        gpu_ring_handle, l, gpu_pos,
+                        self->sync_tmp.data(), stale_entries, n_embd)) {
+                    return false;
+                }
+                for (int t = 0; t < stale_entries; ++t) {
+                    const int cpu_slot =
+                        (ring_write_pos-stale_entries+t+RING_SIZE)%RING_SIZE;
+                    memcpy(
+                        self->ring_buf[l].data()+size_t(cpu_slot)*n_embd,
+                        self->sync_tmp.data()+size_t(t)*n_embd,
+                        size_t(n_embd)*sizeof(float));
+                }
+            }
+            const auto * src = reinterpret_cast<const uint8_t *>(
+                ring_buf[l].data());
+            for (size_t offset = 0; offset < layer_bytes;) {
+                const size_t quantum = std::min(
+                    MAX_QUANTUM, layer_bytes-offset);
+                if (!sink(src+offset, quantum)) {
+                    return false;
+                }
+                offset += quantum;
+            }
+        }
+        if (stale_entries > 0 || (cpu_ring_stale && gpu_ring_handle)) {
+            self->cpu_ring_stale = false;
+            self->staged_since_sync = 0;
+        }
+        return true;
+    }
+
+    void ring_state_save(uint8_t * buf, size_t size) const {
+        const size_t expected = ring_state_size();
+        if (!buf || size < expected) {
+            return;
+        }
+        size_t offset = 0;
+        const bool emitted = ring_state_emit(
+            [&](const uint8_t * data, size_t n) {
+                if (n > size-offset) {
+                    return false;
+                }
+                memcpy(buf+offset, data, n);
+                offset += n;
+                return true;
+            });
+        GGML_ASSERT(!emitted || offset == expected);
+    }
+
+    bool ring_state_write(llama_io_write_i & output) const {
+        const size_t before = output.n_bytes();
+        if (!ring_state_emit([&](const uint8_t * data, size_t n) {
+                output.write(data, n);
+                return true;
+            })) {
+            return false;
+        }
+        return output.n_bytes() >= before &&
+            output.n_bytes()-before == ring_state_size();
     }
 
     bool ring_state_load(const uint8_t * buf, size_t size) {
-        if (size < 6 * sizeof(int32_t)) return false;
-
-        const int32_t * hdr = (const int32_t *)buf;
-        int saved_write_pos = hdr[0];
-        int saved_filled    = hdr[1];
-        int saved_committed = hdr[2];
-        int saved_layers    = hdr[3];
-        int saved_embd      = hdr[4];
-        int saved_entries    = hdr[5];
-
-        if (saved_layers != n_target_layers || saved_embd != n_embd) {
-            LOG_WRN("dflash: ring state mismatch: layers %d/%d, embd %d/%d\n",
-                    saved_layers, n_target_layers, saved_embd, n_embd);
-            return false;
-        }
-
-        if (saved_write_pos < 0 || saved_write_pos >= RING_SIZE ||
-            saved_filled < 0 || saved_entries < 0 || saved_entries > RING_SIZE) {
-            LOG_WRN("dflash: ring state corrupt: write_pos=%d, filled=%d, entries=%d\n",
-                    saved_write_pos, saved_filled, saved_entries);
+        int saved_write_pos = 0;
+        int saved_filled = 0;
+        int saved_committed = 0;
+        int saved_entries = 0;
+        if (!ring_state_header(
+                buf, size, saved_write_pos, saved_filled,
+                saved_committed, saved_entries)) {
             return false;
         }
 
         size_t layer_bytes = (size_t)saved_entries * n_embd * sizeof(float);
-        if (size < 6 * sizeof(int32_t) + layer_bytes * n_target_layers) return false;
 
         ring_write_pos = saved_write_pos;
         ring_filled    = saved_filled;
@@ -4084,7 +4136,219 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
         // restored ring contents are new to the projected cache — force cold refill
         crosskv_projected_len = 0;
+        cpu_ring_stale = false;
+        staged_since_sync = 0;
 
+        bump_ring_mutation_epoch();
+
+        return true;
+    }
+
+    bool ring_state_read(llama_io_read_i & input, size_t size) {
+        constexpr size_t HEADER_BYTES = 6*sizeof(int32_t);
+        constexpr size_t MAX_QUANTUM = size_t(1) << 20;
+        if (size < HEADER_BYTES) {
+            return false;
+        }
+
+        const size_t before = input.n_bytes();
+        int32_t header[6] = {};
+        input.read(header, sizeof(header));
+
+        int saved_write_pos = 0;
+        int saved_filled = 0;
+        int saved_committed = 0;
+        int saved_entries = 0;
+        if (!ring_state_header_values(
+                header, size, saved_write_pos, saved_filled,
+                saved_committed, saved_entries)) {
+            return false;
+        }
+
+        const size_t row_bytes = size_t(n_embd)*sizeof(float);
+        if (row_bytes == 0 || row_bytes > MAX_QUANTUM) {
+            return false;
+        }
+        const size_t layer_bytes = size_t(saved_entries)*row_bytes;
+        for (int l = 0; l < n_target_layers; ++l) {
+            auto * destination = reinterpret_cast<uint8_t *>(
+                ring_buf[l].data());
+            for (size_t offset = 0; offset < layer_bytes;) {
+                const size_t quantum = std::min(
+                    MAX_QUANTUM, layer_bytes-offset);
+                input.read(destination+offset, quantum);
+                offset += quantum;
+            }
+        }
+        if (input.n_bytes() < before || input.n_bytes()-before != size) {
+            return false;
+        }
+
+        ring_write_pos = saved_write_pos;
+        ring_filled = saved_filled;
+        committed_len = saved_committed;
+
+        // Keep both the host read and each backend upload bounded to 1 MiB.
+        // A row is indivisible for the backend API, so reject an unsupported
+        // geometry rather than silently issuing an oversized operation.
+        if (gpu_ring_handle) {
+            const int gpu_entries = std::min(ring_filled, ctx_window);
+            const int max_chunk_entries = std::max<int>(
+                1, int(MAX_QUANTUM/row_bytes));
+            std::vector<float> tmp(
+                size_t(std::min(gpu_entries, max_chunk_entries))*n_embd);
+            const int gpu_begin =
+                ((ring_write_pos-gpu_entries)%ctx_window+ctx_window)%ctx_window;
+            for (int l = 0; l < n_target_layers; ++l) {
+                for (int first = 0; first < gpu_entries;
+                        first += max_chunk_entries) {
+                    const int count = std::min(
+                        max_chunk_entries, gpu_entries-first);
+                    for (int t = 0; t < count; ++t) {
+                        const int cpu_slot =
+                            (ring_write_pos-gpu_entries+first+t+RING_SIZE)%
+                            RING_SIZE;
+                        memcpy(
+                            tmp.data()+size_t(t)*n_embd,
+                            ring_buf[l].data()+size_t(cpu_slot)*n_embd,
+                            row_bytes);
+                    }
+                    llama_dflash_cross_ring_gpu_write(
+                        gpu_ring_handle, l,
+                        (gpu_begin+first)%ctx_window,
+                        tmp.data(), count, n_embd);
+                }
+            }
+        }
+
+        prefill_flushed = true;
+        cpu_ring_stale = false;
+        staged_since_sync = 0;
+        crosskv_projected_len = 0;
+        bump_ring_mutation_epoch();
+        return true;
+    }
+
+    bool ring_state_header(
+            const uint8_t * buf,
+            size_t size,
+            int & saved_write_pos,
+            int & saved_filled,
+            int & saved_committed,
+            int & saved_entries) const {
+        if (!buf || size < 6 * sizeof(int32_t)) {
+            return false;
+        }
+        const int32_t * hdr = reinterpret_cast<const int32_t *>(buf);
+        return ring_state_header_values(
+            hdr, size, saved_write_pos, saved_filled,
+            saved_committed, saved_entries);
+    }
+
+    bool ring_state_header_values(
+            const int32_t * hdr,
+            size_t size,
+            int & saved_write_pos,
+            int & saved_filled,
+            int & saved_committed,
+            int & saved_entries) const {
+        if (!hdr || size < 6*sizeof(int32_t)) {
+            return false;
+        }
+        saved_write_pos = hdr[0];
+        saved_filled = hdr[1];
+        saved_committed = hdr[2];
+        const int saved_layers = hdr[3];
+        const int saved_embd = hdr[4];
+        saved_entries = hdr[5];
+        if (saved_layers != n_target_layers || saved_embd != n_embd ||
+            saved_write_pos < 0 || saved_write_pos >= RING_SIZE ||
+            saved_filled < 0 || saved_filled > RING_SIZE ||
+            saved_entries < 0 || saved_entries > RING_SIZE ||
+            saved_entries != std::min(saved_filled, RING_SIZE) ||
+            saved_committed <= 0 || saved_filled > saved_committed) {
+            return false;
+        }
+        const size_t rows = size_t(saved_entries);
+        const size_t columns = size_t(n_embd);
+        const size_t layers = size_t(n_target_layers);
+        if (columns != 0 && rows > SIZE_MAX/columns) {
+            return false;
+        }
+        const size_t values = rows*columns;
+        if (values > SIZE_MAX/sizeof(float) ||
+            (layers != 0 && values*sizeof(float) >
+                (SIZE_MAX-6*sizeof(int32_t))/layers)) {
+            return false;
+        }
+        return size == 6*sizeof(int32_t)+
+            values*sizeof(float)*layers;
+    }
+
+    bool ring_state_matches_frontier(
+            const uint8_t * buf,
+            size_t size,
+            llama_pos expected_terminal) const {
+        int saved_write_pos = 0;
+        int saved_filled = 0;
+        int saved_committed = 0;
+        int saved_entries = 0;
+        return expected_terminal >= 0 &&
+            ring_state_header(
+                buf, size, saved_write_pos, saved_filled,
+                saved_committed, saved_entries) &&
+            int64_t(saved_committed) == int64_t(expected_terminal)+1;
+    }
+
+    bool ring_state_serialized_size(
+            const uint8_t * buf,
+            size_t available,
+            size_t & serialized_size) const {
+        serialized_size = 0;
+        if (!buf || available < 6*sizeof(int32_t)) {
+            return false;
+        }
+        const auto * hdr = reinterpret_cast<const int32_t *>(buf);
+        const int saved_entries = hdr[5];
+        if (saved_entries < 0 || saved_entries > RING_SIZE) {
+            return false;
+        }
+        const size_t rows = size_t(saved_entries);
+        const size_t columns = size_t(n_embd);
+        const size_t layers = size_t(n_target_layers);
+        if (columns != 0 && rows > SIZE_MAX/columns) {
+            return false;
+        }
+        const size_t values = rows*columns;
+        if (values > SIZE_MAX/sizeof(float) ||
+            (layers != 0 && values*sizeof(float) >
+                (SIZE_MAX-6*sizeof(int32_t))/layers)) {
+            return false;
+        }
+        const size_t exact = 6*sizeof(int32_t)+
+            values*sizeof(float)*layers;
+        if (exact > available) {
+            return false;
+        }
+        int saved_write_pos = 0;
+        int saved_filled = 0;
+        int saved_committed = 0;
+        int checked_entries = 0;
+        if (!ring_state_header(
+                buf, exact, saved_write_pos, saved_filled,
+                saved_committed, checked_entries)) {
+            return false;
+        }
+        serialized_size = exact;
+        return true;
+    }
+
+    bool ring_state_terminal(llama_pos & terminal) const {
+        terminal = -1;
+        if (committed_len <= 0) {
+            return false;
+        }
+        terminal = llama_pos(committed_len-1);
         return true;
     }
 
@@ -4093,11 +4357,26 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     }
 
     void ring_state_reset() {
+        const bool changed = ring_write_pos != 0 || ring_filled != 0 ||
+            committed_len != 0 || prefill_flushed || cpu_ring_stale ||
+            staged_since_sync != 0;
         ring_write_pos = 0;
         ring_filled = 0;
         committed_len = 0;
         crosskv_projected_len = 0;
         prefill_flushed = false;
+        cpu_ring_stale = false;
+        staged_since_sync = 0;
+        if (changed) {
+            bump_ring_mutation_epoch();
+        }
+    }
+
+    void ring_state_currency(
+            common_speculative_ring_state_currency & output) const {
+        output.serialized_bytes = ring_state_size();
+        output.terminal = committed_len > 0 ? llama_pos(committed_len-1) : -1;
+        output.mutation_epoch = ring_mutation_epoch;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -4470,6 +4749,14 @@ private:
         }
         ring_write_pos = (ring_write_pos + n_tokens) % RING_SIZE;
         ring_filled = std::min(ring_filled + n_tokens, RING_SIZE);
+        bump_ring_mutation_epoch();
+    }
+
+    void bump_ring_mutation_epoch() {
+        ++ring_mutation_epoch;
+        if (ring_mutation_epoch == 0) {
+            ring_mutation_epoch = 1;
+        }
     }
 
     // Rebuild the host ring mirror from the GPU ring (only the cross window is GPU-
@@ -5823,6 +6110,28 @@ void common_speculative_ring_state_save(const common_speculative * spec, uint8_t
     }
 }
 
+bool common_speculative_ring_state_write(
+        const common_speculative * spec,
+        llama_io_write_i & output) {
+    if (spec == nullptr) {
+        return false;
+    }
+    size_t written = 0;
+    for (const auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            continue;
+        }
+        const auto * dfl = static_cast<
+            const common_speculative_impl_dflash *>(impl.get());
+        const size_t before = output.n_bytes();
+        if (!dfl->ring_state_write(output) || output.n_bytes() < before) {
+            return false;
+        }
+        written += output.n_bytes()-before;
+    }
+    return written != 0;
+}
+
 bool common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size) {
     if (spec == nullptr) return false;
     for (auto & impl : spec->impls) {
@@ -5833,6 +6142,125 @@ bool common_speculative_ring_state_load(common_speculative * spec, const uint8_t
         }
     }
     return false;
+}
+
+bool common_speculative_ring_state_read(
+        common_speculative * spec,
+        llama_io_read_i & input,
+        size_t size) {
+    if (spec == nullptr || size == 0) {
+        return false;
+    }
+    common_speculative_impl_dflash * selected = nullptr;
+    for (auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            continue;
+        }
+        // The contiguous load API has always selected one DFlash image. Keep
+        // the streaming authority equally narrow instead of ambiguously
+        // partitioning a single companion across multiple implementations.
+        if (selected != nullptr) {
+            return false;
+        }
+        selected = static_cast<common_speculative_impl_dflash *>(impl.get());
+    }
+    return selected && selected->ring_state_read(input, size);
+}
+
+bool common_speculative_ring_state_get_currency(
+        const common_speculative * spec,
+        common_speculative_ring_state_currency & output) {
+    output = {};
+    output.terminal = -1;
+    if (spec == nullptr) {
+        return false;
+    }
+    const common_speculative_impl_dflash * selected = nullptr;
+    for (const auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            continue;
+        }
+        if (selected != nullptr) {
+            return false;
+        }
+        selected = static_cast<const common_speculative_impl_dflash *>(
+            impl.get());
+    }
+    if (!selected) {
+        return false;
+    }
+    selected->ring_state_currency(output);
+    return output.mutation_epoch != 0;
+}
+
+bool common_speculative_ring_state_matches_frontier(
+        const common_speculative * spec,
+        const uint8_t * buf,
+        size_t size,
+        llama_pos expected_terminal) {
+    if (spec == nullptr || buf == nullptr || size == 0) {
+        return false;
+    }
+    size_t matched = 0;
+    for (const auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            continue;
+        }
+        const auto * dfl = static_cast<
+            const common_speculative_impl_dflash *>(impl.get());
+        size_t impl_size = 0;
+        if (!dfl->ring_state_serialized_size(
+                buf+matched, size-matched, impl_size) ||
+            impl_size == 0 ||
+            !dfl->ring_state_matches_frontier(
+                buf+matched, impl_size, expected_terminal)) {
+            return false;
+        }
+        matched += impl_size;
+    }
+    return matched != 0 && matched == size;
+}
+
+bool common_speculative_ring_state_terminal(
+        const common_speculative * spec,
+        llama_pos & terminal) {
+    terminal = -1;
+    if (spec == nullptr) {
+        return false;
+    }
+    bool found = false;
+    for (const auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            continue;
+        }
+        llama_pos one = -1;
+        if (!static_cast<const common_speculative_impl_dflash *>(impl.get())->
+                ring_state_terminal(one) ||
+            (found && one != terminal)) {
+            terminal = -1;
+            return false;
+        }
+        terminal = one;
+        found = true;
+    }
+    return found;
+}
+
+bool common_speculative_ring_state_serialized_terminal(
+        const uint8_t * buf,
+        size_t size,
+        llama_pos & terminal) {
+    terminal = -1;
+    if (!buf || size < 6*sizeof(int32_t)) {
+        return false;
+    }
+    int32_t committed = 0;
+    std::memcpy(&committed, buf+2*sizeof(int32_t), sizeof(committed));
+    if (committed <= 0) {
+        return false;
+    }
+    terminal = llama_pos(committed-1);
+    return true;
 }
 
 bool common_speculative_ring_state_empty(const common_speculative * spec) {

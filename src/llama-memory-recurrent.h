@@ -76,6 +76,11 @@ public:
     // cell management for speculative decoding checkpoint/restore
     void copy_cell(int32_t i_src, int32_t i_dst);
     int  get_cell_count(llama_seq_id seq_id) const;
+    bool vbr_capture_readiness_cells(
+            uint64_t logical_growth,
+            uint64_t & committed,
+            uint64_t & projected,
+            uint64_t & capacity) const override;
 
     bool expand(uint32_t new_mem_size);
     bool shrink(uint32_t new_mem_size);

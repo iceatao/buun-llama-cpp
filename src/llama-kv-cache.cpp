@@ -34,7 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
-// Dynamic VBR (S3): degrade tier ladder + the measured price order (generated table).
+// Dynamic-VBR degrade tier ladder and measured price order (generated table).
 enum vbr_tier : uint8_t {
     VBR_TIER_T8,
     VBR_TIER_T4,
@@ -1236,7 +1236,7 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // Dynamic VBR S2 (option C): back the KV context with a VMM pool — one VA reservation, each
+    // Back the dynamic-VBR KV context with a VMM pool: one VA reservation, each
     // (layer,side) tensor at a fixed page-aligned offset sized for the MAX tier (F16 x kv_size),
     // physical pages mapped on demand as occupancy grows (vbr_vmm_ensure_mapped). Tier degrades
     // then shrink a tensor in place and unmap its tail; freed pages are fungible across tensors,
@@ -1573,8 +1573,8 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // Dynamic VBR (M2): record per-(layer,side) descriptors over the just-placed KV tensors.
-    // Pure bookkeeping — allocation behavior above is unchanged (bit-identical decode). M3 uses
+    // Record per-(layer,side) dynamic-VBR descriptors over the just-placed KV tensors.
+    // Pure bookkeeping: allocation behavior above is unchanged. The runtime controller uses
     // these to transcode a tensor down a tier in place and return the freed bytes to the pool.
     if ((vbr_layer_policy.enabled || is_turbo) && !hparams.no_alloc) {
         // Per-pool tensor instances: a tensor placed in a plain device buffer is its own (single)
@@ -1609,7 +1609,7 @@ llama_kv_cache::llama_kv_cache(
                         p.buf  = inst->buffer;
                         p.base = (char *) ggml_backend_buffer_get_base(inst->buffer);
                         p.size = ggml_backend_buffer_get_size(inst->buffer);
-                        // #88: even bookkeeping-only (static, non-VMM) pools need the backend
+                        // Even bookkeeping-only (static, non-VMM) pools need the backend
                         // vtable + device ordinal for the boundary-time dequant-scratch reserve.
                         // inst is always a simple (non-meta) buffer here, so the resolver
                         // returns 0 or 1 entries; empty (no turbo support) leaves be null and
@@ -1656,7 +1656,7 @@ llama_kv_cache::llama_kv_cache(
             record(layers[ikv].v, ikv, true);
         }
         // Rotation matrices are model constants placed in a KV buffer; include them in the owning
-        // pool's high-water so the free region [used, size) never overlaps them (M3/M4 reuse safety).
+        // pool's high-water so the free region [used, size) never overlaps them.
         for (ggml_tensor * rt : { turbo_rotation, turbo_rotation_inv }) {
             for (ggml_tensor * inst : tensor_instances(rt)) {
                 vbr_pool * p = vbr_pool_of(inst);
@@ -1690,7 +1690,7 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
         }
-        // S3/S4: arm the decode-time degrade controller (VMM mode only). Inputs come from
+        // Arm the decode-time degrade controller (VMM mode only). Inputs come from
         // cparams (llama_memory_vbr_params, threaded through create_memory): budget_bytes is
         // either the explicit --vbr-vram value or the fit pass's auto budget; min_bits is the
         // --vbr-floor aggregate clamp (see vbr_floor_clamp_order). VBR_BUDGET_MIB / VBR_MIN_BITS
@@ -1731,13 +1731,14 @@ llama_kv_cache::llama_kv_cache(
                 vbr_budget_bytes_    = (size_t) strtoull(env, nullptr, 10) * 1024 * 1024;
                 vbr_budget_explicit_ = true; // forced-budget instrumentation must never grow
             }
-            // WS-0 (P1): deterministic freeze — TEST/GATING ONLY (see header). Read after the budget
+            // Deterministic freeze is test/gating only (see header). Read after the budget
             // is final so the explicit-budget precondition is decided. Skips the vbr_budget_eff live
             // clamp + the ledger; a fixed budget + no clamp makes degrade waves a pure function of
             // occupancy (deterministic "scripted" waves). No effect on any production run.
             vbr_freeze_ = turbo_vbr_env_enabled("VBR_FREEZE");
-            vbr_f5_preserve_empty_tiers_ = vbr_freeze_ &&
-                turbo_vbr_env_enabled("VBR_F5_PRESERVE_EMPTY_TIERS");
+            const bool preserve_empty_tiers =
+                turbo_vbr_env_enabled("VBR_FREEZE_PRESERVE_EMPTY_TIERS");
+            vbr_freeze_preserve_empty_tiers_ = vbr_freeze_ && preserve_empty_tiers;
             if (vbr_freeze_) {
                 LLAMA_LOG_INFO("%s: VBR_FREEZE active — live-VRAM clamp + ledger disabled "
                         "(deterministic tier schedule; test/gating only)\n", __func__);
@@ -1746,15 +1747,15 @@ llama_kv_cache::llama_kv_cache(
                             "re-derivation reads live free VRAM and is NOT frozen; set VBR_BUDGET_MIB\n",
                             __func__);
                 }
-                if (vbr_f5_preserve_empty_tiers_) {
-                    LLAMA_LOG_WARN("%s: VBR_F5_PRESERVE_EMPTY_TIERS active — "
+                if (vbr_freeze_preserve_empty_tiers_) {
+                    LLAMA_LOG_WARN("%s: VBR_FREEZE_PRESERVE_EMPTY_TIERS active — "
                             "empty boundaries retain the current tier vector "
-                            "(F5 gate only)\n", __func__);
+                            "(deterministic freeze testing only)\n", __func__);
                 }
             }
-            // WS-0 (P1) schedule-trace recorder (test/gating only): open the sink if requested.
+            // Test-only schedule trace recorder: open the sink if requested.
             if (const char * tp = turbo_vbr_getenv("VBR_TRACE")) {
-                // per-child suffix (Sol F2): iSWA base/SWA caches must not both truncate the same
+                // Per-child suffix: iSWA base/SWA caches must not both truncate the same
                 // path. Standalone caches (trace_label == nullptr) keep the bare path unchanged.
                 std::string trace_path = tp;
                 if (vbr_params_.trace_label != nullptr) {
@@ -1882,7 +1883,7 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
 
-            // Revision-9 A1 construction-final arming. This is shadow-only dual-write storage:
+            // Generation-tracker construction-final arming. This is shadow-only dual-write storage:
             // current checkpoint selection still reads the legacy epoch exclusively. Allocate
             // only after the effective budget is final, so an unarmed/static cache is byte-for-
             // byte and allocation-for-allocation unchanged.
@@ -1890,10 +1891,10 @@ llama_kv_cache::llama_kv_cache(
                 vbr_generation_ = std::make_unique<vbr_generation_tracker>(
                         n_stream, kv_size, static_cast<uint32_t>(layers.size() * 2));
                 vbr_capture_unit_leases_.resize(layers.size() * 2);
-                // F4.0 has no capture/import refusal surface yet. Keep construction fail-closed;
-                // F4.1 will route unavailable durable lineage into its typed refusal path.
+                // Keep construction fail-closed; unavailable durable lineage
+                // is routed through the typed import-refusal path.
                 GGML_ASSERT(vbr_generation_->active());
-                // A2 dual-view ownership index (D-A2-1v2): physical masks for enumeration +
+                // Dual-view ownership index: physical masks for enumeration plus
                 // per-active-seq logical-position order statistic for scan-free exact rank.
                 vbr_ownership_ = std::make_unique<vbr_ownership_index>(
                         n_stream, static_cast<uint32_t>(seq_to_stream.size()), kv_size);
@@ -2016,7 +2017,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
-    // vbr_trace_fp_ closes itself (RAII unique_ptr, Sol review F5)
+    // vbr_trace_fp_ closes itself through its RAII unique_ptr.
     // Normally the enclosing llama_context's detach guard clears these while this context's
     // compute backends are still alive. Keep RAII cleanup for direct construction and for a
     // cache constructor that throws after registering with its owner.
@@ -2024,7 +2025,7 @@ llama_kv_cache::~llama_kv_cache() {
 
     for (auto & p : vbr_pools_) {
         if (p.backend != nullptr) {
-            // S5: a degrade wave may still be in flight on the side stream — it must finish before
+            // A degrade wave may still be in flight on the side stream; it must finish before
             // the stash buffer / VMM VA it touches are torn down. The queued tail unmaps are moot
             // here (vmm_pool_free unmaps every chunk).
             ggml_backend_synchronize(p.backend);
@@ -2049,7 +2050,7 @@ llama_kv_cache::~llama_kv_cache() {
             p.vmm = nullptr;
         }
     }
-    // TQ2: retire the imported-live accounting receipt only after the mapped
+    // Retire the imported-live accounting receipt only after the mapped
     // target ranges are no longer live. Never create a release-first window.
     vbr_import_receipts_release();
 }
@@ -2203,7 +2204,7 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
-        // S5: settle any in-flight degrade wave first — its transcode/scrub writes must not race
+        // Settle any in-flight degrade wave first; its transcode/scrub writes must not race
         // the memsets below, and the queued tail unmaps must land before pages are re-zeroed
         if (vbr_vmm_active()) {
             vbr_flush_deferred_unmaps();
@@ -2300,9 +2301,9 @@ bool llama_kv_cache::seq_rm_impl(
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    // A2 operation scope: authenticated (sequence_edit, seq, [p0,p1)). Generic seq_rm remains
+    // VBR mutation scope: authenticated (sequence_edit, seq, [p0,p1)). Generic seq_rm remains
     // membership-only state_api (not provenance-bearing); the destructive §7.5 classes arrive
-    // with the classed server paths in the A2 coordinator commit.
+    // with the classed server paths in the mutation coordinator commit.
     const bool commit = mode != seq_rm_mode::dry_run;
     vbr_mutation_op mutation_op(commit ? this : nullptr, vbr_operation_kind::sequence_edit,
             vbr_operation_class::state_api, seq_id, p0, p1);
@@ -2403,7 +2404,11 @@ bool llama_kv_cache::seq_rm_impl(
     }
 
     if (mode == seq_rm_mode::public_commit && changed) {
-        vbr_attention_content_changed();
+        if (seq_id >= 0) {
+            vbr_attention_content_changed(seq_id);
+        } else {
+            vbr_attention_content_changed();
+        }
     }
     if (commit) {
         vbr_import_receipts_release_if_empty();
@@ -2436,9 +2441,9 @@ void llama_kv_cache::seq_cp_impl(
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
 
-    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
+    vbr_normalize_edit_range(p0, p1);  // Canonical range before the scope.
 
-    // A2 operation scope. Cross-stream copies additionally reserve recovery + carry the
+    // VBR mutation scope. Cross-stream copies additionally reserve recovery and carry the
     // source-stability token; that wiring rides the sc_info pending owner below.
     vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
             vbr_operation_class::state_api, seq_id_dst, p0, p1);
@@ -2475,7 +2480,7 @@ void llama_kv_cache::seq_cp_impl(
         }
 
         if (publish_lineage && changed) {
-            vbr_attention_content_changed();
+            vbr_attention_content_changed(seq_id_dst);
         }
 
         return;
@@ -2483,12 +2488,12 @@ void llama_kv_cache::seq_cp_impl(
 
     // cross-stream sequence copies require to copy the actual buffer data
 
-    // A2: the deferred-copy fence (pending owner through stream_copy_info, commit at byte-copy
+    // Deferred-copy fence (pending owner through stream_copy_info, commit at byte-copy
     // completion) is NOT implemented — it is structurally unreachable because armed VBR
     // requires n_stream == 1. Fail loudly if that invariant ever breaks rather than let a
     // cross-stream copy close its operation before bytes land (design finding R3-4).
     GGML_ASSERT(vbr_generation_tracker_mut() == nullptr &&
-                "cross-stream seq_cp under armed VBR requires the A2 pending-owner fence");
+                "cross-stream seq_cp under armed VBR requires the pending-owner fence");
 
     bool is_full = true;
 
@@ -2548,7 +2553,7 @@ void llama_kv_cache::seq_cp_impl(
     v_heads[s1] = v_heads[s0];
 
     if (publish_lineage && changed) {
-        vbr_attention_content_changed();
+        vbr_attention_content_changed(seq_id_dst);
     }
 
     //for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2562,8 +2567,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
-    // A2 operation scope: whole-range membership edit. The manifest declares the SEQ
-    // WILDCARD (P1v2): keep removes membership from every sequence EXCEPT the kept one, so
+    // VBR mutation scope: whole-range membership edit. The manifest declares the sequence.
+    // Wildcard: keep removes membership from every sequence except the kept one, so
     // per-cell stamps carry whichever sequence remains (or none) — a single-seq claim would
     // be a false declaration.
     vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
@@ -2581,11 +2586,17 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     uint32_t new_head = cells.size();
     bool changed_any = false;
+    std::array<bool, LLAMA_MAX_SEQ> changed_sequences = {};
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         const bool changed = !cells.is_empty(i) && (!cells.seq_has(i, seq_id) || cells.seq_count(i) > 1);
         changed_any = changed_any || changed;
         if (changed) {
+            for (llama_seq_id removed = 0; removed < LLAMA_MAX_SEQ; ++removed) {
+                if (removed != seq_id && cells.seq_has(i, removed)) {
+                    changed_sequences[size_t(removed)] = true;
+                }
+            }
             vbr_ownership_update_all_seqs(stream, i, cells.pos_get(i), /*add=*/false,
                                           /*exclude_seq=*/seq_id);
         }
@@ -2608,7 +2619,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         head = new_head;
     }
     if (changed_any) {
-        vbr_attention_content_changed();
+        vbr_attention_content_changed(changed_sequences);
     }
 }
 
@@ -2624,8 +2635,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     const uint32_t stream = seq_to_stream[seq_id];
     auto & cells = v_cells[stream];
     auto & head  = v_heads[stream];
-    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
-    // A2 operation scope: position shift is a dependency-changing edit over [p0,p1).
+    vbr_normalize_edit_range(p0, p1);  // Canonical range before the scope.
+    // VBR mutation scope: position shift is a dependency-changing edit over [p0,p1).
     vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
             vbr_operation_class::state_api, seq_id, p0, p1);
     const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
@@ -2674,7 +2685,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     // Otherwise we just start the next search from the beginning.
     head = new_head != cells.size() ? new_head : 0;
     if (changed) {
-        vbr_attention_content_changed();
+        vbr_attention_content_changed(seq_id);
     }
 }
 
@@ -2689,8 +2700,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
 
     const uint32_t stream = seq_to_stream[seq_id];
     auto & cells = v_cells[stream];
-    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
-    // A2 operation scope: position division is a dependency-changing edit over [p0,p1).
+    vbr_normalize_edit_range(p0, p1);  // Canonical range before the scope.
+    // VBR mutation scope: position division is a dependency-changing edit over [p0,p1).
     vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
             vbr_operation_class::state_api, seq_id, p0, p1);
     const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
@@ -2724,7 +2735,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         }
     }
     if (changed) {
-        vbr_attention_content_changed();
+        vbr_attention_content_changed(seq_id);
     }
 }
 
@@ -2862,7 +2873,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
     GGML_ASSERT(sinfos.size() == ubatches.size());
 
     vbr_runtime_was_over_ = false;
-    // VBR S4 degrade trigger — MUST run at the llama_decode boundary, before any of this batch's
+    // The VBR degrade trigger must run at the llama_decode boundary, before any of this batch's
     // cells are committed. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
     // execution by up to the whole batch — a mid-batch transcode captures positioned-but-unwritten
     // rows as zeros and races graphs built against the old tier. Here slot admission has completed,
@@ -2882,11 +2893,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             root->vbr_ledger_sibling_->vbr_hard_seal_blocked_ = false;
             root->vbr_ledger_sibling_->vbr_hard_seal_evidence_.clear();
         }
-        // S5: release the tail pages queued by the PREVIOUS wave first — their transcodes are long
+        // Release the tail pages queued by the previous wave first; their transcodes are long
         // done (fence-ordered before the previous graph). Must precede this boundary's degrades and
         // ensure_mapped so no later page map can be ripped by a stale queued unmap.
         vbr_flush_deferred_unmaps();
-        // P3 idleness input: a boundary IS decode activity; ticks never write this
+        // A boundary is decode activity for idleness; ticks never write this
         vbr_last_prepare_ns_ = llama_vram_ledger_now_ns();
     }
     // one ubatch token sum serves the budget block and the unified scratch projection below;
@@ -2910,7 +2921,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         static const int32_t  VBR_USED_DELTA   = 512; // occupancy delta below which we're stable
         // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
         // a peer's rename (new claim, offer change) forces the full controller path.
-        // WS-0 (P1) freeze: ledger off (test/gating) — skip so the schedule ignores co-tenant
+        // Freeze mode disables the ledger for deterministic tests, so the schedule ignores co-tenant
         // state; the tree force stays clear and the scan below is skipped too.
         if (!vbr_freeze_) {
             vbr_ledger_precheck();
@@ -2952,7 +2963,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             //    with headroom — old rows keep their degraded quality (re-encoded recon, no
             //    information restored), but FUTURE rows encode at the higher tier.
             if (vbr_degrade_cursor_ > 0 && used_now == 0 &&
-                !vbr_f5_preserve_empty_tiers_) {
+                !vbr_freeze_preserve_empty_tiers_) {
                 vbr_full_reset();
             }
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
@@ -2968,7 +2979,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
             // that owns its tensor, but the cursor is a global price order — advancing it while any
             // pool is over budget is the simplest rule that terminates and preserves the price order.
-            // P3c: pre-loop pressure snapshot — the runtime demand's honest ask is what
+            // Pre-loop pressure snapshot: the runtime demand's honest ask is what
             // this boundary was short BEFORE the own ladder's sacrifice resolved it
             const bool vbr_was_over = vbr_over_budget(wm_next);
             vbr_runtime_was_over_ = vbr_was_over;
@@ -3043,7 +3054,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                         __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
                         p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
             }
-            // P3 runtime-growth demand: the trigger is band-spent AND under pressure THIS
+            // Runtime-growth demand: the trigger is band-spent and under pressure this
             // boundary (pre-own-loop snapshot) — the own loop's exit makes post-loop
             // projected <= budget_eff whenever the sub-band ladder still works, which must
             // not hide the demand (the band is what peers owe; the sub-band walk is the
@@ -3062,7 +3073,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                     return {};
                 }
             }
-            // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
+            // The wave's transcodes/scrubs are queued on each pool's side stream; arm that
             // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
             // to graph build.
             vbr_arm_wave_fences();
@@ -3092,7 +3103,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             // rename-free co-tenant would otherwise never publish its runtime demand and
             // livelock on failing batches
             vbr_tree_force();
-            // Sol F4: this boundary's degrade may already have flipped tiers, so trace it (distinct
+            // This boundary's degrade may already have flipped tiers, so trace it (distinct
             // phase, counter not advanced) instead of silently dropping it under OOM/fault validation.
             vbr_trace_emit("prepare_mapfail", wm_next, used_now);
             return {};
@@ -3106,7 +3117,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         vbr_trace_emit("prepare", wm_next, used_now);
     }
 
-    // #88: grow the fattn f16 dequant scratch to this batch's watermark OUTSIDE the graphs, for
+    // Grow flash-attention f16 dequant scratch to this batch's watermark outside the graphs, for
     // the sides that are dequant-active after the wave above — see vbr_scratch_reserve. Runs for
     // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
     // non-turbo caches have no pools and skip in O(1).
@@ -3256,12 +3267,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<lla
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
-    // C4 (v3.2): this tracker's cache services its pending quarantines at the decode boundary
+    // This tracker's cache services its pending quarantines at the decode boundary
     // — perform the invalidation FIRST, then ack with the token; only the ack reclaims the
     // ring slot. Failures without capabilities resolve here too, keeping the ring live.
     if (auto * tracker = vbr_generation_tracker_mut()) {
         const vbr_controller_instance_id instance = tracker->runtime_instance();
-        vbr_recovery_advance_recorded(instance);  // B3: recorded failures quarantine
+        vbr_recovery_advance_recorded(instance);  // Recorded failures enter quarantine.
         for (;;) {
             auto work = vbr_recovery_take_quarantine(instance);
             if (!work.token) {
@@ -3279,7 +3290,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             }
             GGML_ASSERT(vbr_recovery_ack_quarantine(work.token, instance));
         }
-        // B7/v4-F3 upgraded by P4v2 (v6): monotone re-arm — the tracker owns the whole
+        // Monotone re-arm: the tracker owns the whole
         // availability-creating transition (ring + capacity proof, sanctioned invalidation,
         // monotone clear). Never re-arms in the same pass that latched: the latch path above
         // breaks with an un-acked record that the ring proof still sees.
@@ -3580,11 +3591,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
-    // C1 (v3.1): one decode-kind operation scope per apply_ubatch commit. Recovery is EAGER
+    // One decode-kind operation scope per apply_ubatch commit. Recovery is eager
     // (reserved in the ctor — the wrap class is provenance-bearing); the extents and the
     // reuse EVENT are LAZY — reserved per SELECTED target at the first destructive stamp, so
     // a wrap-free decode pays neither extent traffic nor a destructive event.
-    // P2v2 (v6): the ubatch target scan is ARMED-ONLY — non-VBR decode never pays it — and
+    // The ubatch target scan is armed-only, so non-VBR decode never pays it, and
     // skipped entirely when a composite wrapper already supplied the manifest (adoption).
     const bool decode_armed = commit && vbr_generation_tracker_get() != nullptr;
     const bool wrap_provenance = decode_armed && n_swa != 0;
@@ -3594,7 +3605,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             static_cast<uint16_t>(sinfo.n_stream() == 1 ? sinfo.strm[0] : VBR_STREAM_ANY);
     const vbr_controller_instance_id decode_instance =
             decode_armed ? vbr_instance_id() : vbr_controller_instance_id{};
-    // v4 review F4: seq/range-bound manifest from the actual ubatch; ceiling overflow yields a
+    // Build a sequence/range-bound manifest from the actual ubatch; ceiling overflow yields a
     // zero-target binding, which the registry REFUSES -> fail-closed shadow-unavailable.
     vbr_operation_binding decode_manifest;
     decode_manifest.kind        = vbr_operation_kind::decode;
@@ -3603,15 +3614,15 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         (void) vbr_decode_targets_from_ubatch(decode_manifest, decode_instance,
                                               wrap_provenance, extent_stream, ubatch);
     }
-    // v3.1 amendment 1 (fully applied per v4 review F1): EVERY async decode op reserves
+    // Every asynchronous decode operation reserves
     // recovery eagerly; only the tombstone EXTENTS stay wrap-gated and lazy.
     vbr_mutation_op mutation_op(
             decode_armed ? this : nullptr,
             decode_manifest,
             /*provenance_bearing=*/decode_armed);
     if (decode_armed) {
-        // pre-reserve pending capacity BEFORE any mutation (C1: allocation never follows
-        // apply); geometric growth so the ramp is O(k) copies, not O(k^2). v6-fix F5: the
+        // Pre-reserve pending capacity before any mutation so allocation never follows
+        // apply; geometric growth keeps the ramp O(k), not O(k^2). The
         // awaiting list must absorb EVERY accumulated pending record without allocating —
         // terminal transfer runs inside the decode transaction's noexcept destructor.
         if (vbr_pending_decode_ops_.capacity() == vbr_pending_decode_ops_.size()) {
@@ -3627,6 +3638,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 
     bool reused_occupied_cell = false;
+    std::array<bool, LLAMA_MAX_SEQ> reused_sequences = {};
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const uint32_t stream = sinfo.strm[s];
         auto append_event = decode_armed
@@ -3636,7 +3648,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                     stream,
                     vbr_generation_stamp_kind::dependency)
                 : vbr_generation_event{};
-        std::optional<vbr_generation_event> reuse_event;  // lazily minted at first reuse (C1)
+        std::optional<vbr_generation_event> reuse_event;  // Lazily minted at first reuse.
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
 
@@ -3648,7 +3660,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             llama_pos  prior_pos = -1;
             if (occupied) {
                 if (decode_armed && !reuse_event.has_value()) {
-                    // P1v2 (v6): no eager extent — the destructive stamps below reserve
+                    // No eager extent: the destructive stamps below reserve
                     // per-SELECTED-target extents through the event's trampoline.
                     reuse_event.emplace(vbr_generation_begin(
                             vbr_mutation_registrant::apply_ubatch_occupied_reuse,
@@ -3662,6 +3674,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 prior_pos = pos;
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+                reused_sequences[size_t(seq_id)] = true;
 
                 if (decode_armed && vbr_ownership_) {
                     vbr_ownership_->remove_cell(stream, seq_id, idx, pos);
@@ -3684,6 +3697,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
+                if (occupied) {
+                    reused_sequences[size_t(ubatch.seq_id[i][s])] = true;
+                }
             }
 
             if (decode_armed && vbr_ownership_) {
@@ -3696,7 +3712,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                     occupied ? (reuse_event.has_value() && *reuse_event ? &*reuse_event : nullptr)
                              : (append_event ? &append_event : nullptr);
             if (generation_event != nullptr) {
-                // P1v2 (v6): the stamp proves a covering target for EVERY member of the
+                // The stamp proves a covering target for every member of the
                 // token's sequence set at its pre-mutation position; a refusal poisons the
                 // event, latches the shadow, and fails the operation (via vbr_stamp) — the
                 // decode proceeds untracked.
@@ -3711,7 +3727,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // occupied SWA/ring cell does: the following graph overwrites bytes a checkpoint may still
     // reference, so make that ownership/representation change visible before graph execution.
     if (commit && reused_occupied_cell) {
-        vbr_attention_content_changed();
+        vbr_attention_content_changed(reused_sequences);
     }
 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
@@ -3749,7 +3765,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         vbr_vmm_ensure_mapped();
     }
 
-    // Dynamic VBR M3 anchor self-test (env-gated, runs once). Fires from the 2nd apply_ubatch call so
+    // Dynamic-VBR anchor self-test (environment-gated, runs once). It fires from the second apply_ubatch call so
     // a prior attention has identity-init'd the decode-side InnerQ scales the dequant relies on.
     static const bool vbr_test_env = getenv("VBR_TRANSCODE_TEST") != nullptr; // once, not per ubatch
     if (commit && vbr_test_env) {
@@ -3769,7 +3785,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         }
     }
 
-    // A2 (review F3): the decode operation outlives apply_ubatch — outcome is unknown until
+    // The decode operation outlives apply_ubatch; its outcome is unknown until
     // the graph result. Transfer op + extent + recovery reservation to the pending list;
     // vbr_decode_ops_finish(ok) resolves them at the decode boundary (extent -> submitted on
     // success, promoted to committed at the synchronize fence; everything fails closed on a
@@ -3792,10 +3808,10 @@ void llama_kv_cache::vbr_commit_submitted() {
     if (vbr_awaiting_commit_.empty()) {
         return;
     }
-    // C1/Rev 5.1: the sync fence delivers the TERMINAL result to each pending owner. Commit
+    // The sync fence delivers the terminal result to each pending owner. Commit
     // success closes the operation committed and releases recovery; a failed commit (slab
     // reset / obsolete handle) is counted, latches availability, and closes failed — never a
-    // silent vanish (#10). P1v2 (v6): every per-target handle commits; one failure fails the
+    // silent vanish. Every per-target handle commits; one failure fails the
     // owner and every remaining handle.
     auto * tracker = vbr_generation_tracker_mut();
     for (auto & pending : vbr_awaiting_commit_) {
@@ -3818,7 +3834,7 @@ void llama_kv_cache::vbr_commit_submitted() {
             vbr_recovery_release_unused(pending.recovery_index, pending.operation_id);
         }
         if (pending.composite) {
-            // P3v2 (v6): the sealed aggregate owns the root close — this slot's terminal
+            // The sealed aggregate owns the root close: this slot's terminal
             // result feeds it, failure dominating.
             pending.composite->report_terminal(committed);
         } else if (pending.owns_close) {
@@ -4010,17 +4026,17 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
 size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
     size_t budget_eff = p.budget;
     const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm); // deterministic (pool mapped bytes)
-    // WS-0 (P1) freeze: skip every live-VRAM / co-tenancy input — the live free-VRAM clamp
+    // Freeze mode skips every live-VRAM/co-tenancy input, including the free-VRAM clamp
     // (cudaMemGetInfo), the N_live>1 fair-share relax, and the grant-decrement subtraction — so
     // budget_eff stays the fixed armed budget (still floored at mapped_now below). This clamp is the
     // ONLY live-VRAM path that fires under an explicit budget, so neutralizing it makes both the pp
     // one-shot fit and the tg degrade trajectory a pure function of the fixed budget + occupancy.
-    // OFF => this block runs verbatim, so a freeze-off build is bit-identical (the P0 ratchet).
+    // With freezing off this block runs verbatim, preserving the original behavior.
     if (!vbr_freeze_) {
         const size_t ledger_headroom = llama_vram_headroom_bytes();
         size_t free_b = 0, total_b = 0;
         p.be->get_device_memory(p.device, &free_b, &total_b);
-        // P3 fairness: reserve the ordinary ledger headroom for every live peer. An explicit
+        // Fairness: reserve ordinary ledger headroom for every live peer. An explicit
         // budget's own process instead reserves the (usually larger) fit growth target because it
         // has no auto re-derivation path. At N_live > 1 the budget base also relaxes to a fair
         // share of its own spare — mapped-anchored and 64 MiB-quantized.
@@ -4128,16 +4144,12 @@ void llama_kv_cache::vbr_rederive_budget() {
         size_t reach = vbr_pool_reach(p);
         reach = std::max(reach, p.budget_base); // the armed/fallback value is the floor
         if (reach != p.budget) {
-            LLAMA_LOG_INFO("%s: VBR pool #%zu (device %d) budget re-derived %.2f -> %.2f MiB "
-                    "(headroom %.2f, share %.2f)\n",
-                    __func__, pi, p.device, p.budget/1024.0/1024.0, reach/1024.0/1024.0,
-                    vbr_growth_headroom_/1024.0/1024.0, vbr_params_.device_share);
             p.budget = reach;
         }
     }
 }
 
-// WS-0 (P1) schedule-trace recorder (test/gating only). One line per boundary. The tier vector is
+// Schedule-trace recorder (test/gating only). One line per boundary. The tier vector is
 // the live type of every populated (layer,side) extent across all pools, in a stable pool->ikv->k,v
 // order, folded into an FNV-1a digest; two runs whose (boundary,cursor,digest,wm,used) columns match
 // at every boundary took the identical tier schedule. No effect on the schedule itself.
@@ -4178,11 +4190,11 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
     return false;
 }
 
-// #88: boundary-time f16 dequant scratch reserve. The fattn prefill/materialize paths grow a
+// Boundary-time f16 dequant scratch reserve. The flash-attention prefill/materialize paths grow a
 // per-(device, side) f16 scratch to the flattened attended view implicitly, mid-graph: a
 // context-linear consumer for unified KV and n_kv*stream_span for non-unified KV. The budget
 // does not own it, and it can JUMP from zero to watermark width in a
-// single graph when a degrade wave first takes a side off f16 (the #88 abort: a 217 MiB grow
+// single graph when a degrade wave first takes a side off f16 (a 217 MiB grow
 // with only the 192 MiB live headroom left at wave time). Growing it HERE — sized for the sides
 // that are dequant-active AFTER this boundary's wave — keeps every grow in an eager pass where
 // exhaustion fails the batch recoverably. Sides that never leave f16 never reserve a byte, so
@@ -4327,7 +4339,7 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
 
 void llama_kv_cache::vbr_vmm_ensure_mapped() {
     // the coming graph's writes land on positioned cells below the watermark; reads pad up to it.
-    // NOTE: the S4 degrade trigger deliberately does NOT live here — apply_ubatch runs mid-batch
+    // The degrade trigger deliberately does not live here: apply_ubatch runs mid-batch
     // where positioned cells outrun the graph writes (see prepare()). prepare() already mapped to
     // its predicted watermark recoverably, so this fires only when placement outran the
     // prediction (freed low cells + a head above used_max_p1) — with graphs already built,
@@ -4388,13 +4400,13 @@ void llama_kv_cache::breathe() {
         used_now += v_cells[st].get_used();
     }
     if (vbr_degrade_cursor_ > 0 && used_now == 0 &&
-        !vbr_f5_preserve_empty_tiers_) {
+        !vbr_freeze_preserve_empty_tiers_) {
         vbr_full_reset();
     }
     const uint32_t wm_next = vbr_watermark_cells(0);
     vbr_runtime_wm_ = wm_next;
     vbr_shrink_watermark();
-    // WS-0 (P1) freeze: ledger off (test/gating) — skip precheck + idle scan for a deterministic
+    // Freeze mode disables the ledger for deterministic tests; skip precheck and idle scan for a deterministic
     // idle path. OFF => both run verbatim (bit-identical).
     if (!vbr_freeze_) {
         vbr_ledger_precheck();
@@ -4421,7 +4433,7 @@ void llama_kv_cache::breathe() {
     vbr_trace_emit("breathe", wm_next, used_now);
 }
 
-// S5: unmap tail pages queued by the previous degrade wave. Safe only after the wave's transcodes
+// Unmap tail pages queued by the previous degrade wave. Safe only after the wave's transcodes
 // finished (they READ the old tier-A extent, which reaches into these pages) — one side-stream
 // sync per pool makes that certain; by the next decode boundary the wave is long done, so this is
 // ~free.
@@ -4965,7 +4977,7 @@ double llama_kv_cache::memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_t
     return vbr_floor_sim(vbr_resolve_floor_bpv(floor_bpv), !vbr_pools_.empty(), entry_k, entry_v).bits_per_token;
 }
 
-// #88: per-token bytes of the fattn f16 dequant scratch at the SETTLED (deep-fill) state,
+// Per-token bytes of flash-attention f16 dequant scratch at the settled deep-fill state,
 // summed over KV-hosting devices. The scratch is one f16-width buffer per (device, side),
 // shared across layers — its per-token cost is the widest layer's f16 row, NOT a per-layer
 // sum. A side contributes when its settled state needs dequant: static/pinned turbo entry
@@ -5064,7 +5076,7 @@ void llama_kv_cache::vbr_floor_clamp_order() {
 }
 
 // flip a cache tensor (and its per-stream views) to a new tier — host metadata consumed at graph
-// BUILD time; callers order the GPU against the matching transcode via the S5 fence
+// build time; callers order the GPU against the matching transcode via the wave fence
 static void vbr_set_tensor_type_impl(ggml_tensor * t, const std::vector<ggml_tensor *> & views, ggml_type type) {
     t->type  = type;
     t->nb[0] = ggml_type_size(type);
@@ -6185,6 +6197,33 @@ void llama_kv_cache::vbr_attention_content_changed() {
         GGML_ASSERT(vbr_checkpoint_epoch_ != UINT64_MAX);
         vbr_representation_epoch_++;
         vbr_checkpoint_epoch_++;
+        vbr_checkpoint_seq_epochs_.fill(vbr_checkpoint_epoch_);
+    }
+}
+
+void llama_kv_cache::vbr_attention_content_changed(llama_seq_id seq_id) {
+    GGML_ASSERT(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+    if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
+        GGML_ASSERT(vbr_representation_epoch_ != UINT64_MAX);
+        GGML_ASSERT(vbr_checkpoint_epoch_ != UINT64_MAX);
+        vbr_representation_epoch_++;
+        vbr_checkpoint_epoch_++;
+        vbr_checkpoint_seq_epochs_[size_t(seq_id)] = vbr_checkpoint_epoch_;
+    }
+}
+
+void llama_kv_cache::vbr_attention_content_changed(
+        const std::array<bool, LLAMA_MAX_SEQ> & affected) {
+    if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
+        GGML_ASSERT(vbr_representation_epoch_ != UINT64_MAX);
+        GGML_ASSERT(vbr_checkpoint_epoch_ != UINT64_MAX);
+        vbr_representation_epoch_++;
+        vbr_checkpoint_epoch_++;
+        for (size_t seq_id = 0; seq_id < affected.size(); ++seq_id) {
+            if (affected[seq_id]) {
+                vbr_checkpoint_seq_epochs_[seq_id] = vbr_checkpoint_epoch_;
+            }
+        }
     }
 }
 
@@ -6340,7 +6379,7 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
 }
 
 // VBR_EXPLICIT_CAPTURE_STABILITY_REGION_BEGIN
-// Reviewed F3 read authority: these private hooks snapshot and re-read live
+// Reviewed capture read authority: these private hooks snapshot and re-read live
 // generations to prove a byte capture stayed exact. They never perform
 // checkpoint admission; the isolation gate strips only this bounded region.
 bool llama_kv_cache::vbr_capture_policy_snapshot(
@@ -6651,9 +6690,12 @@ bool llama_kv_cache::vbr_capture_stream_unit(
         const vbr_capture_unit_plan & plan,
         vbr_unit_build & sink,
         vbr_pinned_chunk_ring & ring,
-        vbr_capture_stream_stats & stats) const noexcept {
+        vbr_capture_stream_stats & stats,
+        void * continue_context,
+        bool (*continue_transfer)(void * context) noexcept) const noexcept {
     if (other != nullptr) {
-        return other->vbr_capture_stream_unit(plan, sink, ring, stats);
+        return other->vbr_capture_stream_unit(
+            plan, sink, ring, stats, continue_context, continue_transfer);
     }
     try {
         std::vector<vbr_capture_projected_shard_source> sources;
@@ -6671,6 +6713,8 @@ bool llama_kv_cache::vbr_capture_stream_unit(
             }
             auto chain = std::make_shared<artifact_segment_chain>();
             vbr_capture_stream_stats one;
+            sources[shard_index].source.continue_context = continue_context;
+            sources[shard_index].source.continue_transfer = continue_transfer;
             const auto status = ring.stream(
                 sources[shard_index].source, *chain, one);
             if (status != vbr_capture_stream_status::ok) {
@@ -6718,6 +6762,8 @@ bool llama_kv_cache::vbr_capture_stream_unit(
                 stash_source.device =
                     ggml_backend_get_device(pool->backend);
                 stash_source.tensor = alias;
+                stash_source.continue_context = continue_context;
+                stash_source.continue_transfer = continue_transfer;
                 auto stash_chain =
                     std::make_shared<artifact_segment_chain>();
                 vbr_capture_stream_stats stash_stats;
@@ -7341,7 +7387,7 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
             }
             if (j == n_seqs) {
                 if (n_seqs == vbr_operation_binding::MAX_TARGETS) {
-                    binding.n_targets = 0;  // P2v2: transactional — complete or nothing
+                    binding.n_targets = 0;  // Transactional: complete or nothing.
                     return false;
                 }
                 seqs[n_seqs] = seq;
@@ -7357,7 +7403,7 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
     const uint8_t per_seq = wrap_possible ? 2 : 1;
     const uint8_t flat    = wrap_possible ? 1 : 0;
     if (binding.n_targets + n_seqs * per_seq + flat > vbr_operation_binding::MAX_TARGETS) {
-        binding.n_targets = 0;  // P2v2: transactional — complete or nothing
+        binding.n_targets = 0;  // Transactional: complete or nothing.
         return false;
     }
     for (uint8_t j = 0; j < n_seqs; ++j) {
@@ -7365,7 +7411,7 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
                 vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
                 instance, stream, seqs[j], lo[j], hi[j]);
         if (wrap_possible) {
-            // v6-fix F1: unified-SWA slot selection may reuse a masked cell of a DIFFERENT
+            // Unified-SWA slot selection may reuse a masked cell of a different
             // sequence whose position is unbounded by this batch (find_slot checks only the
             // old owner's own SWA mask), so the destructive claim is the incoming sequence's
             // whole range — the SELECTED target still binds the exact seq's damage extent.
@@ -7381,7 +7427,7 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
         // by slot selection INSIDE apply — unknowable at manifest build (the composite mints
         // before its children run) — so the purge is DECLARED as one seq-wildcard whole-range
         // target: still instance-exact, operation-bound, and confined to the generic seq_rm
-        // trim class (v6 P1: wildcards match only where the manifest declared them).
+        // trim class; wildcards match only where the manifest declared them.
         binding.targets[binding.n_targets++] = vbr_make_target(
                 vbr_operation_kind::decode, vbr_operation_class::state_api,
                 instance, stream, -1, 0, std::numeric_limits<llama_pos>::max());
@@ -7394,7 +7440,7 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
     (vbr_current_mutation_ != nullptr && vbr_current_mutation_->active() \
              ? vbr_current_mutation_->operation_id_ : vbr_operation_id{})
 
-// P1v2 (v6): one spelling of "fail every per-target handle" — shared by the scope, the
+// One spelling of "fail every per-target handle", shared by the scope and the
 // pending records, and the commit fence. A failed operation leaves NO admissible evidence,
 // including any handle that already reached committed before a later one failed.
 static void vbr_fail_extent_set(
@@ -7439,20 +7485,20 @@ llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *              c
 
     kind_         = manifest.kind;
     extent_owner_ = this;
-    // Review F10/C1: composite participation. A nested scope (library-internal composite,
+    // Composite participation. A nested scope (library-internal composite,
     // e.g. apply_ubatch's purge trims) borrows the outer identity fully. An ADOPTED scope
     // (wrapper-forwarded, e.g. iSWA children under one decode id) shares the id but owns its
     // tracker-local reservations (v2 finding 3).
     if (cache_->vbr_current_mutation_ != nullptr) {
-        // v6-fix F3: ANY outer scope determines nested identity. An active outer is joined;
+        // Any outer scope determines nested identity. An active outer is joined;
         // a refused/poisoned/inactive outer makes this nested scope inert under the same
-        // ABSENT identity — it never falls through to mint (A0 one-id, including refusal).
+        // ABSENT identity — it never falls through to mint (operation registry one-id, including refusal).
         joined_       = true;
         operation_id_ = cache_->vbr_current_mutation_->operation_id_;  // empty when inactive
         extent_owner_ = cache_->vbr_current_mutation_->extent_owner_;
     } else if (cache_->vbr_adopted_refused_) {
-        // P2v2 (v6): the composite root's mint was REFUSED — this child fails closed under
-        // the one (absent) identity instead of minting independently (A0 one-id in refusal).
+        // The composite root's mint was refused, so this child fails closed under
+        // the one (absent) identity instead of minting independently (operation registry one-id in refusal).
         adopted_ = true;
         abort_to_shadow_unavailable();
     } else if (cache_->vbr_adopted_operation_) {
@@ -7460,7 +7506,7 @@ llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *              c
         operation_id_ = cache_->vbr_adopted_operation_;
         composite_    = cache_->vbr_adopted_composite_;
         if (composite_ != nullptr) {
-            // P3v2 (v6): claim the parent-declared participant slot BEFORE any mutation.
+            // Claim the parent-declared participant slot before any mutation.
             composite_->claim();
         }
         if (!vbr_operation_registry_binding(operation_id_, manifest_)) {
@@ -7470,10 +7516,10 @@ llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *              c
         owned_op_.emplace(manifest);
         operation_id_ = owned_op_->id();
         if (!operation_id_) {
-            // Review F2: registry refusal is FAIL-CLOSED — the shadow must not survive an
+            // Registry refusal is fail-closed: the shadow must not survive an
             // untracked mutation. Invalidate before the legacy mutation proceeds, then FALL
             // THROUGH to scope registration: the inert scope must still be current so event
-            // sites no-op instead of asserting (F2/#8).
+            // sites no-op instead of asserting.
             abort_to_shadow_unavailable();
         }
     }
@@ -7504,7 +7550,7 @@ llama_kv_cache::vbr_mutation_op::~vbr_mutation_op() {
         return;  // borrowed identity: the owner resolves extent/recovery/close
     }
     if (adopted_) {
-        // P3v2 (v6): an adopted participant that never transferred its token is terminal
+        // An adopted participant that never transferred its token is terminal
         // here — setup refusal, poison, and exceptions before detach all report FAILED
         // exactly once. Its evidence fails; the shared root's failed close autorecords this
         // child's recovery reservation for the quarantine drain.
@@ -7550,7 +7596,7 @@ vbr_extent_handle llama_kv_cache::vbr_mutation_op::ensure_extent_for(uint8_t tar
     if (tracker == nullptr) {
         return {};
     }
-    // v3-B4 upgraded by P1v2 (v6): the extent copies the SELECTED covering target exactly —
+    // The extent copies the selected covering target exactly:
     // the tracker chose it per stamp by (seq, pre-mutation position), so the damage evidence
     // is target-exact by construction.
     const auto & target = scope_manifest().targets[target_index];
@@ -7575,7 +7621,7 @@ void llama_kv_cache::vbr_mutation_op::fail_extents() {
 // The one spelling of the shadow-unavailable transition (altitude review): fail whatever
 // evidence this scope reserved, invalidate the shadow BEFORE the legacy mutation proceeds,
 // and leave the scope inert-but-open (its close stays clean). The recovery reservation is
-// deliberately KEPT (v6 P1): the operation closes FAILED, that close autorecords the slot,
+// deliberately kept: the operation closes failed, that close autorecords the slot,
 // and the boundary quarantine drain performs the sanctioned invalidation — the slot must
 // survive to that drain.
 void llama_kv_cache::vbr_mutation_op::abort_to_shadow_unavailable() {
@@ -7587,24 +7633,24 @@ void llama_kv_cache::vbr_mutation_op::abort_to_shadow_unavailable() {
     fail_extents();
     (void) tracker->global_invalidate_and_reset_extents(
             vbr_mutation_registrant::authenticated_recovery, vbr_operation_class::controller);
-    // P4v2 (v6): ALWAYS latch — even when the invalidation above succeeded. The legacy
+    // Always latch, even when the invalidation above succeeded. The legacy
     // mutation that follows this scope is UNTRACKED; no capture may slip in between it and
     // the next sanctioned transition, which try_clear now proves happened strictly later.
     tracker->set_shadow_unavailable();
     // The scope stays OPEN and inert (operation_id_ empty => events refuse politely); event
-    // sites see a current scope and no-op instead of asserting (F2/#8).
+    // sites see a current scope and no-op instead of asserting.
     operation_id_ = {};
     owned_op_.reset();
 }
 
-// Ownership transfer for deferred families (review F3 lifetime + altitude review): everything
+// Ownership transfer for deferred mutation families: everything
 // the destructor would resolve moves to the pending record instead. Joined scopes own nothing.
 std::optional<llama_kv_cache::vbr_pending_decode_op> llama_kv_cache::vbr_mutation_op::detach_deferred() {
     if (joined_) {
         return std::nullopt;
     }
     if (!active() || poisoned_) {
-        // P1v2 (v6): a poisoned/refused decode op never transfers — the destructor reports
+        // A poisoned or refused decode operation never transfers; the destructor reports
         // its terminal FAILURE (aggregate report for composite children, failed close for
         // owned scopes), and the failed close autorecords its recovery reservation.
         return std::nullopt;
@@ -7618,7 +7664,7 @@ std::optional<llama_kv_cache::vbr_pending_decode_op> llama_kv_cache::vbr_mutatio
         pending.operation_id = owned_op_->release();
         pending.owns_close   = true;
     } else {
-        // P3v2 (v6): detach transfers the still-OPEN participant token to the pending owner
+        // Detach transfers the still-open participant token to the pending owner
         // — never a terminal report; the sealed aggregate closes the root when every
         // declared slot has terminated.
         pending.operation_id = operation_id_;
@@ -7666,7 +7712,7 @@ void llama_kv_cache::vbr_release_adopted() {
     vbr_adopted_refused_   = false;
 }
 
-// P3v2 (v6): the fixed-participant aggregate. Defined here so the registry close stays in
+// Fixed-participant aggregate. Defined here so the registry close stays in
 // the kv-cache trust domain; the iSWA wrapper only constructs/seals it.
 void llama_kv_cache::vbr_composite_outcome::claim() {
     ++claimed;
@@ -7710,7 +7756,7 @@ void llama_kv_cache::vbr_decode_ops_finish(bool ok) {
         other->vbr_decode_ops_finish(ok);
         return;
     }
-    // C1 (scoped per v3 review B1): ok=false conservatively fails ONLY this decode's
+    // ok=false conservatively fails only this decode's
     // operations — awaiting records are PRIOR submitted decodes whose graphs already ran;
     // only the scheduler fence may decide them. ok=true moves every per-target extent
     // prepared -> submitted; operations + recovery reservations stay OPEN until the
@@ -7734,7 +7780,7 @@ void llama_kv_cache::vbr_decode_ops_finish(bool ok) {
         }
         vbr_fail_extent_set(tracker, pending.extents);
         if (pending.composite) {
-            // P3v2 (v6): terminal failure feeds the sealed aggregate.
+            // Terminal failure feeds the sealed aggregate.
             pending.composite->report_terminal(false);
         } else if (pending.owns_close) {
             vbr_operation_registry_close(pending.operation_id, vbr_operation_outcome::failed);
@@ -7754,7 +7800,7 @@ vbr_generation_event llama_kv_cache::vbr_generation_begin(
     if (tracker == nullptr) {
         return {};
     }
-    // A2: events cite the innermost open mutation scope (§7.2 explicit binding). A mutation
+    // Events cite the innermost open mutation scope. A mutation
     // reaching here without a scope is a wiring bug — refuse the event loudly rather than mint
     // an uncited one. A scope that opened shadow-unavailable (registry refusal) yields inert
     // events, matching the legacy-proceeds contract — and once a poison latched the shadow
@@ -8151,7 +8197,7 @@ void llama_kv_cache::vbr_full_reset() {
 // the tail pages. They are phantom cost against the budget (mapped but unreadable — attention
 // pads only to used+256), and both promotion's hysteresis and its re-encode row count follow
 // wm_cells, so leaving it at the old high-water lets a promotion map tiers back up at a stale
-// size (the G4b bug: approved at 1536 live rows, executed at 5632). The rows shrunk away keep
+// size. The rows shrunk away keep
 // valid current-tier bytes, so no scrub is needed; regrowth remaps zero-filled pages on demand.
 // 25% hysteresis so growth/trim jitter cannot thrash map/unmap.
 void llama_kv_cache::vbr_shrink_watermark() {
@@ -8644,7 +8690,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                     }
                 }
 
-                // S5: transcode + scrub run ASYNC on the side stream; the fence armed at end-of-wave
+                // Transcode and scrub run asynchronously on the side stream; the end-of-wave fence
                 // (prepare()) makes the next decode graph GPU-wait on them. The scrub zeroes stale
                 // tier-A bytes on kept mapped pages past the new extent — attention pads reads up to
                 // 256 rows past the used cells BEFORE those rows are rewritten, and old bytes read as
@@ -9111,7 +9157,7 @@ llama_memory_vbr_state_data_v2 llama_kv_cache::memory_vbr_state_v2(
     llama_memory_vbr_state_data_v2 result = {};
     auto & st = result.state;
     st.representation_epoch = vbr_representation_epoch();
-    st.checkpoint_epoch     = vbr_checkpoint_epoch();
+    st.checkpoint_epoch     = vbr_checkpoint_epoch(seq_id);
     st.retier_freeze_depth       = other ? other->vbr_retier_freeze_depth_       : vbr_retier_freeze_depth_;
     st.retier_env_freeze         = other ? other->vbr_freeze_                    : vbr_freeze_;
     st.retier_freeze_enters      = other ? other->vbr_retier_freeze_enters_      : vbr_retier_freeze_enters_;
@@ -9212,6 +9258,25 @@ llama_memory_vbr_state_data_v2 llama_kv_cache::memory_vbr_state_v2(
     st.bpv_if_degraded = sum_vals > 0 ? sum_bits / (double) sum_vals : 0.0;
 
     return result;
+}
+
+bool llama_kv_cache::vbr_capture_readiness_cells(
+        uint64_t logical_growth,
+        uint64_t & committed,
+        uint64_t & projected,
+        uint64_t & capacity) const {
+    committed = 0;
+    projected = 0;
+    capacity = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        committed += cells.get_used();
+        capacity += cells.size();
+    }
+    projected = committed > capacity ? capacity :
+        std::min<uint64_t>(capacity, committed+std::min<uint64_t>(
+            logical_growth, capacity-committed));
+    return capacity != 0;
 }
 
 bool llama_kv_cache::vbr_accumulate_exclusive_cells(
@@ -9700,7 +9765,7 @@ llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
         types, vbr_watermark_cells(n_tokens_extra), physical);
 }
 
-// ---- co-tenancy donor side (P2) ----
+// ---- co-tenancy donor side ----
 
 const std::string & llama_kv_cache::vbr_pool_busid(vbr_pool & p) const {
     // resolved eagerly at pool arming; "-" = resolved-and-absent (never publish). The
@@ -9823,8 +9888,8 @@ uint32_t llama_kv_cache::vbr_pool_n_live(const vbr_pool & p) const {
 }
 
 bool llama_kv_cache::vbr_presence_quiet() const {
-    // WS-0 freeze (Sol review F3): the presence census is fed by the ledger scan, which freeze
-    // disables -- so vbr_scan_events_ stays 0 and this would be permanently false, DISABLING
+    // The presence census is normally fed by the ledger scan, which freeze mode
+    // disables. vbr_scan_events_ therefore stays zero and would otherwise disable
     // promotion under freeze (the frozen schedule would be degrade-only, structurally unlike
     // production). Single-tenant frozen has no presence changes by definition -> always quiet,
     // leaving promotion gated only by the deterministic vbr_quiet_boundaries_ cooldown.
@@ -9837,7 +9902,7 @@ bool llama_kv_cache::vbr_presence_quiet() const {
                    (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE;
 }
 
-// P3 runtime-growth demand, demander side. Publishes a phase=runtime claim when this
+// Runtime-growth demand, demander side. Publishes a phase=runtime claim when this
 // resident spent its own consent window and is still over budget (the try_map-failed case
 // arrives here at the NEXT boundary — the map failure fails that batch recoverably first);
 // the est carries projected - budget_eff with est_partial=0 so donors apply the shed-sizing
@@ -10000,7 +10065,7 @@ void llama_kv_cache::vbr_ledger_precheck() {
 // the pool's own degrade loop and before the existing fence-arm (a demand wave queued here
 // is fenced by that same loop).
 void llama_kv_cache::vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers) {
-    // ---- P3 presence census: N_live per device = self + live peer markers ----
+    // ---- Presence census: N_live per device = self + live peer markers ----
     vbr_scan_events_++;
     std::map<std::string, uint32_t> raw;
     auto seed_child = [&](llama_kv_cache * child) {
@@ -10055,7 +10120,7 @@ void llama_kv_cache::vbr_presence_census(const std::vector<llama_vram_peer_marke
 
 }
 
-// P3 census + grant upkeep + demand service + hygiene: the four phases of the full
+// Census, grant upkeep, demand service, and hygiene: the four phases of the full
 // ledger pass, split for readability — vbr_ledger_scan_service composes them.
 bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now) {
     // lift on claim-disappearance-with-live-pid / pid-death /
@@ -12330,7 +12395,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     GGML_UNUSED(flags);
 
     if (vbr_vmm_active()) {
-        // settle in-flight degrade waves: the S5 fence only orders graph_compute, not the
+        // Settle in-flight degrade waves: the wave fence orders graph_compute, not the
         // tensor_get path io.write_tensor uses — an unsettled wave would serialize torn bytes
         // under the already-flipped type
         for (const auto & p : vbr_pools_) {
@@ -12413,7 +12478,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // B6: imports are provenance-bearing — recovery reserved BEFORE the first read so a
+    // Imports are provenance-bearing: recovery is reserved before the first read so a
     // partial-import unwind autorecords and the boundary drain quarantines + invalidates.
     vbr_mutation_op mutation_op(this, vbr_operation_kind::state_import,
             vbr_operation_class::state_api, seq_id, 0, std::numeric_limits<llama_pos>::max(),
@@ -12485,7 +12550,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     }
 }
 
-// A2 (altitude review): the one spelling of "update the index for every seq that owns a cell".
+// The one spelling of "update the index for every sequence that owns a cell".
 // exclude_seq = -1 means none excluded; add=false removes.
 void llama_kv_cache::vbr_ownership_update_all_seqs(uint32_t stream, uint32_t cell, llama_pos pos,
                                                    bool add, llama_seq_id exclude_seq) {
@@ -12506,7 +12571,7 @@ void llama_kv_cache::vbr_ownership_update_all_seqs(uint32_t stream, uint32_t cel
     });
 }
 
-// A2: one-time index rebuild at import/install boundaries (infrequent, sanctioned scan class).
+// One-time index rebuild at import/install boundaries (an infrequent, sanctioned scan).
 void llama_kv_cache::vbr_ownership_rebuild() {
     if (!vbr_ownership_) {
         return;
@@ -13033,7 +13098,7 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_context * lctx,
         bool do_shift,
         stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
-    // C4: unresolved recovery work IS an update — update() owns the quarantine drain and the
+    // Unresolved recovery work is an update: update() owns the quarantine drain and the
     // monotone re-arm, and a NO_UPDATE short-circuit here would starve a latched tracker on
     // quiet decode streams until an unrelated shift happened to run.
     if (!do_shift && this->sc_info.empty() && !kv->vbr_recovery_service_pending()) {

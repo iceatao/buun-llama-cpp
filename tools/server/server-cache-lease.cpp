@@ -1151,7 +1151,7 @@ bool server_cache_lease_table::admit_scalar_artifact(
         return false;
     }
     if (target.kind == server_cache_destruction_target_kind::host_artifact) {
-        // A host-cache entry owns copied checkpoint records, but D-S3 does not
+        // A host-cache entry owns copied checkpoint records, but the retention catalog does not
         // yet persist their parent relation. Fail closed if any host-side
         // checkpoint evidence cannot be assigned to this scalar target.
         const auto unresolved_host_checkpoint = [&](const auto & value) {
@@ -1246,6 +1246,33 @@ server_cache_lease_table::event_snapshot() const noexcept {
     }
     out.first_ordinal = out.events[0].ordinal;
     out.last_ordinal = out.events[out.size - 1].ordinal;
+    return out;
+}
+
+server_cache_lease_retry_witness
+server_cache_lease_table::retry_witness(
+        bool include_next_expiry) const noexcept {
+    server_cache_lease_retry_witness out;
+    if (!available || clock == nullptr) {
+        return out;
+    }
+    out.available = true;
+    out.event_ordinal = next_event_ordinal > 0
+        ? next_event_ordinal - 1 : 0;
+    out.now_ns = clock->now_ns();
+    if (!include_next_expiry) {
+        return out;
+    }
+    for (const auto & lease : leases) {
+        if (lease.explicit_hard || lease.subject_lost || lease.orphaned ||
+            lease.expires_at_ns <= out.now_ns) {
+            continue;
+        }
+        if (out.next_expiry_ns == 0 ||
+            lease.expires_at_ns < out.next_expiry_ns) {
+            out.next_expiry_ns = lease.expires_at_ns;
+        }
+    }
     return out;
 }
 

@@ -10,18 +10,19 @@
 #include <fstream>
 #include <tuple>
 
-// Fitted calibration table. Filled ONLY by the dorei microbench sweep + offline fit
+// Fitted calibration table. Filled ONLY by the recorded RTX 3090 microbench sweep + offline fit
 // (tools/server/bench/cache-plan-calibrate.py); entries are data reviewed like code.
-// Profiles without an entry refuse (B-2: no default coefficients, ever).
+// Profiles without an entry refuse; there are no default coefficients.
 
-// dorei 2026-07-28 campaign (36 cold records over 64-2048 tokens, 6 composed host->ckpt
+// RTX 3090 campaign on 2026-07-28 (36 cold records over 64-2048 tokens, 6 composed host->ckpt
 // restores over 20-50 MiB payloads; replay intercept ~13.3 ms absorbed by the fit)
-static const common_cache_plan_calib CALIB_DOREI_QWEN35_2B_3090_B512 = {
+static const common_cache_plan_calib CALIB_QWEN35_2B_RTX3090_B512 = {
     "qwen35-2b-q4-k---medium/nvidia-geforce-rtx-3090-ngl99/b512/kf16-vf16", 1,
     75.688, 0.000010, 7184.4,
 };
 
-// dorei 2026-07-28 campaign, buun's 27B-VBR serving config under PINNED -ngl 99 and the
+// RTX 3090 campaign on 2026-07-28, using the pinned 27B VBR serving configuration with
+// -ngl 99 and the
 // DEFAULT VBR ladder regime (dynamic budget / auto floor / auto vram / auto policy /
 // reclaim 8.125 / reset-keep 0.25 — the key names it; a different ladder config is a
 // different regime and must be re-fitted). (the
@@ -29,14 +30,14 @@ static const common_cache_plan_calib CALIB_DOREI_QWEN35_2B_3090_B512 = {
 // 861.5: the profile key distinguishing placements is load-bearing). 23 cold records,
 // 5 checkpoint restores — hybrid payloads constant at 156.9 MiB, restore cost FLAT
 // ~158 ms carried by workspace; crossover vs replay ~= 183 tokens.
-static const common_cache_plan_calib CALIB_DOREI_QWEN36_27B_VBR_3090 = {
+static const common_cache_plan_calib CALIB_QWEN36_27B_VBR_RTX3090 = {
     "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl99/b2048/kvbr-vvbr-vbr-dynamic-dynamic-runtime-controller--1.25-1.25-0-8.125-0.25", 1,
     861.510, 0.0, 158069.2,
 };
 
 static const common_cache_plan_calib * const calib_table[] = {
-    &CALIB_DOREI_QWEN35_2B_3090_B512,
-    &CALIB_DOREI_QWEN36_27B_VBR_3090,
+    &CALIB_QWEN35_2B_RTX3090_B512,
+    &CALIB_QWEN36_27B_VBR_RTX3090,
     nullptr, // sentinel so the array is never empty; skipped by the scan below
 };
 
@@ -194,7 +195,7 @@ common_cache_plan_vbr_regime common_cache_plan_vbr_regime_from_params(
 std::string common_cache_plan_calib_profile(const std::string & model_stem,
                                             const std::string & hw_desc, int n_batch,
                                             const std::string & kv_desc) {
-    // REFUSAL PROPAGATES (D-pins r3 finding 3): an empty segment means its regime could not
+    // Refusal propagates: an empty segment means its regime could not
     // be established, so there is NO profile — composing "model/hw/bN/" would hand back a
     // nonempty key that merely fails to match, losing the no_profile distinction and
     // risking a collision with a genuinely-empty segment.
@@ -310,12 +311,12 @@ static bool cache_plan_lru_stratum_complete(
 
 // Root-optimum membership: valid AND independently executable from the request's starting
 // state — a component-only row (checkpoint exposed by a delivered host entry) is priced as
-// a chain component but can never win on its own (verify-r1 finding 1).
+// a chain component but can never win on its own.
 static bool cache_plan_row_participates(
         const common_cache_plan_record & rec,
         const common_cache_plan_candidate & c,
         const common_cache_plan_candidate * lru_legacy) {
-    // B-A absorbs tiers cumulatively. A similarity decision may compare only
+    // Authority absorbs tiers cumulatively. A similarity decision may compare only
     // targets that crossed the strict similarity threshold; route-home/LRU
     // rows remain evidence but cannot win until their ratchets are enabled.
     if (!cache_plan_base_row_participates(rec, c)) {
@@ -324,8 +325,8 @@ static bool cache_plan_row_participates(
     if (rec.selection != common_cache_plan_selection::lru) {
         return true;
     }
-    // buun's B-A4 rule: speculative capability is a hard eligibility
-    // stratum exactly matching legacy. B has no calibrated speculation credit;
+    // Speculative capability is a hard eligibility stratum matching legacy.
+    // The planner has no calibrated speculation credit;
     // minimize only among targets in the legacy-selected stratum.
     const auto * target = cache_plan_target_live_row(rec, c.target_slot_id);
     return lru_legacy && target && lru_legacy->spec_capable_known &&
@@ -422,7 +423,7 @@ static bool cache_plan_estimate_row(common_cache_plan_candidate & c, uint64_t n_
 
 static common_cache_plan_planner_status cache_plan_estimate_impl(
         common_cache_plan_record & rec, const common_cache_plan_calib & calib) {
-    // trust boundary (verify-r1 finding 6): the estimator validates its calibration —
+    // At the trust boundary the estimator validates its calibration:
     // exact profile match against the record, a reviewed (nonzero) version, and
     // finite/nonnegative coefficients. A false match here would fabricate economics.
     double restore_check = 0.0;
@@ -437,7 +438,7 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
 
     // completeness over the DECLARED domain: overflow means the observed inventory lost
     // rows, and a dropped derived plan means the plan SET is incomplete — never an optimum
-    // over a partial set (A1/A2). Truncation is fine: the domain is the shipped-visited
+    // over a partial set. Truncation is fine: the domain is the shipped-visited
     // set by construction.
     for (const auto st : rec.inventory_states) {
         if (st == common_cache_plan_inventory_state::overflowed) {
@@ -457,9 +458,9 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
         ? cache_plan_target_live_row(rec, rec.id_slot) : nullptr;
     const uint64_t n_prompt = rec.n_prompt_tokens.value;
 
-    // pass 0 (verify-r1 finding 2): a visited candidate whose shipped phase established
+    // First pass: a visited candidate whose shipped phase established
     // neither validity nor invalidity (disposition unavailable — e.g. an LRU-only slot
-    // whose reuse was never evaluated) makes the whole optimum unavailable. Under B-a the
+    // whose reuse was never evaluated) makes the whole optimum unavailable. The
     // observer may not resolve it itself; honest refusal beats silent omission.
     for (uint32_t i = 0; i < rec.n_inventory; i++) {
         if (rec.inventory[i].disposition == common_cache_plan_disposition::unavailable) {
@@ -569,7 +570,7 @@ common_cache_plan_planner_status common_cache_plan_estimate_and_choose(
         common_cache_plan_record & rec, const common_cache_plan_calib & calib) {
     // all-or-nothing is THIS function's postcondition, not a call-site convention: a
     // refusal mid-pass leaves earlier rows carrying committed estimates, which would be
-    // exactly the half-estimated evidence A2/B-3 forbid — clear before returning non-ok
+    // exactly the half-estimated evidence the planner forbids: clear before returning non-ok
     const auto status = cache_plan_estimate_impl(rec, calib);
     if (status != common_cache_plan_planner_status::ok) {
         rec.clear_planner_outputs();

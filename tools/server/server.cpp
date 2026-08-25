@@ -136,6 +136,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty();
 
+    // The control surface requires lifecycle authority, so requesting the
+    // surface implies its internal substrate. Prompt-cache-driven lifecycle
+    // is resolved later, after the cache is actually constructed.
+    params.cache_lifecycle = server_cache_lifecycle_default(
+        params.cache_lifecycle, false, params.cache_control_api);
+
     if (params.cache_plan_preflight &&
         (is_router_server ||
          !server_cache_plan_preflight_exposure_allowed(
@@ -144,10 +150,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
         return 1;
     }
     if (params.cache_control_api &&
-        (!params.cache_lifecycle || is_router_server ||
+        (is_router_server ||
          !server_cache_plan_preflight_exposure_allowed(
              params.hostname, params.api_keys.size()))) {
-        SRV_ERR("%s", "--cache-control-api requires --cache-lifecycle and a single-model, trusted-local, single-principal server\n");
+        SRV_ERR("%s", "--cache-control-api requires a single-model, trusted-local, single-principal server\n");
         return 1;
     }
 

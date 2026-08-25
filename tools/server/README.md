@@ -238,7 +238,7 @@ full matrix is in
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--cache-plan-preflight` | expose trusted-local `POST /cache/plan` point-in-time previews (default: disabled)<br/>(env: LLAMA_ARG_CACHE_PLAN_PREFLIGHT) |
-| `--cache-control-api` | expose the trusted-local E1 holder/family/lease control routes; requires `--cache-lifecycle` (default: disabled)<br/>(env: LLAMA_ARG_CACHE_CONTROL_API) |
+| `--cache-control-api` | expose the trusted-local holder/family/lease control routes and enable their required cache-lifecycle authority (default: disabled)<br/>(env: LLAMA_ARG_CACHE_CONTROL_API) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
@@ -959,8 +959,8 @@ curl --request POST http://127.0.0.1:8080/cache/plan \
 
 ### POST `/cache/...`: Trusted-local cache control
 
-`--cache-control-api --cache-lifecycle` registers the E1 holder, family, and
-lease routes under `/cache/holders/*`, `/cache/families/*`,
+`--cache-control-api` enables the required cache-lifecycle authority and registers the
+holder, family, and lease routes under `/cache/holders/*`, `/cache/families/*`,
 `/cache/leases/*`, and `/cache/events/query`. The surface has the same
 single-model, loopback/Unix-socket, at-most-one-key boundary as cache-plan
 preflight. All operations run on the scheduler thread; HTTP workers cannot
@@ -994,7 +994,7 @@ all-sealed pressure wave fails the in-flight completion with the typed
 `hard_lease_blocked` error rather than stalling. Releasing the lease returns
 deferred units to the normal ladder. V1 refuses every protected crossing even
 when the hard lease holds a durable fallback; proof-backed crossing with a
-transaction-held recovery pin is planned as the separately gated E1.1c-b
+transaction-held recovery pin is planned as a separately gated
 follow-up. `allow_soft_fallback:true` remains an
 explicit client choice when the durable proof cannot support a hard grant.
 Because dynamic VBR uses unified, per-layer/side KV units, one live-prefix hard

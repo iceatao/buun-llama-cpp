@@ -310,7 +310,7 @@ static void test_holder_hard_orphan_frontier_and_proof() {
         &leases, retention.artifact_id(live), identity, 7, 8, 4));
     CHECK(!server_cache_hard_lease_blocks_range(
         nullptr, retention.artifact_id(live), identity, 7, 0, 8));
-    std::puts("E1_VBR_RANGE hard=blocked beyond_frontier=allowed absent=allowed");
+    std::puts("CACHE_VBR_RANGE hard=blocked beyond_frontier=allowed absent=allowed");
     server_cache_control_request lease_events_request;
     lease_events_request.holder = holder.holder;
     lease_events_request.event_limit = SERVER_CACHE_LEASE_EVENT_RING;
@@ -833,7 +833,7 @@ static void test_http_codec_and_golden() {
     expected << golden.rdbuf();
     CHECK(encoded == expected.str());
 #endif
-    std::puts("E1_HTTP codec_golden PASS redacted=1");
+    std::puts("CACHE_CONTROL_HTTP codec_golden PASS redacted=1");
 }
 
 static void test_family_registry_and_binding() {
@@ -906,7 +906,7 @@ static void test_family_registry_and_binding() {
           server_cache_control_status::ok);
     CHECK(resolved_branch == branch_binding.cache_family);
     CHECK(resolved_branch.role != resolved.role);
-    std::puts("E1_FAMILY two_roles_one_family PASS main=1 branch=1");
+    std::puts("CACHE_FAMILY two_roles_one_family PASS main=1 branch=1");
 
     for (uint64_t i = 0; i < SERVER_CACHE_LEASE_EVENT_RING + 2; ++i) {
         server_cache_control_request extra;
@@ -990,7 +990,7 @@ static void test_family_registry_and_binding() {
         replay_authority, server_cache_control_operation::holder_create,
         replay_create);
     CHECK(!(replay_second.holder == replay_first.holder));
-    std::puts("E1_FAMILY registry_binding PASS role=main expired=not_found");
+    std::puts("CACHE_FAMILY registry_binding PASS role=main expired=not_found");
 }
 
 static void test_production_store_resolver_leg() {
@@ -1063,7 +1063,7 @@ static void test_production_store_resolver_leg() {
     CHECK(execute(authority, server_cache_control_operation::lease_acquire,
                   acquire).status == server_cache_control_status::not_found);
     CHECK(store->counters().requested == 0);
-    std::puts("E1_STORE_RESOLVER default_leg PASS status=not_found");
+    std::puts("CACHE_STORE_RESOLVER default_leg PASS status=not_found");
 }
 
 int main() {

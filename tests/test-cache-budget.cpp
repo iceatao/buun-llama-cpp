@@ -1,4 +1,4 @@
-// D-S2 policy-neutral budget arithmetic: closed category classification,
+// Policy-neutral budget arithmetic: closed category classification,
 // durable+reserved accounting, hierarchical constraints, and fail-closed plans.
 
 #include "llama-cache-budget.h"

@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// D-S4's one closed inventory. The second argument is the physical choke-point allowed to
+// One closed lifecycle inventory. The second argument is the physical choke point allowed to
 // contain the corresponding raw primitive; the third is its logical admission owner; the
 // fourth names the accounting release owner. Two full-slot classes deliberately share one
 // manifest builder/admission owner. Only host artifacts own committed C operations today:
@@ -70,23 +70,23 @@ enum class server_cache_destruction_verdict : uint8_t {
 
 enum class server_cache_destruction_execution : uint8_t {
     pass_through = 0,
-    // D-A1: the legacy-selected host victim is still chosen by the existing
+    // The legacy-selected host victim is still chosen by the existing
     // FIFO/dedup policy, but its exact C release is committed through the
     // prepared capability after the physical erase. Lease verdicts remain
-    // pricing evidence here; host victim-selection authority lands in D-A3.
+    // pricing evidence here; this terminal does not select the victim.
     prepared_release,
-    // D-A2: a host victim was erased only after all three payload planes were
+    // A host victim was erased only after all three payload planes were
     // proved identical to a disjoint survivor and the survivor was pinned
     // through the exact prepared-release commit.
     redundant_host_eviction,
-    // D-A3: B-priced host capacity/token victim, certified against a
+    // A cache-plan-priced host capacity/token victim, certified against a
     // disjoint retained or pre-authorized durable recovery source.
     priced_host_eviction,
-    // D-A4: one independently accounted live checkpoint member was removed
+    // One independently accounted live checkpoint member was removed
     // under a pinned replay-source certificate. Host-entry checkpoint rings
     // remain aggregate-owned and can never reach this terminal.
     priced_checkpoint_thinning,
-    // D-A5: B selected an occupied live target only after a durable recovery
+    // The cache plan selected an occupied live target only after a durable recovery
     // source and the complete fixed-pool/checkpoint union were certified.
     priced_live_displacement,
     _count,
@@ -170,8 +170,8 @@ using server_cache_lease_evaluator = server_cache_destruction_verdict (*)(
         void * context,
         const server_cache_destruction_request & request) noexcept;
 
-// A logical operation keeps this small token across split physical phases. D-S4 and D-S5
-// execute pass-through; D-A can later change execution authority without re-cutting joined
+// A logical operation keeps this small token across split physical phases. Admission and retirement
+// execute pass-through; execution authority can change later without recutting joined
 // operations such as low-LCP reset.
 struct server_cache_destruction_admission {
     server_cache_destruction_class cls =
@@ -202,8 +202,8 @@ struct server_cache_destruction_event {
     uint64_t sequence = 0;
 };
 
-// Transient, process-local D-S4 observer. It is deliberately absent from cache-plan JSON
-// until D-S7. Recording is fixed-capacity and noexcept; overwriting the oldest detail never
+// Transient, process-local lifecycle observer. It is deliberately absent from cache-plan JSON
+// until final projection. Recording is fixed-capacity and noexcept; overwriting the oldest detail never
 // loses the monotone per-class totals.
 struct server_cache_destruction_observer {
     std::array<server_cache_destruction_event,
@@ -225,7 +225,7 @@ struct server_cache_destruction_observer {
     uint64_t host_trade_refused = 0;
     uint64_t host_trade_unpriced = 0;
     uint64_t host_trade_legacy_fallbacks = 0;
-    uint64_t host_trade_df2_executed = 0;
+    uint64_t host_trade_retention_capacity_executed = 0;
     uint64_t host_trade_hard_lease_vetoes = 0;
     uint64_t host_trade_publication_skips = 0;
     uint64_t host_trade_substrate_unavailable = 0;
@@ -437,9 +437,9 @@ struct server_cache_destruction_observer {
     }
 };
 
-// The ONE retention-admission API. D-A0b supplies the type-erased evaluator
+// The one retention-admission API. The authority layer supplies the type-erased evaluator
 // under cache-debug OR cache-lifecycle; only record/log emission remains
-// debug-only. Execution remains pass-through until a later D-A ratchet flips.
+// for debug and production use. Execution remains pass-through until lifecycle policy enables it.
 inline server_cache_destruction_admission server_cache_retention_admit(
         server_cache_destruction_observer * observer,
         const server_cache_destruction_request & request) noexcept {

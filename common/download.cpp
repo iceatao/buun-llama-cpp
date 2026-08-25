@@ -890,7 +890,7 @@ std::string common_docker_resolve_model(const std::string & docker) {
         auto validate_oci_digest = [](const std::string & digest) -> std::string {
             // Expected: algo:hex ; start with sha256 (64 hex chars)
             // You can extend this map if supporting other algorithms in future.
-            static const std::regex re("^sha256:([a-fA-F0-9]{64})$");
+            static const std::regex re("^sha256:([a-fA--9]{64})$");
             std::smatch m;
             if (!std::regex_match(digest, m, re)) {
                 throw std::runtime_error("Invalid OCI digest format received in manifest: " + digest);

@@ -180,6 +180,11 @@ struct vbr_staged_read_descriptor {
     uint64_t destination_offset = 0;
     std::vector<vbr_h2d_source_range> projection_ranges;
     uint64_t proof_verified_bytes = 0;
+    // Recovery reads restore the incumbent representation, which may differ
+    // from the incoming transform source.  Keep that destination authority
+    // on the immutable staged descriptor rather than consulting the incoming
+    // child plan during rollback.
+    int32_t destination_type = -1;
 };
 
 enum class vbr_adopt_stage_status : uint8_t {

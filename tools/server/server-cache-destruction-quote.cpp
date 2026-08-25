@@ -1032,12 +1032,12 @@ void server_cache_destruction_finalize_projection(
             common_cache_plan_destruction_comparison::ds6_unavailable;
     }
 
-    // Schema v6 defines the selected D-A quote as the sole projected-byte
-    // source once its exact union is available. D-S6 remains an independent
+    // Schema v6 defines the selected destruction quote as the sole projected-byte
+    // source once its exact union is available. Yield accounting remains an independent
     // comparator: its complete result becomes matched/differed above and any
     // incomplete verdict becomes comparison=unavailable. We intentionally do
-    // not serialize a second D-S6 status/byte table. Actual remains explicitly
-    // not_observed because D-A0a never mutates.
+    // not serialize a second status/byte table. Actual remains explicitly
+    // not_observed because shadow quoting never mutates.
     rec.yield.status = common_cache_plan_yield_status::fits;
     rec.yield.plan_state = common_cache_plan_yield_plan_state::planned;
     rec.yield.actual_state = common_cache_plan_yield_actual_state::not_observed;
@@ -1063,7 +1063,7 @@ common_cache_plan_destruction_reason server_cache_destruction_effect_recheck(
         const common_cache_plan_destruction_effect_digest & current_effect,
         const std::vector<common_cache_plan_yield_domain> & quoted_domains,
         const std::vector<common_cache_plan_yield_domain> & current_domains) noexcept {
-    // Mutation-boundary equivalence is deliberately narrower than the D-S6
+    // Mutation-boundary equivalence is deliberately narrower than the projected-yield
     // full-row oracle above. Unrelated gauge/reservation traffic may change
     // before/after while leaving the selected union effect intact; only the
     // domain and exact projected release are capability inputs.

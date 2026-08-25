@@ -1,7 +1,7 @@
-// B shadow-planner estimator/chooser contract tests: profile refusal (no default
+// Shadow-planner estimator/chooser contract tests: profile refusal (no default
 // coefficients) + composition rule, calibration validation at the estimator boundary
 // (mismatch / version-0 / NaN / negative), per-provider term estimation with version
-// stamping, the A3 CONTROLLED DISAGREEMENT fixture (two valid complete plans whose
+// stamping, the controlled-disagreement fixture (two valid complete plans whose
 // calibrated costs force the independent shadow choice away from the shipped choice,
 // exact predicted saving asserted), tie-set membership + planner-owned stable choice,
 // unavailability propagation (overflow / dropped derived plan / unresolved candidate /
@@ -59,7 +59,7 @@ static common_cache_plan_candidate * add_row(common_cache_plan_record & rec,
     return c;
 }
 
-// B-2: an unfitted profile refuses — the checked-in table starts empty
+// An unfitted profile refuses: the checked-in table starts empty.
 static void test_profile_refusal() {
     CHECK(common_cache_plan_calib_find("qwen3.5-2b-q4km/rtx-3090/b512") == nullptr);
     CHECK(common_cache_plan_calib_find("") == nullptr);
@@ -94,7 +94,7 @@ static void test_profile_composition() {
           common_cache_plan_calib_profile("m", "cpu", 1, "kvbr-vf16"));
 }
 
-// D-pins r2 finding 2: EVERY effective VBR dimension must move the key, requested-string
+// Every effective VBR dimension must move the key; requested-string
 // equality must not alias differing resolved regimes, and an unrepresentable override must
 // yield no profile at all
 static void test_vbr_regime_key() {
@@ -139,7 +139,7 @@ static void test_vbr_regime_key() {
     common_cache_plan_vbr_regime off;
     CHECK(common_cache_plan_calib_kv(off, "f16", "q8_0") == "kf16-vq8_0");
 
-    // END-TO-END refusal (r3 finding 3): an empty segment must yield NO profile, not a
+    // End-to-end refusal: an empty segment must yield no profile, not a
     // composed "model/hw/bN/" key that merely fails to match
     CHECK(common_cache_plan_calib_profile("m", "gpu", 512,
               common_cache_plan_calib_kv(unk, "f16", "f16")).empty());
@@ -147,26 +147,26 @@ static void test_vbr_regime_key() {
     CHECK(common_cache_plan_calib_profile("", "gpu", 512, "kf16-vf16").empty());
     CHECK(!common_cache_plan_calib_profile("m", "gpu", 512, "kf16-vf16").empty());
 
-    // Checked-in dorei 27B entry: reconstruct the measured default through the production
+    // Checked-in RTX 3090 27B entry: reconstruct the measured default through the production
     // assembly helper, not a hand-built common_cache_plan_vbr_regime.
-    common_params dorei_params;
-    dorei_params.vbr_cache_type_k = dorei_params.vbr_cache_type_v = true;
-    dorei_params.vbr_budget = "dynamic";
-    dorei_params.vbr_selected_family = "dynamic";
-    dorei_params.vbr_selected_policy = "runtime-controller";
-    dorei_params.vbr_capacity_bits = 1.25;
-    dorei_params.vbr_selected_bpv = 1.25;
-    dorei_params.vbr_reclaim_floor_bpv = 8.125f;
-    dorei_params.vbr_reset_keep_frac = 0.25f;
-    const auto dorei = common_cache_plan_vbr_regime_from_params(
-        dorei_params, [](const char *) -> const char * { return nullptr; });
-    const std::string dorei_profile = common_cache_plan_calib_profile(
+    common_params rtx3090_params;
+    rtx3090_params.vbr_cache_type_k = rtx3090_params.vbr_cache_type_v = true;
+    rtx3090_params.vbr_budget = "dynamic";
+    rtx3090_params.vbr_selected_family = "dynamic";
+    rtx3090_params.vbr_selected_policy = "runtime-controller";
+    rtx3090_params.vbr_capacity_bits = 1.25;
+    rtx3090_params.vbr_selected_bpv = 1.25;
+    rtx3090_params.vbr_reclaim_floor_bpv = 8.125f;
+    rtx3090_params.vbr_reset_keep_frac = 0.25f;
+    const auto rtx3090 = common_cache_plan_vbr_regime_from_params(
+        rtx3090_params, [](const char *) -> const char * { return nullptr; });
+    const std::string rtx3090_profile = common_cache_plan_calib_profile(
         "qwen35-27b-q6-k", "nvidia-geforce-rtx-3090-ngl99", 2048,
-        common_cache_plan_calib_kv(dorei, "f16", "f16"));
-    CHECK(dorei_profile ==
+        common_cache_plan_calib_kv(rtx3090, "f16", "f16"));
+    CHECK(rtx3090_profile ==
           "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl99/b2048/"
           "kvbr-vvbr-vbr-dynamic-dynamic-runtime-controller--1.25-1.25-0-8.125-0.25");
-    CHECK(common_cache_plan_calib_find(dorei_profile) != nullptr);
+    CHECK(common_cache_plan_calib_find(rtx3090_profile) != nullptr);
 }
 
 static void write_test_file(const std::filesystem::path & path, const std::string & bytes) {
@@ -176,7 +176,7 @@ static void write_test_file(const std::filesystem::path & path, const std::strin
     CHECK(bool(out));
 }
 
-// D-pins r6 C-2/C-3: file-valued overrides key on SHA-256 content. Moving identical
+// File-valued overrides key on SHA-256 content. Moving identical
 // content cannot move identity; editing a file in place must; unreadable content refuses.
 static void test_vbr_file_override_identity() {
     using grammar = common_cache_plan_vbr_value_grammar;
@@ -319,7 +319,7 @@ static void test_vbr_file_override_identity() {
     std::filesystem::remove_all(root);
 }
 
-// verify-r4/r5: the placement key is pure and positional — reversed heterogeneous device
+// The placement key is pure and positional: reversed heterogeneous device
 // orders produce DISTINCT keys, equivalent inputs are stable, empty/ngl==0 maps to cpu
 static void test_placement_key() {
     const float ts37[2] = {0.37f, 0.63f};
@@ -342,7 +342,7 @@ static void test_placement_key() {
           "RTX 3090+P100 ngl40 sm1 mg1 ts0-0");
 }
 
-// verify-r1 finding 6: the estimator is a trust boundary — profile mismatch, unreviewed
+// The estimator is a trust boundary: profile mismatch, unreviewed
 // version, and non-finite/negative coefficients all refuse as invalid_calibration
 static void test_calibration_validation() {
     common_cache_plan_record rec = make_record(100);
@@ -410,7 +410,7 @@ static void test_basic_estimation() {
     CHECK(rec.n_shadow_ties == 1);
 }
 
-// A3: the controlled disagreement fixture. Two valid, complete plans; the shipped path
+// Controlled disagreement: two valid, complete plans; the shipped path
 // chose the host entry (deepest prefix), but the calibrated costs make the live slot's
 // pure-replay plan cheaper than the host's restore+replay plan. The independent shadow
 // choice must disagree with the shipped choice by the exact predicted saving.
@@ -545,7 +545,7 @@ static void test_unavailability() {
     }
     {
         // a dropped derived plan (chain lost at capacity) refuses even when every
-        // provider inventory looks intact (verify-r1 finding 4)
+        // provider inventory looks intact
         common_cache_plan_record rec = make_record(100);
         add_row(rec, common_cache_plan_provider::cold_replay, -1, 0, 0, 0,
                 common_cache_plan_disposition::accepted);
@@ -555,7 +555,7 @@ static void test_unavailability() {
     }
     {
         // an unresolved visited candidate (LRU-only slot, no reuse verdict) refuses:
-        // honest refusal beats silently minimizing over a partial set (verify-r1 finding 2)
+        // honest refusal beats silently minimizing over a partial set
         common_cache_plan_record rec = make_record(100);
         add_row(rec, common_cache_plan_provider::cold_replay, -1, 0, 0, 0,
                 common_cache_plan_disposition::accepted);
@@ -588,7 +588,7 @@ static void test_unavailability() {
     }
 }
 
-// exact-capacity boundary (verify-r1 finding 4): 96 real rows all fit, then the required
+// Exact-capacity boundary: 96 real rows all fit, then the required
 // chain is dropped — derived_plans_incomplete latches and the planner refuses
 static void test_capacity_chain_boundary() {
     common_cache_plan_record rec = make_record(100);
@@ -605,7 +605,7 @@ static void test_capacity_chain_boundary() {
           planner_status::incomplete_evidence);
 }
 
-// production shape of a composed delivery (verify-r1 finding 1): the chain is the shipped
+// Production shape of a composed delivery: the chain is the shipped
 // plan; the bare checkpoint is component-only and can NEVER win the root optimum even
 // when its standalone total is the cheapest number on the record
 static void test_chain_composition_and_root_feasibility() {
@@ -648,7 +648,7 @@ static void test_chain_composition_and_root_feasibility() {
     CHECK(!ckpt_in_ties);
 }
 
-// verify-r2 finding 1: a NON-delivered checkpoint sibling exposed by the host restore is
+// A non-delivered checkpoint sibling exposed by the host restore is
 // also component-only, and its true complete plan (host→sibling cost-loser chain) competes
 // in the root optimum — a cheaper sibling chain is a legitimate shadow disagreement
 static void test_sibling_chain_alternative() {

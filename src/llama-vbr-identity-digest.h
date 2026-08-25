@@ -10,7 +10,7 @@
 #include <vector>
 
 // Canonical checkpoint/artifact identity-policy row. Keeping the hash recipe
-// here makes the WS-4 checkpoint bridge and F3 explicit capture share one
+// here makes the checkpoint bridge and explicit capture share one
 // source; neither the server nor a codec may invent a weaker ordering digest.
 struct vbr_identity_policy_digest_row {
     uint32_t child_id = 0;
@@ -28,8 +28,8 @@ inline bool vbr_digest_nonzero(const std::array<uint8_t, 32> & digest) {
     return false;
 }
 
-// Canonical capture/controller type-vector identity. One shared recipe so F3
-// capture, downward validation, and phase-10 rechecks cannot drift.
+// Canonical capture/controller type-vector identity. One shared recipe keeps
+// capture, downward validation, and late rechecks from drifting.
 inline std::array<uint8_t, 32> vbr_type_vector_digest(
         const ggml_type * types, size_t count) {
     llama_sha256_writer writer;

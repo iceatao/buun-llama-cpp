@@ -16,10 +16,10 @@ constexpr size_t VBR_OPERATION_REGISTRY_CAPACITY = 4096;
 std::atomic<uint64_t> g_vbr_next_operation_id { 1 };
 std::atomic<bool> g_vbr_operation_id_exhausted { false };
 std::array<std::atomic<uint64_t>, VBR_OPERATION_REGISTRY_CAPACITY> g_vbr_live_operations {};
-// A2: authenticated binding retained per live slot.
-// C3 (v3 design, Sol CONCUR): one mutex serializes every binding write/read/reuse and the
+// Authenticated mutation binding retained per live slot.
+// One mutex serializes every binding write, read, reuse, and the
 // whole recovery state machine — the registries run per-operation, never per-token, so a lock
-// is the honest concurrency model (lock-free correctness failed review twice). The atomic id
+// is the honest concurrency model. The atomic ID
 // slots remain ONLY as the lock-free is_live fast path.
 std::mutex g_vbr_registry_mutex;
 std::array<vbr_operation_binding, VBR_OPERATION_REGISTRY_CAPACITY> g_vbr_live_bindings {};
@@ -36,7 +36,7 @@ vbr_operation_id vbr_operation_allocate() {
             return {};
         }
 
-        // UINT64_MAX is reserved as the slot-claim sentinel (F5): exhaust one id early rather
+        // UINT64_MAX is reserved as the slot-claim sentinel (): exhaust one id early rather
         // than ever handing out a value that could alias a mid-claim slot.
         if (expected == std::numeric_limits<uint64_t>::max()) {
             g_vbr_operation_id_exhausted.store(true, std::memory_order_release);
@@ -61,7 +61,7 @@ vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding) {
     if (binding.operation_id) {
         return {};
     }
-    // v4 review F4: the manifest itself is validated at mint — closed enums per target, a
+    // The manifest itself is validated at mint: closed enums per target, a
     // sane target count, and at least one target for mutate-phase operations.
     if (static_cast<uint8_t>(binding.kind) >=
             static_cast<uint8_t>(vbr_operation_kind::count) ||
@@ -73,7 +73,7 @@ vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding) {
     }
     for (uint8_t t = 0; t < binding.n_targets; ++t) {
         const auto & target = binding.targets[t];
-        // P5v2 (v6): closed validation domain per target. The registrant mask is a nonzero
+        // Closed validation domain per target. The registrant mask is a nonzero
         // subset of the kind's canonical set (equality valid): mask != 0 && no out-of-kind
         // bit. Targets carry the mutate phase (the stated convention). Mutation targets bind
         // exact nonzero instances — recovery alone is capability-subset-restricted instead.
@@ -86,7 +86,7 @@ vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding) {
             (target.registrant_mask & ~vbr_operation_kind_registrants(binding.kind)) != 0 ||
             (binding.kind != vbr_operation_kind::recovery &&
              !vbr_controller_instance_id_is_set(target.instance_id)) ||
-            // v6-fix F7: the CLOSED seq domain — declared wildcard or [0, LLAMA_MAX_SEQ).
+            // The closed sequence domain is a declared wildcard or [0, LLAMA_MAX_SEQ).
             target.seq_id < -1 || target.seq_id >= LLAMA_MAX_SEQ ||
             !vbr_target_range_valid(binding.kind, target.range)) {
             return {};
@@ -105,7 +105,7 @@ vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding) {
         const size_t slot_index = (first + i) % VBR_OPERATION_REGISTRY_CAPACITY;
         auto & slot = g_vbr_live_operations[slot_index];
         uint64_t empty = 0;
-        // F5: claim exclusively FIRST (0 -> sentinel); only the claimant writes the binding,
+        // Claim exclusively first (0 -> sentinel); only the claimant writes the binding,
         // then publishes the real id with release ordering. Readers ignore the sentinel.
         if (!slot.compare_exchange_strong(
                     empty, VBR_SLOT_CLAIM_SENTINEL, std::memory_order_acq_rel, std::memory_order_relaxed)) {
@@ -178,7 +178,7 @@ bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation
         if (g_vbr_live_operations[slot].load(std::memory_order_acquire) != operation_id.value) {
             continue;
         }
-        // Under the registry mutex the copy cannot race an end/reuse (C3).
+        // Under the registry mutex the copy cannot race an end or reuse.
         out = g_vbr_live_bindings[slot];
         return true;
     }
@@ -232,14 +232,14 @@ bool vbr_operation_registry_close(vbr_operation_id operation_id, vbr_operation_o
     if (outcome != vbr_operation_outcome::committed) {
         // A reserved-but-unrecorded recovery record for this operation transitions to
         // `recorded` automatically so a non-committed close can never orphan the reservation
-        // (design D-A2-4v3: no odd serial without an authenticated resolution path).
+        // No odd serial is permitted without an authenticated resolution path.
         vbr_recovery_autorecord_on_close(operation_id);
     }
     return vbr_operation_registry_end(operation_id);
 }
 
 // ---------------------------------------------------------------------------
-// A2 authenticated recovery ring
+// Authenticated operation-recovery ring.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -247,11 +247,11 @@ namespace {
 constexpr int32_t VBR_RECOVERY_RING_CAPACITY = 64;
 
 vbr_failed_operation_record g_vbr_recovery_ring[VBR_RECOVERY_RING_CAPACITY];
-// C4: per-slot ack nonces (token authenticity) — a stale token cannot ack a reused slot.
+// Per-slot acknowledgement nonces prevent a stale token from acknowledging a reused slot.
 uint64_t g_vbr_quarantine_nonce[VBR_RECOVERY_RING_CAPACITY] = {};
 uint64_t g_vbr_quarantine_nonce_next = 1;
 // Lock-free fast path for the per-decode-boundary drain: only nonzero when awaiting_ack
-// records exist (efficiency review — the empty ring is the overwhelmingly common state).
+// records exist; the empty ring is the overwhelmingly common state.
 std::atomic<uint32_t> g_vbr_quarantine_pending { 0 };
 
 vbr_failed_operation_record * recovery_slot(int32_t record_index) {
@@ -318,7 +318,7 @@ int32_t vbr_recovery_reserve(vbr_operation_id operation_id,
     if (!operation_id) {
         return -1;
     }
-    // One lock acquisition for lookup + reserve (efficiency review).
+    // One lock acquisition for lookup and reserve.
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
     const size_t first = vbr_operation_slot(operation_id);
     for (size_t i = 0; i < VBR_OPERATION_REGISTRY_CAPACITY; ++i) {
@@ -358,7 +358,7 @@ bool vbr_recovery_record_failure(int32_t                   record_index,
     return true;
 }
 
-// Reserved for the cross-stream pending-owner fence (design Rev 5 pin 2) — currently
+// Reserved for the cross-stream pending-owner fence; currently
 // unreachable: armed VBR forces n_stream == 1 and the seq_cp fence asserts.
 bool vbr_recovery_set_source_token(int32_t                       record_index,
                                    vbr_operation_id              operation_id,
@@ -410,7 +410,7 @@ vbr_recovery_capability::~vbr_recovery_capability() {
         return;
     }
     // Fail-closed: destruction without explicit resolution quarantines the record and latches
-    // the pending flag the owner must consume with a global invalidation (design Rev 4 item 6).
+    // the pending flag the owner must consume with a global invalidation.
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
     auto * record = minted_record(record_index_);
     if (record != nullptr) {
@@ -428,8 +428,8 @@ bool vbr_recovery_capability::target_allowed(uint16_t stream, llama_seq_id seq_i
     if (record == nullptr) {
         return false;
     }
-    // C2: validate against the manifest targets — a recovery mutation must fall inside ONE
-    // declared target (wildcards only if the binding declared them). v6-fix F6: the stream is
+    // Validate against the manifest targets: a recovery mutation must fall inside one
+    // declared target (wildcards only if the binding declared them). The stream is
     // target-exact through the ONE stream predicate; the src/dst source-token fields never
     // widen authorization (their default 0 authorized stream 0 against any record). A future
     // cross-stream recovery must declare explicit source/destination TARGETS instead.
@@ -452,7 +452,7 @@ bool vbr_recovery_capability::resolve_completed() {
     if (record == nullptr) {
         return false;
     }
-    // F6: resolution reclaims the ring slot (records are evidence for recovery, not history).
+    // Resolution reclaims the ring slot; records are recovery evidence, not history.
     *record       = {};
     record_index_ = -1;
     return true;
@@ -464,7 +464,7 @@ bool vbr_recovery_capability::resolve_quarantined() {
     if (record == nullptr) {
         return false;
     }
-    // C4: retain the record + manifest targets until the owning tracker acks the invalidation.
+    // Retain the record and manifest targets until the owning tracker acknowledges invalidation.
     record->state                            = vbr_recovery_state::awaiting_ack;
     g_vbr_quarantine_nonce[record_index_]    = g_vbr_quarantine_nonce_next++;
     g_vbr_quarantine_pending.fetch_add(1, std::memory_order_release);
@@ -482,7 +482,7 @@ vbr_quarantine_work vbr_recovery_take_quarantine(vbr_controller_instance_id inst
         if (record.state != vbr_recovery_state::awaiting_ack || record.taken) {
             continue;
         }
-        // v4 review F2: OWNER-instance match only — never the composite manifest.
+        // Match only the owner instance, never the composite manifest.
         const bool matches = !vbr_controller_instance_id_is_set(record.owner_instance) ||
                              record.owner_instance == instance;
         if (!matches) {
@@ -537,7 +537,7 @@ static bool ring_has_nonfree(
 }
 
 bool vbr_recovery_pending_for(vbr_controller_instance_id instance) {
-    // P4v2 (v6): the FULL cause set — reserved (in-flight operation) and
+    // Full cause set: reserved (in-flight operation) and
     // capability_minted (recovery mid-execution) block re-arm exactly like recorded and
     // awaiting_ack; every non-free state is unresolved recovery work serviceable here.
     return ring_has_nonfree(instance, /*count_wildcard_owner=*/true);
@@ -609,7 +609,7 @@ vbr_scoped_operation::vbr_scoped_operation(vbr_scoped_operation && other) noexce
 }
 
 vbr_scoped_operation::~vbr_scoped_operation() {
-    // v3.1 amendment 4 applies to the ROOT RAII too (v3 review B5): destruction without an
+    // Destruction without an
     // explicit close is a failure — forgotten paths and unwind can never commit.
     if (binding_.operation_id) {
         vbr_operation_registry_close(binding_.operation_id, vbr_operation_outcome::failed);

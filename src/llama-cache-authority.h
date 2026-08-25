@@ -1,15 +1,15 @@
 #pragma once
 
-// llama-cache-authority.h — P2 F0a admission composer (library side).
+// llama-cache-authority.h — cache-admission composer (library side).
 //
 // The policy-free ledger (llama-cache-accounting) records; the budget coordinator
 // (llama-cache-budget) prices. This unit is the single place that COMPOSES them into the
-// authoritative admission sequence F flips on:
+// authoritative admission sequence used by host-cache and artifact publication:
 //
 //     snapshot() → fits(reserve-only plan) → reserve_if_serial(snapshot.serial)
 //
 // It is reserve-only and single-shot by contract:
-//   - reserve-only: the plan credits NO planned release. Crediting a release before F0b owns an
+//   - reserve-only: the plan credits no planned release. Crediting a release before a caller owns an
 //     atomic release/mutate transaction would let a reservation be admitted against bytes that are
 //     not yet actually free (false admission).
 //   - single-shot: on serial drift it returns serial_conflict immediately rather than retrying with
@@ -19,7 +19,7 @@
 // `llama_cache_admit_reservation` (the single-leaf composer) is called in production only by the
 // shared multi-leaf transaction primitive below; direct callers are unit tests. That primitive owns
 // the mutation-adjacent stage/commit/abort sequence and is wired into two production mutation paths:
-// F0b's host-cache publish (server-cache-authority) and F2's artifact catalog publish.
+// host-cache publication (server-cache-authority) and artifact-catalog publication.
 
 #include "llama-cache-accounting.h"
 #include "llama-cache-budget.h"
@@ -59,10 +59,10 @@ struct llama_cache_transaction_leaf;
 class llama_cache_prepared_claim_group;
 
 // Move-only handle to an admitted-but-not-yet-committed reservation. If it is destroyed while still
-// holding a live op (an exception or early return before F0b's stage/commit), it aborts that op so a
+// holding a live op (an exception or early return before stage/commit), it aborts that op so a
 // reserved operation can never leak (snapshot.live_ops would otherwise never return to zero). Only
 // the composer mints an armed claim (constructor is private + friended), so no two claims can ever
-// own the same op. The only disarm-without-abort path is F0b's commit-through-claim terminal, which
+// own the same op. The only disarm-without-abort path is the commit-through-claim terminal, which
 // disarms ONLY on a verified commit and hands the committed id to its durable artifact. Exposing a
 // bare "discharge" would let a still-reserved (or committed-then-failed) op leak.
 class llama_cache_reservation_claim {
@@ -116,7 +116,7 @@ struct llama_cache_admission_result {
 // capacity/config (the server samples physical capacity immediately before calling). A local
 // coordinator is used because reset() mutates coordinator state — a shared mutable coordinator is
 // not safe across concurrent admissions. noexcept: every failure — including its own allocation —
-// becomes a typed status, so no exception ever crosses the authority boundary into F0b.
+// becomes a typed status, so no exception ever crosses the admission authority boundary.
 llama_cache_admission_result llama_cache_admit_reservation(
         llama_cache_acct_ledger          & ledger,
         const llama_cache_budget_config  & budget_config,
@@ -208,7 +208,7 @@ struct llama_cache_transaction_leaf {
     llama_cache_acct_alloc_id *     allocation_out = nullptr;
 };
 
-// Library-owned fault vocabulary shared by F0b's translated server fault and F2's fake-shard
+// Library-owned fault vocabulary shared by the translated server fault and fake-shard
 // tests. UINT32_MAX disables an indexed seam.
 struct llama_cache_transaction_fault {
     uint32_t fail_stage_at  = UINT32_MAX;
@@ -217,8 +217,9 @@ struct llama_cache_transaction_fault {
 };
 
 // Optional call-site preparation that must remain between "all capacity claims admitted" and
-// "first C stage". F2 uses it to allocate catalog-owned shard storage without crossing the
-// reserve-before-mutate boundary; F0b has no preparation hook. Exceptions are caught by the
+// first accounting stage. Artifact publication uses it to allocate catalog-owned shard storage
+// without crossing the reserve-before-mutate boundary; host-cache publication has no preparation
+// hook. Exceptions are caught by the
 // primitive and become internal_fault.
 struct llama_cache_transaction_after_admit {
     void * context = nullptr;
@@ -275,7 +276,7 @@ struct llama_cache_prepare_result {
 // Split-phase form of the shared authority transaction. A prepared group owns
 // every admitted reservation claim until its one materialize-and-commit
 // terminal runs. Dropping or replacing the group aborts all still-live claims.
-// This is the F3 streaming seam: capacity is proven before a bounded D2H
+// This is the streaming seam: capacity is proven before a bounded D2H
 // materialization without introducing a second admission or rollback path.
 class llama_cache_prepared_claim_group {
 public:
@@ -325,7 +326,7 @@ public:
         const llama_cache_transaction_fault & fault = {},
         const llama_cache_transaction_after_admit & after_admit = {}) noexcept;
 
-    // F3 prepares capacity before the content-addressed byte stream exists.
+    // Capture prepares capacity before the content-addressed byte stream exists.
     // The terminal may bind the final artifact/content/lineage citations and
     // success-output locations, while every priced field remains identical
     // to the prepared leaf. Any shape change fails closed before staging.
@@ -359,7 +360,7 @@ llama_cache_prepare_reservation_transaction(
         const llama_cache_budget_config & budget_config,
         const std::vector<llama_cache_transaction_leaf> & leaves) noexcept;
 
-// Shared F0/F2 transaction:
+// Shared host-cache/artifact-catalog transaction:
 //   admit every leaf (bounded serial-conflict retry) → optional preparation → stage all →
 //   commit all → post-commit fault seam → publish success-only outputs.
 // Any failure releases already-committed ops and lets the move-only claims

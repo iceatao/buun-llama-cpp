@@ -197,7 +197,7 @@ struct dflash_capture_data {
     ggml_backend_buffer_t replay_buf = nullptr;
     size_t replay_buf_size = 0;
 
-    // S2: pre-allocated zeros buffer for Q input (avoids per-call alloc+zero)
+    // Preallocated zeros buffer for Q input (avoids per-call allocation and clearing).
     std::vector<float> replay_zeros;
 
     // async tape replay state (GDN launched, waiting for sync before conv rebuild)
@@ -375,6 +375,21 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    // Internal bounded serializer used by exact companion capture. Unlike the
+    // contiguous C API this preserves writer-owned cancellation quanta and
+    // does not materialize a second complete sequence-state buffer.
+    size_t state_seq_write_data_stream(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags);
+    // Internal streaming counterpart used by immutable VBR companion chains.
+    // The reader supplies the canonical sequence header and bounded tensor
+    // chunks, avoiding a second full host image during restore.
+    size_t state_seq_read_data_stream(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags);
 
     bool state_load_file(
             const char * filepath,

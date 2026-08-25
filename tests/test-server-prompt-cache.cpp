@@ -99,6 +99,34 @@ void test_idle_capture_session_cancellation() {
         CHECK(escaped.continue_capture());
     }
     CHECK(!escaped.continue_capture());
+
+    {
+        server_queue queue;
+        server_task wake;
+        wake.id = 10;
+        wake.type = SERVER_TASK_TYPE_NEXT_RESPONSE;
+        CHECK(queue.post(std::move(wake)) == 10);
+        CHECK(!queue.try_begin_idle_capture());
+        auto boundary = queue.try_begin_prompt_boundary_capture();
+        CHECK(boundary);
+        CHECK(boundary.continue_capture());
+        CHECK(queue.post(idle_capture_test_task(11)) == 11);
+        CHECK(!boundary.continue_capture());
+    }
+    {
+        server_queue queue;
+        CHECK(queue.post(idle_capture_test_task(12)) == 12);
+        CHECK(!queue.try_begin_prompt_boundary_capture());
+    }
+    {
+        server_queue queue;
+        server_task wake;
+        wake.id = 13;
+        wake.type = SERVER_TASK_TYPE_NEXT_RESPONSE;
+        CHECK(queue.post(std::move(wake)) == 13);
+        queue.defer(idle_capture_test_task(14));
+        CHECK(!queue.try_begin_prompt_boundary_capture());
+    }
 }
 
 void fill_checkpoint_bytes(
@@ -698,7 +726,7 @@ void test_fixed_host_pressure_shadow_records_counterfactual() {
         common_retention_credit_result::credited);
 
     // Two 100-byte entries exceed this bound by one victim. Shipping remains
-    // FIFO and removes the hot oldest entry; DF1 records that the cold newer
+    // FIFO removes the hot oldest entry; retention observation records that the cold newer
     // lineage would have been the lower-value victim.
     cache.limit_size = 150;
     cache.update();
@@ -845,7 +873,7 @@ void test_fixed_host_pressure_shadow_advances_one_wave() {
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(cache.states.empty());
     CHECK(shadow.pressure_waves == 1);
-    // DF1 is a counterfactual observer, not authority. It samples the first
+    // The counterfactual retention observer is not authority. It samples the first
     // decision once per pressure wave so an N-victim FIFO cleanup cannot
     // multiply the full inventory/sort cost by N.
     CHECK(shadow.choices == 1);
@@ -1272,47 +1300,47 @@ server_prompt_cache::iterator install_host_trade_retention_entry(
     return installed;
 }
 
-struct retention_df2_benchmark_fixture {
+struct retention_capacity_benchmark_fixture {
     size_t cardinality;
     size_t trial;
-    bool df2_enabled;
+    bool retention_capacity_enabled;
     server_cache_authority authority;
     std::string execution;
     server_prompt_cache cache;
     server_retention_instance_key oldest_key;
 
-    retention_df2_benchmark_fixture(
+    retention_capacity_benchmark_fixture(
             size_t cardinality,
             size_t trial,
-            bool df2_enabled) :
+            bool retention_capacity_enabled) :
         cardinality(cardinality),
         trial(trial),
-        df2_enabled(df2_enabled),
+        retention_capacity_enabled(retention_capacity_enabled),
         execution(
-            "df2-bench-" + std::to_string(trial)),
+            "retention-capacity-bench-" + std::to_string(trial)),
         cache(0, 0) {
     }
 
     bool fail(const char * reason) const {
         std::fprintf(stderr,
-            "RETENTION_DF2_BENCH failed cardinality=%zu trial=%zu "
-            "df2=%d reason=%s\n",
-            cardinality, trial, df2_enabled, reason);
+            "RETENTION_CAPACITY_BENCH failed cardinality=%zu trial=%zu "
+            "retention_capacity=%d reason=%s\n",
+            cardinality, trial, retention_capacity_enabled, reason);
         return false;
     }
 
     bool prepare() {
         configure_host_trade(authority, cache, execution);
         authority.calibration_profile = {};
-        cache.retention_df2_authority = df2_enabled;
-        if (df2_enabled &&
+        cache.retention_capacity_authority = retention_capacity_enabled;
+        if (retention_capacity_enabled &&
             (!authority.retention.enable_prefix_tracking() ||
              !cache.enable_retention_shadow())) {
             return fail("workspace-or-prefix-index");
         }
         for (size_t i = 0; i < cardinality; ++i) {
             const auto identity =
-                "df2-bench-" + std::to_string(trial) + "-" +
+                "retention-capacity-bench-" + std::to_string(trial) + "-" +
                 std::to_string(i);
             (void) install_host_trade_retention_entry(
                 cache, authority, identity.c_str(),
@@ -1339,18 +1367,18 @@ struct retention_df2_benchmark_fixture {
         if (cache.states.size() != cardinality - 1 ||
             cache.states.empty() ||
             cache.states.front().adapter_config_key !=
-                "df2-bench-" + std::to_string(trial) + "-1" ||
+                "retention-capacity-bench-" + std::to_string(trial) + "-1" ||
             authority.retention.artifact_id(oldest_key).v != 0 ||
             authority.destruction.prepared_release_commits != 1 ||
             authority.destruction.prepared_release_fallbacks != 0) {
             return fail("survivor-or-terminal");
         }
-        if (df2_enabled) {
-            if (authority.destruction.host_trade_df2_executed != 1 ||
+        if (retention_capacity_enabled) {
+            if (authority.destruction.host_trade_retention_capacity_executed != 1 ||
                 authority.destruction.host_trade_legacy_fallbacks != 0) {
-                return fail("df2-terminal");
+                return fail("retention-capacity-terminal");
             }
-        } else if (authority.destruction.host_trade_df2_executed != 0 ||
+        } else if (authority.destruction.host_trade_retention_capacity_executed != 0 ||
                    authority.destruction.host_trade_legacy_fallbacks != 1) {
             return fail("baseline-terminal");
         }
@@ -1358,7 +1386,7 @@ struct retention_df2_benchmark_fixture {
     }
 };
 
-bool run_retention_df2_benchmark(size_t cardinality, size_t trials) {
+bool run_retention_capacity_benchmark(size_t cardinality, size_t trials) {
     std::vector<uint64_t> baseline_samples;
     std::vector<uint64_t> total_samples;
     std::vector<int64_t> added_samples;
@@ -1367,16 +1395,16 @@ bool run_retention_df2_benchmark(size_t cardinality, size_t trials) {
     total_samples.reserve(trials);
     added_samples.reserve(trials);
     for (size_t trial = 0; trial < trials; ++trial) {
-        retention_df2_benchmark_fixture baseline(
+        retention_capacity_benchmark_fixture baseline(
             cardinality, trial, false);
-        retention_df2_benchmark_fixture total(
+        retention_capacity_benchmark_fixture total(
             cardinality, trial, true);
         uint64_t baseline_ns = 0;
         uint64_t total_ns = 0;
         const size_t order = trial % order_samples.size();
-        const bool prepare_df2_first = order >= 2;
-        const bool run_df2_first = order % 2 != 0;
-        if (prepare_df2_first) {
+        const bool prepare_retention_capacity_first = order >= 2;
+        const bool run_retention_capacity_first = order % 2 != 0;
+        if (prepare_retention_capacity_first) {
             if (!total.prepare() || !baseline.prepare()) {
                 return false;
             }
@@ -1385,7 +1413,7 @@ bool run_retention_df2_benchmark(size_t cardinality, size_t trials) {
                 return false;
             }
         }
-        if (run_df2_first) {
+        if (run_retention_capacity_first) {
             if (!total.run(total_ns) || !baseline.run(baseline_ns)) {
                 return false;
             }
@@ -1435,7 +1463,7 @@ bool run_retention_df2_benchmark(size_t cardinality, size_t trials) {
         added_p95 <= allowance_i64 && order_accepted;
     const bool marginal_gate_accepted = marginal_accepted;
     std::printf(
-        "RETENTION_DF2_BENCH cardinality=%zu trials=%zu "
+        "RETENTION_CAPACITY_BENCH cardinality=%zu trials=%zu "
         "evictions_per_wave=1 "
         "baseline_p50_ns=%" PRIu64 " baseline_p95_ns=%" PRIu64 " "
         "total_p50_ns=%" PRIu64 " total_p95_ns=%" PRIu64 " "
@@ -1453,12 +1481,12 @@ bool run_retention_df2_benchmark(size_t cardinality, size_t trials) {
     return marginal_gate_accepted;
 }
 
-int retention_df2_benchmark() {
+int retention_capacity_benchmark() {
     const int old_verbosity = common_log_get_verbosity_thold();
     common_log_set_verbosity_thold(LOG_LEVEL_OUTPUT);
     const bool ok =
-        run_retention_df2_benchmark(1024, 21) &&
-        run_retention_df2_benchmark(
+        run_retention_capacity_benchmark(1024, 21) &&
+        run_retention_capacity_benchmark(
             SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES, 21);
     common_log_set_verbosity_thold(old_verbosity);
     return ok ? 0 : 1;
@@ -1500,7 +1528,7 @@ void test_lifecycle_pressure_records_decayed_shadow() {
     cache.update();
 
     // Lifecycle retains its existing certified pricing authority and removes
-    // the equally sized oldest entry. DF1 uses the same evaluated lease and
+    // the equally sized oldest entry. Retention observation uses the same evaluated lease and
     // serial-bound accounting evidence to record that the credited oldest
     // lineage should have survived; it still cannot authorize destruction.
     CHECK(cache.states.size() == 1);
@@ -1566,12 +1594,12 @@ void test_lifecycle_shadow_retains_live_alias_coverage() {
     authority.retention.retire(live_key);
 }
 
-void test_lifecycle_df2_token_pressure_uses_tokens() {
+void test_lifecycle_retention_capacity_token_pressure_uses_tokens() {
     server_cache_authority authority;
     const std::string execution = "lifecycle-token-shadow";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -1593,28 +1621,20 @@ void test_lifecycle_df2_token_pressure_uses_tokens() {
           server_cache_destruction_reason::host_token_limit);
     CHECK(shadow.last.proposed_artifact == oldest_artifact);
     CHECK(shadow.last.proposed_resource == 100);
-    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
     CHECK(authority.destruction.host_trade_unpriced == 0);
 }
 
-void test_lifecycle_df2_rollout_and_reuse_thresholds() {
-    CHECK(server_prompt_cache_df2_rollout_parse(nullptr) ==
-          server_prompt_cache_df2_rollout::enabled);
-    CHECK(server_prompt_cache_df2_rollout_parse("") ==
-          server_prompt_cache_df2_rollout::enabled);
-    CHECK(server_prompt_cache_df2_rollout_parse("1") ==
-          server_prompt_cache_df2_rollout::enabled);
-    CHECK(server_prompt_cache_df2_rollout_parse("0") ==
-          server_prompt_cache_df2_rollout::disabled);
-    CHECK(server_prompt_cache_df2_rollout_parse("garbage") ==
-          server_prompt_cache_df2_rollout::invalid);
-    CHECK(server_prompt_cache_lifecycle_default(
-        false, true));
-    CHECK(!server_prompt_cache_lifecycle_default(
-        false, false));
-    CHECK(server_prompt_cache_lifecycle_default(
-        true, false));
+void test_lifecycle_defaults_and_reuse_thresholds() {
+    CHECK(server_cache_lifecycle_default(
+        false, true, false));
+    CHECK(!server_cache_lifecycle_default(
+        false, false, false));
+    CHECK(server_cache_lifecycle_default(
+        true, false, false));
+    CHECK(server_cache_lifecycle_default(
+        false, false, true));
     const auto fully_off = server_retention_owner_plan_for(
         false, false, false, false, false);
     CHECK(fully_off.owner == server_retention_owner_kind::none);
@@ -1635,11 +1655,11 @@ void test_lifecycle_df2_rollout_and_reuse_thresholds() {
         true, false, false, true, false);
     CHECK(vbr_debug.owner == server_retention_owner_kind::authority);
     CHECK(vbr_debug.prefix_tracking);
-    const auto fixed_df2 = server_retention_owner_plan_for(
+    const auto fixed_retention_capacity = server_retention_owner_plan_for(
         false, true, true, false, true);
-    CHECK(fixed_df2.owner == server_retention_owner_kind::authority);
-    CHECK(fixed_df2.prompt_shadow_workspace);
-    CHECK(fixed_df2.prefix_tracking);
+    CHECK(fixed_retention_capacity.owner == server_retention_owner_kind::authority);
+    CHECK(fixed_retention_capacity.prompt_shadow_workspace);
+    CHECK(fixed_retention_capacity.prefix_tracking);
     const auto fixed_rollback = server_retention_owner_plan_for(
         false, true, true, false, false);
     CHECK(fixed_rollback.owner == server_retention_owner_kind::authority);
@@ -1662,24 +1682,58 @@ void test_lifecycle_df2_rollout_and_reuse_thresholds() {
     CHECK(vbr_reclaim.mixed_host_kept_hot);
     CHECK(vbr_reclaim.mixed_host_removed_cold);
     CHECK(vbr_reclaim.token_identity_distinguishes_attempt);
+    CHECK(vbr_reclaim.successful_attempt_is_state_sealed);
     CHECK(vbr_reclaim.multi_fresh_pressure_isolated);
+    CHECK(vbr_reclaim.unchanged_admission_refusal_is_suppressed);
+    CHECK(vbr_reclaim.checkpoint_admission_refusals_are_independent);
+    CHECK(vbr_reclaim.admission_refusal_reopens_on_currency_change);
+    CHECK(vbr_reclaim.admission_refusal_reopens_at_lease_expiry);
     available_host_fallback vbr_selection_fallback;
     const auto vbr_selection = server_vbr_slot_selection_for_test(
         &vbr_selection_fallback);
     CHECK(vbr_selection.learned_selected_cold);
     CHECK(vbr_selection.learned_kept_hot);
     CHECK(vbr_selection.selection_was_pure);
+    CHECK(vbr_selection.fixed_learned_selected_cold);
+    CHECK(vbr_selection.fixed_learned_kept_hot);
+    CHECK(vbr_selection.fixed_selection_was_pure);
+    CHECK(vbr_selection.fixed_incomplete_used_lru);
+    CHECK(vbr_selection.fixed_protected_fallback_was_safe);
+    CHECK(vbr_selection.fixed_capability_tier_was_preserved);
     CHECK(vbr_selection.incomplete_used_lru);
     CHECK(vbr_selection.protected_fallback_was_safe);
     CHECK(vbr_selection.all_protected_has_no_target);
     CHECK(vbr_selection.empty_slot_was_preferred);
     CHECK(vbr_selection.capability_tier_was_preserved);
     CHECK(vbr_selection.exhausted_tier_used_alternate);
-    CHECK(vbr_selection.route_home_unchanged);
+    CHECK(vbr_selection.weak_prefix_preserved_empty);
+    CHECK(vbr_selection.weak_prefix_preserved_hot);
     CHECK(!server_prompt_cache_retention_reuse_is_useful(
         SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS - 1));
     CHECK(server_prompt_cache_retention_reuse_is_useful(
         SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS));
+    common_chat_msg_spans short_system_prefix;
+    short_system_prefix.add(COMMON_CHAT_ROLE_SYSTEM, 3, 189);
+    short_system_prefix.add(COMMON_CHAT_ROLE_USER, 195, 10);
+    CHECK(server_prompt_cache_retention_reuse_is_useful(
+        195, &short_system_prefix));
+    CHECK(server_prompt_cache_retention_reuse_is_useful(
+        232, &short_system_prefix));
+    CHECK(!server_prompt_cache_retention_reuse_is_useful(
+        194, &short_system_prefix));
+    common_chat_msg_spans user_only_prefix;
+    user_only_prefix.add(COMMON_CHAT_ROLE_USER, 0, 200);
+    CHECK(!server_prompt_cache_retention_reuse_is_useful(
+        195, &user_only_prefix));
+    user_only_prefix.spans.clear();
+    user_only_prefix.add(COMMON_CHAT_ROLE_USER, 3, 197);
+    CHECK(!server_prompt_cache_retention_reuse_is_useful(
+        195, &user_only_prefix));
+    common_chat_msg_spans incomplete_system_prefix;
+    incomplete_system_prefix.add(COMMON_CHAT_ROLE_SYSTEM, 3, 197);
+    incomplete_system_prefix.add(COMMON_CHAT_ROLE_USER, 195, 10);
+    CHECK(!server_prompt_cache_retention_reuse_is_useful(
+        195, &incomplete_system_prefix));
 }
 
 void test_slot_prompt_admission_boundaries() {
@@ -1716,7 +1770,7 @@ void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
     const std::string execution = "lifecycle-prefix-failure";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(!authority.retention.enable_prefix_tracking(true));
     CHECK(cache.enable_retention_shadow());
 
@@ -1738,23 +1792,23 @@ void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
     CHECK(shadow.complete == 0);
     CHECK(shadow.unavailable == 1);
     CHECK(shadow.last.proposed_artifact.v == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 0);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 0);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
 }
 
-void test_lifecycle_df2_capacity_executes_decayed_fallback() {
+void test_lifecycle_retention_capacity_executes_decayed_fallback() {
     server_cache_authority authority;
-    const std::string execution = "lifecycle-df2-capacity";
+    const std::string execution = "lifecycle-retention-capacity-capacity";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
     const auto oldest =
-        install_host_trade_entry(cache, authority, "df2-hot", 100);
+        install_host_trade_entry(cache, authority, "retention-capacity-hot", 100);
     const auto newest =
-        install_host_trade_entry(cache, authority, "df2-cold", 100);
+        install_host_trade_entry(cache, authority, "retention-capacity-cold", 100);
     const auto oldest_key =
         server_retention_instance_key::for_host_entry(&*oldest);
     const auto newest_key =
@@ -1778,7 +1832,7 @@ void test_lifecycle_df2_capacity_executes_decayed_fallback() {
     cache.update();
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(cache.states.size() == 1);
-    CHECK(cache.states.front().adapter_config_key == "df2-hot");
+    CHECK(cache.states.front().adapter_config_key == "retention-capacity-hot");
     CHECK(shadow.complete == 1);
     CHECK(shadow.unavailable == 0);
     CHECK(shadow.disagreements == 1);
@@ -1786,19 +1840,19 @@ void test_lifecycle_df2_capacity_executes_decayed_fallback() {
     CHECK(shadow.last.proposed_artifact == newest_artifact);
 }
 
-void test_lifecycle_df2_accounting_fault_falls_back_to_fifo() {
+void test_lifecycle_retention_capacity_accounting_fault_falls_back_to_fifo() {
     server_cache_authority authority;
-    const std::string execution = "lifecycle-df2-accounting-fault";
+    const std::string execution = "lifecycle-retention-capacity-accounting-fault";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
     const auto oldest =
-        install_host_trade_entry(cache, authority, "df2-fault-hot", 100);
+        install_host_trade_entry(cache, authority, "retention-capacity-fault-hot", 100);
     const auto newest =
-        install_host_trade_entry(cache, authority, "df2-fault-cold", 100);
+        install_host_trade_entry(cache, authority, "retention-capacity-fault-cold", 100);
     const auto oldest_key =
         server_retention_instance_key::for_host_entry(&*oldest);
     const auto newest_key =
@@ -1818,7 +1872,7 @@ void test_lifecycle_df2_accounting_fault_falls_back_to_fifo() {
     const auto newest_artifact =
         authority.retention.artifact_id(newest_key);
 
-    // Corrupt only DF2's proposed cold victim. Its immutable payload bytes
+    // Corrupt only retention capacity's proposed cold victim. Its immutable payload bytes
     // remain rankable, but authority must refuse the stale release set and
     // return to the lawful FIFO floor before touching that entry.
     CHECK(!newest->release_ops().empty());
@@ -1826,25 +1880,25 @@ void test_lifecycle_df2_accounting_fault_falls_back_to_fifo() {
     cache.limit_size = 150;
     cache.update();
     CHECK(cache.states.size() == 1);
-    CHECK(cache.states.front().adapter_config_key == "df2-fault-cold");
+    CHECK(cache.states.front().adapter_config_key == "retention-capacity-fault-cold");
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(shadow.complete == 1);
     CHECK(shadow.last.proposed_artifact == newest_artifact);
-    CHECK(authority.destruction.host_trade_df2_executed == 0);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 0);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
 }
 
-void test_lifecycle_df2_capacity_handles_incoming_publication() {
+void test_lifecycle_retention_capacity_handles_incoming_publication() {
     server_cache_authority authority;
-    const std::string execution = "lifecycle-df2-incoming";
+    const std::string execution = "lifecycle-retention-capacity-incoming";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
     const auto incumbent =
-        install_host_trade_entry(cache, authority, "df2-incumbent", 100);
+        install_host_trade_entry(cache, authority, "retention-capacity-incumbent", 100);
     const auto incumbent_key =
         server_retention_instance_key::for_host_entry(&*incumbent);
     CHECK(server_prompt_retention_publish_exact_prefix(
@@ -1853,7 +1907,7 @@ void test_lifecycle_df2_capacity_handles_incoming_publication() {
     const auto incumbent_artifact =
         authority.retention.artifact_id(incumbent_key);
 
-    auto incoming = make_retention_entry("df2-incoming", 9000, 3, 100);
+    auto incoming = make_retention_entry("retention-capacity-incoming", 9000, 3, 100);
     server_prompt source = incoming.front().prompt.clone();
     const auto source_artifact = publish_live_retention(
         authority.retention, source, 31);
@@ -1868,8 +1922,8 @@ void test_lifecycle_df2_capacity_handles_incoming_publication() {
     CHECK(cache.publish(std::move(incoming), &source, 31, &published));
     CHECK(published != cache.states.end());
     CHECK(cache.states.size() == 1);
-    CHECK(cache.states.front().adapter_config_key == "df2-incoming");
-    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(cache.states.front().adapter_config_key == "retention-capacity-incoming");
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(shadow.complete == 1);
@@ -1877,19 +1931,19 @@ void test_lifecycle_df2_capacity_handles_incoming_publication() {
     CHECK(shadow.last.proposed_artifact == incumbent_artifact);
 }
 
-void test_lifecycle_df2_capacity_counts_recovery_pinned_coverage() {
+void test_lifecycle_retention_capacity_counts_recovery_pinned_coverage() {
     server_cache_authority authority;
-    const std::string execution = "lifecycle-df2-pinned";
+    const std::string execution = "lifecycle-retention-capacity-pinned";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
     const auto pinned =
-        install_host_trade_entry(cache, authority, "df2-pinned", 100);
+        install_host_trade_entry(cache, authority, "retention-capacity-pinned", 100);
     const auto alias =
-        install_host_trade_entry(cache, authority, "df2-alias", 100);
+        install_host_trade_entry(cache, authority, "retention-capacity-alias", 100);
     const auto pinned_key =
         server_retention_instance_key::for_host_entry(&*pinned);
     const auto alias_key =
@@ -1908,8 +1962,8 @@ void test_lifecycle_df2_capacity_counts_recovery_pinned_coverage() {
     cache.limit_size = 100;
     cache.update();
     CHECK(cache.states.size() == 1);
-    CHECK(cache.states.front().adapter_config_key == "df2-pinned");
-    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(cache.states.front().adapter_config_key == "retention-capacity-pinned");
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(shadow.complete == 1);
@@ -1917,53 +1971,63 @@ void test_lifecycle_df2_capacity_counts_recovery_pinned_coverage() {
     cache.states.front().recovery_pins = 0;
 }
 
-void test_lifecycle_df2_live_transition_matrix() {
+void test_lifecycle_retention_capacity_live_transition_matrix() {
     common_retention_lineage_record never_reused;
     never_reused.reuse_hits = 0;
     common_retention_lineage_record reused;
     reused.reuse_hits = 1;
 
-    const auto off = server_prompt_cache_df2_live_transition_for(
+    const auto off = server_prompt_cache_retention_capacity_live_transition_for(
         false, true, false, 1000, 800, &reused);
     CHECK(!off.lookup_host);
     CHECK(!off.preserve_source);
 
-    const auto probationary = server_prompt_cache_df2_live_transition_for(
+    const auto probationary = server_prompt_cache_retention_capacity_live_transition_for(
         true, true, false, 1000, 800, &never_reused);
     CHECK(probationary.lookup_host);
     CHECK(!probationary.preserve_source);
 
-    const auto reused_branch = server_prompt_cache_df2_live_transition_for(
+    const auto reused_branch = server_prompt_cache_retention_capacity_live_transition_for(
         true, true, false, 1000, 800, &reused);
     CHECK(reused_branch.lookup_host);
     CHECK(reused_branch.preserve_source);
 
-    const auto tiny_reused_branch = server_prompt_cache_df2_live_transition_for(
+    const auto tiny_reused_branch = server_prompt_cache_retention_capacity_live_transition_for(
         true, true, false, 1000,
         SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS - 1, &reused);
     CHECK(tiny_reused_branch.lookup_host);
     CHECK(!tiny_reused_branch.preserve_source);
 
+    common_chat_msg_spans short_system_prefix;
+    short_system_prefix.add(COMMON_CHAT_ROLE_SYSTEM, 3, 189);
+    short_system_prefix.add(COMMON_CHAT_ROLE_USER, 195, 10);
+    const auto semantic_reused_branch =
+        server_prompt_cache_retention_capacity_live_transition_for(
+            true, true, false, 1000, 195, &reused,
+            &short_system_prefix);
+    CHECK(semantic_reused_branch.lookup_host);
+    CHECK(semantic_reused_branch.preserve_source);
+
     for (const auto unchanged : {
-            server_prompt_cache_df2_live_transition_for(
+            server_prompt_cache_retention_capacity_live_transition_for(
                 true, true, false, 1000, 1000, &reused),
-            server_prompt_cache_df2_live_transition_for(
+            server_prompt_cache_retention_capacity_live_transition_for(
                 true, false, false, 1000, 800, &reused),
-            server_prompt_cache_df2_live_transition_for(
+            server_prompt_cache_retention_capacity_live_transition_for(
                 true, true, true, 1000, 800, &reused),
-            server_prompt_cache_df2_live_transition_for(
+            server_prompt_cache_retention_capacity_live_transition_for(
                 true, true, false, 0, 0, &reused) }) {
         CHECK(!unchanged.lookup_host);
         CHECK(!unchanged.preserve_source);
     }
 }
 
-void test_lifecycle_df2_reprojects_each_multi_victim_wave() {
+void test_lifecycle_retention_capacity_reprojects_each_multi_victim_wave() {
     server_cache_authority authority;
-    const std::string execution = "lifecycle-df2-multi";
+    const std::string execution = "lifecycle-retention-capacity-multi";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -2014,18 +2078,18 @@ void test_lifecycle_df2_reprojects_each_multi_victim_wave() {
     CHECK(shadow.complete == 1);
     CHECK(shadow.last.proposed_artifact == b_artifact);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 2);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 2);
 }
 
-void test_lifecycle_df2_phase_change_forgets_old_reuse() {
+void test_lifecycle_retention_capacity_phase_change_forgets_old_reuse() {
     const auto run = [](bool age_old_credit) {
         server_cache_authority authority;
         const std::string execution = age_old_credit
-            ? "lifecycle-df2-phase-aged"
-            : "lifecycle-df2-phase-fresh";
+            ? "lifecycle-retention-capacity-phase-aged"
+            : "lifecycle-retention-capacity-phase-fresh";
         server_prompt_cache cache(0, 0);
         configure_host_trade(authority, cache, execution);
-        cache.retention_df2_authority = true;
+        cache.retention_capacity_authority = true;
         CHECK(authority.retention.enable_prefix_tracking());
         CHECK(cache.enable_retention_shadow());
 
@@ -2066,7 +2130,7 @@ void test_lifecycle_df2_phase_change_forgets_old_reuse() {
         cache.limit_size = 100;
         cache.update();
         CHECK(cache.states.size() == 1);
-        CHECK(authority.destruction.host_trade_df2_executed == 1);
+        CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
         CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
         const auto shadow = cache.retention_shadow_snapshot();
         CHECK(shadow.complete == 1);
@@ -2083,12 +2147,12 @@ void test_lifecycle_df2_phase_change_forgets_old_reuse() {
     CHECK(run(true) == "phase-current");
 }
 
-void test_lifecycle_df2_all_one_shot_converges_to_fifo() {
+void test_lifecycle_retention_capacity_all_one_shot_converges_to_fifo() {
     server_cache_authority authority;
-    const std::string execution = "lifecycle-df2-all-one-shot";
+    const std::string execution = "lifecycle-retention-capacity-all-one-shot";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -2113,7 +2177,7 @@ void test_lifecycle_df2_all_one_shot_converges_to_fifo() {
     CHECK(cache.states.size() == 2);
     CHECK(cache.states.front().adapter_config_key == "one-shot-b");
     CHECK(cache.states.back().adapter_config_key == "one-shot-c");
-    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(shadow.complete == 1);
@@ -2122,13 +2186,13 @@ void test_lifecycle_df2_all_one_shot_converges_to_fifo() {
     CHECK(shadow.last.agrees);
 }
 
-void test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin() {
+void test_lifecycle_retention_capacity_uses_value_density_not_reuse_as_a_pin() {
     {
         server_cache_authority authority;
-        const std::string execution = "lifecycle-df2-expensive-infrequent";
+        const std::string execution = "lifecycle-retention-capacity-expensive-infrequent";
         server_prompt_cache cache(0, 0);
         configure_host_trade(authority, cache, execution);
-        cache.retention_df2_authority = true;
+        cache.retention_capacity_authority = true;
         CHECK(authority.retention.enable_prefix_tracking());
         CHECK(cache.enable_retention_shadow());
 
@@ -2151,7 +2215,7 @@ void test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin() {
         CHECK(cache.states.size() == 1);
         CHECK(cache.states.front().adapter_config_key ==
               "density-expensive");
-        CHECK(authority.destruction.host_trade_df2_executed == 1);
+        CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
         CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
         CHECK(cache.retention_shadow_snapshot().last.proposed_artifact ==
               cheap_artifact);
@@ -2159,10 +2223,10 @@ void test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin() {
 
     {
         server_cache_authority authority;
-        const std::string execution = "lifecycle-df2-cheap-frequent";
+        const std::string execution = "lifecycle-retention-capacity-cheap-frequent";
         server_prompt_cache cache(0, 0);
         configure_host_trade(authority, cache, execution);
-        cache.retention_df2_authority = true;
+        cache.retention_capacity_authority = true;
         CHECK(authority.retention.enable_prefix_tracking());
         CHECK(cache.enable_retention_shadow());
 
@@ -2184,22 +2248,22 @@ void test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin() {
         cache.update();
         CHECK(cache.states.size() == 1);
         CHECK(cache.states.front().adapter_config_key == "density-compact");
-        CHECK(authority.destruction.host_trade_df2_executed == 1);
+        CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
         CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
         CHECK(cache.retention_shadow_snapshot().last.proposed_artifact ==
               large_artifact);
     }
 }
 
-void test_lifecycle_df2_cold_start_prior_ages_to_recency() {
+void test_lifecycle_retention_capacity_cold_start_prior_ages_to_recency() {
     const auto run = [](bool age_prior) {
         server_cache_authority authority;
         const std::string execution = age_prior
-            ? "lifecycle-df2-prior-aged"
-            : "lifecycle-df2-prior-fresh";
+            ? "lifecycle-retention-capacity-prior-aged"
+            : "lifecycle-retention-capacity-prior-fresh";
         server_prompt_cache cache(0, 0);
         configure_host_trade(authority, cache, execution);
-        cache.retention_df2_authority = true;
+        cache.retention_capacity_authority = true;
         CHECK(authority.retention.enable_prefix_tracking());
         CHECK(cache.enable_retention_shadow());
 
@@ -2248,7 +2312,7 @@ void test_lifecycle_df2_cold_start_prior_ages_to_recency() {
         cache.limit_size = 100;
         cache.update();
         CHECK(cache.states.size() == 1);
-        CHECK(authority.destruction.host_trade_df2_executed == 1);
+        CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
         CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
         const auto shadow = cache.retention_shadow_snapshot();
         CHECK(shadow.complete == 1);
@@ -2285,7 +2349,7 @@ void make_host_trade_pair(
     recovery->cache_plan_source_id = source_id + 100;
     victim->main_family = main_family;
     // Keep the proof source outside the victim candidate set while still
-    // allowing D-A's short-lived pin to nest over it.
+    // allowing the short-lived destruction pin to nest over it.
     recovery->recovery_pins = 1;
     CHECK(server_prompt_cache::exactly_redundant(*victim, *recovery));
 }
@@ -2520,10 +2584,10 @@ void test_declared_family_round_trip_and_price() {
     CHECK(slot_round_trip.host_save_carries);
     CHECK(slot_round_trip.checkpoint_carries);
     std::puts(
-        "E1_FAMILY two_slot_save PASS main=1 branch=1 distinct=1");
+        "CACHE_FAMILY two_slot_save PASS main=1 branch=1 distinct=1");
     std::puts(
-        "E1_FAMILY actual_slot_resume PASS binding_intact=1 host=1 checkpoint=1");
-    std::puts("E1_FAMILY round_trip PASS main_price_equal no_stack");
+        "CACHE_FAMILY actual_slot_resume PASS binding_intact=1 host=1 checkpoint=1");
+    std::puts("CACHE_FAMILY round_trip PASS main_price_equal no_stack");
 }
 
 void test_checkpoint_lineage_ignores_retier_but_rejects_content_change() {
@@ -2587,7 +2651,7 @@ bool host_source_present(
         });
 }
 
-// Regression for F0b review MUST-1: lifecycle accounting may prove/transact publication, but the
+// Regression for  review MUST-1: lifecycle accounting may prove/transact publication, but the
 // prompt cache's configured limit remains a FIFO rotation policy—not an admission ceiling. A full
 // 1 MiB cache must accept a second 700 KiB entry and evict the oldest, rather than become fill-once.
 void test_lifecycle_full_cache_rotates() {
@@ -2899,7 +2963,7 @@ void test_lifecycle_restore_retains_immutable_source() {
         lease_release).status == server_cache_control_status::ok);
     CHECK(cache.states.front().recovery_pins == 0);
     std::printf(
-        "E1_TWO_COPIES restored_host_fallback PASS live=%" PRIu64
+        "CACHE_TWO_COPIES restored_host_fallback PASS live=%" PRIu64
         " appended=%" PRIu64 " host=%" PRIu64
         " distinct=1 prefix_lookup=0 append=partially_stale"
         " adapter_rebind=subject_lost\n",
@@ -2929,7 +2993,7 @@ void test_lifecycle_restore_retains_immutable_source() {
           common_retention_frequency_state::promoted);
 
     // Restored members own independent operations and therefore participate
-    // in the exact D-A4 release terminal instead of remaining permanently
+    // in the exact release terminal instead of remaining permanently
     // fail-closed. Releasing the newer member leaves its restored survivor
     // and survivor operations intact.
     auto restored_victim = std::next(live_second.checkpoints.begin());
@@ -3037,7 +3101,7 @@ void test_implicit_soft_append_chain_is_bounded() {
         authority.leases.event_snapshot(), retired));
     CHECK(retired.active.empty());
     CHECK(authority.ledger.snapshot().live_ops == 0);
-    std::puts("E1_FAMILY implicit_soft_append_bound PASS turns=32 leases=1");
+    std::puts("CACHE_FAMILY implicit_soft_append_bound PASS turns=32 leases=1");
 }
 
 void test_durable_recovery_binds_exact_published_peer() {
@@ -3719,7 +3783,7 @@ void test_lifecycle_release_prepare_failure_keeps_legacy_bound() {
     cache.publish_authority = &authority;
     cache.destruction_obs = &authority.destruction;
 
-    // A pre-authority/unaccounted node has no releasable op union. D-A1 may
+    // A pre-authority/unaccounted node has no releasable operation union. It may
     // not certify it, but must retain the legacy explicit-eviction bound.
     auto entry = make_prompt_entry("same", { 1, 2, 3 });
     cache.states.splice(cache.states.end(), entry);
@@ -4171,7 +4235,7 @@ void test_host_trade_hard_lease_veto() {
     const std::string execution = "trade-hard";
     server_prompt_cache cache(0, 0);
     configure_host_trade(authority, cache, execution, &hard_leases);
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(authority.retention.enable_prefix_tracking());
     CHECK(cache.enable_retention_shadow());
 
@@ -4191,7 +4255,7 @@ void test_host_trade_hard_lease_veto() {
         cache, hard_leases, hard, server_cache_lease_class::hard));
 
     // Neither victim has durable recovery evidence, so the ranked ladder
-    // refuses. DF2 must still honor the hard veto and evict only the open
+    // refuses. retention capacity must still honor the hard veto and evict only the open
     // known-nonhard entry.
     cache.limit_size = cache.size() - open->size() + 1;
     cache.update();
@@ -4202,7 +4266,7 @@ void test_host_trade_hard_lease_veto() {
     CHECK(authority.destruction.host_trade_refused == 1);
     CHECK(authority.destruction.host_trade_executed == 0);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
     const auto shadow = cache.retention_shadow_snapshot();
     CHECK(shadow.complete == 1);
     CHECK(shadow.unavailable == 0);
@@ -4324,7 +4388,7 @@ void test_host_trade_floor_skips_recovery_pin() {
     CHECK(cache.debug_last_recovery_pin_excluded == pinned_artifact);
     CHECK(cache.debug_destruction_emissions == 3);
     std::printf(
-        "E1_TWO_COPIES floor_vs_pinned_fallback PASS pinned=%d open=%d pins=%u\n",
+        "CACHE_TWO_COPIES floor_vs_pinned_fallback PASS pinned=%d open=%d pins=%u\n",
         host_source_present(cache, 21) ? 1 : 0,
         host_source_present(cache, 22) ? 1 : 0,
         pinned->recovery_pins);
@@ -4400,7 +4464,7 @@ void test_cache_control_shutdown_drains_host_pin() {
     control.reset();
     CHECK(fallback->recovery_pins == 0);
     cache.states.clear();
-    std::puts("E1_SHUTDOWN live_hard_lease PASS pins=0");
+    std::puts("CACHE_SHUTDOWN live_hard_lease PASS pins=0");
 }
 
 void test_host_trade_partial_substrate_is_typed() {
@@ -4622,7 +4686,7 @@ void test_checkpoint_thin_lane_skips_pinned_member() {
     CHECK(thin_reason ==
           common_cache_plan_destruction_reason::mandatory_anchor);
     std::printf(
-        "E1_TWO_COPIES thin_lane_pinned_member PASS members=%zu pinned=%d\n",
+        "CACHE_TWO_COPIES thin_lane_pinned_member PASS members=%zu pinned=%d\n",
         ring.size(), authority.retention.recovery_pinned(pinned_key) ? 1 : 0);
     pin = {};
     authority.retention.retire_slot(17);
@@ -5074,8 +5138,8 @@ int main(int argc, char ** argv) {
         return result;
     }
     if (argc == 2 &&
-        std::string(argv[1]) == "--retention-df2-bench") {
-        const int result = retention_df2_benchmark();
+        std::string(argv[1]) == "--retention-capacity-bench") {
+        const int result = retention_capacity_benchmark();
         llama_backend_free();
         return result;
     }
@@ -5121,20 +5185,20 @@ int main(int argc, char ** argv) {
     test_fixed_host_pressure_observes_incoming_publication();
     test_lifecycle_pressure_records_decayed_shadow();
     test_lifecycle_shadow_retains_live_alias_coverage();
-    test_lifecycle_df2_token_pressure_uses_tokens();
-    test_lifecycle_df2_rollout_and_reuse_thresholds();
+    test_lifecycle_retention_capacity_token_pressure_uses_tokens();
+    test_lifecycle_defaults_and_reuse_thresholds();
     test_slot_prompt_admission_boundaries();
     test_lifecycle_shadow_prefix_failure_does_not_change_authority();
-    test_lifecycle_df2_capacity_executes_decayed_fallback();
-    test_lifecycle_df2_accounting_fault_falls_back_to_fifo();
-    test_lifecycle_df2_capacity_handles_incoming_publication();
-    test_lifecycle_df2_capacity_counts_recovery_pinned_coverage();
-    test_lifecycle_df2_live_transition_matrix();
-    test_lifecycle_df2_reprojects_each_multi_victim_wave();
-    test_lifecycle_df2_phase_change_forgets_old_reuse();
-    test_lifecycle_df2_all_one_shot_converges_to_fifo();
-    test_lifecycle_df2_uses_value_density_not_reuse_as_a_pin();
-    test_lifecycle_df2_cold_start_prior_ages_to_recency();
+    test_lifecycle_retention_capacity_executes_decayed_fallback();
+    test_lifecycle_retention_capacity_accounting_fault_falls_back_to_fifo();
+    test_lifecycle_retention_capacity_handles_incoming_publication();
+    test_lifecycle_retention_capacity_counts_recovery_pinned_coverage();
+    test_lifecycle_retention_capacity_live_transition_matrix();
+    test_lifecycle_retention_capacity_reprojects_each_multi_victim_wave();
+    test_lifecycle_retention_capacity_phase_change_forgets_old_reuse();
+    test_lifecycle_retention_capacity_all_one_shot_converges_to_fifo();
+    test_lifecycle_retention_capacity_uses_value_density_not_reuse_as_a_pin();
+    test_lifecycle_retention_capacity_cold_start_prior_ages_to_recency();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();

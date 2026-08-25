@@ -46,7 +46,7 @@ struct common_vbr_fit_costs {
     // under dynamic VBR (no per-tier degrade), so the dry-load KV bytes are already the truth
     // and the floor/price capacity scaling must not be applied.
     bool      types_coupled = false;
-    // #88: per-token bytes of the fattn f16 dequant scratch at the settled deep-fill state — a
+    // Per-token bytes of the flash-attention f16 dequant scratch at settled deep fill: a
     // context-linear consumer OUTSIDE the KV budget (it draws from the fit margin). Charged in
     // the total-VRAM wall constraint only, never in the budget-capacity solves.
     double    scratch_bytes_pt = 0.0;    // out
@@ -699,7 +699,7 @@ static void common_params_fit_impl(
         return (uint32_t) n_ctx;
     };
 
-    // Dynamic VBR (M3 runtime controller): the fit pass owns the "auto" KV VRAM budget. In
+    // The dynamic-VBR runtime controller's fit pass owns the "auto" KV VRAM budget. In
     // dynamic mode the KV is priced at the FLOOR tier throughout this function (swap in
     // common_fit_params) — the runtime cache starts at turbo8 and degrades toward the floor as
     // it fills, with mapped-physical bytes capped at the budget. The BUDGET handed to the
@@ -722,7 +722,7 @@ static void common_params_fit_impl(
     // permanently shrink the context ceiling the runtime budget can later grow back into.
     // Returns 0 when no cap is needed (the full trained context is servable at the floor).
     //
-    // #88: the fattn f16 dequant scratch grows linearly with the attended width at depth
+    // The flash-attention f16 dequant scratch grows linearly with attended width at depth
     // (turbo/degraded tiers materialize K/V to f16). It lives OUTSIDE the KV budget — it is
     // paid from the fit MARGIN — so it is charged against the margin, not on top of it:
     // vbr_scratch_excess is the scratch demand beyond the summed margins, and only that excess
@@ -834,7 +834,7 @@ static void common_params_fit_impl(
                     "clamp early\n", __func__, budget / MiB,
                     floor_bpv, (double) ctx_priced * vbr_kv_scale / (double) MiB);
         }
-        // #88: explicit -c bypasses every advert estimator, so the only startup honesty signal
+        // An explicit -c bypasses every advert estimator, so the only startup honesty signal
         // for an overcommitted context is this warn: the f16 dequant scratch is paid from the
         // fit margin, and when the full-context scratch outgrows it (shared vbr_scratch_excess,
         // same margin basis as the growth-reachable cap) the deepest fills can stop short of -c

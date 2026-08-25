@@ -1,4 +1,4 @@
-// F0a admission-composer + reservation-claim contract tests. The composer is the single place
+// Admission-composer + reservation-claim contract tests. The composer is the single place
 // that runs snapshot -> fits(reserve-only) -> reserve_if_serial; these tests pin its honest status
 // taxonomy (fail-closed on incomplete evidence; no fabricated precision) and the move-only claim's
 // auto-abort so an admitted-but-uncommitted reservation can never leak. The reserve_if_serial and
@@ -149,8 +149,8 @@ static void test_exceeds_budget() {
     CHECK(ledger.snapshot().live_ops == 0);
 }
 
-// A dropped claim (the only F0a terminal — there is no bare discharge) aborts its reserved op, so an
-// admitted-but-abandoned reservation leaves the ledger with zero live ops — the leak guard for F0b.
+// A dropped claim (the only  terminal — there is no bare discharge) aborts its reserved op, so an
+// admitted-but-abandoned reservation leaves the ledger with zero live ops — the leak guard for .
 static void test_claim_auto_abort() {
     llama_cache_acct_ledger ledger;
     {
@@ -358,7 +358,7 @@ static void test_transaction_existing_allocation() {
 }
 
 // A group fault releases every already-committed leaf, lets the remaining claims abort, and leaves
-// success-only output destinations untouched. This is the rollback contract both F0b and F2 consume.
+// success-only output destinations untouched. This is the rollback contract both  and  consume.
 static void test_transaction_fault_rollback() {
     llama_cache_acct_ledger ledger;
     configure_fitting_host(ledger);
@@ -866,10 +866,10 @@ static void test_prepared_release_set() {
     CHECK(prepared.preview().rows.size() == 1);
     CHECK(prepared.preview().rows[0].resident_allocated == 64);
 
-    // Any observable ledger write invalidates this preparation without
+    // A changed observable ledger value invalidates this preparation without
     // releasing the operation. A fresh prepare absorbs the serial drift.
     ledger.gauge_set(PAYLOAD, HOST,
-                     llama_cache_acct_measure::logical_payload, 64);
+                     llama_cache_acct_measure::logical_payload, 65);
     CHECK(prepared.commit() ==
           llama_cache_conditional_release_status::serial_conflict);
     CHECK(ledger.snapshot().live_ops == 1);

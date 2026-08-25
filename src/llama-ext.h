@@ -170,7 +170,7 @@ LLAMA_API llama_live_memory_breakdown llama_get_live_memory_breakdown(
 LLAMA_API double llama_vbr_floor_bits_per_token(struct llama_context * ctx,
         enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
 
-// #88: per-token bytes of the fattn f16 dequant scratch at the settled (deep-fill) tier state
+// Per-token bytes of the flash-attention f16 dequant scratch at the settled deep-fill tier state
 // (see llama-memory.h memory_vbr_scratch_bytes_per_token). The fit charges this in its
 // total-VRAM wall constraint only — it must NOT enter the KV budget solves (the scratch draws
 // from the fit margin, not the budget). Works on no_alloc (fit dry-load) contexts.

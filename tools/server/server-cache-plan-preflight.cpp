@@ -165,13 +165,13 @@ bool server_cache_plan_local_source_registry::find(
     return true;
 }
 
-server_cache_plan_stage1_semantics server_cache_plan_stage1_semantics_for(
+server_cache_plan_preflight_semantics server_cache_plan_preflight_semantics_for(
         bool is_preflight,
         bool native_completion,
         bool update_cache,
         bool prompt_cache_available,
         bool adapter_matches) noexcept {
-    server_cache_plan_stage1_semantics out;
+    server_cache_plan_preflight_semantics out;
     out.completion_semantics = is_preflight || native_completion;
     out.host_lookup_enabled = update_cache && prompt_cache_available &&
                               out.completion_semantics && adapter_matches;

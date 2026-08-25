@@ -292,9 +292,11 @@ public:
         }
         account(size);
         while (size != 0) {
+            check_continue();
             ensure_scratch();
             const size_t take = std::min(size, scratch_.size() - used_);
             std::memcpy(scratch_.data() + used_, cursor, take);
+            check_continue();
             used_ += take;
             cursor += take;
             size -= take;
@@ -350,6 +352,7 @@ public:
     }
 
     bool finish() {
+        check_continue();
         flush();
         return written_ == expected_bytes_ &&
                chain_.size() == expected_bytes_;
@@ -432,6 +435,17 @@ struct recurrent_companion_plan {
     vbr_artifact_companion_payload descriptor;
 };
 
+constexpr uint32_t VBR_SEQUENCE_STATE_MAGIC = 0xaf143cd8;
+
+void recurrent_companion_write(
+        llama_io_write_i & writer,
+        llama_memory_recurrent & source,
+        llama_seq_id sequence) {
+    writer.write(&VBR_SEQUENCE_STATE_MAGIC, sizeof(VBR_SEQUENCE_STATE_MAGIC));
+    writer.write(&sequence, sizeof(sequence));
+    source.state_write(writer, sequence, 0);
+}
+
 bool recurrent_companion_current(
         const recurrent_companion_plan & plan,
         llama_seq_id sequence) noexcept {
@@ -460,7 +474,7 @@ bool recurrent_companion_prepare(
             return false;
         }
         counting_io_writer writer;
-        source->state_write(writer, sequence, 0);
+        recurrent_companion_write(writer, *source, sequence);
         if (writer.n_bytes() == 0 ||
             source->seq_pos_min(sequence) != expected_terminal ||
             source->seq_pos_max(sequence) != expected_terminal) {
@@ -525,7 +539,7 @@ bool recurrent_companion_capture(
             *chain, plan.descriptor.payload_bytes,
             continue_context, continue_transfer,
             d2h_bytes, d2h_reads);
-        plan.source->state_write(writer, sequence, 0);
+        recurrent_companion_write(writer, *plan.source, sequence);
         if (!writer.finish() ||
             writer.n_bytes() != plan.descriptor.payload_bytes ||
             !recurrent_companion_current(plan, sequence)) {
@@ -540,6 +554,161 @@ bool recurrent_companion_capture(
         }
         if (!recurrent_companion_current(plan, sequence)) {
             status = vbr_explicit_capture_status::source_changed;
+            return false;
+        }
+        output = std::move(chain);
+        return true;
+    } catch (const capture_transfer_cancelled &) {
+        output.reset();
+        digest = {};
+        status = vbr_explicit_capture_status::cancelled;
+        return false;
+    } catch (...) {
+        output.reset();
+        digest = {};
+        status = vbr_explicit_capture_status::
+            required_companion_unavailable;
+        return false;
+    }
+}
+
+struct projected_companion_plan {
+    recurrent_companion_plan recurrent;
+    vbr_explicit_companion_provider provider;
+    vbr_artifact_companion_payload descriptor;
+    bool has_provider = false;
+};
+
+bool projected_provider_current(
+        const projected_companion_plan & plan,
+        llama_seq_id sequence,
+        llama_pos next_position) noexcept {
+    if (!plan.has_provider || plan.provider.terminal_position == nullptr) {
+        return true;
+    }
+    llama_pos terminal = -1;
+    return next_position > 0 &&
+        plan.provider.terminal_position(
+            plan.provider.context, sequence, terminal) &&
+        terminal == next_position - 1;
+}
+
+bool projected_provider_prepare(
+        const vbr_explicit_companion_provider & provider,
+        llama_seq_id sequence,
+        llama_pos next_position,
+        projected_companion_plan & output,
+        vbr_explicit_capture_status & status) noexcept {
+    output = {};
+    try {
+        if (sequence < 0 || next_position <= 0 || provider.size == nullptr ||
+            (provider.capture == nullptr &&
+             provider.capture_stream == nullptr) ||
+            provider.format_version == 0 ||
+            !digest_nonzero(provider.build_identity_digest)) {
+            status = vbr_explicit_capture_status::
+                required_companion_unavailable;
+            return false;
+        }
+        uint64_t bytes = 0;
+        if (!provider.size(provider.context, sequence, bytes) || bytes == 0 ||
+            bytes > std::numeric_limits<size_t>::max()) {
+            status = vbr_explicit_capture_status::
+                required_companion_unavailable;
+            return false;
+        }
+        output.provider = provider;
+        output.has_provider = true;
+        output.descriptor.kind = provider.kind;
+        output.descriptor.format_version = provider.format_version;
+        output.descriptor.build_identity_digest =
+            provider.build_identity_digest;
+        output.descriptor.domain = provider.domain;
+        output.descriptor.payload_bytes = bytes;
+        if ((provider.kind == vbr_artifact_companion_kind::recurrent ||
+             provider.terminal_position != nullptr) &&
+            !projected_provider_current(output, sequence, next_position)) {
+            output = {};
+            status = vbr_explicit_capture_status::source_changed;
+            return false;
+        }
+        return true;
+    } catch (...) {
+        output = {};
+        status = vbr_explicit_capture_status::
+            required_companion_unavailable;
+        return false;
+    }
+}
+
+bool projected_provider_capture(
+        const projected_companion_plan & plan,
+        llama_seq_id sequence,
+        llama_pos next_position,
+        std::unique_ptr<artifact_segment_chain> & output,
+        std::array<uint8_t, 32> & digest,
+        vbr_explicit_capture_status & status,
+        void * continue_context,
+        vbr_projected_capture_batch_request::continue_transfer_fn
+            continue_transfer) noexcept {
+    output.reset();
+    digest = {};
+    try {
+        if (!plan.has_provider || plan.descriptor.payload_bytes == 0 ||
+            !projected_provider_current(plan, sequence, next_position)) {
+            status = plan.has_provider
+                ? vbr_explicit_capture_status::source_changed
+                : vbr_explicit_capture_status::required_companion_unavailable;
+            return false;
+        }
+        if (continue_transfer && !continue_transfer(continue_context)) {
+            status = vbr_explicit_capture_status::cancelled;
+            return false;
+        }
+        auto chain = std::make_unique<artifact_segment_chain>(
+            plan.descriptor.payload_bytes);
+        if (plan.provider.capture_stream != nullptr) {
+            chain_io_writer writer(
+                *chain, plan.descriptor.payload_bytes,
+                continue_context, continue_transfer);
+            if (!plan.provider.capture_stream(
+                    plan.provider.context, sequence, writer) ||
+                !writer.finish()) {
+                status = vbr_explicit_capture_status::
+                    required_companion_unavailable;
+                return false;
+            }
+        } else {
+            std::vector<uint8_t> bytes;
+            if (!plan.provider.capture ||
+                !plan.provider.capture(
+                    plan.provider.context, sequence, bytes) ||
+                bytes.size() != plan.descriptor.payload_bytes) {
+                status = vbr_explicit_capture_status::source_changed;
+                return false;
+            }
+            static constexpr size_t CHUNK_BYTES = 1024*1024;
+            for (size_t offset = 0; offset < bytes.size();) {
+                if (continue_transfer && !continue_transfer(continue_context)) {
+                    status = vbr_explicit_capture_status::cancelled;
+                    return false;
+                }
+                const size_t take = std::min(
+                    CHUNK_BYTES, bytes.size() - offset);
+                if (!chain->append(bytes.data() + offset, take)) {
+                    status = vbr_explicit_capture_status::accounting_failed;
+                    return false;
+                }
+                offset += take;
+            }
+        }
+        if (!projected_provider_current(plan, sequence, next_position)) {
+            status = vbr_explicit_capture_status::source_changed;
+            return false;
+        }
+        digest = vbr_capture_stream_digest(*chain);
+        if (!digest_nonzero(digest)) {
+            status = vbr_explicit_capture_status::hash_mismatch;
             return false;
         }
         output = std::move(chain);
@@ -1207,7 +1376,8 @@ public:
     static bool negotiate_import_destination(
             const std::vector<llama_memory_tree_child> & tree,
             const vbr_artifact_package_view & package,
-            vbr_import_schedule_quote & quote) noexcept {
+            vbr_import_schedule_quote & quote,
+            uint64_t selected_frontier) noexcept {
         quote.destination_ = {};
         try {
             struct child_state {
@@ -1225,9 +1395,12 @@ public:
                         package.manifest().controller_policy.size()) {
                     return false;
                 }
-                const uint64_t wm = package.manifest().controller_policy[
+                const uint64_t parent_wm = package.manifest().controller_policy[
                     tree_child.child_id].wm_cells;
-                if (wm == 0 || wm > UINT32_MAX) {
+                const uint64_t wm = selected_frontier != 0
+                    ? selected_frontier : parent_wm;
+                if (parent_wm == 0 || parent_wm > UINT32_MAX || wm == 0 ||
+                    wm > parent_wm || wm > UINT32_MAX) {
                     return false;
                 }
                 child_state state;
@@ -1964,10 +2137,14 @@ public:
             const llama_kv_cache::vbr_capture_unit_plan & unit,
             vbr_unit_build & sink,
             vbr_pinned_chunk_ring & ring,
-            vbr_capture_stream_stats & stats) {
+            vbr_capture_stream_stats & stats,
+            void * continue_context = nullptr,
+            vbr_explicit_capture_request::continue_transfer_fn
+                continue_transfer = nullptr) {
         return value.cache != nullptr &&
                value.cache->vbr_capture_stream_unit(
-                   unit, sink, ring, stats);
+                   unit, sink, ring, stats,
+                   continue_context, continue_transfer);
     }
 };
 
@@ -1988,7 +2165,8 @@ static bool import_target_snapshot_core(
     vbr_import_schedule_quote * schedule_quote,
     const vbr_import_schedule_quote * authenticated_schedule,
     std::array<uint8_t, 32> * transform_tree_digest = nullptr,
-    const std::vector<llama_memory_tree_child> * canonical_tree = nullptr)
+    const std::vector<llama_memory_tree_child> * canonical_tree = nullptr,
+    uint64_t selected_frontier = 0)
     noexcept;
 
 
@@ -2003,23 +2181,135 @@ vbr_explicit_prepare_occupied_replacement_guard(
         const void * representation_context,
         vbr_explicit_representation_identity_fn representation_identity,
         vbr_occupied_replacement_guard & output,
-        const vbr_import_schedule_quote * authenticated_incoming) noexcept {
+        const vbr_import_schedule_quote * authenticated_incoming,
+        const std::vector<vbr_target_companion_snapshot> *
+            external_companions) noexcept {
     output.reset();
     try {
         std::vector<llama_memory_tree_child> tree;
-        if (!llama_memory_tree_collect(&memory, tree) || tree.size() != 1 ||
-            !tree.front().attention || tree.front().recurrent) {
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            return vbr_occupied_replacement_guard_status::unsupported_tree;
+        }
+        const auto attention = std::find_if(
+            tree.begin(), tree.end(), [](const auto & child) {
+                return child.attention != nullptr && child.recurrent == nullptr;
+            });
+        if (attention == tree.end() ||
+            std::count_if(tree.begin(), tree.end(), [](const auto & child) {
+                return child.attention != nullptr;
+            }) != 1 ||
+            std::count_if(tree.begin(), tree.end(), [](const auto & child) {
+                return child.recurrent != nullptr;
+            }) > 1 ||
+            std::any_of(tree.begin(), tree.end(), [](const auto & child) {
+                return child.attention == nullptr && child.recurrent == nullptr;
+            })) {
             return vbr_occupied_replacement_guard_status::unsupported_tree;
         }
         vbr_target_validation_snapshot target;
         vbr_import_schedule_quote recovery_quote;
         if (!import_target_snapshot_core(
-                memory, destination, recovery, bindings, false,
+                memory, destination, recovery, bindings, true,
                 accounting_serial, representation_context,
                 representation_identity, target,
                 nullptr, nullptr, &recovery_quote, nullptr, nullptr, &tree) ||
             target.destination_sequence_absent) {
             return vbr_occupied_replacement_guard_status::unsupported_tree;
+        }
+        if (external_companions) {
+            target.companions = *external_companions;
+        }
+        std::vector<vbr_occupied_replacement_cell> cells;
+        std::vector<vbr_occupied_replacement_unit_currency> units;
+        vbr_occupied_replacement_observation observation;
+        if (!vbr_live_capture_adapter::occupied_observation(
+                *attention->attention, destination,
+                recovery.manifest().identity.sequence_epoch,
+                cells, units, observation)) {
+            return vbr_occupied_replacement_guard_status::unsupported_layout;
+        }
+        vbr_target_validation_snapshot selected_target = target;
+        if (authenticated_incoming) {
+            vbr_downward_policy_projection selected_projection;
+            bool selected_downward = false;
+            if (!import_target_snapshot_core(
+                    memory, destination, incoming, bindings, true,
+                    accounting_serial, representation_context,
+                    representation_identity, selected_target,
+                    &selected_projection, &selected_downward, nullptr,
+                    authenticated_incoming, nullptr, &tree)) {
+                return vbr_occupied_replacement_guard_status::
+                    representation_mismatch;
+            }
+            if (external_companions) {
+                selected_target.companions = *external_companions;
+            }
+        }
+        const auto status = vbr_prepare_occupied_replacement_guard(
+            target, selected_target, incoming, recovery, observation, output,
+            authenticated_incoming, &recovery_quote);
+        if (status != vbr_occupied_replacement_guard_status::ready) {
+            return status;
+        }
+        std::array<uint8_t, 32> direct;
+        if (!vbr_live_capture_adapter::occupied_direct_currency_digest(
+                *attention->attention, destination, accounting_serial,
+                representation_context, representation_identity, {}, direct)) {
+            output.reset();
+            return vbr_occupied_replacement_guard_status::currency_changed;
+        }
+        output.memory_ = &memory;
+        output.cache_ = attention->attention;
+        output.direct_currency_digest_ = direct;
+        return status;
+    } catch (...) {
+        output.reset();
+        return vbr_occupied_replacement_guard_status::internal_error;
+    }
+}
+
+vbr_occupied_replacement_guard_status
+vbr_explicit_prepare_occupied_prefix_replacement_guard(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_artifact_package_view & incoming_parent,
+        uint64_t prefix_tokens,
+        const std::vector<vbr_artifact_prefix_cell_run> & prefix_runs,
+        const vbr_artifact_package_view & recovery,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        uint64_t accounting_serial,
+        const void * representation_context,
+        vbr_explicit_representation_identity_fn representation_identity,
+        vbr_occupied_replacement_guard & output,
+        const vbr_import_schedule_quote & authenticated_incoming) noexcept {
+    output.reset();
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (prefix_tokens == 0 ||
+            !llama_memory_tree_collect(&memory, tree) || tree.size() != 1 ||
+            !tree.front().attention || tree.front().recurrent) {
+            return vbr_occupied_replacement_guard_status::unsupported_tree;
+        }
+        vbr_target_validation_snapshot live_target;
+        vbr_import_schedule_quote recovery_quote;
+        if (!import_target_snapshot_core(
+                memory, destination, recovery, bindings, false,
+                accounting_serial, representation_context,
+                representation_identity, live_target,
+                nullptr, nullptr, &recovery_quote, nullptr, nullptr, &tree) ||
+            live_target.destination_sequence_absent) {
+            return vbr_occupied_replacement_guard_status::unsupported_tree;
+        }
+        vbr_target_validation_snapshot selected_target;
+        vbr_downward_policy_projection selected_projection;
+        bool selected_downward = false;
+        if (!import_target_snapshot_core(
+                memory, destination, incoming_parent, bindings, false,
+                accounting_serial, representation_context,
+                representation_identity, selected_target,
+                &selected_projection, &selected_downward, nullptr,
+                &authenticated_incoming, nullptr, &tree, prefix_tokens)) {
+            return vbr_occupied_replacement_guard_status::representation_mismatch;
         }
         std::vector<vbr_occupied_replacement_cell> cells;
         std::vector<vbr_occupied_replacement_unit_currency> units;
@@ -2030,8 +2320,9 @@ vbr_explicit_prepare_occupied_replacement_guard(
                 cells, units, observation)) {
             return vbr_occupied_replacement_guard_status::unsupported_layout;
         }
-        const auto status = vbr_prepare_occupied_replacement_guard(
-            target, incoming, recovery, observation, output,
+        const auto status = vbr_prepare_occupied_prefix_replacement_guard(
+            live_target, selected_target, incoming_parent, prefix_tokens,
+            prefix_runs, recovery, observation, output,
             authenticated_incoming, &recovery_quote);
         if (status != vbr_occupied_replacement_guard_status::ready) {
             return status;
@@ -2570,10 +2861,10 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
         targets.reserve(request.manifests.size()*children.size());
         expectations.reserve(request.manifests.size()*children.size());
         std::vector<uint64_t> manifest_ids;
-        std::vector<std::vector<recurrent_companion_plan>> recurrent_plans;
+        std::vector<std::vector<projected_companion_plan>> companion_plans;
         std::vector<bool> manifest_dependency_available;
         manifest_ids.reserve(request.manifests.size());
-        recurrent_plans.reserve(request.manifests.size());
+        companion_plans.reserve(request.manifests.size());
         manifest_dependency_available.reserve(request.manifests.size());
         for (const auto & manifest_request : request.manifests) {
             vbr_artifact_identity_block selected_identity;
@@ -2625,24 +2916,62 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             projected.generation.status =
                 vbr_checkpoint_generation_status::complete;
             bool dependencies_available = true;
-            std::vector<recurrent_companion_plan> manifest_recurrent_plans;
-            manifest_recurrent_plans.reserve(recurrent_children.size());
+            std::vector<projected_companion_plan> manifest_companion_plans;
+            manifest_companion_plans.reserve(
+                recurrent_children.size() + manifest_request.companions.size());
+            const size_t supplied_recurrent = size_t(std::count_if(
+                manifest_request.companions.begin(),
+                manifest_request.companions.end(),
+                [](const vbr_explicit_companion_provider & provider) {
+                    return provider.kind ==
+                        vbr_artifact_companion_kind::recurrent;
+                }));
+            if (supplied_recurrent != 0 &&
+                supplied_recurrent != recurrent_children.size()) {
+                dependencies_available = false;
+            }
             for (auto * recurrent : recurrent_children) {
-                recurrent_companion_plan companion;
+                if (!dependencies_available || supplied_recurrent != 0) {
+                    break;
+                }
+                projected_companion_plan companion;
                 vbr_explicit_capture_status companion_status =
                     vbr_explicit_capture_status::
                         required_companion_unavailable;
                 if (!recurrent_companion_prepare(
                         recurrent, manifest_request.sequence,
                         identity.next_position,
-                        companion, companion_status)) {
+                        companion.recurrent, companion_status)) {
                     dependencies_available = false;
                     projected.companions.clear();
-                    manifest_recurrent_plans.clear();
+                    manifest_companion_plans.clear();
                     break;
                 }
+                companion.descriptor = companion.recurrent.descriptor;
                 projected.companions.push_back(companion.descriptor);
-                manifest_recurrent_plans.push_back(std::move(companion));
+                manifest_companion_plans.push_back(std::move(companion));
+            }
+            for (const auto & provider : manifest_request.companions) {
+                if (!dependencies_available) {
+                    break;
+                }
+                projected_companion_plan companion;
+                vbr_explicit_capture_status companion_status =
+                    vbr_explicit_capture_status::
+                        required_companion_unavailable;
+                if (!projected_provider_prepare(
+                        provider, manifest_request.sequence,
+                        identity.next_position, companion,
+                        companion_status)) {
+                    if (provider.required) {
+                        dependencies_available = false;
+                        projected.companions.clear();
+                        manifest_companion_plans.clear();
+                    }
+                    continue;
+                }
+                projected.companions.push_back(companion.descriptor);
+                manifest_companion_plans.push_back(std::move(companion));
             }
             std::vector<vbr_identity_policy_digest_row> identity_policy;
             identity_policy.reserve(children.size());
@@ -2745,8 +3074,8 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             projected.identity_policy_order_digest = identity_digest;
             projected.generation.identity_policy_order_digest =
                 identity_digest;
-            recurrent_plans.push_back(
-                std::move(manifest_recurrent_plans));
+            companion_plans.push_back(
+                std::move(manifest_companion_plans));
             manifest_dependency_available.push_back(
                 dependencies_available);
             projection_manifests.push_back(std::move(projected));
@@ -2776,7 +3105,7 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 projected.dependencies_available = false;
                 projected.placements.clear();
                 projected.companions.clear();
-                recurrent_plans[manifest_index].clear();
+                companion_plans[manifest_index].clear();
             }
             targets.erase(
                 std::remove_if(
@@ -2956,12 +3285,12 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 }
             }
             for (size_t manifest_index = 0;
-                 manifest_index < recurrent_plans.size(); ++manifest_index) {
+                 manifest_index < companion_plans.size(); ++manifest_index) {
                 if (!manifest_dependency_available[manifest_index]) {
                     continue;
                 }
                 for (const auto & companion :
-                     recurrent_plans[manifest_index]) {
+                     companion_plans[manifest_index]) {
                     if (!add_planned_bytes(
                             companion.descriptor.domain,
                             companion.descriptor.payload_bytes)) {
@@ -3039,11 +3368,15 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                     vbr_artifact_accounting_role::reference_metadata,
                     host_domain, reference_bytes);
                 for (const auto & companion :
-                     recurrent_plans[manifest_index]) {
+                     companion_plans[manifest_index]) {
                     add_accounting(
                         durable.accounting,
-                        vbr_artifact_accounting_role::recurrent_payload,
-                        host_domain,
+                        companion.descriptor.kind ==
+                                vbr_artifact_companion_kind::recurrent
+                            ? vbr_artifact_accounting_role::recurrent_payload
+                            : vbr_artifact_accounting_role::
+                                typed_accelerator_payload,
+                        companion.descriptor.domain,
                         companion.descriptor.payload_bytes);
                 }
                 quote.durable.push_back(std::move(durable));
@@ -3142,9 +3475,9 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             if (!manifest_dependency_available[manifest_index]) {
                 continue;
             }
-            sealed.reserve(recurrent_plans[manifest_index].size());
+            sealed.reserve(companion_plans[manifest_index].size());
             for (size_t companion_index = 0;
-                 companion_index < recurrent_plans[manifest_index].size();
+                 companion_index < companion_plans[manifest_index].size();
                  ++companion_index) {
                 std::unique_ptr<artifact_segment_chain> chain;
                 std::array<uint8_t, 32> companion_digest;
@@ -3154,8 +3487,18 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 vbr_capture_sealed_companion capability;
                 uint64_t companion_d2h_bytes = 0;
                 uint64_t companion_d2h_reads = 0;
-                const bool companion_captured = recurrent_companion_capture(
-                        recurrent_plans[manifest_index][companion_index],
+                const auto & companion =
+                    companion_plans[manifest_index][companion_index];
+                const bool companion_captured = companion.has_provider
+                    ? projected_provider_capture(
+                        companion,
+                        request.manifests[manifest_index].sequence,
+                        request.manifests[manifest_index].identity.next_position,
+                        chain, companion_digest, companion_status,
+                        request.continue_context,
+                        request.continue_transfer)
+                    : recurrent_companion_capture(
+                        companion.recurrent,
                         request.manifests[manifest_index].sequence,
                         chain, companion_digest, companion_status,
                         request.continue_context,
@@ -3177,9 +3520,15 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                         uint32_t(companion_index), std::move(chain),
                         capability) ||
                     capability.streaming_digest() != companion_digest ||
-                    !recurrent_companion_current(
-                        recurrent_plans[manifest_index][companion_index],
-                        request.manifests[manifest_index].sequence)) {
+                    (companion.has_provider
+                        ? !projected_provider_current(
+                            companion,
+                            request.manifests[manifest_index].sequence,
+                            request.manifests[manifest_index].identity.
+                                next_position)
+                        : !recurrent_companion_current(
+                            companion.recurrent,
+                            request.manifests[manifest_index].sequence))) {
                     if (companion_status ==
                             vbr_explicit_capture_status::cancelled) {
                         result.status = companion_status;
@@ -3364,10 +3713,16 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             if (!manifest_dependency_available[manifest_index]) {
                 continue;
             }
-            for (const auto & companion : recurrent_plans[manifest_index]) {
-                if (!recurrent_companion_current(
+            for (const auto & companion : companion_plans[manifest_index]) {
+                const bool current = companion.has_provider
+                    ? projected_provider_current(
                         companion,
-                        request.manifests[manifest_index].sequence)) {
+                        request.manifests[manifest_index].sequence,
+                        request.manifests[manifest_index].identity.next_position)
+                    : recurrent_companion_current(
+                        companion.recurrent,
+                        request.manifests[manifest_index].sequence);
+                if (!current) {
                     result.status =
                         vbr_explicit_capture_status::source_changed;
                     return result;
@@ -3543,7 +3898,8 @@ static bool import_target_snapshot_core(
         vbr_import_schedule_quote * schedule_quote,
         const vbr_import_schedule_quote * authenticated_schedule,
         std::array<uint8_t, 32> * transform_tree_digest,
-        const std::vector<llama_memory_tree_child> * canonical_tree) noexcept {
+        const std::vector<llama_memory_tree_child> * canonical_tree,
+        uint64_t selected_frontier) noexcept {
     output = {};
     if (transform_projection) {
         *transform_projection = {};
@@ -3590,7 +3946,8 @@ static bool import_target_snapshot_core(
         size_t n_recurrent = 0;
         for (const auto & child : tree) {
             if (child.recurrent) {
-                if (n_recurrent != 0 || !recurrent_target_empty(child)) {
+                if (n_recurrent != 0 ||
+                    (!previously_observed && !recurrent_target_empty(child))) {
                     output = {};
                     return false;
                 }
@@ -3664,7 +4021,7 @@ static bool import_target_snapshot_core(
                 return false;
             }
             if (!vbr_live_capture_adapter::negotiate_import_destination(
-                    tree, package, *destination)) {
+                    tree, package, *destination, selected_frontier)) {
                 output = {};
                 *destination = {};
                 return false;
@@ -3737,26 +4094,6 @@ static bool import_target_snapshot_core(
     }
 }
 
-bool vbr_explicit_import_target_snapshot(
-        llama_memory_i & memory,
-        llama_seq_id destination,
-        const vbr_artifact_package_view & package,
-        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
-        bool previously_observed,
-        uint64_t accounting_serial,
-        const void * representation_context,
-        vbr_explicit_capture_request::representation_identity_fn
-            representation_identity,
-        vbr_target_validation_snapshot & output,
-        vbr_downward_policy_projection * downward_projection,
-        bool * downward_required) noexcept {
-    return import_target_snapshot_core(
-        memory, destination, package, bindings, previously_observed,
-        accounting_serial, representation_context, representation_identity,
-        output, downward_projection, downward_required,
-        nullptr, nullptr);
-}
-
 vbr_import_target_snapshot_status
 vbr_explicit_import_target_schedule_snapshot(
         llama_memory_i & memory,
@@ -3771,14 +4108,16 @@ vbr_explicit_import_target_schedule_snapshot(
         vbr_target_validation_snapshot & output,
         vbr_downward_policy_projection & downward_projection,
         bool & downward_required,
-        vbr_import_schedule_quote & schedule_quote) noexcept {
+        vbr_import_schedule_quote & schedule_quote,
+        uint64_t selected_frontier) noexcept {
     downward_projection = {};
     vbr_downward_policy_projection transform_projection;
     if (!import_target_snapshot_core(
         memory, destination, package, bindings, previously_observed,
         accounting_serial, representation_context, representation_identity,
         output, &transform_projection,
-            &downward_required, &schedule_quote, nullptr)) {
+            &downward_required, &schedule_quote, nullptr, nullptr, nullptr,
+            selected_frontier)) {
         return vbr_import_target_snapshot_status::unavailable;
     }
     if (downward_required) {
@@ -3988,11 +4327,113 @@ bool vbr_explicit_import_reserve_transform(
     }
 }
 
-vbr_explicit_capture_result vbr_capture_explicit_manifest(
+std::array<uint8_t, 32>
+vbr_explicit_recurrent_companion_build_identity() noexcept {
+    return tagged_digest(VBR_RECURRENT_CODEC_DOMAIN, 1);
+}
+
+bool vbr_explicit_recurrent_companion_terminal(
+        const void * data, size_t size, llama_pos & output) noexcept {
+    output = -1;
+    constexpr size_t prefix = sizeof(uint32_t)+sizeof(llama_seq_id);
+    if (!data || size < prefix+sizeof(uint32_t)+sizeof(llama_pos)) {
+        return false;
+    }
+    uint32_t magic = 0;
+    llama_seq_id source_sequence = -1;
+    uint32_t cell_count = 0;
+    llama_pos position = -1;
+    std::memcpy(&magic, data, sizeof(magic));
+    std::memcpy(&source_sequence,
+                static_cast<const uint8_t *>(data)+sizeof(magic),
+                sizeof(source_sequence));
+    std::memcpy(&cell_count,
+                static_cast<const uint8_t *>(data)+prefix,
+                sizeof(cell_count));
+    std::memcpy(&position,
+                static_cast<const uint8_t *>(data)+prefix+
+                    sizeof(cell_count),
+                sizeof(position));
+    if (magic != VBR_SEQUENCE_STATE_MAGIC || source_sequence < 0 ||
+        cell_count != 1 || position < 0) {
+        return false;
+    }
+    output = position;
+    return true;
+}
+
+bool vbr_explicit_capture_pretransfer_quote_admissible(
+        const vbr_explicit_capture_pretransfer_quote & quote,
+        uint64_t max_packed_bytes) noexcept {
+    uint64_t packed = quote.payload_bytes;
+    if (quote.stash_bytes > UINT64_MAX - packed) {
+        return false;
+    }
+    packed += quote.stash_bytes;
+    if (quote.companion_bytes > UINT64_MAX - packed) {
+        return false;
+    }
+    packed += quote.companion_bytes;
+    if (quote.metadata_bytes > UINT64_MAX - packed) {
+        return false;
+    }
+    const uint64_t host = packed + quote.metadata_bytes;
+    return quote.controllers != 0 && quote.units != 0 &&
+           quote.planned_packed_bytes == packed &&
+           quote.conservative_host_resident_bytes == host &&
+           (max_packed_bytes == 0 || packed <= max_packed_bytes);
+}
+
+struct vbr_explicit_capture_operation::impl {
+    struct pending_companion {
+        recurrent_companion_plan recurrent;
+        vbr_explicit_companion_provider provider;
+        bool has_provider = false;
+        uint64_t bytes = 0;
+    };
+
+    vbr_explicit_capture_request request;
+    std::vector<vbr_live_capture_adapter::child> children;
+    std::vector<vbr_controller_instance_id> instances;
+    vbr_artifact_package package;
+    std::vector<pending_companion> pending_companions;
+    std::unique_ptr<vbr_capture_build> build;
+    vbr_explicit_capture_result result;
+    bool transfer_started = false;
+    bool transferred = false;
+    bool published = false;
+};
+
+vbr_explicit_capture_operation::vbr_explicit_capture_operation() noexcept =
+    default;
+vbr_explicit_capture_operation::vbr_explicit_capture_operation(
+        vbr_explicit_capture_operation && other) noexcept = default;
+vbr_explicit_capture_operation &
+vbr_explicit_capture_operation::operator=(
+        vbr_explicit_capture_operation && other) noexcept = default;
+vbr_explicit_capture_operation::~vbr_explicit_capture_operation() = default;
+
+bool vbr_explicit_capture_operation::ready_for_transfer() const noexcept {
+    return impl_ && impl_->build && !impl_->transfer_started &&
+        !impl_->transferred && !impl_->published;
+}
+
+bool vbr_explicit_capture_operation::ready_for_publication() const noexcept {
+    return impl_ && impl_->build && impl_->transferred && !impl_->published &&
+        impl_->result.status == vbr_explicit_capture_status::ok;
+}
+
+void vbr_explicit_capture_operation::reset() noexcept {
+    impl_.reset();
+}
+
+vbr_explicit_capture_result vbr_prepare_explicit_manifest(
         llama_memory_i & memory,
-        const vbr_explicit_capture_request & request,
+        vbr_explicit_capture_request request,
         vbr_unit_version_sink & sink,
-        const vbr_explicit_capture_accounting & accounting) noexcept {
+        const vbr_explicit_capture_accounting & accounting,
+        vbr_explicit_capture_operation & operation) noexcept {
+    operation.reset();
     vbr_explicit_capture_result result;
     if (!request.idle_decode_thread) {
         result.status = vbr_explicit_capture_status::slot_not_idle;
@@ -4117,7 +4558,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         vbr_artifact_package package;
         package.topologies = request.topologies;
         package.manifest.identity = request.identity;
-        package.manifest.token_block.tokens = request.token_block;
+        package.manifest.token_block.tokens = std::move(request.token_block);
         package.manifest.identity_policy_order_digest =
             identity_policy_order_digest;
         package.manifest.generation.version = 1;
@@ -4212,13 +4653,29 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             }
         }
 
-        struct pending_companion {
-            recurrent_companion_plan recurrent;
-            const vbr_explicit_companion_provider * provider = nullptr;
-            uint64_t bytes = 0;
-        };
-        std::vector<pending_companion> pending_companions;
+        std::vector<vbr_explicit_capture_operation::impl::pending_companion>
+            pending_companions;
+        const size_t supplied_recurrent = size_t(std::count_if(
+            request.companions.begin(), request.companions.end(),
+            [](const vbr_explicit_companion_provider & provider) {
+                return provider.kind ==
+                    vbr_artifact_companion_kind::recurrent;
+            }));
+        // A frontier checkpoint may carry the exact recurrent image for an
+        // earlier attention prefix.  It replaces (rather than supplements)
+        // the live recurrent serializer: combining both would bind two
+        // different frontiers under one manifest.  Require a complete
+        // one-for-one replacement so a partial recurrent tree cannot be
+        // published accidentally.
+        if (supplied_recurrent != 0 && supplied_recurrent != recurrent.size()) {
+            result.status = vbr_explicit_capture_status::
+                required_companion_unavailable;
+            return result;
+        }
         for (auto * memory_recurrent : recurrent) {
+            if (supplied_recurrent != 0) {
+                break;
+            }
             recurrent_companion_plan recurrent_plan;
             if (!recurrent_companion_prepare(
                     memory_recurrent, request.sequence,
@@ -4227,14 +4684,15 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 return result;
             }
             pending_companions.push_back({
-                recurrent_plan, nullptr,
+                recurrent_plan, {}, false,
                 recurrent_plan.descriptor.payload_bytes,
             });
             package.companions.push_back(recurrent_plan.descriptor);
         }
         for (const auto & provider : request.companions) {
             if (provider.size == nullptr ||
-                provider.capture == nullptr ||
+                (provider.capture == nullptr &&
+                 provider.capture_stream == nullptr) ||
                 provider.format_version == 0 ||
                 !digest_nonzero(provider.build_identity_digest)) {
                 if (provider.required) {
@@ -4260,8 +4718,22 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 }
                 continue;
             }
+            if (provider.kind ==
+                    vbr_artifact_companion_kind::recurrent ||
+                provider.terminal_position != nullptr) {
+                llama_pos terminal = -1;
+                if (request.frontier.next_position <= 0 ||
+                    provider.terminal_position == nullptr ||
+                    !provider.terminal_position(
+                        provider.context, request.sequence, terminal) ||
+                    terminal != request.frontier.next_position-1) {
+                    result.status = vbr_explicit_capture_status::
+                        required_companion_unavailable;
+                    return result;
+                }
+            }
             pending_companions.push_back({
-                {}, &provider, companion_size,
+                {}, provider, true, companion_size,
             });
             vbr_artifact_companion_payload companion;
             companion.kind = provider.kind;
@@ -4303,6 +4775,88 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         package.manifest.consistency.kind =
             vbr_artifact_consistency_kind::capture_exact;
 
+        // The exact companion route previously discovered its total only after
+        // companion and attention D2H. Price the authenticated size/schema
+        // inventory once and expose one scalar admission before transfer-side
+        // allocation or byte movement.
+        result.phase =
+            vbr_explicit_capture_phase::reservation_preparation;
+        auto & quote = result.pretransfer;
+        if (children.size() > UINT32_MAX ||
+            package.unit_blobs.size() > UINT32_MAX ||
+            package.companions.size() > UINT32_MAX) {
+            result.status = vbr_explicit_capture_status::size_overflow;
+            return result;
+        }
+        quote.controllers = uint32_t(children.size());
+        quote.units = uint32_t(package.unit_blobs.size());
+        quote.companions = uint32_t(package.companions.size());
+        const auto add_quote_bytes = [&] (
+                uint64_t & destination, uint64_t bytes) noexcept {
+            if (bytes > UINT64_MAX - destination) {
+                return false;
+            }
+            destination += bytes;
+            return true;
+        };
+        for (const auto & child : children) {
+            for (const auto & plan : child.units) {
+                for (const auto & shard : plan.shards) {
+                    if (!add_quote_bytes(
+                            quote.payload_bytes, shard.payload_bytes) ||
+                        !add_quote_bytes(
+                            quote.stash_bytes, shard.stash_bytes)) {
+                        result.status =
+                            vbr_explicit_capture_status::size_overflow;
+                        return result;
+                    }
+                }
+            }
+        }
+        quote.companion_bytes = result.companion_bytes;
+        uint64_t accounted_host_bytes = 0;
+        for (const auto & row : package.manifest.accounting) {
+            if (!add_quote_bytes(accounted_host_bytes, row.resident_bytes)) {
+                result.status = vbr_explicit_capture_status::size_overflow;
+                return result;
+            }
+        }
+        quote.planned_packed_bytes = quote.payload_bytes;
+        if (!add_quote_bytes(
+                quote.planned_packed_bytes, quote.stash_bytes) ||
+            !add_quote_bytes(
+                quote.planned_packed_bytes, quote.companion_bytes) ||
+            accounted_host_bytes < quote.planned_packed_bytes) {
+            result.status = vbr_explicit_capture_status::size_overflow;
+            return result;
+        }
+        quote.metadata_bytes =
+            accounted_host_bytes - quote.planned_packed_bytes;
+        quote.conservative_host_resident_bytes = accounted_host_bytes;
+        if (!vbr_explicit_capture_pretransfer_quote_admissible(quote, 0)) {
+            result.status = vbr_explicit_capture_status::internal_error;
+            return result;
+        }
+        if (!vbr_explicit_capture_pretransfer_quote_admissible(
+                quote, request.max_packed_bytes)) {
+            result.status = vbr_explicit_capture_status::admission_refused;
+            return result;
+        }
+        if (request.pretransfer_admit &&
+            !request.pretransfer_admit(
+                request.pretransfer_context, quote)) {
+            result.status = request.continue_transfer &&
+                    !request.continue_transfer(request.continue_context)
+                ? vbr_explicit_capture_status::cancelled
+                : vbr_explicit_capture_status::admission_refused;
+            return result;
+        }
+        if (request.continue_transfer &&
+            !request.continue_transfer(request.continue_context)) {
+            result.status = vbr_explicit_capture_status::cancelled;
+            return result;
+        }
+
         result.phase =
             vbr_explicit_capture_phase::pre_transfer_stability;
         // Exact equality immediately before the first data byte.
@@ -4338,36 +4892,141 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             return result;
         }
 
+        auto prepared = std::make_unique<
+            vbr_explicit_capture_operation::impl>();
+        prepared->request = std::move(request);
+        prepared->children = std::move(children);
+        prepared->instances = std::move(instances);
+        prepared->package = std::move(package);
+        prepared->pending_companions = std::move(pending_companions);
+        prepared->build = std::move(build);
+        result.status = vbr_explicit_capture_status::ok;
+        prepared->result = result;
+        operation.impl_ = std::move(prepared);
+        return result;
+    } catch (...) {
+        result.status = vbr_explicit_capture_status::internal_error;
+        return result;
+    }
+}
+
+vbr_explicit_capture_result vbr_transfer_explicit_manifest(
+        vbr_explicit_capture_operation & operation) noexcept {
+    vbr_explicit_capture_result result;
+    if (!operation.ready_for_transfer()) {
+        result.status = vbr_explicit_capture_status::internal_error;
+        return result;
+    }
+    auto & state = *operation.impl_;
+    auto & request = state.request;
+    auto & children = state.children;
+    auto & instances = state.instances;
+    auto & package = state.package;
+    auto & pending_companions = state.pending_companions;
+    auto & build = state.build;
+    result = state.result;
+    state.transfer_started = true;
+    try {
+
         result.phase =
             vbr_explicit_capture_phase::companion_capture;
         // Durable + transfer-staging claims now exist. Only at this point may
         // companion codecs allocate their pageable byte images.
         for (size_t i = 0; i < pending_companions.size(); ++i) {
+            result.companion_failure_index = uint32_t(i);
+            result.companion_failure_kind =
+                package.companions[i].kind;
+            if (request.continue_transfer &&
+                !request.continue_transfer(request.continue_context)) {
+                result.status = vbr_explicit_capture_status::cancelled;
+                return result;
+            }
             std::vector<uint8_t> bytes;
             const auto & pending = pending_companions[i];
+            const auto provider_frontier_current = [&]() noexcept {
+                if (!pending.has_provider ||
+                    pending.provider.terminal_position == nullptr) {
+                    return true;
+                }
+                llama_pos terminal = -1;
+                return request.frontier.next_position > 0 &&
+                    pending.provider.terminal_position != nullptr &&
+                    pending.provider.terminal_position(
+                        pending.provider.context, request.sequence,
+                        terminal) &&
+                    terminal == request.frontier.next_position-1;
+            };
+            if (!provider_frontier_current()) {
+                result.status = vbr_explicit_capture_status::source_changed;
+                return result;
+            }
             std::unique_ptr<artifact_segment_chain> recurrent_chain;
             std::array<uint8_t, 32> recurrent_digest;
             if (pending.recurrent.source != nullptr) {
                 if (!recurrent_companion_capture(
                         pending.recurrent, request.sequence,
                         recurrent_chain, recurrent_digest,
-                        result.status)) {
+                        result.status, request.continue_context,
+                        request.continue_transfer)) {
                     return result;
                 }
-            } else if (pending.provider == nullptr ||
-                       !pending.provider->capture(
-                           pending.provider->context,
-                           request.sequence, bytes)) {
-                result.status =
-                    vbr_explicit_capture_status::
+            } else if (!pending.has_provider) {
+                result.status = vbr_explicit_capture_status::
+                    required_companion_unavailable;
+                return result;
+            } else if (pending.provider.capture_stream) {
+                try {
+                    recurrent_chain =
+                        std::make_unique<artifact_segment_chain>(
+                            pending.bytes);
+                    chain_io_writer writer(
+                        *recurrent_chain, pending.bytes,
+                        request.continue_context,
+                        request.continue_transfer);
+                    if (!pending.provider.capture_stream(
+                            pending.provider.context, request.sequence,
+                            writer) || !writer.finish()) {
+                        result.status = vbr_explicit_capture_status::
+                            required_companion_unavailable;
+                        return result;
+                    }
+                    recurrent_digest =
+                        vbr_capture_stream_digest(*recurrent_chain);
+                    if (!digest_nonzero(recurrent_digest)) {
+                        result.status = vbr_explicit_capture_status::
+                            hash_mismatch;
+                        return result;
+                    }
+                } catch (const capture_transfer_cancelled &) {
+                    result.status = vbr_explicit_capture_status::cancelled;
+                    return result;
+                } catch (...) {
+                    result.status = vbr_explicit_capture_status::
                         required_companion_unavailable;
+                    return result;
+                }
+            } else if (!pending.provider.capture ||
+                       !pending.provider.capture(
+                           pending.provider.context,
+                           request.sequence, bytes)) {
+                result.status = vbr_explicit_capture_status::
+                    required_companion_unavailable;
+                return result;
+            }
+            if (request.continue_transfer &&
+                !request.continue_transfer(request.continue_context)) {
+                result.status = vbr_explicit_capture_status::cancelled;
+                return result;
+            }
+            if (!provider_frontier_current()) {
+                result.status = vbr_explicit_capture_status::source_changed;
                 return result;
             }
             // Companion size→data coherence relies on the required idle-slot,
-            // no-decode route invariant. F3.3 must enforce that invariant;
-            // size equality is intentionally the F3.2 guard, not a second
+            // no-decode route invariant. The server route enforces that invariant;
+            // size equality is intentionally the capture guard, not a second
             // content-hash pass over the existing companion codecs.
-            if (pending.recurrent.source == nullptr &&
+            if (pending.recurrent.source == nullptr && !recurrent_chain &&
                 bytes.size() != pending.bytes) {
                 result.status =
                     vbr_explicit_capture_status::source_changed;
@@ -4381,9 +5040,16 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 digest = recurrent_digest;
             } else {
                 auto provider_chain =
-                    std::make_shared<artifact_segment_chain>();
+                    std::make_shared<artifact_segment_chain>(pending.bytes);
                 static constexpr size_t CHUNK = 1024*1024;
                 for (size_t offset = 0; offset < bytes.size();) {
+                    if (request.continue_transfer &&
+                        !request.continue_transfer(
+                            request.continue_context)) {
+                        result.status =
+                            vbr_explicit_capture_status::cancelled;
+                        return result;
+                    }
                     const size_t size = std::min(
                         CHUNK, bytes.size() - offset);
                     if (!provider_chain->append(
@@ -4395,6 +5061,11 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                     offset += size;
                 }
                 digest = vbr_capture_stream_digest(*provider_chain);
+                if (!digest_nonzero(digest)) {
+                    result.status =
+                        vbr_explicit_capture_status::hash_mismatch;
+                    return result;
+                }
                 chain = std::move(provider_chain);
             }
             vbr_verified_companion verified;
@@ -4409,11 +5080,19 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 return result;
             }
         }
+        result.companion_failure_index = UINT32_MAX;
+        result.companion_failure_kind =
+            vbr_artifact_companion_kind::_count;
 
         result.phase = vbr_explicit_capture_phase::unit_transfer;
         uint32_t unit_index = 0;
         for (const auto & child : children) {
             for (const auto & plan : child.units) {
+                if (request.continue_transfer &&
+                    !request.continue_transfer(request.continue_context)) {
+                    result.status = vbr_explicit_capture_status::cancelled;
+                    return result;
+                }
                 vbr_capture_stream_status unit_status;
                 auto unit = build->begin_unit(unit_index, unit_status);
                 if (!unit) {
@@ -4423,9 +5102,14 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 }
                 vbr_capture_stream_stats stats;
                 if (!vbr_live_capture_adapter::stream(
-                        child, plan, *unit, *request.ring, stats)) {
-                    result.status =
-                        vbr_explicit_capture_status::transfer_failed;
+                        child, plan, *unit, *request.ring, stats,
+                        request.continue_context,
+                        request.continue_transfer)) {
+                    result.status = request.continue_transfer &&
+                            !request.continue_transfer(
+                                request.continue_context)
+                        ? vbr_explicit_capture_status::cancelled
+                        : vbr_explicit_capture_status::transfer_failed;
                     return result;
                 }
                 result.chunks += stats.chunks;
@@ -4475,21 +5159,57 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             return result;
         }
 
-        result.phase = vbr_explicit_capture_phase::publication;
-        result.sink = build->publish_reference();
-        result.inner_stream_status = result.sink.status;
-        result.status = stream_status(result.sink.status);
         result.controllers = children.size();
         result.units = unit_index;
         result.companions = package.companions.size();
-        if (result.status == vbr_explicit_capture_status::ok) {
-            result.phase = vbr_explicit_capture_phase::complete;
-        }
+        result.status = vbr_explicit_capture_status::ok;
+        state.result = result;
+        state.transferred = true;
         return result;
     } catch (...) {
         result.status = vbr_explicit_capture_status::internal_error;
+        state.result = result;
         return result;
     }
+}
+
+vbr_explicit_capture_result vbr_publish_explicit_manifest(
+        vbr_explicit_capture_operation & operation) noexcept {
+    vbr_explicit_capture_result result;
+    if (!operation.ready_for_publication()) {
+        result.status = vbr_explicit_capture_status::internal_error;
+        return result;
+    }
+    auto & state = *operation.impl_;
+    result = state.result;
+    result.phase = vbr_explicit_capture_phase::publication;
+    state.published = true;
+    result.sink = state.build->publish_reference();
+    result.inner_stream_status = result.sink.status;
+    result.status = stream_status(result.sink.status);
+    if (result.status == vbr_explicit_capture_status::ok) {
+        result.phase = vbr_explicit_capture_phase::complete;
+    }
+    state.result = result;
+    return result;
+}
+
+vbr_explicit_capture_result vbr_capture_explicit_manifest(
+        llama_memory_i & memory,
+        const vbr_explicit_capture_request & request,
+        vbr_unit_version_sink & sink,
+        const vbr_explicit_capture_accounting & accounting) noexcept {
+    vbr_explicit_capture_operation operation;
+    auto result = vbr_prepare_explicit_manifest(
+        memory, request, sink, accounting, operation);
+    if (result.status != vbr_explicit_capture_status::ok) {
+        return result;
+    }
+    result = vbr_transfer_explicit_manifest(operation);
+    if (result.status != vbr_explicit_capture_status::ok) {
+        return result;
+    }
+    return vbr_publish_explicit_manifest(operation);
 }
 
 const char * vbr_explicit_capture_phase_name(

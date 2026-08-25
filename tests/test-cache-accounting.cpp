@@ -1,4 +1,4 @@
-// C0 shadow-ledger contract tests: reserve/stage/commit/abort/release state machine,
+// Cache-accounting ledger contract tests: reserve/stage/commit/abort/release state machine,
 // minted-allocation identity + immutable citation tuples, charge-once shared allocations,
 // reserved-vs-actual byte separation, concurrent-staged transient peak, unknown-vs-zero,
 // checked overflow latching, serial coherence (faults included), and attribution round-trip
@@ -112,7 +112,7 @@ static void test_lifecycle() {
           s.faults_unknown_id == 0 && s.faults_allocation == 0);
 }
 
-// Sol verify-r1 finding 5.1: reserved is charged/unwound by the RESERVED amount even when
+// Reserved capacity is charged and unwound by the reserved amount even when
 // the staged actual differs — reserve 64, stage 32, abort must leave reserved == 0
 static void test_reserve_stage_mismatch() {
     llama_cache_acct_ledger ledger;
@@ -137,7 +137,7 @@ static void test_reserve_stage_mismatch() {
     CHECK(ledger.release(op2));
 }
 
-// Sol verify-r1 finding 5.2: the transient peak is the high-water mark of CONCURRENTLY
+// The transient peak is the high-water mark of concurrently
 // staged bytes — two live stages of 100 and 200 must report 300
 static void test_concurrent_peak() {
     llama_cache_acct_ledger ledger;
@@ -184,7 +184,7 @@ static void test_invalid_transitions() {
     CHECK(s.faults_unknown_id == 4);
 }
 
-// Sol verify-r1 finding 5.4: an allocation's citation tuple is immutable — a second
+// An allocation's citation tuple is immutable: a second
 // transaction citing the same alloc with a different size/category is a fault, never a
 // silent merge; a later commit with a different logical size is a fault too
 static void test_alloc_tuple_immutable() {
@@ -274,7 +274,7 @@ static void test_charge_once() {
     CHECK(cell(s, CAT, DOM, llama_cache_acct_measure::logical_payload).value == 0);
 }
 
-// D-S4: release preview is observational and last-reference-aware. Shared references
+// Release preview is observational and last-reference-aware. Shared references
 // advertise measured zero until the final reference; previewing changes neither serial nor
 // fault counters, and the final release applies exactly the advertised delta.
 static void test_release_preview() {
@@ -318,7 +318,7 @@ static void test_release_preview() {
     CHECK(ledger.snapshot().faults_unknown_id == faults_before);
 }
 
-// D-S6 SEAM B: a set preview applies last-reference accounting over the entire
+// A set preview applies last-reference accounting over the entire
 // selected union. Neither individual reference frees a shared allocation, while
 // selecting both does. The query is serial-bound and remains observational.
 static void test_release_set_preview() {
@@ -475,7 +475,7 @@ static void test_release_set_resident_batch_cardinality() {
     CHECK(ledger.snapshot().live_ops == 0);
 }
 
-// Sol verify-r2 finding 3: a RETIRED allocation id can never name a new physical allocation.
+// A retired allocation ID can never name a new physical allocation.
 // Terminal entries are reaped, so a stale id is unknown rather than a retained tombstone; monotone
 // allocation ids still prevent reuse. The complete live citation tuple remains immutable.
 static void test_alloc_no_resurrection() {
@@ -513,7 +513,7 @@ static void test_alloc_no_resurrection() {
     CHECK(ledger.abort(op4));
 }
 
-// Sol verify-r3 blocker: an outstanding STAGED claim defers retirement — the exact
+// An outstanding staged claim defers retirement: the exact
 // interleaving commit(op1) → stage(op2) → release(op1) → commit(op2) must accept the join,
 // keep valid same-tuple citations working, and retire only after both claim kinds drain
 static void test_staged_handoff() {
@@ -611,7 +611,7 @@ static void test_overflow_latch() {
     CHECK(s.faults_overflow == 1);
 }
 
-// Sol verify-r1 finding 5.3: EVERY observable change bumps the serial — fault counters
+// Every observable change bumps the serial; fault counters
 // included — so the serial is a usable coherence epoch
 static void test_serial_on_fault() {
     llama_cache_acct_ledger ledger;
@@ -649,6 +649,32 @@ static void test_snapshot_serial() {
     CHECK(cell(s1, CAT, DOM, llama_cache_acct_measure::logical_payload).state ==
           llama_cache_acct_known::unknown);
     CHECK(cell(s2, CAT, DOM, llama_cache_acct_measure::logical_payload).value == 1);
+}
+
+static void test_gauge_set_idempotent() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+
+    const auto unknown = ledger.snapshot();
+    ledger.gauge_set(
+        CAT, DOM, llama_cache_acct_measure::logical_payload, 17);
+    const auto first = ledger.snapshot();
+    CHECK(first.serial > unknown.serial);
+    CHECK(cell(
+        first, CAT, DOM,
+        llama_cache_acct_measure::logical_payload).value == 17);
+
+    ledger.gauge_set(
+        CAT, DOM, llama_cache_acct_measure::logical_payload, 17);
+    CHECK(ledger.snapshot().serial == first.serial);
+
+    ledger.gauge_set(
+        CAT, DOM, llama_cache_acct_measure::logical_payload, 18);
+    const auto changed = ledger.snapshot();
+    CHECK(changed.serial > first.serial);
+    CHECK(cell(
+        changed, CAT, DOM,
+        llama_cache_acct_measure::logical_payload).value == 18);
 }
 
 static llama_cache_acct_shard_topology test_topology(
@@ -798,7 +824,7 @@ static void test_v1_adapter_fail_closed() {
     CHECK(v1.completeness == llama_cache_acct_known::unavailable);
 }
 
-// F0a conditional reserve — serial matches: admits exactly like reserve(), no conflict counted.
+// Conditional reserve — serial matches: admits exactly like reserve(), no conflict counted.
 static void test_reserve_if_serial_match() {
     llama_cache_acct_ledger ledger;
     configure_default(ledger);
@@ -813,7 +839,7 @@ static void test_reserve_if_serial_match() {
     CHECK(s.faults_invalid_transition == 0 && s.faults_overflow == 0);
 }
 
-// F0a conditional reserve — serial drifted: refuses with the ledger COMPLETELY untouched (no op,
+// Conditional reserve — serial drifted: refuses with the ledger COMPLETELY untouched (no op,
 // no cell change, no serial bump, no fault), only the process-local conflict counter moves.
 static void test_reserve_if_serial_drift() {
     llama_cache_acct_ledger ledger;
@@ -836,7 +862,7 @@ static void test_reserve_if_serial_drift() {
     CHECK(ledger.serial_conflicts() == 1);             // conflict is telemetry, not a fault
 }
 
-// F0a conditional reserve — serial matches but the reservation itself hard-faults (unmanifested
+// Conditional reserve — serial matches but the reservation itself hard-faults (unmanifested
 // domain): ledger_fault, distinct from a conflict.
 static void test_reserve_if_serial_ledger_fault() {
     llama_cache_acct_ledger ledger;
@@ -852,7 +878,7 @@ static void test_reserve_if_serial_ledger_fault() {
     CHECK(ledger.snapshot().faults_invalid_transition >= 1);
 }
 
-// F0a conditional reserve — two admissions priced against one serial: exactly one wins, the other
+// Conditional reserve — two admissions priced against one serial: exactly one wins, the other
 // sees the drift caused by the first (no fault). The conflict must consume NO op id: a following
 // fresh-serial reservation gets the id immediately after the winner's (proves next_op preserved).
 static void test_reserve_if_serial_serial_reuse() {
@@ -872,8 +898,8 @@ static void test_reserve_if_serial_serial_reuse() {
     CHECK(c.op.v == a.op.v + 1); // b consumed no op id
 }
 
-// F0a conditional reserve — a reservation the ledger cannot record must be ledger_fault BEFORE an op
-// is minted (Sol review blocker 2): a reserved-aggregate overflow, and an already-unavailable
+// Conditional reserve — a reservation the ledger cannot record must be ledger_fault BEFORE an op
+// is minted: a reserved-aggregate overflow, and an already-unavailable
 // reserved cell. Neither may consume an op id or report admitted.
 static void test_reserve_if_serial_unrecordable() {
     // (a) reserved overflow: prime reserved near the ceiling, then a big reservation would overflow.
@@ -903,7 +929,7 @@ static void test_reserve_if_serial_unrecordable() {
     }
 }
 
-// F0a conditional reserve — under REAL concurrency the serial guard is the admission gate: two
+// Conditional reserve — under REAL concurrency the serial guard is the admission gate: two
 // threads price against one serial and race; exactly one is admitted, the other conflicts, no fault.
 static void test_reserve_if_serial_threads() {
     llama_cache_acct_ledger ledger;
@@ -951,6 +977,7 @@ int main() {
     test_overflow_latch();
     test_serial_on_fault();
     test_snapshot_serial();
+    test_gauge_set_idempotent();
     test_resource_domains_and_tuple();
     test_per_domain_completeness();
     test_v1_adapter_fail_closed();

@@ -72,17 +72,17 @@ struct server_retention_candidate {
     server_retention_instance_key instance_key;
     common_retention_artifact_record record;
     common_retention_lineage_record lineage;
-    // D-S3's descriptor charge is provenance only. It is excluded from the D-S2
+    // The descriptor charge is provenance only. It is excluded from the payload
     // budget and must never be credited as eviction yield.
     llama_cache_acct_op_id provenance_op;
-    // Exact physical release ownership. Host rows are joined by D-S6's
-    // backing resolver; D-A4 live checkpoints carry it in the catalog itself.
+    // Exact physical release ownership. Host rows are joined by the
+    // backing resolver; live checkpoints carry it in the catalog itself.
     std::vector<llama_cache_acct_op_id> release_ops;
     server_retention_candidate_availability avail =
         server_retention_candidate_availability::backing_missing_or_stale;
 };
 
-// Allocation-free DF1 value view. Pressure observation needs only immutable
+// Allocation-free retention-value view. Pressure observation needs only immutable
 // score/lineage scalars; it must not copy accounting-operation vectors or the
 // shared turn table while a request is making room.
 struct server_retention_value_snapshot {
@@ -111,7 +111,7 @@ using server_retention_value_snapshot_visitor = bool (*)(
     void *, const server_retention_value_snapshot &) noexcept;
 
 // Bounded exact-token radix index used to lower cross-lineage shared-prefix
-// coverage into the pure DF1 projector. Same-lineage aliases never count as
+// coverage into the pure retention projector. Same-lineage aliases never count as
 // external coverage. Any allocation, arithmetic, or cardinality failure
 // poisons the index so callers cannot consume a partially indexed view.
 class server_retention_prefix_index {
@@ -184,7 +184,7 @@ struct server_retention_lineage_ticket {
     bool valid() const noexcept { return lineage_id != 0 && bool(turns); }
 };
 
-// Allocation-free D-A4 creation-path view. The three comparison strings are
+// Allocation-free checkpoint creation-path view. The three comparison strings are
 // stored in the catalog once when the immutable checkpoint member is
 // published (and copied once when that member is cloned). Repeated thinning
 // scans consume only scalar fields plus the lease-table result; they never
@@ -215,7 +215,7 @@ llama_cache_acct_op_id server_cache_acct_charge_shadow(
         uint64_t logical_bytes,
         uint64_t resident_bytes) noexcept;
 
-// Observer-owned D-S3 catalog. This server layer owns process-local accounting handles;
+// Observer-owned retention catalog. This server layer owns process-local accounting handles;
 // the common codec remains a pure, serializable value format.
 class server_retention_sidecar_store {
 public:
@@ -349,8 +349,8 @@ public:
         const server_retention_instance_key & source,
         uint32_t prior_milli) noexcept;
     // One pressure/reclaim wave advances competition once, regardless of how
-    // many victims it later removes. DF1 exposes this only to tests/shadow
-    // observation; DF2 will own the authority call site.
+    // many victims it later removes. The same terminal serves observation and
+    // the authoritative reclaim call site.
     bool begin_competition_wave() noexcept;
     bool lineage_for_instance(
         const server_retention_instance_key & key,
@@ -359,8 +359,8 @@ public:
         void * context,
         server_retention_value_snapshot_visitor visitor,
         llama_cache_acct_artifact_id excluded = {}) const noexcept;
-    // Interim D-S bridge: lifecycle choke points retire associations directly.
-    // D-S5/D-S6 can consolidate this onto retire-by-artifact-id once D-S4 admission
+    // Lifecycle choke points retire associations directly.
+    // This can consolidate onto retire-by-artifact-id once admission
     // owns the catalog mutation rather than merely carrying the strong id.
     void retire(const server_retention_instance_key & key) noexcept;
     void retire_slot(int32_t owner_slot) noexcept;
@@ -377,7 +377,7 @@ public:
     bool checkpoint_inventory(
         const server_retention_instance_key & key,
         server_retention_checkpoint_inventory & out) const noexcept;
-    // D-A4 checkpoint payload ownership. Host saves and non-consuming restores
+    // Checkpoint payload ownership. Host saves and non-consuming restores
     // join the immutable plane allocations instead of charging copied bytes;
     // each independently retireable logical checkpoint still owns one exact
     // operation reference per unique plane allocation.
@@ -393,7 +393,7 @@ public:
     // only the sidecar descriptor/association after the physical mutation.
     void retire_after_committed_release(
         const server_retention_instance_key & key) noexcept;
-    // D-A5 complete-slot terminal. The selected artifact set is the
+    // Complete-slot retirement terminal. The selected artifact set is the
     // capability's committed manifest. Every slot association must belong to
     // it before payload and descriptor operation ownership is cleared.
     bool retire_slot_after_committed_release(

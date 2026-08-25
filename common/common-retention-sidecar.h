@@ -53,8 +53,8 @@ enum class common_retention_frequency_state : uint8_t {
     _count,
 };
 
-// Shadow-policy constants remain explicit inputs until DF1 trace selection
-// freezes them for DF2. Arithmetic is integer-only and saturating.
+// Retention-policy constants remain explicit inputs. Arithmetic is integer-only
+// and saturating.
 struct common_retention_frequency_config {
     uint64_t credit_q = COMMON_RETENTION_FREQUENCY_ONE;
     uint64_t maximum_q = COMMON_RETENTION_FREQUENCY_ONE*16;
@@ -147,7 +147,7 @@ bool common_retention_shadow_quote(
         common_retention_shadow_value & out) noexcept;
 
 // Negative means a is the preferred victim, positive means b, zero means the
-// quotes are identical. This is a shadow-only DF1 comparator.
+// quotes are identical. This comparator is policy-free and non-mutating.
 int common_retention_shadow_compare(
         const common_retention_shadow_value & a,
         const common_retention_shadow_value & b) noexcept;

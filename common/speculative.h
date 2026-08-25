@@ -4,6 +4,8 @@
 #include "common.h"
 
 struct common_speculative;
+class llama_io_write_i;
+class llama_io_read_i;
 
 // Select the shared DFlash driver while preserving composable extensions.
 void common_speculative_select_dflash2(common_params_speculative & params);
@@ -169,7 +171,44 @@ void   common_speculative_rollback_dft(common_speculative * spec, llama_seq_id s
 // fork: DFlash ring buffer state save/load
 size_t common_speculative_ring_state_size(const common_speculative * spec);
 void   common_speculative_ring_state_save(const common_speculative * spec, uint8_t * buf, size_t size);
+bool   common_speculative_ring_state_write(
+        const common_speculative * spec,
+        llama_io_write_i & output);
 bool   common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size);
+// Restore a DFlash ring directly from a bounded reader. The reader is consumed
+// exactly `size` bytes on success; implementations issue no read larger than
+// 1 MiB so retained artifact chains do not need a contiguous materialization.
+bool   common_speculative_ring_state_read(
+        common_speculative * spec,
+        llama_io_read_i & input,
+        size_t size);
+
+// Cheap post-install currency. A successful ring mutation changes the epoch;
+// callers can therefore close a late publication gate without serializing the
+// full ring again.
+struct common_speculative_ring_state_currency {
+    size_t serialized_bytes = 0;
+    llama_pos terminal = -1;
+    uint64_t mutation_epoch = 0;
+};
+bool   common_speculative_ring_state_get_currency(
+        const common_speculative * spec,
+        common_speculative_ring_state_currency & output);
+// Authenticate a serialized DFlash ring against the exact committed prompt
+// frontier before it is captured or installed.  The terminal is the logical
+// position of the last committed token (committed_len - 1).
+bool   common_speculative_ring_state_matches_frontier(
+        const common_speculative * spec,
+        const uint8_t * buf,
+        size_t size,
+        llama_pos expected_terminal);
+bool   common_speculative_ring_state_terminal(
+        const common_speculative * spec,
+        llama_pos & terminal);
+bool   common_speculative_ring_state_serialized_terminal(
+        const uint8_t * buf,
+        size_t size,
+        llama_pos & terminal);
 bool   common_speculative_ring_state_empty(const common_speculative * spec);
 void   common_speculative_ring_state_reset(common_speculative * spec);
 

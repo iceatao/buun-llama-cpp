@@ -1860,8 +1860,8 @@ bool llama_vbr_artifact_catalog::configure_accounting(
                 return false;
             }
             needed.insert({ category, domain });
-            // Kept for the landed F2/F0 capacity tests and future
-            // device-local codec staging. F3's pageable segment image uses
+            // Retained for capacity tests and future
+            // device-local codec staging. The artifact catalog's pageable segment image uses
             // the single host-domain transfer_staging cell inserted above.
             needed.insert({
                 llama_cache_acct_category::transfer_staging,

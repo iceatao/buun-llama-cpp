@@ -27,7 +27,7 @@ struct server_prompt_cache_vbr_budget_summary {
     size_t anchor_allocations = 0;
 };
 
-// Internal H1 accounting kernel. The catalog is free to expose the same
+// Internal VBR allocation-accounting kernel. The catalog may expose the same
 // physical allocation through multiple immutable views; charge each exact
 // allocation ID once and reject inconsistent aliases.
 bool server_prompt_cache_summarize_vbr_allocations(
@@ -152,9 +152,9 @@ enum class server_prompt_cache_payload_kind : uint8_t {
     _count,
 };
 
-// One logical host entry may carry either the legacy fixed state image or an
-// immutable VBR catalog lease. H1 may publish either payload, but only fixed
-// state is restorable until H2 wires VBR import/adoption.
+// One logical host entry may carry either a legacy fixed-state image or an
+// immutable VBR catalog lease. Fixed-state selection uses the predicate below;
+// VBR restoration is selected and authenticated by prepare_vbr_restore().
 class server_prompt_cache_payload {
 public:
     using vbr_owner = server_prompt_cache_vbr_owner;
@@ -177,7 +177,7 @@ public:
 
     bool valid() const noexcept;
     bool publishable() const noexcept;
-    bool restorable() const noexcept;
+    bool fixed_state_restorable() const noexcept;
     bool accounted_by(const llama_cache_acct_ledger * ledger) const noexcept;
     bool vbr_retirement_owned() const noexcept;
     bool vbr_retirement_exclusive() const noexcept;

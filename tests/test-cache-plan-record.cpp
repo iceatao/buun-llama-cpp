@@ -1,4 +1,4 @@
-// B0/B/D-S/B-A decision-record contract tests (schema v5): band monotonicity (compile-time),
+// Decision-record contract tests (schema v5): band monotonicity (compile-time),
 // multi-failure first-reason precedence including out-of-order arrival, valid-loser
 // disposition, per-entry inventory merge/overflow/completeness semantics, selection
 // mapping, planner-output clearing, unknown-vs-zero on measured fields, and exhaustive
@@ -55,7 +55,7 @@ static void test_valid_loser() {
 }
 
 // per-entry inventory: cross-phase merge on (target, provider, source), never duplicate rows for
-// one physical candidate; phases accumulate; selection maps to a row (r3/r4 A1)
+// one physical candidate; phases accumulate; selection maps to a row
 static void test_inventory_merge() {
     common_cache_plan_record rec;
     CHECK(rec.n_inventory == 0);
@@ -75,7 +75,7 @@ static void test_inventory_merge() {
     CHECK(b == a);
     CHECK(rec.n_inventory == 1);
     CHECK(a->phases_seen == (COMMON_CACHE_PLAN_PHASE_SIMILARITY | COMMON_CACHE_PLAN_PHASE_LRU));
-    CHECK(a->sim_known); // phase 2 added its scalars without erasing phase 1's
+    CHECK(a->sim_known); // the later observation did not erase earlier similarity evidence
 
     // the same provider/source offered to another target is another executable plan
     auto * other_target = rec.find_or_add(
@@ -109,7 +109,7 @@ static void test_inventory_merge() {
 }
 
 // capacity exhaustion: overflow latches, append stops, shipped-side calls keep succeeding
-// as no-ops (nullptr), and the latched state never downgrades (A2/A3 overflow gate)
+// as no-ops (nullptr), and the latched state never downgrades
 static void test_inventory_overflow() {
     common_cache_plan_record rec;
     for (size_t i = 0; i < COMMON_CACHE_PLAN_MAX_CANDIDATES; i++) {
@@ -130,7 +130,7 @@ static void test_inventory_overflow() {
     CHECK(rec.find_or_add(common_cache_plan_provider::host_cache_entry, 0,
                           COMMON_CACHE_PLAN_PHASE_HOST_SCAN) != nullptr);
     // a dropped derived plan latches the record-level flag WITHOUT touching any
-    // provider's inventory state (verify-r1 finding 4)
+    // provider's inventory state
     const auto host_state_before =
         rec.inventory_states[size_t(common_cache_plan_provider::host_cache_entry)];
     CHECK(rec.add_chain(common_cache_plan_provider::host_cache_entry, 0, 1) == nullptr);
@@ -139,7 +139,7 @@ static void test_inventory_overflow() {
           host_state_before);
 }
 
-// truncation marks a shipped short-circuit; complete never overwrites it (r3 A1 reading 2)
+// Truncation marks a shipped short-circuit; complete never overwrites it.
 static void test_inventory_truncation() {
     common_cache_plan_record rec;
     rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
@@ -151,7 +151,7 @@ static void test_inventory_truncation() {
 }
 
 // revocation clears every non-cold delivery; planner-fault clearing wipes planner outputs
-// only, leaving the B0 evidence intact (A2)
+// only, leaving rejection evidence intact
 static void test_revoke_and_planner_clear() {
     common_cache_plan_record rec;
     auto * s = rec.find_or_add(common_cache_plan_provider::live_slot, 0, COMMON_CACHE_PLAN_PHASE_LRU);
@@ -172,14 +172,14 @@ static void test_revoke_and_planner_clear() {
     rec.yield.status = common_cache_plan_yield_status::fits;
     rec.yield.plan_state = common_cache_plan_yield_plan_state::not_required;
     rec.yield.accounting_serial = 17;
-    k->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED); // B0 evidence
+    k->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
 
     rec.clear_planner_outputs();
     CHECK(rec.shadow_choice == -1 && rec.n_shadow_ties == 0);
     CHECK(k->predicted_total_us.state == llama_cache_acct_known::unknown);
     CHECK(k->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimated_us.state ==
           llama_cache_acct_known::unknown);
-    // the B0 evidence survives the planner fault
+    // rejection evidence survives the planner fault
     CHECK(k->reason == COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
     CHECK(rec.n_inventory == 3);
     CHECK(rec.yield.status == common_cache_plan_yield_status::fits);
@@ -332,7 +332,7 @@ static void test_name_tables() {
     CHECK(uint16_t(COMMON_CACHE_PLAN_REASON_COUNT_SENTINEL) == 601);
 }
 
-// verify-r1 finding 9: couple the golden schema to the ACTUAL C++ serializer — a
+// Couple the golden schema to the actual C++ serializer: a
 // representative composed-delivery record through common_cache_plan_record_json, with
 // structural assertions on every load-bearing v2 key
 static void test_json_serialization() {
@@ -653,7 +653,7 @@ static void test_actual_yield_uses_post_commit_observation() {
     CHECK(yield.actual_domains.empty());
 }
 
-// finalize-shaped chain composition (verify-r4): the ONE tested implementation the server
+// Finalize-shaped chain composition: the tested implementation the server
 // calls — simple delivery, composed delivery with sibling cost-loser chains, and the
 // exact-capacity shape where the delivered pair's chain cannot be recorded
 static void test_compose_chains() {
@@ -738,7 +738,7 @@ static void test_compose_chains() {
 static void test_destruction_observer() {
     static_assert(
         size_t(server_cache_destruction_class::_count) == 6,
-        "D-S4 inventory is closed at six logical classes");
+        "destruction inventory is closed at six logical classes");
 
     server_cache_destruction_observer observer;
     server_cache_destruction_request request;
@@ -786,7 +786,7 @@ static void test_destruction_observer() {
         (observer.n_events - 1) % observer.events.size())];
     CHECK(newest.sequence == observer.n_events);
 
-    // Manifest overflow is observable but cannot block D-S4 execution.
+    // Manifest overflow is observable but cannot block destruction execution.
     server_cache_destruction_request oversized;
     oversized.cls = server_cache_destruction_class::slot_drop;
     for (size_t i = 0; i <= SERVER_CACHE_DESTRUCTION_MAX_TARGETS; ++i) {

@@ -115,7 +115,7 @@ int main() {
         std::fputs("VBR hard-seal transaction defer failed\n", stderr);
         return 1;
     }
-    std::puts("E1_VBR_TX_DEFER interleaved=1,3 cursor=4 PASS");
+    std::puts("VBR_TRANSACTION_DEFER interleaved=1,3 cursor=4 PASS");
 
     // The decode terminal consumes the latch on every outcome. A refusal
     // during a successful donor shed cannot retype a later ordinary failure.
@@ -130,7 +130,7 @@ int main() {
         std::fputs("VBR hard-seal failed-decode terminal failed\n", stderr);
         return 1;
     }
-    std::puts("E1_VBR_LATCH successful_shed_then_cell_failure=normal PASS");
+    std::puts("VBR_FAILURE_LATCH successful_shed_then_cell_failure=normal PASS");
     std::puts("VBR hard-seal classification passed");
     return 0;
 }

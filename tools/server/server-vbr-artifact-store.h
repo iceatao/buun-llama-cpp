@@ -17,6 +17,17 @@ struct common_speculative;
 struct llama_context;
 struct server_vbr_artifact_store_test_door;
 
+struct server_vbr_companion_codec {
+    vbr_artifact_companion_kind kind =
+        vbr_artifact_companion_kind::_count;
+    uint32_t format_version = 0;
+    std::array<uint8_t, 32> build_identity_digest = {};
+};
+
+bool server_vbr_companion_codec_for(
+    vbr_artifact_companion_kind kind,
+    server_vbr_companion_codec & output) noexcept;
+
 enum class server_vbr_artifact_capture_status : uint8_t {
     ok = 0,
     unsupported,
@@ -155,12 +166,16 @@ struct server_vbr_artifact_capture_output {
     vbr_explicit_size_failure size_failure =
         vbr_explicit_size_failure::none;
     vbr_capture_begin_diagnostics begin_diagnostics;
+    vbr_explicit_capture_pretransfer_quote pretransfer;
     std::string reference;
     vbr_artifact_consistency_kind consistency =
         vbr_artifact_consistency_kind::capture_exact;
     uint32_t controllers = 0;
     uint32_t units = 0;
     uint32_t companions = 0;
+    uint32_t companion_failure_index = UINT32_MAX;
+    vbr_artifact_companion_kind companion_failure_kind =
+        vbr_artifact_companion_kind::_count;
     uint64_t payload_bytes = 0;
     uint64_t stash_bytes = 0;
     uint64_t companion_bytes = 0;
@@ -169,6 +184,34 @@ struct server_vbr_artifact_capture_output {
     uint64_t event_completions = 0;
     uint64_t synchronous_fallbacks = 0;
     bool dedup = false;
+};
+
+// Store-owned move-only exact host capture. Preparation and publication are
+// scheduler terminals; transfer is the only method intended for a background
+// worker. Resetting an unpublished operation abandons private catalog staging
+// without creating a host-visible artifact.
+class server_vbr_explicit_host_capture {
+public:
+    server_vbr_explicit_host_capture() noexcept;
+    server_vbr_explicit_host_capture(
+        server_vbr_explicit_host_capture && other) noexcept;
+    server_vbr_explicit_host_capture & operator=(
+        server_vbr_explicit_host_capture && other) noexcept;
+    ~server_vbr_explicit_host_capture();
+
+    server_vbr_explicit_host_capture(
+        const server_vbr_explicit_host_capture &) = delete;
+    server_vbr_explicit_host_capture & operator=(
+        const server_vbr_explicit_host_capture &) = delete;
+
+    bool ready_for_transfer() const noexcept;
+    bool ready_for_publication() const noexcept;
+    void reset() noexcept;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> impl_;
+    friend class server_vbr_artifact_store;
 };
 
 // Scheduler-facing terminal for one row of an immutable projected capture
@@ -346,6 +389,8 @@ struct server_vbr_artifact_import_output {
     vbr_adopt_recovery_outcome recovery =
         vbr_adopt_recovery_outcome::not_needed;
     bool adopt_attempted = false;
+    vbr_occupied_replacement_guard_status occupied_guard_status =
+        vbr_occupied_replacement_guard_status::_count;
     vbr_adopt_phase phase = vbr_adopt_phase::consume_capabilities;
     vbr_downward_adopt_subphase downward_subphase =
         vbr_downward_adopt_subphase::none;
@@ -397,7 +442,7 @@ private:
     std::map<std::string, binding> entries_;
 };
 
-// F3.3 server owner for the internal catalog/ring. Explicit control APIs
+// Server owner for the internal artifact catalog and transfer ring. Explicit control APIs
 // return and resolve tenant-bound opaque handles only through the exact
 // capture-time tenant key. The trusted scheduler path below instead receives
 // typed host owners directly; neither path exposes catalog enumeration or a
@@ -420,13 +465,14 @@ public:
         vbr_explicit_capture_request request,
         const std::string & tenant_key) noexcept;
 
-    // Scheduler-only exact capture for memory trees whose complete artifact
-    // includes payload-complete attention children (notably bounded iSWA).
-    // The returned owner is claimed directly from the catalog; no tenant
-    // handle or reference-index row is created.
-    server_vbr_artifact_capture_output capture_host_payload(
+    server_vbr_artifact_capture_output prepare_host_payload(
         llama_memory_i & memory,
         vbr_explicit_capture_request request,
+        server_vbr_explicit_host_capture & operation) noexcept;
+    server_vbr_artifact_capture_output transfer_host_payload(
+        server_vbr_explicit_host_capture & operation) noexcept;
+    server_vbr_artifact_capture_output publish_host_payload(
+        server_vbr_explicit_host_capture & operation,
         std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
         noexcept;
 
@@ -441,7 +487,7 @@ public:
         server_vbr_projected_host_publish_diagnostics * diagnostics = nullptr)
         noexcept;
 
-    // Trusted scheduler composition of the H2 capture coordinator and the
+    // Trusted scheduler composition of projected capture and the
     // catalog handoff above. Runtime transport/topology/representation
     // authority remains store-owned; callers provide only bounded semantic
     // manifests and the admitted aggregate payload runway.
@@ -487,8 +533,13 @@ public:
         server_vbr_artifact_import_target request,
         std::shared_ptr<const server_prompt_cache_vbr_payload> payload,
         vbr_artifact_attention_prefix_projection projection) noexcept;
+    server_vbr_artifact_import_output import_host_occupied_prefix_replacement(
+        server_vbr_artifact_import_target request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> incoming,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> recovery,
+        vbr_artifact_attention_prefix_projection projection) noexcept;
 
-    // Scheduler-only E1 resolver. Authorization is identical to import and
+    // Scheduler-only control resolver. Authorization is identical to import and
     // the returned move-only package is the durable catalog pin. No raw
     // artifact lookup or tenant-agnostic enumeration is exposed.
     bool resolve_control_reference(
@@ -496,7 +547,7 @@ public:
         const std::string & tenant_key,
         vbr_artifact_package_view & package) noexcept;
 
-    // H1 host-cache adapter. Authorization is identical to explicit import;
+    // Host-cache adapter. Authorization is identical to explicit import;
     // the catalog's sealed publication is the validation proof, so retaining
     // the immutable capability performs no payload read or rehash. The
     // returned shared owner holds one catalog borrow for all host aliases.
@@ -513,9 +564,7 @@ private:
     server_vbr_artifact_capture_output capture_impl(
         llama_memory_i & memory,
         vbr_explicit_capture_request request,
-        const std::string * tenant_key,
-        std::shared_ptr<const server_prompt_cache_vbr_payload> * payload)
-        noexcept;
+        const std::string & tenant_key) noexcept;
     server_vbr_artifact_import_output complete_validated_import(
         server_vbr_artifact_import_target request,
         vbr_manifest_validation_result validated,
@@ -542,6 +591,12 @@ private:
         server_vbr_artifact_import_target request,
         const vbr_artifact_package_view & package,
         const vbr_artifact_package_view * recovery) noexcept;
+    server_vbr_artifact_import_output import_host_prefix_payload_impl(
+        server_vbr_artifact_import_target request,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> payload,
+        vbr_artifact_attention_prefix_projection projection,
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> * recovery)
+        noexcept;
     struct impl;
     explicit server_vbr_artifact_store(std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;

@@ -64,7 +64,7 @@ void common_cache_plan_fill_actual_yield(
     }
 }
 
-// Exhaustive name tables for the B0 closed enums. Switch-based with no default case so a new
+// Exhaustive name tables for the cache-plan closed enums. Switch-based with no default case so a new
 // member without a name is a compile-time -Wswitch error, and the single unreachable return
 // keeps release builds defined. These are the ONLY spellings of these names — CI bans replicas.
 
@@ -342,7 +342,7 @@ void common_cache_plan_destruction_counters::observe(
         common_cache_plan_selection tier,
         const common_cache_plan_destruction_receipt & receipt,
         bool observe_classification) noexcept {
-    // Unlike B-A's one-receipt observe(), D-A calls this once per candidate.
+    // Unlike the one-receipt authority observer, destruction quoting calls this once per candidate.
     // The server boundary publishes the selected/finalized receipt exactly once.
     const size_t t = size_t(tier);
     if (t >= n_tiers) {
@@ -700,8 +700,7 @@ void common_cache_plan_compose_chains(common_cache_plan_record & rec) {
         }
     }
     // a composed delivery whose chain could not be recorded has NO honest shipped-plan
-    // ordinal — the bare dependent checkpoint must not stand in for it (verify-r3
-    // finding 2)
+    // ordinal: the bare dependent checkpoint must not stand in for it.
     if (sel_ckpt >= 0 && rec.inventory[size_t(sel_ckpt)].delivered &&
         !shipped_chain_recorded) {
         rec.shipped_plan_candidate = -1;

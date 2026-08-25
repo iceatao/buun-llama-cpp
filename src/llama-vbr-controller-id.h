@@ -58,7 +58,7 @@ bool vbr_controller_instance_check_and_claim(
 bool vbr_controller_instance_release(
     vbr_controller_instance_id instance,
     const void * owner) noexcept;
-// Allocation-free exact-owner probe used by the F4 import barrier. It never
+// Allocation-free exact-owner probe used by the import barrier. It never
 // claims or refreshes an instance and therefore cannot turn stale evidence
 // into a live routing identity.
 bool vbr_controller_instance_owned_by(

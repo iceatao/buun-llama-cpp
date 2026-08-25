@@ -183,11 +183,11 @@ static void test_saturated_inventory_refuses_typed() {
 }
 
 static void test_as_if_completion_semantics() {
-    const auto native = server_cache_plan_stage1_semantics_for(
+    const auto native = server_cache_plan_preflight_semantics_for(
         false, true, true, true, true);
-    const auto literal_preflight = server_cache_plan_stage1_semantics_for(
+    const auto literal_preflight = server_cache_plan_preflight_semantics_for(
         false, false, true, true, true);
-    const auto as_if_preflight = server_cache_plan_stage1_semantics_for(
+    const auto as_if_preflight = server_cache_plan_preflight_semantics_for(
         true, false, true, true, true);
     CHECK(native.completion_semantics);
     CHECK(native.host_lookup_enabled);
@@ -279,7 +279,7 @@ static void test_local_source_registry() {
 }
 
 static void assert_redacted_keys(const nlohmann::ordered_json & value) {
-    // Canonical exhaustive E0 private-key oracle. The contract scan and live
+    // Canonical exhaustive  private-key oracle. The contract scan and live
     // driver carry deliberate security-critical subsets and point back here.
     static const std::set<std::string> forbidden = {
         "target_slot_id", "source_id", "candidate_id", "component_ids",

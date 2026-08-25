@@ -6,7 +6,7 @@
 #include <memory>
 #include <vector>
 
-// Internal F2.2 immutable artifact catalog. It is deliberately absent from
+// Internal immutable artifact catalog. It is deliberately absent from
 // public llama.h and has no server/backend dependency.
 enum class llama_vbr_artifact_publish_status : uint8_t {
     published = 0,
@@ -323,7 +323,7 @@ enum class vbr_projected_manifest_publish_status : uint8_t {
 // policy, unit geometry, payload sources, and content IDs come exclusively
 // from the sealed assembly. The caller supplies only the portable accounting
 // budget and the topology namespace in which those rows are interpreted.
-// Keeping this envelope narrow prevents an H2 scheduler from manufacturing a
+// Keeping this envelope narrow prevents the restore scheduler from manufacturing a
 // mostly-placeholder artifact package that the catalog then overwrites.
 struct vbr_projected_manifest_publication {
     uint64_t manifest_id = 0;
@@ -479,12 +479,12 @@ public:
         const std::vector<vbr_artifact_portable_topology> & topologies,
         std::vector<llama_vbr_artifact_domain_binding> & bindings) noexcept;
 
-    // Create measured-zero cells for every package accounting row plus the F3
+    // Create measured-zero cells for every package accounting row plus the
     // temporary leaves in those same capacity domains. This never certifies a
     // producer and never resets a cell already configured by this catalog.
     bool configure_accounting(const vbr_artifact_package & package) noexcept;
 
-    // F3 explicit-capture preparation door: atomically requires/binds the
+    // The explicit-capture preparation door atomically requires/binds the
     // package topology set and creates every measured-zero accounting cell.
     bool prepare_capture_package(
         const vbr_artifact_package & package) noexcept;
@@ -524,7 +524,7 @@ public:
         llama_vbr_projected_publication_batch_claim && claim,
         std::vector<llama_vbr_projected_publication_claim> & output) noexcept;
 
-    // F3.1 streaming path and the abstract F3.2 capture sink entry point.
+    // bounded streaming path and the abstract capture-sink entry point.
     std::unique_ptr<vbr_capture_build> begin_capture(
         const vbr_artifact_package & package,
         const llama_cache_budget_config & budget,
@@ -533,7 +533,7 @@ public:
         vbr_capture_begin_diagnostics * diagnostics =
             nullptr) noexcept override;
 
-    // H1 dependency-scoped publication. Structural assembly corruption or a
+    // Dependency-scoped publication. Structural assembly corruption or a
     // malformed publication inventory clears all output and returns false.
     // Missing/stale unit or companion evidence is reported per manifest;
     // unaffected rows publish independently. Main payload bytes are never

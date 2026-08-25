@@ -141,7 +141,8 @@ vbr_prepared_companion_image::~vbr_prepared_companion_image() = default;
 vbr_adopt_status vbr_adopt_check_complete_tree(
         const std::vector<vbr_adopt_expected_attention> & expected,
         const std::vector<llama_memory_tree_child> & live,
-        const std::vector<vbr_companion_adoption_provider> & companions) noexcept {
+        const std::vector<vbr_companion_adoption_provider> & companions,
+        bool occupied_replacement) noexcept {
     const size_t live_attention = std::count_if(
         live.begin(), live.end(),
         [](const llama_memory_tree_child & child) {
@@ -183,7 +184,9 @@ vbr_adopt_status vbr_adopt_check_complete_tree(
         if (duplicate != companions.end()) {
             return vbr_adopt_status::required_companion_unavailable;
         }
-        if (!prepared->target_empty(prepared->context)) {
+        if (!prepared->target_empty(prepared->context) &&
+            (!occupied_replacement ||
+             prepared->prepare_replacement == nullptr)) {
             return vbr_adopt_status::target_drift;
         }
     }
@@ -258,7 +261,7 @@ bool vbr_artifact_epoch_capacity(
            tier_changes <= UINT64_MAX-tier_epoch;
 }
 
-// This class is the sole friend of llama_kv_cache for F4 adoption. It owns
+// This class is the sole friend of llama_kv_cache for artifact adoption. It owns
 // every prepublication mutation and its inverse; callers cannot acquire a
 // tensor/pool destination outside the open journal.
 class vbr_kv_import_session {
@@ -273,7 +276,7 @@ class vbr_kv_import_session {
         llama_kv_cache::vbr_extent * extent = nullptr;
         size_t pool_index = SIZE_MAX;
         // A transform maps the larger of source and target before H2D.  The
-        // phase-12 invariant is the target-tier prefix left after the
+        // publication invariant is the target-tier prefix left after the
         // fallible transform (and downward-only tail trim).
         uint64_t mapped_row_bytes = 0;
         uint64_t final_row_bytes = 0;
@@ -600,7 +603,7 @@ class vbr_kv_import_session {
                 backing_watermarks[i] = std::max(
                     backing_watermarks[i], final_watermarks_[i]);
             }
-            // H1: mapping is an extent-prefix invariant, not merely the union
+            // Mapping is an extent-prefix invariant, not merely the union
             // of authorized copy runs.  Foreign rows remain untouched, but
             // every extent is backed over [0, final_watermark) before publish.
             for (const auto & prefix : extent_prefixes_) {
@@ -640,8 +643,12 @@ class vbr_kv_import_session {
                             SIZE_MAX/prefix.mapped_row_bytes) {
                         return false;
                     }
+                    if (prefix.initial_watermark >
+                            SIZE_MAX/prefix.final_row_bytes) {
+                        return false;
+                    }
                     const size_t old_bytes = size_t(
-                        prefix.initial_watermark*prefix.mapped_row_bytes);
+                        prefix.initial_watermark*prefix.final_row_bytes);
                     if (absolute > SIZE_MAX-old_bytes ||
                         absolute+old_bytes > SIZE_MAX-(gran-1)) {
                         return false;
@@ -700,9 +707,13 @@ class vbr_kv_import_session {
         ggml_tensor source_alias;
         ggml_tensor * destination = extent->t;
         const auto source_type = source_types_.find(read.logical_unit_id);
-        if (source_type != source_types_.end()) {
+        const ggml_type destination_type = read.destination_type >= 0
+            ? static_cast<ggml_type>(read.destination_type)
+            : source_type != source_types_.end()
+                ? source_type->second : extent->t->type;
+        if (destination_type != extent->t->type) {
             if (!cache_->vbr_import_source_alias(
-                    *extent->t, source_type->second, source_alias)) {
+                    *extent->t, destination_type, source_alias)) {
                 return false;
             }
             destination = &source_alias;
@@ -1110,7 +1121,7 @@ class vbr_kv_import_session {
             }
             // Validation writes the target cursor on every unit plan, even
             // when a coherent projection changes only a subset of units. The
-            // cursor is tree-wide, so phase 12 must never reconstruct it from
+            // cursor is tree-wide, so publication must never reconstruct it from
             // the source policy of an unchanged unit.
             final_cursor_ = plans.front()->target_controller_cursor;
             for (const auto * plan : plans) {
@@ -1181,11 +1192,6 @@ class vbr_kv_import_session {
             const size_t start = prefix.extent->byte_off;
             const size_t bytes = size_t(bytes64);
             if (occupied_replacement_ &&
-                final_watermarks_[size_t(pool_it-cache_->vbr_pools_.begin())] <=
-                    prefix.initial_watermark) {
-                continue;
-            }
-            if (occupied_replacement_ &&
                 prefix.initial_watermark > SIZE_MAX/prefix.final_row_bytes) {
                 return false;
             }
@@ -1195,10 +1201,23 @@ class vbr_kv_import_session {
                 start+initial_bytes > SIZE_MAX-(prefix.pool->gran-1)) {
                 return false;
             }
-            const size_t required_start = occupied_replacement_
+            const size_t old_last = occupied_replacement_
                 ? ((start+initial_bytes+prefix.pool->gran-1)/prefix.pool->gran)*
                     prefix.pool->gran
                 : start;
+            if (occupied_replacement_) {
+                if (start > SIZE_MAX-bytes ||
+                    start+bytes > SIZE_MAX-(prefix.pool->gran-1)) {
+                    return false;
+                }
+                const size_t new_last =
+                    ((start+bytes+prefix.pool->gran-1)/prefix.pool->gran)*
+                        prefix.pool->gran;
+                if (new_last <= old_last) {
+                    continue;
+                }
+            }
+            const size_t required_start = old_last;
             const auto covered = std::find_if(
                 mapped_.begin(), mapped_.end(),
                 [&](const mapped_range & range) {
@@ -1352,7 +1371,7 @@ class vbr_kv_import_session {
     // The pool's f16 sink stash is a fixed-VA VMM slab with construction-assigned extent
     // offsets (recoverable-stash rework). Import writes the clean stash DIRECTLY into the
     // destination extent's slot: the adopt target is construction-empty and readers ignore
-    // stash content until phase-12 publishes stash_valid, so a failed import leaves only
+    // stash content until composite publication sets stash_valid, so a failed import leaves only
     // ignored bytes behind. Mapping goes through the pool's idempotent grow-only reserve,
     // keeping allocation failure recoverable and outside the no-fail boundary.
     ggml_tensor * stash_alias(llama_kv_cache::vbr_pool & pool,
@@ -2130,6 +2149,10 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         uint64_t completion = 0;
         if (out.decision == vbr_import_decision::downward_rebase ||
             out.decision == vbr_import_decision::upward_reconstruct) {
+            // A recycle transform may initialize/clear incumbent backing.
+            // Arm byte-exact recovery before the first such mutation, not
+            // merely before the first incoming H2D descriptor.
+            destructive_started = destructive_started || recycle;
             const auto status = transform_source_h2d(children, *manifest);
             if (status != vbr_adopt_status::adopted) {
                 return fail(status);
@@ -2261,20 +2284,38 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                     return value.kind == plan.descriptor.kind &&
                            value.target_cookie == plan.target_cookie;
                 });
+            const bool replacement = plan.recovery_parsed != nullptr;
             if (provider == server_hooks.companions.end() ||
-                provider->prepare == nullptr || provider->recheck == nullptr ||
+                (replacement
+                    ? provider->prepare_replacement == nullptr
+                    : provider->prepare == nullptr) ||
+                provider->recheck == nullptr ||
                 provider->publish_swap == nullptr ||
                 provider->target_empty == nullptr ||
-                !plan.parsed || !provider->target_empty(provider->context)) {
+                !plan.parsed ||
+                (!replacement &&
+                 !provider->target_empty(provider->context))) {
                 return fail(vbr_adopt_status::companion_failed);
             }
             std::unique_ptr<vbr_prepared_companion_image> image;
-            if (!provider->prepare(
+            const size_t prepared_before = companions.size();
+            const bool prepared = replacement
+                ? provider->prepare_replacement(
                     provider->context, std::move(plan.parsed),
-                    destination, image) || !image) {
+                    std::move(plan.recovery_parsed), destination, image)
+                : provider->prepare(
+                    provider->context, std::move(plan.parsed),
+                    destination, image);
+            // Replacement providers publish their recovery owner before the
+            // first mutation. Retain it even when preparation fails so the
+            // common reverse-order rollback can restore the incumbent.
+            if (image) {
+                companions.push_back({ &*provider, std::move(image) });
+            }
+            if (!prepared || companions.size() != prepared_before+1 ||
+                companions.back().first != &*provider) {
                 return fail(vbr_adopt_status::companion_failed);
             }
-            companions.push_back({ &*provider, std::move(image) });
             ++out.companions;
         }
         if (fault_after(server_hooks, out.phase)) {
@@ -2382,7 +2423,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             }
         }
         const auto tree_status = vbr_adopt_check_complete_tree(
-            expected_attention, barrier_tree, prepared_providers);
+            expected_attention, barrier_tree, prepared_providers,
+            occupied_replacement);
         if (tree_status != vbr_adopt_status::adopted) {
             return fail(tree_status);
         }
@@ -2434,8 +2476,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         if (fault_before(server_hooks, out.phase)) {
             return fail(vbr_adopt_status::barrier_failed);
         }
-        // Phase 11 is the final fault-injection checkpoint. All substantive
-        // installability revalidation is the phase-10 complete-tree barrier.
+        // This is the final fault-injection checkpoint. All substantive
+        // installability revalidation is the complete-tree barrier.
 
         // BEGIN VBR_IMPORT_NOFAIL_PUBLISH: metadata-only; CI bans backend,
         // allocation, logging and legacy state-reader calls in this region.
@@ -2459,13 +2501,13 @@ vbr_adopt_result vbr_adopt_empty_manifest(
 
         out.phase = vbr_adopt_phase::close;
         // Retain every committed reference in the imported target until its
-        // reset/retire. This is the conservative TQ2 handoff: staging is not
+        // reset/retire. This conservative accounting handoff keeps staging
         // released before a live producer can account the installed bytes.
         for (auto & entry : children) {
             entry.second.session->publish_receipts();
         }
         receipt_group->activate();
-        // Phase 13 is the committed no-fail terminal.  Do not report adoption
+        // Close is the committed no-fail terminal. Do not report adoption
         // unless the exact registry/recovery predicate enforced by the target
         // tracker's destructor has been proved here.
         GGML_ASSERT(operation.finish(true, false));

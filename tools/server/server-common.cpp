@@ -411,7 +411,7 @@ bool server_tokens::media_content_identity(int64_t n_tokens, std::string & out) 
 
         // A frontier in the middle of a media chunk has no coherent media
         // prefix. Empty ids are likewise unverifiable (notably expanded video
-        // frames); get_common_prefix already treats them as divergence [I6].
+        // frames); get_common_prefix already treats them as divergence.
         if (start + n_tok > (size_t) n_tokens || id == nullptr || id[0] == '\0') {
             out.clear();
             return false;
@@ -675,7 +675,7 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
             // An empty chunk id means unidentified media: video frame chunks lose the file-level
             // content hash on expansion and carry id == "". Matching "" == "" would reuse one
             // video's KV for a different video of the same shape, so fail closed — an empty-id chunk
-            // is always a divergence point. Images/audio carry the FNV content hash, unaffected. [I6]
+            // is always a divergence point. Images/audio carry the FNV content hash, unaffected.
             if (id_ai && id_ai[0] != '\0' && id_bi && std::strcmp(id_ai, id_bi) == 0 && n_tok_a == n_tok_b) {
                 GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
                 i += n_tok_a - 1; // will be +1 by the for loop

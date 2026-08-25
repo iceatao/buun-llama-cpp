@@ -58,7 +58,7 @@ vbr_extent_handle vbr_extent_store::reserve(vbr_mutation_family family,
     // Odd generation = live slot. The bump is what invalidates any stale ref left over from a
     // prior occupant of this slot.
     if (entry.slot_gen >= std::numeric_limits<uint32_t>::max() - 2) {
-        // No-wrap rule (design Rev 4 item 2): refuse and latch; the owner performs the global
+        // No-wrap rule: refuse and latch; the owner performs the global
         // invalidation + reset_all() which rebases every generation.
         free_list_.push_back(index);
         exhausted_ = true;
@@ -205,7 +205,7 @@ vbr_ownership_index::vbr_ownership_index(uint32_t n_stream, uint32_t n_seq_max, 
     n_seq_max_(n_seq_max),
     n_cells_(n_cells),
     n_pages_((n_cells + VBR_GENERATION_PAGE_CELLS - 1) / VBR_GENERATION_PAGE_CELLS) {
-    // Flat O(1) slot map (efficiency review): views are lazy but their SLOTS are preallocated.
+    // Flat O(1) slot map: views are lazy but their slots are preallocated.
     views_.resize(size_t(n_stream_) * n_seq_max_);
 }
 
@@ -238,7 +238,7 @@ bool vbr_ownership_index::add_cell(uint32_t stream, llama_seq_id seq_id, uint32_
     if (stream >= n_stream_ || cell >= n_cells_) {
         return false;
     }
-    // Gap fix (review): lazy view allocation may throw mid-mutation; fail closed to an
+    // Lazy view allocation may throw mid-mutation; fail closed to an
     // unavailable view instead of unwinding through a registrant transaction.
     seq_view * view_ptr = nullptr;
     try {
@@ -251,7 +251,7 @@ bool vbr_ownership_index::add_cell(uint32_t stream, llama_seq_id seq_id, uint32_
     }
     auto & view = *view_ptr;
     if (pos < 0 || static_cast<uint32_t>(pos) >= n_cells_) {
-        // Fail-closed domain restriction (design Rev 5 pin 3).
+        // Fail-closed domain restriction.
         view.unavailable = true;
         return false;
     }
@@ -313,7 +313,7 @@ bool vbr_ownership_index::move_cell(uint32_t stream, llama_seq_id seq_id, uint32
 void vbr_ownership_index::clear_seq(uint32_t stream, llama_seq_id seq_id) {
     if (auto * view = find_view(stream, seq_id)) {
         // Capacity is deliberately RETAINED: server slots cycle seq ids, and re-zeroing via
-        // assign() is cheaper than an allocator round-trip per request (efficiency review).
+        // assign() is cheaper than an allocator round-trip per request.
         view->in_use      = false;
         view->unavailable = false;
         view->owned       = 0;
@@ -321,7 +321,7 @@ void vbr_ownership_index::clear_seq(uint32_t stream, llama_seq_id seq_id) {
 }
 
 void vbr_ownership_index::clear_all() {
-    // C5 (v3 design): the flat slot map is FIXED — reset views in place; the lookup domain
+    // The flat slot map is fixed: reset views in place; the lookup domain
     // (n_stream * n_seq_max slots) never changes after construction.
     for (auto & view : views_) {
         view.in_use      = false;

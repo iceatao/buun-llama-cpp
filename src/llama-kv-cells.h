@@ -299,7 +299,7 @@ public:
 
     // check if the cell contains seq_id
     // Iterate the sequences ACTUALLY occupying cell i — O(occupants), not O(LLAMA_MAX_SEQ).
-    // (A2 ownership-index maintenance walks this per touched cell on whole-cache edits.)
+    // Ownership-index maintenance walks this per touched cell on whole-cache edits.
     template <typename F>
     void seq_for_each(uint32_t i, F && f) const {
         assert(i < seq.size());
@@ -378,9 +378,9 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
-    // Exact cardinality from the canonical ownership index. Revision-9 A1 uses this instead of
-    // trusting the covered mask's subset count. It allocates nothing and never scans empty
-    // physical cells; A2 supplies the child visibility/serializer-manifest filter.
+    // Exact cardinality from the canonical ownership index rather than trusting
+    // the covered mask's subset count. It allocates nothing and never scans empty
+    // physical cells; the child supplies the visibility/serializer-manifest filter.
     uint32_t seq_pos_count_before(llama_seq_id seq_id, llama_pos frontier) const {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);

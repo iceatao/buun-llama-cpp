@@ -11,15 +11,15 @@
 #include <utility>
 #include <vector>
 
-// llama-cache-accounting.h — P2 C accounting contract, schema version 2.
+// llama-cache-accounting.h — cache accounting contract, schema version 2.
 //
-// Policy-free, library-neutral accounting types shared by the server observer (B0), the D
-// lease/lifecycle work, and the F artifact-transaction work. This header is the SOLE byte
-// accounting interface: no consumer grows private byte counters (C/F freeze requirement 9).
+// Policy-free, library-neutral accounting types shared by the server observer,
+// lease/lifecycle owners, and artifact transactions. This header is the sole byte
+// accounting interface: consumers must not grow private byte counters.
 // Presentation (name strings, JSON) lives above, in common/ and server adapters — never here.
 //
-// P2 SEMANTICS: the policy-free ledger supports both C-a shadow observation and F0b authority.
-// Plain `reserve` remains observational. The separately composed F authority path uses
+// The policy-free ledger supports both observation and admission authority.
+// Plain `reserve` remains observational. The composed admission path uses
 // `reserve_if_serial` before mutation and makes publication wait for stage/commit; without the
 // lifecycle flag, existing producers retain the shadow behavior. Every ledger entry point remains
 // genuinely non-throwing: allocation/transition/overflow failures latch counters and typed-
@@ -254,7 +254,7 @@ enum class llama_cache_acct_known : uint8_t {
 enum class llama_cache_acct_producer : uint8_t {
     observer_init = 0,
     host_cache,
-    // Reserved in the refrozen v2 vocabulary for the immediately-following D-S producers;
+    // Reserved in the refrozen v2 vocabulary for the immediately following producers;
     // they are not required until their configuration paths are wired.
     live_memory,
     retention_sidecar,
@@ -288,7 +288,7 @@ enum class llama_cache_acct_cost_kind : uint8_t {
     _count,
 };
 
-// Canonical raw unit per cost kind (Q-C2 ruling): replay is counted in tokens, everything
+// Canonical raw unit per cost kind: replay is counted in tokens, everything
 // else in bytes. The unit is schema metadata, not a measurement — it is valid even while the
 // term itself is unavailable.
 constexpr llama_cache_acct_unit llama_cache_acct_cost_kind_unit(llama_cache_acct_cost_kind k) {
@@ -308,9 +308,9 @@ struct llama_cache_acct_cost_term {
     uint32_t                   estimator_version = 0;
 };
 
-// Attribution axes (C/F freeze requirement 8): a closed kind tag; server-wide rows use the
+// Attribution axes: a closed kind tag; server-wide rows use the
 // defaults. The tenant axis is deliberately ABSENT from this schema version, not an empty
-// field: the server has no tenant identity until E1 (adding it is a schema-version bump).
+// field: this schema has no tenant identity (adding one is a schema-version bump).
 enum class llama_cache_acct_attr_kind : uint8_t {
     server = 0,
     slot,
@@ -537,7 +537,7 @@ bool llama_cache_acct_snapshot_to_v1(
         const llama_cache_acct_snapshot & source,
         llama_cache_acct_snapshot_v1 & destination) noexcept;
 
-// Non-mutating, last-reference-aware release preview used by D's shadow destruction seam.
+// Non-mutating, last-reference-aware release preview used by shadow destruction quoting.
 // Values are exact deltas the ledger's current release(op) would apply. A shared allocation
 // therefore reports measured zero until its last committed reference. False means the op
 // cannot be previewed as a live committed reference; no ledger state or fault counter changes.
@@ -550,7 +550,7 @@ struct llama_cache_acct_release_preview {
 };
 
 // Exact, non-mutating preview of releasing a SET of operation references together. Rows
-// are aggregated by resource domain because D-S2 prices one release entry per domain.
+// are aggregated by resource domain because the budget prices one release entry per domain.
 // Unlike summing llama_cache_acct_release_preview values, this preserves last-reference
 // semantics when several selected operations jointly own one shared allocation.
 struct llama_cache_acct_release_set_row {
@@ -581,9 +581,9 @@ struct llama_cache_acct_release_set_preview {
     std::vector<llama_cache_acct_release_set_yield_row> yield_rows;
 };
 
-// F0a conditional-reserve outcome. A bare op id cannot separate expected optimistic-concurrency
+// Conditional-reserve outcome. A bare op id cannot separate expected optimistic-concurrency
 // drift (retry) from a hard ledger fault (refuse); the admission caller needs that distinction
-// before F0b acts, so reserve_if_serial() returns it typed. serial_conflict mints no op, mutates
+// before the admission composer acts, so reserve_if_serial() returns it typed. serial_conflict mints no op, mutates
 // nothing, and is NOT a ledger fault; ledger_fault collapses the reserve()-class hard failures.
 enum class llama_cache_conditional_reserve_status : uint8_t {
     admitted,
@@ -623,8 +623,8 @@ enum class llama_cache_conditional_release_status : uint8_t {
     _count,
 };
 
-// Shadow accounting ledger: reserve → stage → commit | abort → release, observational in P2
-// (header preamble). Charge-once for shared immutable allocations: the durable bytes of a
+// Accounting ledger: reserve → stage → commit | abort → release. Charge-once for shared
+// immutable allocations: the durable bytes of a
 // physical allocation are charged when its FIRST reference commits and discharged when its
 // LAST reference releases; per-reference metadata is reported by the referrer under its own
 // leaf (artifact_reference_metadata), outside this refcount. Allocation ids must come from
@@ -655,12 +655,12 @@ struct llama_cache_acct_ledger {
             uint64_t                       expected_logical,
             uint64_t                       expected_resident);
 
-    // F0a admission-gating reservation: reserve() only if the ledger is still at expected_serial
+    // Admission-gating reservation: reserve() only if the ledger is still at expected_serial
     // (the serial the caller's coordinator snapshot was priced against), closing the
     // snapshot→fits→reserve TOCTOU. Policy-free: it never consults capacity — that is the
     // coordinator's job before this call. On drift the ledger is untouched (no op, no cell change,
-    // no serial bump, serial_conflicts++), so the caller re-snapshots and retries. Wired into no
-    // mutation path in F0a.
+    // no serial bump, serial_conflicts++), so the caller re-snapshots and retries. This helper
+    // mutates no cache or storage state; the caller owns those mutations after admission.
     llama_cache_conditional_reserve_result reserve_if_serial(
             uint64_t                       expected_serial,
             llama_cache_acct_category      category,
@@ -695,7 +695,7 @@ struct llama_cache_acct_ledger {
     // Associate the op with a minted physical allocation and its actual resident size.
     // Validates the allocation tuple against any existing citation. Updates the concurrent
     // staged high-water mark. The three opaque identities are retained on the transaction
-    // (F populates them; empty is valid in P2). False on any fault.
+    // (artifact transactions populate them; empty is valid for observation). False on any fault.
     bool stage(llama_cache_acct_op_id op, llama_cache_acct_alloc_id alloc,
                uint64_t resident_bytes,
                llama_cache_acct_artifact_id    artifact = {},

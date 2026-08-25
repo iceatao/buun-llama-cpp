@@ -17,6 +17,7 @@
 #include "server-context.h"
 #include "server-task.h"
 #include "server-retention-sidecar.h"
+#include "server-vbr-capture-readiness.h"
 #include "server-vbr-prompt-cache-support.h"
 #endif
 
@@ -111,6 +112,98 @@ static void test_vbr_prompt_cache_support_contract() {
               true, status::supported) == action::enabled);
     CHECK(server_vbr_prompt_cache_fallback_action_for(
               false, status::supported) == action::enabled);
+}
+
+static void test_vbr_capture_readiness_contract() {
+    server_vbr_capture_readiness_estimator estimator;
+    CHECK(estimator.conservative_bandwidth_bytes_per_second() ==
+          64ull*1024ull*1024ull);
+    CHECK(estimator.conservative_growth_cells_per_second() == 1024);
+    estimator.observe_transfer(64ull*1024ull*1024ull, 100000);
+    estimator.observe_transfer(64ull*1024ull*1024ull, 200000);
+    estimator.observe_growth(1000, 1000000);
+    estimator.observe_growth(2000, 1000000);
+    CHECK(estimator.transfer_samples() == 2);
+    CHECK(estimator.growth_samples() == 2);
+    CHECK(estimator.conservative_bandwidth_bytes_per_second() ==
+          320ull*1024ull*1024ull);
+    CHECK(estimator.conservative_growth_cells_per_second() == 2000);
+
+    server_vbr_capture_readiness_input input;
+    input.source_slot = 3;
+    input.candidate_transfer_bytes = 8ull*1024ull*1024ull;
+    input.candidate_host_bytes = 10ull*1024ull*1024ull;
+    input.candidate_metadata_bytes = 2ull*1024ull*1024ull;
+    input.queued_capture_bytes = 8ull*1024ull*1024ull;
+    input.publication_margin_us = 5000;
+    input.host_capacity_bytes = 64ull*1024ull*1024ull;
+    input.host_committed_bytes = 16ull*1024ull*1024ull;
+    input.host_reserved_bytes = 8ull*1024ull*1024ull;
+    input.metadata_capacity_bytes = 8ull*1024ull*1024ull;
+    input.metadata_committed_bytes = 2ull*1024ull*1024ull;
+    input.metadata_reserved_bytes = 1ull*1024ull*1024ull;
+    input.pinned_lane_slots_available = 1;
+    input.queue_slots_available = 1;
+    input.device_capacity_cells = 8192;
+    input.device_committed_cells = 4096;
+    input.admitted_growth_cells = 512;
+    input.emergency_cells = 256;
+    input.conservative_bandwidth_bytes_per_second =
+        estimator.conservative_bandwidth_bytes_per_second();
+    input.conservative_growth_cells_per_second =
+        estimator.conservative_growth_cells_per_second();
+    server_vbr_capture_readiness_reservation reservation;
+    CHECK(server_vbr_capture_readiness_admit(input, 7, reservation) ==
+          server_vbr_capture_readiness_status::ready);
+    CHECK(reservation);
+    CHECK(reservation.generation == 7);
+    CHECK(reservation.source_slot == 3);
+    CHECK(reservation.host_bytes == input.candidate_host_bytes);
+    CHECK(reservation.emergency_cells == 256);
+    CHECK(reservation.forecast_capture_us <=
+          reservation.pressure_runway_us);
+
+    // Unified readiness compares global occupancy with global memory
+    // capacity. Aggregate live usage may legitimately exceed one sequence's
+    // n_ctx_seq while retaining ample whole-tree runway.
+    auto multi_slot = input;
+    multi_slot.device_capacity_cells = 128*1024;
+    multi_slot.device_committed_cells = 40*1024;
+    multi_slot.admitted_growth_cells = 8*1024;
+    multi_slot.emergency_cells = 256;
+    CHECK(server_vbr_capture_readiness_admit(
+              multi_slot, 9, reservation) ==
+          server_vbr_capture_readiness_status::ready);
+    CHECK(reservation.device_cells == multi_slot.emergency_cells);
+
+    auto refused = input;
+    refused.host_reserved_bytes = refused.host_capacity_bytes;
+    CHECK(server_vbr_capture_readiness_admit(refused, 8, reservation) ==
+          server_vbr_capture_readiness_status::host_unavailable);
+
+    refused = input;
+    refused.metadata_reserved_bytes = refused.metadata_capacity_bytes;
+    CHECK(server_vbr_capture_readiness_admit(refused, 8, reservation) ==
+          server_vbr_capture_readiness_status::metadata_unavailable);
+    refused = input;
+    refused.pinned_lane_slots_available = 0;
+    CHECK(server_vbr_capture_readiness_admit(refused, 8, reservation) ==
+          server_vbr_capture_readiness_status::pinned_unavailable);
+    refused = input;
+    refused.queue_slots_available = 0;
+    CHECK(server_vbr_capture_readiness_admit(refused, 8, reservation) ==
+          server_vbr_capture_readiness_status::queue_unavailable);
+    refused = input;
+    refused.admitted_growth_cells = 4096;
+    CHECK(server_vbr_capture_readiness_admit(refused, 8, reservation) ==
+          server_vbr_capture_readiness_status::
+              device_runway_unavailable);
+    refused = input;
+    refused.device_committed_cells = 7900;
+    refused.admitted_growth_cells = 0;
+    refused.conservative_growth_cells_per_second = 1000000;
+    CHECK(server_vbr_capture_readiness_admit(refused, 8, reservation) ==
+          server_vbr_capture_readiness_status::deadline_missed);
 }
 #endif
 
@@ -2738,7 +2831,7 @@ static void test_prompt_cache_vbr_payload_fanout_lifetime() {
           server_prompt_cache_payload_kind::vbr_artifact);
     CHECK(payload.valid());
     CHECK(payload.publishable());
-    CHECK(!payload.restorable());
+    CHECK(!payload.fixed_state_restorable());
     CHECK(payload.size() == expected_resident);
     CHECK(payload.vbr_artifact() == owner.get());
 
@@ -2945,7 +3038,7 @@ static void test_prompt_cache_vbr_same_frontier_variants() {
     auto typed = server_prompt_cache_payload::from_vbr_variants(variants);
     CHECK(typed.valid());
     CHECK(typed.publishable());
-    CHECK(!typed.restorable());
+    CHECK(!typed.fixed_state_restorable());
     CHECK(typed.vbr_variants() == variants.get());
     CHECK(typed.vbr_artifact() == compact.get());
     CHECK(typed.size() == variants->resident_bytes());
@@ -3841,7 +3934,7 @@ static void test_manifest_validator_matrix() {
     CHECK(second.proof->adoption_nonce() == second_policy.adoption_nonce);
     CHECK(second.proof->source_artifact() == native.proof->source_artifact());
 
-    // F4.0 clone semantics: source-lineage liveness/collision never blocks a
+    // VBR identity clone semantics: source-lineage liveness/collision never blocks a
     // native clone because operation authentication uses the fresh target
     // runtime instance instead.
     auto colliding_lineage = f.target;
@@ -5381,7 +5474,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         fixture.package.manifest.identity.adapter_config_identity);
     CHECK(staged.size() == 1);
     CHECK(staged.front().payload.publishable());
-    CHECK(!staged.front().payload.restorable());
+    CHECK(!staged.front().payload.fixed_state_restorable());
     CHECK(staged.front().payload.accounted_by(&fixture.ledger));
     CHECK(staged.front().payload.size() == owner->resident_bytes());
     staged.clear();
@@ -5608,11 +5701,16 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
             stem_source_slot, invalid));
-        CHECK(!stem_cache.prepare_vbr_stem_publication_metadata(
+        // Equal coverage is the prompt-boundary form: it is exact at prepare
+        // time and becomes a prefix witness if sampling appends a suffix while
+        // the immutable KV capture is in flight.
+        CHECK(stem_cache.prepare_vbr_stem_publication_metadata(
             stem_source, stem_source.n_tokens(),
             fixture.package.manifest.identity.execution_identity,
             fixture.package.manifest.identity.adapter_config_identity,
             stem_source_slot, invalid));
+        CHECK(invalid.ready());
+        invalid = {};
         CHECK(!stem_cache.prepare_vbr_stem_publication_metadata(
             stem_source, stem_source.n_tokens() + 1,
             fixture.package.manifest.identity.execution_identity,
@@ -6219,6 +6317,16 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
         retention.artifact_id(replacement_slot_key);
     const auto original_incumbent_tokens =
         incumbent_prompt.tokens.retention_token_ids();
+    incumbent_prompt.checkpoints.emplace_back();
+    incumbent_prompt.checkpoints.back().n_tokens =
+        incumbent_prompt.n_tokens();
+    incumbent_prompt.checkpoints.back().pos_min = 0;
+    incumbent_prompt.checkpoints.back().pos_max =
+        incumbent_prompt.n_tokens()-1;
+    incumbent_prompt.checkpoints.back().data_tgt.overwrite(
+        2, [](uint8_t * data, size_t size) {
+            std::fill_n(data, size, uint8_t(0x5a));
+        });
 
     // The live sidecar alone is not a recovery source. Preparation refuses
     // until a matching immutable VBR host node exists.
@@ -6458,6 +6566,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(recovery_logical->recovery_pins == recovery_pins_before + 1);
     CHECK(incumbent_prompt.tokens.retention_token_ids() ==
         original_incumbent_tokens);
+    CHECK(incumbent_prompt.checkpoints.size() == 1);
     CHECK(retention.artifact_id(replacement_slot_key) ==
         original_incumbent_artifact);
 
@@ -6595,8 +6704,10 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(!consumed_ticket.ready());
     CHECK(incumbent_prompt.tokens.retention_token_ids() ==
           prompt.tokens.retention_token_ids());
+    CHECK(incumbent_prompt.checkpoints.empty());
     CHECK(consumed_ticket.replacement_prompt().tokens.retention_token_ids() ==
           original_incumbent_tokens);
+    CHECK(consumed_ticket.replacement_prompt().checkpoints.size() == 1);
     CHECK(retention.artifact_id(replacement_slot_key) == consumed_provisional);
     CHECK(retention.prepared_for_launch(replacement_slot_key));
     CHECK(fixture.ledger.snapshot().live_ops == consume_ops_before);
@@ -6892,7 +7003,7 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(!bounded.publish(
         std::move(would_displace), &prompt, source_slot));
     CHECK(bounded.states.size() == 1);
-    CHECK(bounded.states.front().payload.restorable());
+    CHECK(bounded.states.front().payload.fixed_state_restorable());
 
     // Prepared host aliases share the live source's immutable prefix block.
     // Eight maximum-frontier aliases must not multiply the 4 MiB token owner
@@ -7076,7 +7187,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     cache.lease_obs = &authority.leases;
     cache.lease_execution_identity =
         &fixture.package.manifest.identity.execution_identity;
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(cache.enable_retention_shadow());
     const auto publish_owned_for =
             [&](llama_cache_acct_artifact_id reference, int32_t owner_slot) {
@@ -7199,7 +7310,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(retention.artifact_id(first_key).v == 0);
     CHECK(retention.artifact_id(second_key).v != 0);
     CHECK(fixture.catalog->snapshot().references == 1);
-    CHECK(authority.destruction.host_trade_df2_executed == 1);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 1);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
     CHECK(cache.retention_shadow_snapshot().last.proposed_resource ==
           first_marginal);
@@ -7278,7 +7389,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(cache.states.empty());
     CHECK(retention.artifact_id(second_key).v == 0);
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 3);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 3);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
 
     // Carry the singleton pressure citation through the real publication
@@ -7338,14 +7449,14 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(cache.states.size() == 1);
     CHECK(pressure_published->payload.vbr_artifact() == pressure_owner);
     CHECK(retention.artifact_id(pressure_incumbent_key).v == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 4);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 4);
     cache.limit_size = size_t(pressure_bytes - 1);
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 5);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 5);
 
-    // Multi-incumbent admission cites the canonical first DF2 victim, not
+    // Multi-incumbent admission cites the canonical first retention victim, not
     // list/FIFO order. Keep the economic evidence tied, then reverse the list
     // so the lower stable artifact identity and the physical front differ.
     fixture_storage multi_storage_a;
@@ -7597,7 +7708,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 9);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 9);
     CHECK(cache.retention_shadow_snapshot().last.reason ==
           server_cache_destruction_reason::host_token_limit);
     CHECK(cache.retention_shadow_snapshot().last.proposed_resource ==
@@ -7649,14 +7760,14 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(cache.states.size() == 1);
     CHECK(fixture.catalog->snapshot().references == 1);
     CHECK(cache.states.front().payload.vbr_retirement_exclusive());
-    CHECK(authority.destruction.host_trade_df2_executed == 9);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 9);
 
     cache.limit_tokens = 0;
     cache.limit_size = cache.states.front().size() - 1;
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 10);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 10);
 
     // A zero-byte alias is also lawful capacity cleanup: erasing it makes
     // the survivor exclusive, after which the next bounded iteration can
@@ -7711,7 +7822,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     cache.update();
     CHECK(cache.states.empty());
     CHECK(fixture.catalog->snapshot().references == 0);
-    CHECK(authority.destruction.host_trade_df2_executed == 12);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed == 12);
 
     // The publication transaction itself—not only later maintenance—may
     // reclaim a lawful incumbent. The incoming node is protected until the
@@ -7854,22 +7965,22 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     CHECK(anchor_stage.size() == 1);
     // The full physical set is larger than this ordinary byte cap, but its
     // compact pool fits exactly. Publication must therefore preserve both
-    // variants without invoking ordinary DF2.
+    // variants without invoking ordinary retention selection.
     cache.limit_size = compact_payload_bytes;
     server_prompt_cache::iterator anchor_state;
     CHECK(cache.publish(
         std::move(anchor_stage), &prompt, source_slot, &anchor_state));
     CHECK(cache.anchor_size() == anchor_marginal_bytes);
     CHECK(cache.size() == anchor_payload_bytes);
-    const auto df2_before_anchor =
-        authority.destruction.host_trade_df2_executed;
+    const auto retention_capacity_before_anchor =
+        authority.destruction.host_trade_retention_capacity_executed;
     cache.update();
     CHECK(cache.states.size() == 1);
     CHECK(&cache.states.front() == &*anchor_state);
     CHECK(anchor_state->payload.vbr_has_quality_anchor());
     CHECK(fixture.catalog->snapshot().references == 2);
-    CHECK(authority.destruction.host_trade_df2_executed ==
-          df2_before_anchor);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed ==
+          retention_capacity_before_anchor);
 
     server_prompt_cache_vbr_restore_candidate quality_restore;
     CHECK(cache.prepare_vbr_restore(
@@ -7978,7 +8089,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
 
     // Tightening only the anchor budget retires the quality variant while
     // preserving the compact node, its stable host association, and the
-    // ordinary DF2 counter.
+    // ordinary retention-selection counter.
     const auto anchor_host_key =
         server_retention_instance_key::for_host_entry(&*anchor_state);
     const auto anchor_host_artifact = retention.artifact_id(anchor_host_key);
@@ -7993,8 +8104,8 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
           anchor_refusals_before + 1);
     CHECK(retention.artifact_id(anchor_host_key) == anchor_host_artifact);
     CHECK(fixture.catalog->snapshot().references == 1);
-    CHECK(authority.destruction.host_trade_df2_executed ==
-          df2_before_anchor);
+    CHECK(authority.destruction.host_trade_retention_capacity_executed ==
+          retention_capacity_before_anchor);
 
     // Equal-quality aliases use immutable catalog identity as their stable
     // tie-break. A newer terminal must not make family/source selection depend
@@ -8428,7 +8539,7 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         drift_cache.lease_obs = &drift_authority.leases;
         drift_cache.lease_execution_identity =
             &fixture.package.manifest.identity.execution_identity;
-        drift_cache.retention_df2_authority = true;
+        drift_cache.retention_capacity_authority = true;
         CHECK(drift_cache.enable_retention_shadow());
         const auto drift_publish = [&](llama_cache_acct_artifact_id reference,
                                        const server_prompt & value,
@@ -8728,8 +8839,8 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         CHECK(pair_capacity.requires_publication_revalidation());
         const uint64_t commits_before =
             authority.destruction.prepared_release_commits;
-        const uint64_t df2_before =
-            authority.destruction.host_trade_df2_executed;
+        const uint64_t retention_capacity_before =
+            authority.destruction.host_trade_retention_capacity_executed;
         const uint64_t attempted_before =
             authority.destruction.host_trade_attempted;
         const uint64_t certified_before =
@@ -8753,8 +8864,8 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
             CHECK(retention.artifact_id(pair_key_b) == pair_artifact_b);
             CHECK(authority.destruction.prepared_release_commits ==
                   commits_before + 1);
-            CHECK(authority.destruction.host_trade_df2_executed ==
-                  df2_before);
+            CHECK(authority.destruction.host_trade_retention_capacity_executed ==
+                  retention_capacity_before);
             CHECK(authority.destruction.host_trade_attempted ==
                   attempted_before);
             CHECK(authority.destruction.host_trade_certified ==
@@ -8770,8 +8881,8 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
             CHECK(retention.artifact_id(pair_key_b).v == 0);
             CHECK(authority.destruction.prepared_release_commits ==
                   commits_before + 1);
-            CHECK(authority.destruction.host_trade_df2_executed ==
-                  df2_before + 2);
+            CHECK(authority.destruction.host_trade_retention_capacity_executed ==
+                  retention_capacity_before + 2);
             CHECK(authority.destruction.host_trade_attempted ==
                   attempted_before + 2);
             CHECK(authority.destruction.host_trade_certified ==
@@ -8905,7 +9016,7 @@ static void test_prompt_cache_vbr_anchor_prepare_rollback() {
     cache.lease_obs = &authority.leases;
     cache.lease_execution_identity =
         &fixture.package.manifest.identity.execution_identity;
-    cache.retention_df2_authority = true;
+    cache.retention_capacity_authority = true;
     CHECK(cache.enable_retention_shadow());
     cache.quality_anchor_budget_enabled = true;
     cache.limit_anchor_size = anchor_bytes;
@@ -9306,6 +9417,7 @@ int main(int argc, char ** argv) {
     test_validated_manifest_staging();
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
     test_vbr_prompt_cache_support_contract();
+    test_vbr_capture_readiness_contract();
     test_server_vbr_occupied_failure_terminal();
     test_prompt_cache_vbr_longest_feasible_restore_selection();
     test_prompt_cache_vbr_atomic_logical_publication();

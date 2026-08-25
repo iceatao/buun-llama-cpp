@@ -136,7 +136,7 @@ static void test_closed_scope_types() {
         CHECK(table.release(lease));
     }
 
-    // Sidecar v1 remains deliberately lease-neutral. D-S6 derives this bit
+    // Sidecar v1 remains deliberately lease-neutral. The planner derives this bit
     // from the table instead of accepting a second authority.
     CHECK(!common_retention_stamp{}.soft_leased);
 
@@ -444,7 +444,17 @@ static void test_replay_and_ring_overflow() {
     server_cache_lease_table expired(&expiry_clock);
     CHECK(expired.grant_soft(
         subject(53), context_scope(), id, 10));
+    const auto refusal_lease = expired.retry_witness(true);
+    CHECK(refusal_lease.available);
+    CHECK(refusal_lease.event_ordinal != 0);
+    CHECK(refusal_lease.now_ns == 100);
+    CHECK(refusal_lease.next_expiry_ns == 110);
     expiry_clock.now = 110;
+    const auto elapsed_lease = expired.retry_witness();
+    CHECK(elapsed_lease.available);
+    CHECK(elapsed_lease.event_ordinal == refusal_lease.event_ordinal);
+    CHECK(elapsed_lease.now_ns == refusal_lease.next_expiry_ns);
+    CHECK(elapsed_lease.next_expiry_ns == 0);
     CHECK(expired.evaluate(llama_cache_acct_artifact_id { 53 }, id).cls ==
           server_cache_lease_class::none);
     const auto expiry_trace = expired.event_snapshot();
@@ -501,7 +511,7 @@ static void test_lifecycle_without_debug_consults_lease() {
 
     // This is the lifecycle-only wiring shape: the policy observer/evaluator
     // exists, while no cache-plan JSON observer is involved. The hard lease is
-    // consulted, yet D-A0b still executes pass-through.
+    // consulted, while an unleased request still executes pass-through.
     server_cache_destruction_observer lifecycle;
     lifecycle.lease_context = &table;
     lifecycle.lease_evaluator = server_cache_lease_evaluate_request;

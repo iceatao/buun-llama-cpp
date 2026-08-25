@@ -29,7 +29,7 @@ enum class common_cache_family_role : uint8_t {
 };
 
 // Strong scheduler-resolved family policy. The default remains undeclared;
-// only the holder-owned E1 registry may construct a production declaration.
+// only the holder-owned cache-family registry may construct a production declaration.
 struct common_cache_family_binding {
     common_cache_family_id family;
     common_cache_family_role role = common_cache_family_role::background;

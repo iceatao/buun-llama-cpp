@@ -195,7 +195,7 @@ llama_cache_admission_result llama_cache_admit_reservation(
 
     // 3. Local coordinator (reset() mutates it; a shared instance is unsafe across admissions).
     //    Move the potentially-large accounting snapshot into the one-shot coordinator now that
-    //    this composer is on F0b's authority path.
+    //    this composer is on the publication authority path.
     llama_cache_budget_coordinator coordinator;
     const uint64_t accounting_serial = snap.serial;
     if (!coordinator.reset(std::move(snap), budget_config)) {
@@ -220,7 +220,7 @@ llama_cache_admission_result llama_cache_admit_reservation(
             return { llama_cache_admission_status::budget_unavailable, {} };
     }
 
-    // 6. Conditional reserve at the priced serial (single-shot: drift refuses, F0b re-drives).
+    // 6. Conditional reserve at the priced serial (single-shot: drift refuses and the caller re-drives).
     const llama_cache_conditional_reserve_result cr = ledger.reserve_if_serial(
         accounting_serial, request.category, request.domain, request.attribution,
         request.expected_logical, request.expected_resident);
@@ -238,7 +238,7 @@ llama_cache_admission_result llama_cache_admit_reservation(
 } catch (...) {
     // The only throwing step is plan.entries.push_back (the ledger/coordinator calls are noexcept);
     // a function-try-block turns any allocation failure into a typed fail-closed verdict, so no
-    // exception ever crosses the authority boundary into F0b.
+    // exception ever crosses the admission authority boundary.
     return { llama_cache_admission_status::internal_fault, {} };
 }
 

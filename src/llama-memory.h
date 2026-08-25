@@ -134,8 +134,8 @@ struct llama_memory_vbr_params {
     // mixed-config side pins, see llama.h vbr_pin_k
     bool     pin_k = false;
     bool     pin_v = false;
-    // WS-0 (P1) trace: VBR_TRACE path suffix so iSWA base/SWA children write to DISTINCT files
-    // instead of both truncating the same path (Sol review F2). nullptr for a standalone cache.
+    // VBR_TRACE path suffix so iSWA base/SWA children write to distinct files
+    // instead of both truncating the same path. nullptr for a standalone cache.
     const char * trace_label = nullptr;
 
     std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
@@ -270,6 +270,20 @@ struct llama_memory_i {
         return false;
     }
 
+    // Physical-cell readiness for background capture. `logical_growth` is
+    // the scheduler's already-admitted token growth; implementations project
+    // it through their actual storage topology (dense, bounded SWA, hybrid,
+    // or recurrent) rather than making the scheduler infer cells from prompt
+    // length.
+    virtual bool vbr_capture_readiness_cells(
+            uint64_t /*logical_growth*/,
+            uint64_t & committed,
+            uint64_t & projected,
+            uint64_t & capacity) const {
+        committed = projected = capacity = 0;
+        return false;
+    }
+
     // Scoped dynamic-VBR representation freeze. The public top-level wrapper mints the
     // process-global operation ID once; composites only forward it. Non-VBR memories stay inert.
     virtual bool vbr_operation_armed() const { return false; }
@@ -277,12 +291,12 @@ struct llama_memory_i {
             const char * /*owner*/, vbr_operation_id /*operation_id*/) { return false; }
     virtual void vbr_retier_freeze_end(
             const char * /*owner*/, vbr_operation_id /*operation_id*/) {}
-    // A2: promote deferred (submitted) extent entries at the context's existing synchronize
+    // Promote deferred (submitted) extent entries at the context's existing synchronize
     // boundary. Inert for non-VBR memories; composites forward to their attention child.
     virtual void vbr_commit_submitted() {}
-    // A2 (review F3): resolve in-flight decode operations once the decode outcome is known.
+    // Resolve in-flight decode operations once the decode outcome is known.
     virtual void vbr_decode_ops_finish(bool /*ok*/) {}
-    // A2 (review F10b): composite wrappers mint one operation per logical mutation and adopt
+    // Composite wrappers mint one operation per logical mutation and adopt
     // it into every armed child so children never mint divergent ids.
     virtual void vbr_adopt_operation(vbr_operation_id /*operation_id*/) {}
     virtual void vbr_release_adopted() {}
@@ -305,7 +319,7 @@ struct llama_memory_i {
         return 0.0;
     }
 
-    // #88: per-token bytes of the fattn f16 dequant scratch at the settled (deep-fill) tier
+    // Per-token bytes of the flash-attention f16 dequant scratch at the settled deep-fill tier
     // state, summed over KV-hosting devices — a context-linear consumer that lives OUTSIDE the
     // KV budget (it draws from the fit margin). The fit charges it in the total-VRAM wall
     // constraint only. 0 = no turbo/VBR-capable cache.
@@ -325,7 +339,7 @@ struct llama_memory_i {
     // Composite memories forward this once for the whole tree.
     virtual bool vbr_ledger_tree_active() const { return false; }
 
-    // E1 hard-seal enforcement. Non-VBR memories remain inert. The callback
+    // Hard-seal enforcement. Non-VBR memories remain inert. The callback
     // is scheduler-owned and read-only; implementations invoke it before any
     // transcode, mapping, cursor publication, or backend mutation.
     virtual void vbr_hard_seal_guard_set(vbr_hard_seal_guard /*guard*/) {}

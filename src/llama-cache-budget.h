@@ -6,8 +6,8 @@
 #include <cstdint>
 #include <vector>
 
-// D-S2 shadow budget arithmetic. These types are deliberately process-local:
-// they are neither C-accounting schema nor cache-plan wire-record fields.
+// Shadow budget arithmetic. These types are deliberately process-local:
+// they are neither accounting schema nor cache-plan wire-record fields.
 enum class llama_cache_budget_capacity_state : uint8_t {
     known = 0,
     unbounded,
@@ -29,10 +29,10 @@ enum class llama_cache_budget_fit_state : uint8_t {
 };
 
 // The classification vocabulary is closed. The CI census requires exactly one
-// entry for every llama_cache_acct_category. `excluded` means D-S2 has no
+// entry for every llama_cache_acct_category. `excluded` means the budget has no
 // certified capacity-participating producer for that leaf yet; it is not a claim that
-// the underlying subsystem consumes no memory. In particular, D-S3 retention
-// metadata remains non-participating while D is shadow.
+// the underlying subsystem consumes no memory. Retention metadata remains
+// non-participating while the budget is observational.
 enum class llama_cache_budget_capacity_participation : uint8_t {
     excluded = 0,
     participating,

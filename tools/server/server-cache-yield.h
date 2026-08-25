@@ -47,7 +47,7 @@ struct server_cache_yield_candidate {
     bool has_unsupported_host_spill = false;
 };
 
-// DF1 counterfactual only. One result is projected per lineage, regardless of
+// Counterfactual retention value. One result is projected per lineage, regardless of
 // how many live/host aliases carry that lineage. `lost_work_units` is the
 // unique prefix coverage that disappears after the proposed release, not a
 // copied value for every alias.
@@ -134,7 +134,7 @@ server_live_retention_projection server_live_retention_project_prepared(
     uint64_t competition_epoch,
     const common_retention_frequency_config & config = {}) noexcept;
 
-// H1 quality-only pool: quote the parent retention value of every eligible
+// Quality-anchor pool: quote the parent retention value of every eligible
 // artifact. The candidate array must already have passed
 // server_live_retention_prepare(); ineligible rows still contribute retained
 // prefix coverage. Exact physical anchor bytes and final ordering belong to
@@ -165,8 +165,8 @@ struct server_cache_yield_result {
                size_t(common_retention_pool::_count)> selected;
     std::vector<llama_cache_budget_plan_entry> plan;
     std::vector<llama_cache_acct_artifact_id> unsupported;
-    // Winning D-S2 fit projection. Its domain rows are the canonical source of
-    // resident/before/released/reserved/after at accounting_serial; D-S7 lowers
+    // Winning fit projection. Its domain rows are the canonical source of
+    // resident/before/released/reserved/after at accounting_serial; serialization lowers
     // them to accounting-only wire types.
     llama_cache_budget_result projected_fit;
 };
@@ -183,7 +183,7 @@ using server_cache_yield_candidate_resolver = std::function<void(
     server_cache_lease_identity &,
     bool & identity_known)>;
 
-// Shared lowering doors for D-S6 and D-A shadow projections. Release bytes
+// Shared lowering doors for shadow yield and destruction projections. Release bytes
 // always come from the exact batch preview; coverage is never a byte estimate.
 bool server_cache_yield_release_plan(
     const llama_cache_acct_release_set_preview & release,

@@ -459,7 +459,7 @@ server_retention_shadow_projection server_retention_shadow_project(
         group_index.reserve(candidates.size());
         bool complete = true;
         for (const auto & candidate : candidates) {
-            // DF1 values whole prompt payloads. A checkpoint is neither a
+            // Retention values cover whole prompt payloads. A checkpoint is neither a
             // substitute for a live/host prefix nor a frequency victim.
             if (candidate.record.kind ==
                     common_retention_artifact_kind::checkpoint) {
@@ -794,7 +794,7 @@ server_cache_yield_result server_cache_yield_plan(
         }
         if (fit.state == llama_cache_budget_fit_state::fits) {
             // The winning fit and selected-union evidence are serial-bound to
-            // the same accounting snapshot; D-S7 projects these rows verbatim.
+            // the same accounting snapshot; final projection uses these rows verbatim.
             result.projected_fit = std::move(fit);
             result.status = server_cache_yield_status::fits;
             return result;
@@ -842,7 +842,7 @@ server_cache_yield_result server_cache_yield_plan(
         // catalog. A host-entry-only catalog can reach insufficient_yield;
         // common mixed live catalogs remain unavailable while slots/checkpoints
         // lack exact operation ownership. unsupported_required additionally
-        // awaits an available spill producer (milestone F).
+        // awaits an available spill producer.
         if (unavailable_evidence) {
             mark_unavailable();
             return result;

@@ -79,6 +79,14 @@ public:
             uint32_t * counts, size_t size) const override {
         return mem_attn->vbr_accumulate_exclusive_cells(counts, size);
     }
+    bool vbr_capture_readiness_cells(
+            uint64_t logical_growth,
+            uint64_t & committed,
+            uint64_t & projected,
+            uint64_t & capacity) const override {
+        return mem_attn->vbr_capture_readiness_cells(
+            logical_growth, committed, projected, capacity);
+    }
 
     bool vbr_operation_armed() const override {
         return mem_attn->vbr_operation_armed();

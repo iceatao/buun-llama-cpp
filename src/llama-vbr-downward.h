@@ -13,11 +13,11 @@
 #include <vector>
 
 constexpr uint32_t VBR_DOWNWARD_RECIPE_VERSION = 1;
-// H1 bounds a package at 16,384 projected units. Each unit has at most the
+// A package is bounded at 16,384 projected units. Each unit has at most the
 // five adjacent downward edges represented by vbr_downward_recipe::edges.
 constexpr size_t VBR_IMPORT_DESTINATION_MAX_STEPS = 16384u*5u;
-// Recipe FAMILY id ("PQ2=A adjacent-chain recipe-v1"); distinct from the
-// serialization version above. Proofs carry both.
+// Adjacent-chain recipe family id, distinct from the serialization version
+// above. Proofs carry both.
 constexpr uint32_t VBR_DOWNWARD_RECIPE_ID = 1;
 
 enum class vbr_downward_recipe_status : uint8_t {
@@ -111,7 +111,7 @@ enum class vbr_downward_policy_status : uint8_t {
 const char * vbr_downward_policy_status_name(vbr_downward_policy_status status) noexcept;
 
 // The canonical type-vector identity digest lives in llama-vbr-identity-digest.h
-// (vbr_type_vector_digest) so F3 capture does not depend on this import module.
+// (vbr_type_vector_digest) so capture does not depend on this import module.
 
 struct vbr_downward_policy_child {
     llama_vbr_policy::child policy;
@@ -363,7 +363,7 @@ vbr_downward_transform_status vbr_downward_execute_edges(
         uint32_t * edge_reached = nullptr) noexcept;
 
 // Injected CPU door used by the edge oracle now and by the live kernel adapter
-// in F4.2b-2. Intermediate recipe tiers are never published.
+// by transformed adoption. Intermediate recipe tiers are never published.
 vbr_downward_transform_result vbr_downward_execute_recipe(
         const vbr_downward_recipe & recipe,
         const std::vector<uint8_t> & source,

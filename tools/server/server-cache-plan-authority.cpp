@@ -35,7 +35,7 @@ common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
         if (rec.selection == common_cache_plan_selection::similarity &&
             planned.provider == common_cache_plan_provider::live_slot &&
             planned.f_keep_known && planned.f_keep >= 1.0) {
-            // The sole B-A zero-destruction cross-target case.
+            // The sole zero-destruction cross-target case.
         } else {
             effects |= common_cache_plan_destruction_effect_bit(
                 rec.selection == common_cache_plan_selection::similarity
@@ -56,9 +56,9 @@ common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
          (destruction_certification_available &&
           (planned.provider == common_cache_plan_provider::host_cache_entry ||
            planned.is_chain()) && legacy_uses_live_target))) {
-        // Cold replacement is the frozen B-A4 effect. D-A5 adds host restore
+        // Cold replacement is the established planner effect. Occupied restoration adds host restore
         // to the same physical class only when lifecycle certification exists;
-        // lifecycle-off therefore preserves B-A4's previously-authorized
+        // lifecycle-off therefore preserves the previously authorized
         // same-target host-restore behavior byte-for-byte.
         // The schema-v6 name predates non-consuming host restore. Its physical
         // class is the stable contract: any certified same-target whole-state
@@ -74,7 +74,7 @@ common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
             common_cache_plan_destruction_effect::different_host_source_consumption);
     }
     // Physical non-effects (lifecycle's non-consuming host restore) and
-    // mutation-boundary D-A certificates share this single row-opening mask.
+    // mutation-boundary destruction certificates share this single row-opening mask.
     return effects & ~permitted_effects;
 }
 
@@ -320,7 +320,7 @@ static common_cache_plan_authority_fallback pre_da_envelope_refusal_reason(
         const server_cache_plan_execution & planned,
         const server_cache_plan_execution & legacy) noexcept {
     // Schema 5 has no eviction_evidence_unavailable spelling. At LRU, use its
-    // existing budget/lease availability reason only for the D-A fence: a
+    // existing budget/lease availability reason only for the destruction fence: a
     // target change, or a cold replacement of retained same-target state.
     // Consuming a different host source remains destruction authority, just as
     // it does at every earlier ratchet.

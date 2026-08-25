@@ -159,14 +159,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-vbr-representation-epoch.cpp)
     target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
     add_test(
-        NAME test-vbr-controller-id-cpu
-        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --f4-cpu)
+        NAME test-vbr-controller-identity-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --identity-cpu)
     add_test(
-        NAME test-vbr-representation-a1-cpu
-        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --a1-cpu)
+        NAME test-vbr-generation-tracker-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --generation-cpu)
     add_test(
-        NAME test-vbr-representation-a2-cpu
-        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --a2-cpu)
+        NAME test-vbr-operation-recovery-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --operation-cpu)
 
     add_test(
         NAME check-memory-tree-coverage
@@ -192,6 +192,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-vbr-artifact-adopt.cpp)
     target_include_directories(test-vbr-artifact-adopt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    set_property(TEST test-vbr-artifact-adopt APPEND PROPERTY LABELS vbr-cache)
 
     llama_build_and_test(
         test-vbr-artifact-capture.cpp
@@ -201,15 +202,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
     llama_test_cmd(test-vbr-artifact
-        NAME test-vbr-h1-capture-projection-scale
-        LABEL "vbr-h1;slow"
+        NAME test-vbr-capture-projection-scale
+        LABEL "vbr-cache;slow"
         ARGS --capture-projection-bench)
     llama_test_cmd(test-vbr-artifact-capture
-        NAME test-vbr-h1-range-proof-scale
-        LABEL "vbr-h1;slow"
+        NAME test-vbr-range-proof-scale
+        LABEL "vbr-cache;slow"
         ARGS --range-pack-bench)
-    set_property(TEST test-vbr-artifact APPEND PROPERTY LABELS vbr-h1)
-    set_property(TEST test-vbr-artifact-capture APPEND PROPERTY LABELS vbr-h1)
+    set_property(TEST test-vbr-artifact APPEND PROPERTY LABELS vbr-cache)
+    set_property(TEST test-vbr-artifact-capture APPEND PROPERTY LABELS vbr-cache)
 
     llama_build_and_test(
         test-cache-lease.cpp
@@ -303,10 +304,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-retention-sidecar PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
-    set_property(TEST test-retention-sidecar APPEND PROPERTY LABELS vbr-h1)
-    set_property(TEST test-vbr-controller-id-cpu APPEND PROPERTY LABELS vbr-h1)
-    set_property(TEST test-vbr-representation-a1-cpu APPEND PROPERTY LABELS vbr-h1)
-    set_property(TEST test-vbr-representation-a2-cpu APPEND PROPERTY LABELS vbr-h1)
+    set_property(TEST test-retention-sidecar APPEND PROPERTY LABELS vbr-cache)
+    set_property(TEST test-vbr-controller-identity-cpu APPEND PROPERTY LABELS vbr-cache)
+    set_property(TEST test-vbr-generation-tracker-cpu APPEND PROPERTY LABELS vbr-cache)
+    set_property(TEST test-vbr-operation-recovery-cpu APPEND PROPERTY LABELS vbr-cache)
 
     llama_build(test-dflash-tape-vs-plane.cpp)
     target_include_directories(test-dflash-tape-vs-plane PRIVATE ${PROJECT_SOURCE_DIR}/src)

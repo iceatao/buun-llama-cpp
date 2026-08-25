@@ -91,8 +91,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     // would target ~2x the configured mapped-physical total before degrading
     llama_memory_vbr_params vbr_base = vbr;
     llama_memory_vbr_params vbr_swa  = vbr;
-    // WS-0 (P1) trace: distinct VBR_TRACE files per child so BOTH schedules are recorded without
-    // the second open truncating the first (Sol review F2).
+    // Distinct VBR_TRACE files per child record both schedules without the
+    // second open truncating the first.
     vbr_base.trace_label = "base";
     vbr_swa.trace_label  = "swa";
     if (vbr.dynamic || vbr.budget_bytes > 0) {
@@ -178,11 +178,11 @@ void llama_kv_cache_iswa::vbr_finalize_prepare_failure(
 
 namespace {
 
-// A2 (review F10b): one operation per LOGICAL wrapper mutation. Minted here via the
+// One operation per logical wrapper mutation. Minted here via the
 // operation-TU RAII (registry_begin never called from this file), adopted into both children
 // so their mutation scopes join the same id instead of minting divergent ones.
-// P2v2 (v6): a REFUSED mint propagates — children open refused (fail closed to
-// shadow-unavailable) instead of minting independently, preserving the A0 one-id invariant
+// A refused mint propagates: children open refused (fail closed to
+// shadow-unavailable) instead of minting independently, preserving the operation registry one-id invariant
 // even in refusal.
 struct iswa_forwarded_op {
     // Synchronous families: armed iff the manifest carries at least one (armed-child) target.
@@ -207,7 +207,7 @@ struct iswa_forwarded_op {
             refused_ = true;
         }
     }
-    // P3v2 (v6): parent-declared FIXED participant slots, created before the first child
+    // Parent-declared fixed participant slots, created before the first child
     // apply. Children claim their slot in their scope constructors; detach transfers the
     // still-open token; the root closes only at sealed && every declared slot terminal,
     // failure dominating.
@@ -264,13 +264,13 @@ struct iswa_forwarded_op {
     int  exceptions_at_entry_ = std::uncaught_exceptions();
 };
 
-// P5v2 (v6): synchronous wrapper families carry an exact-instance manifest — one target per
+// Synchronous wrapper families carry an exact-instance manifest: one target per
 // ARMED child, never an instance wildcard through default arguments. Raw public-API ranges
 // normalize here so the closed mint range rules see canonical values.
 vbr_operation_binding iswa_edit_binding(const llama_kv_cache * base, const llama_kv_cache * swa,
                                         vbr_operation_kind kind, vbr_operation_class cls,
                                         llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    vbr_normalize_edit_range(p0, p1);  // canonical range before the mint (P5v2)
+    vbr_normalize_edit_range(p0, p1);  // Canonical range before the mint.
     vbr_operation_binding binding;
     binding.kind        = kind;
     binding.child_phase = vbr_operation_phase::mutate;
@@ -553,6 +553,27 @@ llama_memory_vbr_state_data_v2 llama_kv_cache_iswa::memory_vbr_state_v2(
     return r;
 }
 
+bool llama_kv_cache_iswa::vbr_capture_readiness_cells(
+        uint64_t logical_growth,
+        uint64_t & committed,
+        uint64_t & projected,
+        uint64_t & capacity) const {
+    uint64_t bc = 0, bp = 0, bz = 0;
+    uint64_t sc = 0, sp = 0, sz = 0;
+    if (!kv_base->vbr_capture_readiness_cells(
+            logical_growth, bc, bp, bz) ||
+        !kv_swa->vbr_capture_readiness_cells(
+            logical_growth, sc, sp, sz) ||
+        bc > UINT64_MAX-sc || bp > UINT64_MAX-sp || bz > UINT64_MAX-sz) {
+        committed = projected = capacity = 0;
+        return false;
+    }
+    committed = bc+sc;
+    projected = bp+sp;
+    capacity = bz+sz;
+    return capacity != 0;
+}
+
 bool llama_kv_cache_iswa::vbr_operation_armed() const {
     return kv_base->vbr_operation_armed() || kv_swa->vbr_operation_armed();
 }
@@ -713,13 +734,13 @@ bool llama_kv_cache_iswa_context::apply() {
         return res;
     }
 
-    // C1 (v3 design) + P2v2/P3v2 (v6): the composite owns ONE logical decode operation with
+    // The composite owns one logical decode operation with
     // a FIXED parent-declared participant set. Both children apply under the adopted shared
     // id (their scopes claim their slot and own tracker-local extent/recovery reservations).
     // Manifest construction is ARMED-ONLY and TRANSACTIONAL: targets publish only when every
     // armed child's ubatch scan succeeded; any overflow leaves a zero-target manifest, the
     // registry refuses the mint, and the refusal PROPAGATES to both children — never
-    // independent minters (A0 one-id even in refusal).
+    // independent minters (operation registry one-id even in refusal).
     const vbr_controller_instance_id base_instance = kv->get_base()->vbr_instance_id();
     const vbr_controller_instance_id swa_instance  = kv->get_swa ()->vbr_instance_id();
     const bool base_armed = vbr_controller_instance_id_is_set(base_instance);
@@ -744,7 +765,7 @@ bool llama_kv_cache_iswa_context::apply() {
     res = res & ctx_base->apply();
     res = res & ctx_swa ->apply();
 
-    // P3v2 (v6): finalize folds the wrapper result and SEALS the aggregate; the root closes
+    // Finalize folds the wrapper result and seals the aggregate; the root closes
     // at sealed && every declared slot terminal — right now for all-synchronous applies, at
     // the sync fence for transferred tokens — failure dominating.
     composite.finalize(res);

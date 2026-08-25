@@ -545,7 +545,7 @@ static void test_quantifiers() {
     // test_grammar("min / max repetition",
     //              // Grammar
     //              R"""(
-    //         start: ("0x" /[A-F0-9]{2}/ " "?){3,5}
+    //         start: ("0x" /[A--9]{2}/ " "?){3,5}
     //     )""",
     //              // Passing strings
     //              {

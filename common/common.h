@@ -822,22 +822,21 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 
-    // B0 shadow cache-plan observer: strictly zero observer work when disabled
+    // Cache-plan observer: strictly zero observer work when disabled.
     bool cache_debug = false;
 
-    // Trusted-local, single-principal E0 cache-plan preview surface. This flag
+    // Trusted-local, single-principal cache-plan preview surface. This flag
     // only exposes the route; ordinary requests allocate no observer/planner
     // state merely because it is enabled.
     bool cache_plan_preflight = false;
 
-    // Trusted-local, single-principal E1 cache-control HTTP surface. The
-    // scheduler authority remains unavailable unless cache lifecycle is also
-    // enabled; this flag only registers the reviewed routes.
+    // Trusted-local, single-principal cache-control HTTP surface. Server
+    // startup enables its required cache-lifecycle authority; this flag also
+    // registers the reviewed routes.
     bool cache_control_api = false;
 
-    // B-A graduated authority request. B-A0b dual-runs every non-off level but
-    // still executes legacy unconditionally; later ratchets consume the same
-    // closed spelling without another flag migration.
+    // Graduated cache-plan authority request. Non-off levels remain
+    // observation-only until the corresponding authority ratchet closes.
     common_cache_plan_authority_level cache_plan_authority{}; // zero = off
 
     // Cache-lifecycle authority substrate (accounting-gated admission). The
@@ -866,7 +865,7 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
-    // cache receipt (PROPOSAL §7.7 Phase 1): untrusted divergence-location hint
+    // Cache receipt: untrusted divergence-location hint
     // on responses. Keyed chain by default; unkeyed only behind the debug flag.
     bool        cache_receipt = false;
     std::string cache_receipt_key;          // per-session/tenant comparison key
@@ -952,7 +951,7 @@ enum class common_vbr_prompt_cache_mode {
     enabled_automatic,
 };
 
-// H3 default policy. Dynamic VBR follows the ordinary nonzero --cache-ram
+// Default prompt-cache policy. Dynamic VBR follows the ordinary nonzero --cache-ram
 // default unless the legacy VBR-specific switch was explicitly set. A zero
 // cache budget is authoritative and prevents all host-cache activation.
 common_vbr_prompt_cache_mode common_vbr_prompt_cache_mode_for(
@@ -1348,7 +1347,7 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
-// Server/common-layer logical computation frontier [WS-4]. This is the state after
+// Server/common-layer logical computation frontier. This is the state after
 // processing the half-open logical prefix [0, token_count); next_position is the next
 // effective model position for that prefix. The three identity keys are opaque,
 // comparison-only server keys:
@@ -1496,7 +1495,7 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    // Attention-content lineage epochs at capture time [I9]. A recurrent-only checkpoint restores
+    // Attention-content lineage epochs at capture time. A recurrent-only checkpoint restores
     // exact recurrent state while retaining the live attention KV. Lossless in-place retiering
     // preserves that lineage; occupied-cell reuse, clear/reset and import do not. Both are 0 when
     // VBR is inactive, making the restore-time check a no-op.
@@ -1504,17 +1503,22 @@ struct common_prompt_checkpoint {
     uint64_t checkpoint_epoch_swa = 0;
 
     // Logical validity record, dual-written beside the legacy physical fields
-    // during the Phase-1 migration. Legacy checkpoints have version == 0.
+    // during the typed-companion migration. Legacy checkpoints have version == 0.
     common_computation_frontier computation_frontier;
 
-    // E1 declared-family provenance. This is policy metadata only: it follows
+    // Declared-family provenance. This is policy metadata only: it follows
     // checkpoint copies/restores but never enters checkpoint payload bytes.
     common_cache_family_binding cache_family;
 
     common_shared_byte_buffer data_tgt;
     common_shared_byte_buffer data_dft;
+    // Draft checkpoints used as VBR companions contain the complete sequence
+    // image so they can populate an empty draft context. Legacy speculative
+    // checkpoints may contain only PARTIAL_ONLY state. Retain the wire mode
+    // with the bytes rather than making restore infer it from current flags.
+    bool data_dft_full_sequence = false;
 
-    // Typed accelerator state stashed with the checkpoint (Phase-1 typed
+    // Typed accelerator state stashed with the checkpoint (typed
     // accelerators). Exact restore readiness is conjunctive (PROPOSAL §6
     // invariant 3): a component that is mandatory-on-presence and fails to
     // apply fails the WHOLE checkpoint restore fail-closed; purely optional

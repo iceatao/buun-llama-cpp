@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <unordered_map>
 
-// E0.1-only host identity transport. Keys are the same stable list-node
+// Internal host-identity transport. Keys are the same stable list-node
 // instance keys used by the retention catalog. This object never writes host
 // entries and dies with one preflight pass; it stays out of server-task.h's
 // transitive public-view include path.
@@ -20,7 +20,7 @@ private:
     int32_t next_source_id_ = 0;
 };
 
-struct server_cache_plan_stage1_semantics {
+struct server_cache_plan_preflight_semantics {
     bool completion_semantics = false;
     bool host_lookup_enabled = false;
     common_cache_plan_recovery_citation recovery_citation =
@@ -29,7 +29,7 @@ struct server_cache_plan_stage1_semantics {
 
 // The preflight task enum is deliberately not a completion. This pure door
 // supplies the as-if-completion predicates without overloading task identity.
-server_cache_plan_stage1_semantics server_cache_plan_stage1_semantics_for(
+server_cache_plan_preflight_semantics server_cache_plan_preflight_semantics_for(
     bool is_preflight,
     bool native_completion,
     bool update_cache,

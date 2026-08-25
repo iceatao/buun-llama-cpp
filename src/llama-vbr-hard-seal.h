@@ -7,7 +7,7 @@
 #include <functional>
 #include <vector>
 
-// One measured degrade-order step. Shared with the E1 read-only hard-seal
+// One measured degrade-order step. Shared with the read-only hard-seal
 // classifier so controller policy continues to have one canonical order.
 struct vbr_degrade_step {
     uint8_t il = 0;
@@ -80,7 +80,7 @@ struct vbr_hard_seal_consult_session {
         vbr_hard_seal_guard_result::allow;
 };
 
-// Frozen E1 default: crossing from the restorable T8 band into T4.
+// Frozen  default: crossing from the restorable T8 band into T4.
 inline constexpr ggml_type VBR_HARD_SEAL_DEFAULT_FLOOR =
     GGML_TYPE_TURBO4_0;
 

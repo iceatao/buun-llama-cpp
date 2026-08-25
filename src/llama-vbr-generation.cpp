@@ -15,7 +15,7 @@
 namespace {
 
 static_assert(LLAMA_MAX_SEQ <= std::numeric_limits<int16_t>::max(),
-              "A1 packed membership provenance must widen with LLAMA_MAX_SEQ");
+              "generation tracker packed membership provenance must widen with LLAMA_MAX_SEQ");
 
 enum class generation_dispatch_effect : uint8_t {
     dependency,
@@ -52,7 +52,7 @@ constexpr std::array<generation_dispatch_effect,
         }
 };
 static_assert(VBR_GENERATION_DISPATCH.size() == static_cast<size_t>(vbr_mutation_registrant::count),
-              "every closed A0 mutation registrant must have an A1 generation effect");
+              "every closed operation registry mutation registrant must have an generation tracker generation effect");
 
 uint16_t pack_provenance(vbr_mutation_family family, vbr_operation_class operation_class) {
     return uint16_t(static_cast<uint8_t>(family)) | uint16_t(uint16_t(static_cast<uint8_t>(operation_class)) << 8);
@@ -167,11 +167,11 @@ struct vbr_generation_stream_state {
     std::vector<uint16_t> cell_membership_provenance;
     std::vector<int16_t>  cell_last_membership_seq;
 
-    // A2: durable committed-extent references (design D-A2-4v3). One per stamp kind — a cell
+    // Durable committed-extent references. One per stamp kind: a cell
     // can retain two different events (latest dependency + latest membership).
     std::vector<vbr_extent_ref> cell_dependency_extent;
     std::vector<vbr_extent_ref> cell_membership_extent;
-    // C2: stamp-time range-proof bits (position was inside the authenticated target range).
+    // Stamp-time range-proof bits: the position was inside the authenticated target range.
     std::vector<uint64_t> cell_dependency_in_range;
     std::vector<uint64_t> cell_membership_in_range;
 };
@@ -394,14 +394,14 @@ vbr_generation_event vbr_generation_tracker::begin_event(vbr_mutation_registrant
         return result;
     }
 
-    // C2 (v3.2, Sol CONCUR): full manifest authentication. The event must cite a live
+    // Full manifest authentication. The event must cite a live
     // operation whose manifest (a) lists this registrant in its closed mask, (b) declares
     // this exact operation class, (c) is in the mutate phase, and (d) carries a target
     // covering this tracker's runtime instance and the event's stream.
     if (!operation_id || !vbr_operation_registry_binding(operation_id, result.manifest)) {
         return result;
     }
-    // P1v2 (v6): begin still refuses when NO target could ever cover this
+    // Begin still refuses when no target could ever cover this
     // instance/stream/class/registrant; the per-(seq, position) selection happens at EACH STAMP
     // against the event's manifest copy, so multi-target manifests authenticate
     // multi-sequence ubatches exactly instead of citing target zero.
@@ -456,7 +456,7 @@ bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,
                                         const llama_seq_id *   seqs,
                                         int32_t                n_seqs,
                                         llama_pos              pre_mutation_pos) {
-    // P1v2 (v6): a poisoned event stays inert — no further metadata moves under it.
+    // A poisoned event stays inert: no further metadata moves under it.
     if (event.poisoned) {
         return false;
     }
@@ -473,19 +473,19 @@ bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,
         return false;
     }
     // Destructive/import evidence binds to exactly ONE selected target; a shared multi-member
-    // cell has no single exact citation, so it goes unavailable instead (v6 P1 rule 3).
+    // cell has no single exact citation, so it goes unavailable instead.
     if (binds_evidence && n_seqs != 1) {
         event.poisoned = true;
         set_shadow_unavailable();
         return false;
     }
-    // P1v2 (v6): per-stamp covering-target selection over the event's authenticated manifest,
+    // Per-stamp covering-target selection over the event's authenticated manifest,
     // keyed by (instance, stream, class, registrant, seq, pre-mutation position). EVERY member of
     // a shared cell's sequence set needs a covering target (target-set proof); the first
     // member's selection supplies the durable evidence binding. NO cover => the stamp
     // refuses, POISONS the event, and latches shadow-unavailable IMMEDIATELY — metadata may
     // already have moved under an unauthenticated claim, so no strict accept can be allowed
-    // to form until a sanctioned transition provably follows (P4v2).
+    // to form until a sanctioned transition provably follows.
     uint8_t selected_index = 0;
     bool    all_real_range = true;
     for (int32_t i = 0; i < n_seqs; ++i) {
@@ -518,7 +518,7 @@ bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,
             return false;
         }
     }
-    // C2: the range proof is RECORDED (in_range bit) so tombstone rows 1/3 can PROVE
+    // Record the range proof (`in_range`) so tombstone rows can prove
     // membership from committed evidence. True only when the position is known AND every
     // member's selected target carries a real (non-wildcard) range containing it.
     const bool in_authorized_range = pre_mutation_pos >= 0 && all_real_range;
@@ -584,7 +584,7 @@ bool vbr_generation_tracker::global_invalidate_and_reset_extents(vbr_mutation_re
         return false;
     }
     // Every stored extent reference is obsolete after the global invalidation; drop them so
-    // reset_all() reclaims a coherent slab (design Rev 4 item 3).
+    // reset_all() reclaims a coherent slab.
     for (auto & stream : streams_) {
         std::fill(stream.cell_dependency_extent.begin(), stream.cell_dependency_extent.end(), vbr_extent_ref{});
         std::fill(stream.cell_membership_extent.begin(), stream.cell_membership_extent.end(), vbr_extent_ref{});
@@ -645,7 +645,7 @@ bool vbr_generation_tracker::try_rearm() {
 bool vbr_generation_tracker::global_transition(vbr_mutation_registrant registrant,
                                                vbr_operation_class     operation_class,
                                                vbr_operation_id        operation_id) {
-    // v3 review B6 / v4 review F5: cited operations validate at manifest depth — the cited
+    // Cited operations validate at manifest depth: the cited
     // binding must carry a covering target for THIS instance authorizing this registrant + class.
     // The recovery drain and registry-refusal fallback run OUTSIDE any operation (empty id) —
     // a NAMED exemption: they are the paths that CREATE availability.
@@ -670,7 +670,7 @@ bool vbr_generation_tracker::global_transition(vbr_mutation_registrant registran
     ++mutation_serial_;
     ++global_generation_;
     ++mutation_serial_;
-    // v3 review B7: the unavailable state does NOT auto-clear here — the cause (registry or
+    // The unavailable state does not auto-clear here: the cause (registry or
     // slab exhaustion) may persist. try_clear_shadow_unavailable() probes the cause.
     return true;
 }
@@ -699,7 +699,7 @@ bool vbr_generation_tracker::publish_unit(uint32_t                unit,
                                           vbr_operation_id        operation_id) {
     if (operation_id) {
         vbr_operation_binding cited;
-        // v4-F5 + P5v2 (v6): the citation authenticates at manifest depth with the EXACT
+        // The citation authenticates at manifest depth with the exact
         // registrant driving this publication — never an OR of plausible ones.
         if (!vbr_operation_registry_binding(operation_id, cited) ||
             cited.find_covering_target(instance_id_, 0,
@@ -731,7 +731,7 @@ bool vbr_generation_tracker::publish_unit(uint32_t                unit,
 }
 
 // VBR_GENERATION_IMPORT_REGION_BEGIN
-// F4's validator-authenticated import is the fourth narrow authority allowed
+// 's validator-authenticated import is the fourth narrow authority allowed
 // to consume captured page generations. It constructs an off-side image only;
 // the artifact adoption validator remains the live admission authority.
 bool vbr_generation_tracker::prepare_import_image(

@@ -127,16 +127,16 @@ bool are_lora_equal(
 // get the ids of all enabled loras
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras);
 
-// Canonical, order-independent identity of the ACTIVE adapter configuration [I6]: the same set of
+// Canonical, order-independent identity of the active adapter configuration: the same set of
 // (adapter content digest, scale) applied in any request order maps to the same string, matching the
 // deterministic graph apply order (sorted by per-adapter content digest, then scale bits). Inactive
 // (scale 0) adapters are excluded. Used to key persisted prompt-cache state so a cache entry built
 // under one adapter set is never restored for a request with a different one.
 std::string lora_config_identity(const std::vector<common_adapter_lora_info> & loras);
 
-// Test-only fault injection [P0 gate]. LLAMA_SERVER_FAULT is a comma-separated list of tags;
+// Test-only fault injection. LLAMA_SERVER_FAULT is a comma-separated list of tags;
 // server_fault(tag) is true when the tag is present. Lets tests drive the prompt-cache / checkpoint
-// transactional failure paths (I7 "save failure retains live state", I10 "short write rejected",
+// transactional failure paths (save failure retains live state, short writes are rejected,
 // non-consuming load) deterministically without provoking real OOM / short-write conditions. Tags:
 //   save_short  - force the state-save writer to report a short write (aborts the save)
 //   load_fail   - force the host-cache target restore to report a short read (non-consuming reject)
@@ -447,7 +447,7 @@ server_tokens format_prompt_rerank(
         const std::string & query,
         const std::string & doc);
 
-// ---- cache receipt (PROPOSAL §7.7, Phase 1) ----
+// ---- cache receipt ----
 // Untrusted divergence-location hint attached to responses when enabled: a
 // keyed, chained block-hash vector over the slot's cached token prefix,
 // versioned against tokenizer/template identity. Never authorization.

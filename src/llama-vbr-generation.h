@@ -64,7 +64,7 @@ enum class vbr_generation_teardown_state : uint8_t {
 const char * vbr_generation_teardown_state_name(
     vbr_generation_teardown_state state) noexcept;
 
-// P1v2 (v6): per-target lazy extent supplier. The tracker calls back into the owning mutation
+// Per-target lazy extent supplier. The tracker calls back into the owning mutation
 // scope at each destructive stamp with the SELECTED manifest-target index; the scope reserves
 // that target's extent on first use and returns it (empty on reservation failure — the scope
 // then latches unavailable). Damage evidence therefore binds to the selected target's own
@@ -94,12 +94,12 @@ struct vbr_generation_event {
     bool                      destructive     = false;
     bool                      imported        = false;
     vbr_operation_id          operation_id    = {};
-    // P1v2 (v6): the full authenticated manifest copy (bounded; events are boundary-rate).
+    // Full authenticated manifest copy (bounded; events are boundary-rate).
     // Covering-target selection happens PER STAMP against it, keyed by the stamped
     // (seq, pre-mutation position) — the single-cached-target model is gone.
     vbr_operation_binding     manifest        = {};
     uint32_t                  registrant_bit  = 0;
-    // P1v2: a stamp with no covering target poisons the event — the tracker latches
+    // A stamp with no covering target poisons the event: the tracker latches
     // shadow-unavailable IMMEDIATELY and every further stamp from this event is inert.
     bool                      poisoned        = false;
     vbr_event_extent_fn       extent_fn       = nullptr;
@@ -108,7 +108,7 @@ struct vbr_generation_event {
 };
 
 // Armed-only dual-write store. The raw arrays stay private behind value-returning accessors.
-// Mutation sites use the closed A0 registrant table
+// Mutation sites use the closed operation registry registrant table
 // through begin_event(); no caller supplies an open-ended family string.
 class vbr_generation_tracker {
   public:
@@ -124,10 +124,10 @@ class vbr_generation_tracker {
     bool     active() const;
     uint32_t stream_count() const;
 
-    // C4/F2 (v3 design): persistent shadow-unavailable state. While set, events are inert,
+    // Persistent shadow-unavailable state. While set, events are inert,
     // capture is unavailable, and qualification cannot advance.
     bool shadow_unavailable() const { return shadow_unavailable_; }
-    // P4v2 (v6): the latch records the controller generation at latch time so clearing can
+    // The latch records the controller generation at latch time so clearing can
     // demand a MONOTONE proof — a sanctioned global transition that provably happened
     // strictly AFTER the latch (and therefore after the untracked legacy interval following
     // it). Re-latching keeps the newest token.
@@ -136,7 +136,7 @@ class vbr_generation_tracker {
         generation_at_latch_ = generation_at_latch_ > global_generation_
                                        ? generation_at_latch_ : global_generation_;
     }
-    // P4v2 (v6): the WHOLE availability-creating transition in one place — while latched (and
+    // The whole availability-creating transition lives in one place: while latched (and
     // only then) it proves an empty recovery ring for this instance across every non-free state
     // and registry capacity, performs the sanctioned global invalidation (the named exemption
     // that runs outside any operation), and clears the monotone latch that invalidation
@@ -169,10 +169,10 @@ class vbr_generation_tracker {
     vbr_lineage_uuid            lineage_identity() const;
     vbr_controller_instance_id  runtime_instance() const;
     uint64_t                    controller_generation() const;
-    // F9: value accessor for the evaluator's post-read stability recheck. Even = stable.
+    // Value accessor for the evaluator's post-read stability recheck. Even = stable.
     uint64_t      mutation_serial() const { return mutation_serial_; }
 
-    // A2: every mutation event cites the live operation it belongs to; the tracker validates
+    // Every mutation event cites the live operation it belongs to; the tracker validates
     // the citation against the registry-retained binding and copies the authenticated
     // manifest into the event. For provenance-bearing (destructive/import) families the
     // event carries the owning scope's per-target extent supplier — stamps then bind durable
@@ -189,12 +189,12 @@ class vbr_generation_tracker {
                                      bool                      imported    = false);
     bool stamp_cell(vbr_generation_event & event, uint32_t cell,
                     llama_seq_id membership_seq = -1, llama_pos pre_mutation_pos = -1);
-    // P1v2 (v6): shared-cell form — a covering target must exist for EVERY member of the
+    // Shared-cell form: a covering target must exist for every member of the
     // cell's sequence set (target-set proof); absent that, the stamp poisons the event.
     bool stamp_cell(vbr_generation_event & event, uint32_t cell,
                     const llama_seq_id * seqs, int32_t n_seqs, llama_pos pre_mutation_pos);
 
-    // A2 extent store owned by the tracker so reference lifecycle stays co-located with the
+    // Extent store owned by the tracker so reference lifecycle stays co-located with the
     // stamps that cite it. Exposed only to the kv-cache operation scope and the evaluator.
     vbr_extent_store &       extent_store()       { return extents_; }
     const vbr_extent_store & extent_store() const { return extents_; }
@@ -206,8 +206,8 @@ class vbr_generation_tracker {
     bool           dependency_in_range(uint32_t stream, uint32_t cell) const;
     bool           membership_in_range(uint32_t stream, uint32_t cell) const;
 
-    // A2 exhaustion/no-wrap recovery: global invalidation + extent slab reset as one action
-    // (design Rev 4 items 2-3). Registrant-validated like global_transition.
+    // Operation-id exhaustion recovery: global invalidation plus extent-slab reset as one action.
+    // Registrant-validated like global_transition.
     bool global_invalidate_and_reset_extents(vbr_mutation_registrant registrant,
                                              vbr_operation_class     operation_class,
                                              vbr_operation_id        operation_id = {});
@@ -215,7 +215,7 @@ class vbr_generation_tracker {
     bool global_transition(vbr_mutation_registrant registrant, vbr_operation_class operation_class,
                            vbr_operation_id operation_id = {});
     bool initialize_unit(uint32_t unit, int32_t type, vbr_repr_domain domain);
-    // P5v2 (v6): publication cites the EXACT registrant driving it — never an OR of
+    // Publication cites the exact registrant driving it, never an OR of
     // plausible ones; a cited operation's manifest must cover that single bit.
     bool publish_unit(uint32_t                unit,
                       int32_t                 source_type,
@@ -226,7 +226,7 @@ class vbr_generation_tracker {
                       vbr_mutation_registrant registrant,
                       vbr_operation_id        operation_id = {});
 
-    // F4 import is built completely off-side. Preparation may allocate; the
+    // Validated import is built completely off-side. Preparation may allocate; the
     // final swap is allocation-free and preserves this tracker's enrolled
     // process-local runtime instance.
     bool prepare_import_image(
@@ -279,9 +279,9 @@ class vbr_generation_tracker {
     vbr_controller_instance_id            instance_id_        = {};
     bool                                  instance_enrolled_  = false;
     bool                                  shadow_unavailable_ = false;
-    // P4v2 (v6): monotone latch token — controller generation at the newest latch.
+    // Monotone latch token: controller generation at the newest latch.
     uint64_t                              generation_at_latch_ = 0;
-    // F9 (v3.2 pin 2): unit tuples publish/read under this lock; the publish_seq parity/
+    // Unit tuples publish and read under this lock; the publish_seq parity/
     // equality checks remain as cheap in-lock assertions. Boundary-rate only, never per-token.
     mutable std::mutex                    units_mutex_;
     vbr_extent_store                      extents_;

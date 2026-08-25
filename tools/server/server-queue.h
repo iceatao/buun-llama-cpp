@@ -17,6 +17,18 @@ struct server_queue_idle_capture_state;
 // in most cases, use server_response_reader to post new tasks and retrieve results
 struct server_queue {
 public:
+    struct diagnostic_snapshot {
+        bool running = false;
+        bool sleeping = false;
+        bool maintenance_requested = false;
+        size_t queued = 0;
+        size_t deferred = 0;
+        size_t matching_queued = 0;
+        size_t matching_deferred = 0;
+        uint64_t posts = 0;
+        uint64_t dequeues = 0;
+    };
+
     // Move-only cancellation session for one synchronous idle capture. Task
     // arrivals cancel it; they never wait for or reject normal queue work.
     class idle_capture_session {
@@ -33,6 +45,7 @@ public:
 
         explicit operator bool() const noexcept;
         bool continue_capture() const noexcept;
+        void cancel() noexcept;
 
     private:
         std::shared_ptr<server_queue_idle_capture_state> state_;
@@ -60,6 +73,10 @@ private:
     std::shared_ptr<server_queue_idle_capture_state> idle_capture_state;
     uint64_t idle_capture_generation = 0;
     bool idle_capture_stopped = false;
+    std::atomic<bool> idle_maintenance_requested { false };
+    std::atomic<bool> diagnostics_enabled_ { false };
+    uint64_t diagnostic_posts_ = 0;
+    uint64_t diagnostic_dequeues_ = 0;
 
     // callback functions
     std::function<void(server_task &&)> callback_new_task;
@@ -141,6 +158,28 @@ public:
     // Allocation occurs only on the first enabled automatic-capture attempt.
     idle_capture_session try_begin_idle_capture() noexcept;
 
+    // Scheduler-only prompt-boundary variant. update_slots() keeps one
+    // synthetic NEXT_RESPONSE wake queued while it is evaluating a live
+    // request; that wake is not external work and may coexist with the
+    // synchronous SWA frontier capture. Any real/deferred task still wins.
+    idle_capture_session try_begin_prompt_boundary_capture() noexcept;
+
+    // Worker-safe scheduler wake used only to run the registered idle
+    // maintenance callback. It never fabricates a task or bypasses task
+    // priority; a concurrently queued task wins and cancels the capture.
+    void request_idle_maintenance() noexcept;
+
+    // Cache-debug-only lifecycle tracing for a response waiter that has not
+    // heard from the scheduler. The snapshot never changes queue state.
+    void set_diagnostics(bool enabled) noexcept {
+        diagnostics_enabled_.store(enabled, std::memory_order_release);
+    }
+    bool diagnostics_enabled() const noexcept {
+        return diagnostics_enabled_.load(std::memory_order_acquire);
+    }
+    diagnostic_snapshot diagnostics(
+        const std::unordered_set<int> & task_ids) noexcept;
+
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //
@@ -195,8 +234,13 @@ private:
 
     std::mutex mutex_results;
     std::condition_variable condition_results;
+    std::atomic<bool> diagnostics_enabled_ { false };
 
 public:
+    void set_diagnostics(bool enabled) noexcept {
+        diagnostics_enabled_.store(enabled, std::memory_order_release);
+    }
+
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
 
@@ -239,6 +283,7 @@ struct server_response_reader {
     size_t received_count = 0;
     bool cancelled = false;
     int polling_interval_seconds;
+    uint64_t diagnostic_wait_seconds = 0;
 
     // tracking generation state and partial tool calls
     // only used by streaming completions

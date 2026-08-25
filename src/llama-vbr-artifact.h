@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-// Internal Phase-2 VBR artifact format. This is intentionally not part of public llama.h:
-// F2.1 defines only immutable value types and a fail-closed streaming codec.
+// Internal VBR artifact format. This is intentionally not part of public llama.h:
+// This header defines immutable value types and a fail-closed streaming codec.
 constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_MIN = 1;
 constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION = 3;
 constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT = 2;
@@ -462,7 +462,7 @@ vbr_artifact_status vbr_artifact_prepare_projected_metadata(
     vbr_artifact_package & package) noexcept;
 
 // Revalidate an already-prepared immutable package without changing it. This
-// is the F4 import door: it reuses the codec's canonical metadata, placement,
+// This is the import door: it reuses the codec's canonical metadata, placement,
 // digest, and payload checks rather than growing a second wire validator.
 vbr_artifact_status vbr_artifact_validate_prepared_package(
     const vbr_artifact_package & package) noexcept;
@@ -494,7 +494,7 @@ bool vbr_artifact_validate_portable_accounting(
     const std::vector<vbr_artifact_portable_topology> & topologies,
     const std::vector<vbr_artifact_portable_accounting_row> & rows) noexcept;
 
-// Closed wire-role to C-leaf mapping shared by format validation and the F2.2
+// Closed wire-role to C-leaf mapping shared by format validation and the
 // transactional catalog. `_count` maps to the category sentinel.
 llama_cache_acct_category vbr_artifact_accounting_category(
     vbr_artifact_accounting_role role) noexcept;

@@ -217,6 +217,17 @@ struct server_cache_lease_event_snapshot {
     }
 };
 
+// Scheduler retry currency. Reading the current form is O(1); refusal
+// capture may additionally request the earliest time-driven soft expiry.
+// This lets callers sleep until a lease mutation can actually change an
+// admission verdict instead of polling the complete lease table.
+struct server_cache_lease_retry_witness {
+    uint64_t event_ordinal = 0;
+    uint64_t now_ns = 0;
+    uint64_t next_expiry_ns = 0;
+    bool available = false;
+};
+
 struct server_cache_lease_replay_result {
     server_cache_lease_eval_state state =
         server_cache_lease_eval_state::unavailable;
@@ -312,7 +323,7 @@ public:
         const server_cache_lease_scope & scope,
         const server_cache_lease_identity & identity,
         uint64_t ttl_ns) noexcept;
-    // E1's holder-owned hard lease. `ttl_ns` is the holder inspection/
+    // Holder-owned hard lease. `ttl_ns` is the holder inspection/
     // reattach deadline; it is deliberately not a destruction deadline.
     // The entry remains enforced until explicit release/owner close/restart.
     server_cache_lease_id grant_hard_owned(
@@ -391,6 +402,8 @@ public:
         const server_cache_destruction_request & request) noexcept;
 
     server_cache_lease_event_snapshot event_snapshot() const noexcept;
+    server_cache_lease_retry_witness retry_witness(
+        bool include_next_expiry = false) const noexcept;
     uint64_t clock_samples() const noexcept { return n_clock_samples; }
     uint64_t unavailable_events() const noexcept { return n_unavailable; }
 

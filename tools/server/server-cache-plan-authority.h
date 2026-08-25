@@ -131,8 +131,8 @@ constexpr int32_t server_cache_plan_planned_target(
         ? selected.target_slot_id : -1;
 }
 
-// One compiled classification door shared by the B-A pre-D-A envelope and
-// D-A quote assembly. A nonzero bit is precisely a destruction certificate
+// One compiled classification door shared by planner authority and
+// destruction-quote assembly. A nonzero bit is precisely a destruction certificate
 // the envelope must refuse until its ratchet is enabled.
 int32_t server_cache_plan_host_source(
     const common_cache_plan_record & rec,
@@ -164,7 +164,7 @@ common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
     int32_t legacy_candidate,
     common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
 
-// B-A pre-mutation decision substrate. It is process-local and contains no
+// Pre-mutation decision substrate. It is process-local and contains no
 // shipped cache state. Authority is graduated through the parallel selection
 // and configured-level order pinned above.
 struct server_cache_plan_authority {
@@ -191,7 +191,7 @@ struct server_cache_plan_authority {
 
     // Authorize one complete plan at the record's selected tier. The argument
     // names the legacy-selected target: by_id remains bound to it, while later
-    // tiers may name a different target only inside the pre-D-A safety
+    // tiers may name a different target only inside the non-destructive safety
     // envelope. Any planner refusal or malformed plan returns the legacy
     // directive and records a typed fallback before mutation.
     server_cache_plan_execution authorize(
@@ -231,7 +231,7 @@ constexpr int32_t server_cache_plan_checkpoint_ordinal_from_source_id(
     int32_t host_source_id) noexcept;
 
 // A selected slot is armed before launch so the existing mutation seams can
-// consume the directive. The D-A recovery source outlives a successful
+// consume the directive. The recovery source outlives a successful
 // displacement through the dependent B execution, but every exit that does
 // not launch must disarm all three process-local pieces together; otherwise a
 // later request could inherit a stale directive/record or over-retain the
@@ -247,7 +247,7 @@ void server_cache_plan_disarm_unlaunched(
 }
 
 // Coverage recovery is a shipped correctness seam, not a cost-planner input.
-// Until B-A2 prices SWA/recurrent frontiers, an authoritative non-checkpoint
+// Until the planner prices SWA/recurrent frontiers, an authoritative non-checkpoint
 // plan reaching this condition must demote and run the legacy recovery block.
 constexpr bool server_cache_plan_requires_coverage_recovery(
         const server_cache_plan_execution & execution,

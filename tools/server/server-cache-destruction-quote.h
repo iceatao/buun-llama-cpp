@@ -38,7 +38,7 @@ struct server_cache_destruction_quote_options {
         common_cache_plan_recovery_citation::unavailable;
     uint64_t admission_sequence = 0;
     common_cache_plan_destruction_effect_set permitted_effects = 0;
-    // E0 may inspect an explicitly unminted receipt. Ordinary callers retain
+    // Preflight may inspect an explicitly unminted receipt. Ordinary callers retain
     // quote_all's fail-closed sequence-zero validation; the capability door
     // independently rejects every never-minted receipt.
     bool preview_unminted = false;
@@ -52,7 +52,7 @@ nlohmann::ordered_json server_cache_destruction_receipt_json(
     uint64_t projected_bytes,
     const char * action_class = nullptr);
 
-// D-A0a's bounded pre-minimization shadow pass. `artifacts` is one normalized
+// Bounded pre-minimization shadow pass. `artifacts` is one normalized
 // retention inventory: identities and leases were each inspected exactly once.
 // Quotes are memoized by canonical victim-manifest digest; no mutation, lease
 // advancement, or accounting claim occurs.
@@ -66,7 +66,7 @@ bool server_cache_destruction_quote_all(
     const server_cache_destruction_quote_options & options,
     common_cache_plan_destruction_counters & counters) noexcept;
 
-// D-A2's exact-redundancy quote for one host victim. This is the same
+// Exact-redundancy quote for one host victim. This is the same
 // artifact classifier, canonical manifest digest, batch preview, and domain
 // projection used by the pre-minimization B-candidate quote path. The caller
 // supplies the separately-proved and pinned survivor at prepare time.
@@ -78,7 +78,7 @@ server_cache_destruction_quote_redundant_host(
     const server_cache_destruction_preview_callback & preview,
     const server_cache_destruction_projection_callback & project) noexcept;
 
-// D-A4 and later independently-owned artifacts reuse the exact single-victim
+// Independently owned artifacts reuse the exact single-victim
 // quote without inheriting the host-consumption effect spelling.
 common_cache_plan_destruction_quote
 server_cache_destruction_quote_single_artifact(
@@ -94,7 +94,7 @@ void server_cache_destruction_select_quote(
     common_cache_plan_destruction_counters & counters,
     common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
 
-// E0's lifecycle-off projection lives beside the production selector so its
+// The lifecycle-off projection lives beside the production selector so its
 // no-quote/refusal semantics cannot drift into a second server-context policy.
 void server_cache_destruction_select_preview(
     common_cache_plan_record & rec,
@@ -123,7 +123,7 @@ server_cache_destruction_recovery_source_digest(
     llama_cache_acct_artifact_id artifact,
     const std::vector<llama_cache_acct_op_id> & ops);
 
-// Forward contract for D-A0b's mutation-boundary certify-time recheck. The
+// Forward contract for the mutation-boundary certify-time recheck. The
 // quote serial is evidence only; exact union/digest/domain equality decides.
 common_cache_plan_destruction_reason server_cache_destruction_effect_recheck(
     const common_cache_plan_destruction_receipt & quote,
@@ -209,7 +209,7 @@ public:
         return release_.accounting_serial();
     }
 
-    // Phase-7 accounting terminal. The API deliberately accepts no callback:
+    // Accounting terminal. The API deliberately accepts no callback:
     // the prepare→physical-mutation→commit interval cannot re-enter the ledger
     // through this substrate. Same-thread ownership and unchanged serial are
     // asserted/checked by this terminal. On success, the caller owns the pin
@@ -239,7 +239,7 @@ struct server_cache_prepare_release_result {
     server_cache_prepared_release_capability capability;
 };
 
-// D-A0b fresh-serial certification. The caller first advances the lease
+// Fresh-serial certification. The caller first advances the lease
 // lifecycle and builds `current_artifacts` with one fresh inspection per
 // artifact. This compares identity/anchor/lease state, the canonical op-set
 // bound inside the exact union digest, and projected release rows against the

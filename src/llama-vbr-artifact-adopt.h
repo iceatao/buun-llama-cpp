@@ -99,7 +99,7 @@ class vbr_prepared_companion_image {
 // Provider callbacks are closed over one companion target. `prepare` runs
 // after unit H2D and may either build an off-side image or install reversible
 // state in an otherwise-empty target. `recheck` is the allocation-free late
-// barrier for that prepared image. `publish_swap` is the phase-12 no-fail
+// barrier for that prepared image. `publish_swap` is the no-fail composite
 // terminal. `rollback` must restore the pre-prepare target and reports whether
 // recovery was complete.
 struct vbr_companion_adoption_provider {
@@ -112,7 +112,17 @@ struct vbr_companion_adoption_provider {
         std::unique_ptr<vbr_parsed_companion_image> parsed,
         llama_seq_id destination,
         std::unique_ptr<vbr_prepared_companion_image> & output) noexcept = nullptr;
-    // Phase-10 drift gate. It must be allocation-free and must describe the
+    // Occupied replacement authenticates the live target against `recovery`
+    // before installing `incoming`. The callback must publish `output`
+    // before its first destructive mutation so the common rollback loop can
+    // replay recovery even when preparation itself fails.
+    bool (*prepare_replacement)(
+        const void * context,
+        std::unique_ptr<vbr_parsed_companion_image> incoming,
+        std::unique_ptr<vbr_parsed_companion_image> recovery,
+        llama_seq_id destination,
+        std::unique_ptr<vbr_prepared_companion_image> & output) noexcept = nullptr;
+    // Late complete-tree drift gate. It must be allocation-free and describe the
     // same target object as target_cookie/prepare/publish_swap.
     bool (*target_empty)(const void * context) noexcept = nullptr;
     bool (*recheck)(
@@ -129,7 +139,7 @@ struct vbr_companion_adoption_provider {
 struct vbr_adopt_fault {
     // Fails immediately before the named phase. `_count` disables the seam.
     vbr_adopt_phase fail_before = vbr_adopt_phase::_count;
-    // Phase 12 publication and phase 13 close deliberately have no after
+    // Composite publication and close deliberately have no after
     // seam: once publication begins the transaction is no-fail.
     vbr_adopt_phase fail_after = vbr_adopt_phase::_count;
     uint32_t fail_child = UINT32_MAX;
@@ -288,7 +298,7 @@ struct vbr_composite_publish_hooks {
     // Optional complete-tree companions, in canonical target-tree order.
     std::vector<vbr_companion_adoption_provider> companions;
     // Optional already-prepared server metadata holder publication. It is
-    // invoked only in the no-fail phase-12 region.
+    // invoked only in the no-fail composite-publication region.
     void (*publish)(void * context) noexcept = nullptr;
     // TEST-ONLY and null by default. This is the single production-boundary
     // null test; fault policy and fake target both live behind it. CI rejects
@@ -296,16 +306,17 @@ struct vbr_composite_publish_hooks {
     const vbr_adopt_test_control * test = nullptr;
 };
 
-// Read-only phase-10 shape barrier, exposed only for the CPU fault matrix.
+// Read-only complete-tree shape barrier, exposed only for the CPU fault matrix.
 // Pointer members are identity cookies; this helper never dereferences them.
 struct vbr_adopt_expected_attention {
     uint32_t child_id = UINT32_MAX;
     const llama_kv_cache * cache = nullptr;
 };
 vbr_adopt_status vbr_adopt_check_complete_tree(
-    const std::vector<vbr_adopt_expected_attention> & expected,
-    const std::vector<llama_memory_tree_child> & live,
-    const std::vector<vbr_companion_adoption_provider> & companions) noexcept;
+        const std::vector<vbr_adopt_expected_attention> & expected,
+        const std::vector<llama_memory_tree_child> & live,
+        const std::vector<vbr_companion_adoption_provider> & companions,
+        bool occupied_replacement = false) noexcept;
 
 // Rollback quarantine is meaningful for VMM backends whose unmap door can
 // return false. CUDA's current unmap door is fail-stop (CU_CHECK aborts on a
@@ -313,8 +324,8 @@ vbr_adopt_status vbr_adopt_check_complete_tree(
 // reach the typed quarantine terminal on that backend.
 
 // Canonical recurrent-v1 companion doors. Validation parses the legacy-shaped
-// bytes into an allocation-only CPU blueprint; adoption prepares fresh private
-// backend tensors and publishes them only through the phase-12 holder swap.
+// bytes into an allocation-only CPU blueprint; adoption journals one target
+// row and publishes it only through the no-fail metadata swap.
 // The existing state_read path is deliberately not called or modified.
 bool vbr_parse_recurrent_companion(
     const void * context,

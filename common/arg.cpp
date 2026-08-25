@@ -889,7 +889,7 @@ static void common_params_postprocess_vbr(common_params & params) {
             params.vbr_min_bits_value = floor_bits;
             params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(floor_bits);
         }
-        // Dynamic = the M3 runtime degrade controller (VMM-backed pool, price-ordered in-place
+        // Dynamic means the runtime degrade controller (VMM-backed pool, price-ordered in-place
         // transcodes). Whole (layer,side) tensors degrade selectively as mapped bytes approach
         // the KV VRAM budget:
         //   entry = F16 (forced below); the baked orders' fp16->t8 band degrades it first under pressure;
@@ -4422,14 +4422,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PLAN_PREFLIGHT"));
     add_opt(common_arg(
         {"--cache-control-api"},
-        string_format("expose trusted-local cache-control routes (default: %s)", params.cache_control_api ? "enabled" : "disabled"),
+        string_format("expose trusted-local cache-control routes and enable their required cache-lifecycle authority (default: %s)", params.cache_control_api ? "enabled" : "disabled"),
         [](common_params & params) {
             params.cache_control_api = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_CONTROL_API"));
     add_opt(common_arg(
         {"--cache-plan-authority"}, "LEVEL",
-        "dual-run the P2 cache-plan authority substrate at LEVEL: off, by_id, similarity, route_home, or lru (B-A0b remains shadow-only; default: off)",
+        "set cache-plan authority at LEVEL: off, by_id, similarity, route_home, or lru (non-off levels remain observation-only; default: off)",
         [](common_params & params, const std::string & value) {
             params.cache_plan_authority =
                 common_cache_plan_authority_level_parse(value);
@@ -4437,7 +4437,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PLAN_AUTHORITY"));
     add_opt(common_arg(
         {"--cache-lifecycle"},
-        string_format("explicitly enable the P2 cache-lifecycle authority substrate (accounting-gated admission); it is enabled automatically with the prompt cache, independent of --cache-debug (explicit default: %s)", params.cache_lifecycle ? "enabled" : "disabled"),
+        string_format("explicitly enable cache-lifecycle authority (accounting-gated admission); it is enabled automatically with the prompt cache, independent of --cache-debug (explicit default: %s)", params.cache_lifecycle ? "enabled" : "disabled"),
         [](common_params & params) {
             params.cache_lifecycle = true;
         }

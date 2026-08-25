@@ -744,7 +744,7 @@ bool server_prompt_cache_payload::publishable() const noexcept {
     return valid();
 }
 
-bool server_prompt_cache_payload::restorable() const noexcept {
+bool server_prompt_cache_payload::fixed_state_restorable() const noexcept {
     const auto * fixed = fixed_state();
     return fixed && !fixed->main.empty();
 }

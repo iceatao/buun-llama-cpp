@@ -875,8 +875,8 @@ static void test_value_record_order_reproduction() {
     CHECK(replayed.selected[0] == original.selected[0]);
 }
 
-// D-S GATE — cross-pool determinism. Pins the invariants the shadow yield planner
-// must hold before D-A can trust its evidence:
+// Cross-pool determinism. Pins the invariants the shadow yield planner
+// must hold before destructive execution can trust its evidence:
 //   (1) attention selection is independent of recurrent presence (attention is
 //       walked first from an empty union) and reflects the intra-pool sort, not
 //       input order;
@@ -970,7 +970,7 @@ static void test_cross_pool_independence() {
     CHECK(dedup.selected[1][0].v == 91);   // rs(90) skipped as zero-marginal
 }
 
-// D-S GATE — suspend/resume reproduction across BOTH pools (prior coverage was
+// Suspend/resume reproduction across both pools (prior coverage was
 // attention-only). Encode the retention sidecar, decode it, rebuild candidates in
 // decoded order, and require the per-pool selection to reproduce byte-for-byte.
 static void test_resume_both_pools() {
@@ -1035,7 +1035,7 @@ static void test_filters_and_terminals() {
     CHECK(result.selected[0].empty());
     CHECK(result.unsupported.empty());
 
-    // Synthetic priceable-only catalogs exercise the known P8 terminals.
+    // Synthetic priceable-only catalogs exercise the known planner terminals.
     // Live catalogs remain unavailable until exact checkpoint/slot op sets land.
     auto protected_candidate = candidate(
         1, 1, common_retention_pool::attention, 1, 1);

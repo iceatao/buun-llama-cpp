@@ -12,7 +12,7 @@ enum class vbr_checkpoint_generation_status : uint8_t {
     generation_unknown,
 };
 
-// D-A2-8: server-layer checkpoint identity/frontier fields bound into the record digest.
+// Server-layer checkpoint identity/frontier fields bound into the record digest.
 // next_position is the EXCLUSIVE computation frontier (dependencies are pos < next_position),
 // matching the capture-side filter — never pos_max.
 struct vbr_checkpoint_frontier_fields {
