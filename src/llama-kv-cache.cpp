@@ -6829,9 +6829,9 @@ uint64_t vbr_capture_shard_source_identity(
         const void * extent) noexcept {
     try {
         llama_sha256_writer hash;
-        static constexpr char DOMAIN[] =
+        static constexpr char source_identity_domain[] =
             "buun.vbr.capture/live-shard-source/v1";
-        hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+        hash.string(source_identity_domain, sizeof(source_identity_domain) - 1);
         hash.u64(instance.hi);
         hash.u64(instance.lo);
         hash.u32(child_id);

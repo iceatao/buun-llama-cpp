@@ -18,6 +18,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <utility>
 #include <vector>
 
 using json = nlohmann::ordered_json;
@@ -197,9 +198,27 @@ public:
     server_tokens(const server_tokens&) = delete;
     server_tokens& operator=(const server_tokens&) = delete;
 
-    // Allow moving (usually implicitly generated if members are movable)
-    server_tokens(server_tokens&&) = default;
-    server_tokens& operator=(server_tokens&&) = default;
+    // Keep moves allocation-free. In particular, Microsoft's STL does not
+    // declare std::map's move constructor noexcept, while swapping two maps
+    // with the default allocator is noexcept. The explicit move constructor
+    // preserves the no-fail prompt publication contract on Windows.
+    server_tokens(server_tokens&& other) noexcept {
+        swap(other);
+    }
+    server_tokens& operator=(server_tokens&&) noexcept = default;
+
+    void swap(server_tokens & other) noexcept {
+        using std::swap;
+        swap(has_mtmd, other.has_mtmd);
+        map_idx_to_media.swap(other.map_idx_to_media);
+        tokens.swap(other.tokens);
+        retention_token_digest_cache.swap(other.retention_token_digest_cache);
+        swap(retention_token_digest_valid, other.retention_token_digest_valid);
+    }
+
+    friend void swap(server_tokens & lhs, server_tokens & rhs) noexcept {
+        lhs.swap(rhs);
+    }
 
     // Allow accessing elements using [] operator
     llama_token operator[](size_t index) { return tokens[index]; }

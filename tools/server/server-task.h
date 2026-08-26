@@ -781,6 +781,13 @@ struct server_prompt {
     // the prompt ledger is structurally cleared.
     uint64_t sequence_epoch = 0;
 
+    friend void swap(server_prompt & lhs, server_prompt & rhs) noexcept {
+        using std::swap;
+        swap(lhs.tokens, rhs.tokens);
+        lhs.checkpoints.swap(rhs.checkpoints);
+        swap(lhs.sequence_epoch, rhs.sequence_epoch);
+    }
+
     void clear() {
         tokens.clear();
         checkpoints.clear();

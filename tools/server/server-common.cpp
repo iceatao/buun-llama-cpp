@@ -529,9 +529,9 @@ bool server_tokens::retention_token_digest(
         std::array<uint8_t, 32> & out) const noexcept {
     if (!retention_token_digest_valid) {
         llama_sha256_writer hash;
-        static constexpr char DOMAIN[] =
+        static constexpr char digest_domain[] =
             "buun.server.retention-token-identity/v1";
-        hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+        hash.string(digest_domain, sizeof(digest_domain) - 1);
         hash.u64(tokens.size());
         for (llama_token token : tokens) {
             hash.u32(uint32_t(token));
@@ -558,9 +558,9 @@ bool server_tokens::retention_token_prefix_digest(
             return false;
         }
         llama_sha256_writer hash;
-        static constexpr char DOMAIN[] =
+        static constexpr char digest_domain[] =
             "buun.server.retention-token-prefix-identity/v1";
-        hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+        hash.string(digest_domain, sizeof(digest_domain) - 1);
         hash.u64(coverage_tokens);
         for (size_t i = 0; i < coverage_tokens; ++i) {
             hash.u32(uint32_t(tokens[i]));
