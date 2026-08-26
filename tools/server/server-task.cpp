@@ -8947,7 +8947,14 @@ void server_prompt_cache::commit_restore_delivery(
 // off, load() runs the pre-cache-plan observer candidate loop with zero observer branches. Single source —
 // every `if constexpr (Observed)` block vanishes from the <false> instantiation.
 template <bool Observed>
-bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family) {
+bool server_prompt_cache::load_impl(
+        server_prompt & prompt, const server_tokens & tokens_new,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        const std::string & adapter_config_key, common_cache_plan_record * rec,
+        int32_t required_source_id,
+        common_cache_family_binding * restored_family,
+        server_prompt_cache_restore_shape & restore_shape) {
+    restore_shape = server_prompt_cache_restore_shape::none;
     if constexpr (!Observed) {
         (void) rec;
         (void) required_source_id;
@@ -9141,6 +9148,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     const auto * fixed = it_best->payload.fixed_state();
     GGML_ASSERT(fixed != nullptr);
+    bool draft_image_restored = false;
     if (ctx_dft && !fixed->drft.empty()) {
         const size_t size_dft = fixed->drft.size();
         const size_t n_dft = llama_state_seq_set_data_ext(
@@ -9155,6 +9163,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
             }
             return false;
         }
+        draft_image_restored = true;
     }
 
     // Both sides restored: atomically select the lifecycle retain terminal or
@@ -9167,6 +9176,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     if (restored_family) {
         *restored_family = delivery.cache_family;
     }
+    restore_shape = draft_image_restored
+        ? server_prompt_cache_restore_shape::target_and_draft
+        : server_prompt_cache_restore_shape::target_only;
     commit_restore_delivery(
         it_best, std::move(delivery), prompt, id_slot, obs_source_best,
         uint64_t(std::max(reuse_lcp_best, 0)),
@@ -9175,15 +9187,21 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     return true;
 }
 
-template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *);
-template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *);
+template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *, server_prompt_cache_restore_shape &);
+template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *, server_prompt_cache_restore_shape &);
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family) {
+bool server_prompt_cache::load(
+        server_prompt & prompt, const server_tokens & tokens_new,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        const std::string & adapter_config_key,
+        server_prompt_cache_restore_shape & restore_shape,
+        common_cache_plan_record * rec, int32_t required_source_id,
+        common_cache_family_binding * restored_family) {
     GGML_ASSERT(rec != nullptr || required_source_id < 0);
     // One dispatch outside every loop: the off path is the original loop.
     return rec != nullptr
-        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_family)
-        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_family);
+        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_family, restore_shape)
+        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_family, restore_shape);
 }
 
 void server_prompt_cache::update() {

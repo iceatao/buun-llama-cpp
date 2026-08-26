@@ -1143,6 +1143,12 @@ struct server_prompt_cache_restore_delivery {
     bool retains_source = false;
 };
 
+enum class server_prompt_cache_restore_shape : uint8_t {
+    none = 0,
+    target_only,
+    target_and_draft,
+};
+
 constexpr size_t SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES =
     SERVER_RETENTION_MAX_CANDIDATES;
 
@@ -1597,10 +1603,22 @@ struct server_prompt_cache {
     // off). It only receives values this selection already computes and never triggers a rescan.
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
     // candidate loop is the original loop with zero observer branches.
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_family_binding * restored_family = nullptr);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new,
+              llama_context * ctx_tgt, llama_context * ctx_dft,
+              int32_t id_slot, const std::string & adapter_config_key,
+              server_prompt_cache_restore_shape & restore_shape,
+              common_cache_plan_record * rec = nullptr,
+              int32_t required_source_id = -1,
+              common_cache_family_binding * restored_family = nullptr);
 
     template <bool Observed>
-    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family);
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new,
+                   llama_context * ctx_tgt, llama_context * ctx_dft,
+                   int32_t id_slot, const std::string & adapter_config_key,
+                   common_cache_plan_record * rec,
+                   int32_t required_source_id,
+                   common_cache_family_binding * restored_family,
+                   server_prompt_cache_restore_shape & restore_shape);
 
     // Two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.

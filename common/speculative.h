@@ -108,12 +108,13 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 enum class common_speculative_sequence_event : uint8_t {
-    prompt_rewind = 0,       // retained draft prefix remains installed
-    checkpoint_reconstruct,  // no complete draft sequence was restored
-    checkpoint_complete,     // a complete draft sequence was restored
-    live_range_shift,        // live target/draft positions were renumbered
-    target_replaced,         // target replaced; draft sequence was cleared
-    full_clear,              // target and draft sequences were cleared
+    prompt_rewind = 0,          // retained draft prefix remains installed
+    target_restored_without_draft, // target restored; draft must reconstruct
+    draft_image_restored,       // complete target+draft sequence images restored
+    composite_image_restored,   // draft plus typed accelerator state restored
+    live_range_shift,           // live target/draft positions were renumbered
+    target_replaced,            // target replaced; draft sequence was cleared
+    full_clear,                 // target and draft sequences were cleared
 };
 
 // One owner for external sequence lifecycle mutations. Implementations discard

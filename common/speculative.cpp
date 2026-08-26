@@ -1381,7 +1381,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         discard_branch_state(seq_id);
 
         switch (event) {
-            case common_speculative_sequence_event::checkpoint_reconstruct:
+            case common_speculative_sequence_event::target_restored_without_draft:
                 llama_memory_seq_rm(
                     llama_get_memory(params.ctx_dft), seq_id, -1, -1);
                 positions[seq_id].rebase_pending = true;
@@ -1394,7 +1394,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             case common_speculative_sequence_event::prompt_rewind:
             case common_speculative_sequence_event::live_range_shift:
                 break;
-            case common_speculative_sequence_event::checkpoint_complete: {
+            case common_speculative_sequence_event::draft_image_restored:
+            case common_speculative_sequence_event::composite_image_restored: {
                 // The compact text drafter and an M-RoPE target can use different
                 // physical positions. A full sequence image restores only the KV,
                 // not this lightweight offset; derive it before the first suffix
@@ -1826,11 +1827,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 LOG_DBG("%s: seq %d rebased target position %d to drafter position 0\n",
                         __func__, (int) seq_id, (int) target_pos0);
             }
-            const llama_pos dft_pos0 = target_pos0 - pstate.target_base;
-            if (dft_pos0 < 0) {
-                LOG_ERR("%s: seq %d target position %d precedes drafter base %d\n",
-                        __func__, (int) seq_id, (int) target_pos0, (int) pstate.target_base);
-                return false;
+            llama_pos dft_pos0 = target_pos0 - pstate.target_base;
+            const bool discontinuous = dft_pos0 < 0 ||
+                (dft_pos_max >= 0 &&
+                 int64_t(dft_pos0) > int64_t(dft_pos_max) + 1);
+            if (discontinuous) {
+                // A lifecycle owner should have announced every external
+                // target/draft replacement. Keep this as a final fail-safe:
+                // an unannounced prompt-cache swap may leave the lightweight
+                // target base describing a different conversation even though
+                // both context images are individually valid. Cold-rebase the
+                // drafter rather than turning the request into an HTTP 500.
+                LOG_WRN(
+                    "%s: seq %d drafter stream discontinuous "
+                    "(dft_pos_max=%d, dft_pos0=%d, target_pos0=%d, base=%d) - "
+                    "resetting drafter sequence\n",
+                    __func__, (int) seq_id, (int) dft_pos_max, (int) dft_pos0,
+                    (int) target_pos0, (int) pstate.target_base);
+                sequence_transition(
+                    seq_id,
+                    common_speculative_sequence_event::target_restored_without_draft);
+                pstate.target_base = target_pos0;
+                pstate.rebase_pending = false;
+                pstate.rebased = true;
+                dft_pos0 = 0;
             }
 
             // phase C: defer generation-cycle injections into the next draft decode.
@@ -4451,8 +4471,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             common_speculative_sequence_event event) override {
         switch (event) {
             case common_speculative_sequence_event::prompt_rewind:
-            case common_speculative_sequence_event::checkpoint_reconstruct:
-            case common_speculative_sequence_event::checkpoint_complete:
+            case common_speculative_sequence_event::target_restored_without_draft:
+            case common_speculative_sequence_event::draft_image_restored:
             case common_speculative_sequence_event::live_range_shift:
             case common_speculative_sequence_event::target_replaced:
             case common_speculative_sequence_event::full_clear:
@@ -4463,6 +4483,12 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 // proof, so it also resets; the next ordinary target decode
                 // appends one verified hidden row and resumes drafting safely.
                 ring_state_reset();
+                break;
+            case common_speculative_sequence_event::composite_image_restored:
+                // The composite VBR transaction has already installed and
+                // authenticated this ring together with the draft image.
+                // Preserve it while other speculative implementations repair
+                // their lightweight restored-frontier metadata.
                 break;
         }
     }

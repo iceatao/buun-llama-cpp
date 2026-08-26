@@ -986,12 +986,29 @@ struct server_slot {
         // with the live lineage; a committed host restore overwrites it with
         // delivery.cache_family inside load_impl.
         common_cache_family_binding restored_family = cache_family;
+        server_prompt_cache_restore_shape restore_shape =
+            server_prompt_cache_restore_shape::none;
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
-                                     adapter_config_key, obs, required_source_id,
-                                     &restored_family);
+                                     adapter_config_key, restore_shape, obs,
+                                     required_source_id, &restored_family);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else {
+            switch (restore_shape) {
+                case server_prompt_cache_restore_shape::none:
+                    break;
+                case server_prompt_cache_restore_shape::target_only:
+                    common_speculative_sequence_transition(
+                        get_spec(), id,
+                        common_speculative_sequence_event::
+                            target_restored_without_draft);
+                    break;
+                case server_prompt_cache_restore_shape::target_and_draft:
+                    common_speculative_sequence_transition(
+                        get_spec(), id,
+                        common_speculative_sequence_event::draft_image_restored);
+                    break;
+            }
             // A host image replaces the live frontier wholesale, including
             // its immutable family provenance. A declared current request may
             // deliberately override this later at the launch boundary.
@@ -2355,6 +2372,12 @@ struct server_slot {
             }
         }
 
+        common_speculative_sequence_transition(
+            other.get_spec(), other.id,
+            ctx_dft
+                ? common_speculative_sequence_event::draft_image_restored
+                : common_speculative_sequence_event::target_restored_without_draft);
+
         other.n_decoded   = n_decoded;
         other.n_remaining = n_remaining;
         other.i_batch     = i_batch;
@@ -2546,11 +2569,13 @@ server_cache_family_slot_round_trip_for_test(
     // This is the identity terminal that previously returned a default.
     server_prompt_cache empty_cache(0, 0);
     common_cache_family_binding restored = slot.cache_family;
+    server_prompt_cache_restore_shape restore_shape =
+        server_prompt_cache_restore_shape::none;
     const server_tokens resumed(
         llama_tokens { 1, 2, 3, 4 }, false);
     result.no_restore_resume = empty_cache.load(
-        slot.prompt, resumed, nullptr, nullptr, slot.id, "", nullptr, -1,
-        &restored);
+        slot.prompt, resumed, nullptr, nullptr, slot.id, "", restore_shape,
+        nullptr, -1, &restored);
     if (result.no_restore_resume) {
         slot.cache_family = restored;
     }
@@ -9611,6 +9636,28 @@ private:
                 }
                 return false;
             }
+            const auto restore_event_for = [](
+                    const server_prompt_cache_vbr_owner & payload) noexcept {
+                bool draft_image = false;
+                bool accelerator_image = false;
+                if (payload) {
+                    for (const auto & companion :
+                            payload->package().companions()) {
+                        draft_image |= companion.descriptor.kind ==
+                            vbr_artifact_companion_kind::required_spec_payload;
+                        accelerator_image |= companion.descriptor.kind ==
+                            vbr_artifact_companion_kind::typed_accelerator;
+                    }
+                }
+                if (!draft_image) {
+                    return common_speculative_sequence_event::
+                        target_restored_without_draft;
+                }
+                return accelerator_image
+                    ? common_speculative_sequence_event::
+                        composite_image_restored
+                    : common_speculative_sequence_event::draft_image_restored;
+            };
             const int32_t plan_source_id = candidate.source_id();
             const uint64_t plan_prefix_tokens = candidate.prefix_tokens();
             const auto observe_vbr_delivery = [&] (
@@ -9737,6 +9784,8 @@ private:
                 const int64_t started = ggml_time_us();
                 const uint64_t prefix_tokens = ticket.incoming_prefix_tokens();
                 const uint64_t incumbent_lcp = ticket.incumbent_live_lcp();
+                const auto restore_event =
+                    restore_event_for(ticket.incoming_payload());
                 const bool incoming_frontier_logits = std::any_of(
                     ticket.incoming_payload()->package().companions().begin(),
                     ticket.incoming_payload()->package().companions().end(),
@@ -9793,6 +9842,8 @@ private:
                 GGML_ASSERT(state.published);
                 prompt_cache->commit_vbr_occupied_replacement(
                     ticket, slot.prompt, slot.cache_family, slot.id);
+                common_speculative_sequence_transition(
+                    slot.get_spec(), slot.id, restore_event);
                 if (incoming_frontier_logits) {
                     slot.vbr_bind_frontier_logits_to_prompt();
                 } else {
@@ -9941,6 +9992,8 @@ private:
             GGML_ASSERT(state.published);
             const uint64_t prefix_tokens = candidate.prefix_tokens();
             const int32_t source_id = candidate.source_id();
+            const auto restore_event =
+                restore_event_for(candidate.payload());
             if (candidate.requires_prefix_projection()) {
                 slot.cache_family = incoming_family;
             }
@@ -9950,6 +10003,8 @@ private:
             if (!committed) {
                 return false;
             }
+            common_speculative_sequence_transition(
+                slot.get_spec(), slot.id, restore_event);
             slot.vbr_bind_frontier_logits_to_prompt();
             SLT_DBG(slot,
                     "restored frontier logits: count=%zu authenticated=%d\n",
@@ -14803,6 +14858,13 @@ private:
                         const int64_t started = ggml_time_us();
                         const auto imported =
                             vbr_artifact_store->import(std::move(request));
+                        if (imported.status ==
+                                server_vbr_artifact_import_status::ok) {
+                            common_speculative_sequence_transition(
+                                slot->get_spec(), slot->id,
+                                common_speculative_sequence_event::
+                                    target_restored_without_draft);
+                        }
                         const auto & totals = vbr_artifact_store->counters();
                         const double duration_ms =
                             (ggml_time_us() - started)/1000.0;
@@ -16430,8 +16492,8 @@ private:
                                                 slot.get_spec(), slot.id,
                                                 !it->data_dft.empty() &&
                                                         it->data_dft_full_sequence
-                                                    ? common_speculative_sequence_event::checkpoint_complete
-                                                    : common_speculative_sequence_event::checkpoint_reconstruct);
+                                                    ? common_speculative_sequence_event::draft_image_restored
+                                                    : common_speculative_sequence_event::target_restored_without_draft);
 
                                             bool checkpoint_aux_ok = true;
                                             if (slot.can_speculate() && !it->accel.ring.empty() &&
