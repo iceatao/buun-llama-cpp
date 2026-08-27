@@ -1085,6 +1085,9 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    // Effective, non-cumulative split weights in the physical device order.
+    // Unlike params.tensor_split, this is populated for automatic placement too.
+    std::vector<float> tensor_split_resolved;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1354,6 +1357,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     } else {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+    }
+
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        // Tensor parallelism exposes one meta device to the model loader. Its
+        // split callback, however, distributes rows across the physical
+        // devices recorded here and treats an all-zero user split as equal.
+        const size_t n_split_devices = get_split_state_ud.n_devices;
+        pimpl->tensor_split_resolved.resize(n_split_devices, 1.0f);
+        if (tensor_split != nullptr &&
+            std::any_of(tensor_split, tensor_split + n_split_devices,
+                        [](float x) { return x != 0.0f; })) {
+            std::copy(tensor_split, tensor_split + n_split_devices,
+                      pimpl->tensor_split_resolved.begin());
+        }
+    } else {
+        pimpl->tensor_split_resolved = splits;
     }
 
     // sum and normalize the splits to get the split points
@@ -1763,6 +1782,10 @@ void llama_model::adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+const std::vector<float> & llama_model::resolved_tensor_split() const {
+    return pimpl->tensor_split_resolved;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -3175,6 +3198,21 @@ size_t llama_model_get_moe_tensor_info(
 
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
+}
+
+size_t llama_model_resolved_tensor_split(
+        const struct llama_model * model,
+        float * weights,
+        size_t capacity) {
+    if (model == nullptr) {
+        return 0;
+    }
+    const auto & resolved = model->resolved_tensor_split();
+    const size_t n = std::min(capacity, resolved.size());
+    if (weights != nullptr && n > 0) {
+        std::copy_n(resolved.data(), n, weights);
+    }
+    return resolved.size();
 }
 
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {

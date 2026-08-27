@@ -7224,11 +7224,15 @@ private:
         std::vector<vbr_capture_lane> capture_lanes;
         uint32_t capture_attention_children = 0;
         bool capture_manifest_enabled = false;
+        size_t capture_resolved_split_count = 0;
+        const char * capture_topology_failure =
+            "cache_authority_unavailable";
         const bool capture_requested =
             params_base.cache_lifecycle &&
             server_vbr_dynamic_active(params_base);
         int ngl_eff = 0;
         if (cache_authority) {
+            capture_topology_failure = "topology_not_built";
             const auto observer_domain = llama_cache_acct_resource_domain::non_device(
                 llama_cache_acct_residency::not_applicable);
             const auto host_domain = llama_cache_acct_resource_domain::non_device(
@@ -7237,11 +7241,28 @@ private:
             // Manifest ordering: resolve the same effective placement used by the
             // calibration profile, build/intern every usable device domain, and retain its
             // runtime device binding BEFORE the one-shot producer manifest is configured.
-            // Multi-device auto placement has no resolved weights here; the canonical
-            // topology builder refuses it rather than fabricating equal shares.
+            // The topology must use the loader's effective placement weights.
+            // Raw CLI weights are all zero for automatic multi-device placement,
+            // while the loader has already resolved them from device capacity.
             std::vector<ggml_backend_dev_t> gpu_devices;
             std::vector<std::string> gpu_identities;
-            if (!params_base.devices.empty()) {
+            if (params_base.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                const int32_t n_model_devices =
+                    llama_model_n_devices(model_tgt);
+                for (int32_t i = 0; i < n_model_devices; ++i) {
+                    auto * dev = llama_model_get_device(model_tgt, i);
+                    if (dev != nullptr &&
+                        ggml_backend_dev_type(dev) ==
+                            GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        gpu_devices.push_back(dev);
+                        gpu_descs.push_back(
+                            ggml_backend_dev_description(dev));
+                        gpu_identities.push_back(
+                            std::string(ggml_backend_dev_name(dev)) + "\n" +
+                            ggml_backend_dev_description(dev));
+                    }
+                }
+            } else if (!params_base.devices.empty()) {
                 // the explicit --device list is nullptr-TERMINATED (parse_device_list);
                 // "none" is a single nullptr -> empty -> "cpu"
                 for (auto * dev : params_base.devices) {
@@ -7271,12 +7292,23 @@ private:
                 ? params_base.n_gpu_layers
                 : llama_model_n_layer(model_tgt) + 1;
             if (ngl_eff > 0 && !gpu_identities.empty()) {
+                std::vector<float> resolved_split(gpu_identities.size());
+                const size_t resolved_count =
+                    llama_model_resolved_tensor_split(
+                        model_tgt, resolved_split.data(),
+                        resolved_split.size());
+                capture_resolved_split_count = resolved_count;
                 llama_cache_acct_shard_topology topology;
-                if (llama_cache_acct_build_shard_topology(
+                const int32_t topology_main_device =
+                    params_base.split_mode == LLAMA_SPLIT_MODE_NONE
+                        ? 0
+                        : params_base.main_gpu;
+                if (resolved_count == gpu_identities.size() &&
+                    llama_cache_acct_build_shard_topology(
                         gpu_identities,
                         int16_t(params_base.split_mode),
-                        params_base.main_gpu,
-                        params_base.tensor_split,
+                        topology_main_device,
+                        resolved_split.data(),
                         topology)) {
                     if (capture_requested) {
                         capture_topologies.push_back(topology);
@@ -7295,9 +7327,24 @@ private:
                             gpu_devices[i], domain,
                         });
                     }
+                    if (cache_authority->configured) {
+                        capture_topology_failure =
+                            "runtime_pool_discovery_failed";
+                    } else {
+                        capture_topology_failure =
+                            "device_domain_unavailable";
+                    }
                 } else {
+                    capture_topology_failure =
+                        resolved_count == gpu_identities.size()
+                            ? "invalid_resolved_split"
+                            : "resolved_split_device_mismatch";
                     cache_authority_config_failed(true);
                 }
+            } else {
+                capture_topology_failure = ngl_eff <= 0
+                    ? "no_gpu_layers"
+                    : "no_gpu_model_device";
             }
 
             // Capture construction discovery is read-only and occurs before the
@@ -7310,6 +7357,8 @@ private:
                     *llama_get_memory(ctx_tgt),
                     capture_runtime_pools,
                     capture_attention_children)) {
+                capture_topology_failure =
+                    "runtime_pool_binding_failed";
                 for (const auto & pool : capture_runtime_pools) {
                     const auto domain = std::find_if(
                         cache_authority->live_device_domains.begin(),
@@ -7364,6 +7413,9 @@ private:
                     !capture_lanes.empty() &&
                     capture_pool_bindings.size() ==
                         capture_runtime_pools.size();
+                if (capture_manifest_enabled) {
+                    capture_topology_failure = "none";
+                }
             }
 
             // C schema-v2 completeness manifest is owned by configuration, not by either
@@ -7629,6 +7681,19 @@ private:
                     vbr_prompt_cache_support =
                         server_vbr_prompt_cache_support_status::
                             artifact_topology_unavailable;
+                    SRV_WRN(
+                        "VBR_ARTIFACT_CAPTURE topology unavailable "
+                        "reason=%s devices=%zu resolved_split=%zu "
+                        "topologies=%zu runtime_pools=%zu bindings=%zu "
+                        "lanes=%zu attention_children=%u\n",
+                        capture_topology_failure,
+                        gpu_identities.size(),
+                        capture_resolved_split_count,
+                        capture_topologies.size(),
+                        capture_runtime_pools.size(),
+                        capture_pool_bindings.size(),
+                        capture_lanes.size(),
+                        capture_attention_children);
                 } else if (!cache_authority->configured) {
                     vbr_prompt_cache_support =
                         server_vbr_prompt_cache_support_status::

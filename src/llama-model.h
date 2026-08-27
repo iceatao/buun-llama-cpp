@@ -676,6 +676,7 @@ struct llama_model {
     // (used for the drafter's gathered tok_embd/output copies under a tensor-sharded target)
     void adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf);
     const float * tensor_split() const;
+    const std::vector<float> & resolved_tensor_split() const;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
