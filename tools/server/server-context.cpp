@@ -4572,7 +4572,12 @@ private:
         // Auto-fit mutates the target's llama_context_params, not params_base.  Reuse the
         // realized target width here; otherwise n_ctx=0 expands the MTP cache to n_ctx_train even
         // when the fitted target is much smaller.
-        cparams.n_ctx         = llama_n_ctx_seq(ctx_tgt);
+        // Honor an explicit --ctx-size-draft (params_base.speculative.draft.n_ctx) so the MTP
+        // draft cache can span more than one target slot's width (e.g. -c 524288 -cd 524288
+        // with --parallel 2) instead of silently capping at n_ctx_seq = target/n_parallel
+        // and failing llama_decode(ctx_dft) past that limit.
+        const int32_t spec_draft_n_ctx = params_base.speculative.draft.n_ctx;
+        cparams.n_ctx         = spec_draft_n_ctx > 0 ? spec_draft_n_ctx : llama_n_ctx_seq(ctx_tgt);
         cparams.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
         cparams.type_k        = params_base.speculative.draft.cache_type_k;
         cparams.type_v        = params_base.speculative.draft.cache_type_v;
