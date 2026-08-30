@@ -15638,6 +15638,21 @@ private:
                         llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id,
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1, -1);
                     }
+                } else if (!slot.spec && spec &&
+                           params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+                    // shared multi-seq MTP spec: arm this slot's own per-seq draft params.
+                    // the single-seq common_speculative_draft(spec, ...) wrapper below
+                    // always writes dparams[0], so slot.id > 0 would draft with stale
+                    // seq-0 state and produce garbage drafts (~random acceptance).
+                    const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+                    auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                    dp.drafting = true;
+                    dp.n_max    = n_draft_max;
+                    dp.n_past   = slot.prompt.tokens.pos_next();
+                    dp.id_last  = slot.sampled;
+                    dp.prompt   = &cached_text_tokens;
+                    dp.result   = &draft;
+                    common_speculative_draft(spec.get());
                 } else {
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     const auto & params_spec = slot.task->params.speculative;
